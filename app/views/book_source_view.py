@@ -14,7 +14,7 @@ from app.views.check_view import CheckView
 class BookSourceView(ft.Column):
     """书源 Tab 页：管理 + 导入"""
 
-    def __init__(self, service: SourceService, on_imported=None):
+    def __init__(self, service: SourceService, on_imported=None, discover_view=None):
         super().__init__(spacing=0, expand=True)
         self.service = service
         self._on_imported_cb = on_imported
@@ -26,10 +26,12 @@ class BookSourceView(ft.Column):
             on_imported=self._on_import_tab_done,
         )
         self.check_view = CheckView(service)
+        self.discover_view = discover_view
 
         # 顶部 Tab 栏
         tab_bar = ft.TabBar(
             tabs=[
+                ft.Tab(label="找书", icon=ft.Icons.TRAVEL_EXPLORE),
                 ft.Tab(label="管理", icon=ft.Icons.LIBRARY_BOOKS),
                 ft.Tab(label="导入", icon=ft.Icons.FILE_DOWNLOAD),
                 ft.Tab(label="检测", icon=ft.Icons.FACT_CHECK_OUTLINED),
@@ -40,6 +42,7 @@ class BookSourceView(ft.Column):
         tab_view = ft.TabBarView(
             expand=True,
             controls=[
+                self.discover_view,
                 self.manage_view,
                 self.import_view,
                 self.check_view,
@@ -48,7 +51,7 @@ class BookSourceView(ft.Column):
 
         self._tabs = ft.Tabs(
             selected_index=0,
-            length=3,
+            length=4,
             expand=True,
             on_change=self._on_tab_change,
             content=ft.Column(
@@ -67,11 +70,13 @@ class BookSourceView(ft.Column):
     def _on_tab_change(self, e):
         """Tab 切换事件"""
         if self._tabs.selected_index == 0:
+            self.discover_view.refresh_sources()
+        elif self._tabs.selected_index == 1:
             self.manage_view._refresh()
 
     def _on_import_tab_done(self, result: dict):
         """导入完成后切回管理 Tab"""
-        self._tabs.selected_index = 0
+        self._tabs.selected_index = 1
         self.manage_view._refresh()
         self.update()
 

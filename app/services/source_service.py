@@ -3,6 +3,8 @@
 """
 from __future__ import annotations
 import json
+import os
+import shutil
 import time
 from pathlib import Path
 from typing import Callable
@@ -13,12 +15,25 @@ from app.models.book_source import BookSource
 class SourceService:
     """书源业务逻辑服务"""
 
-    def __init__(self, resource_dir: str | Path):
+    def __init__(self, resource_dir: str | Path, data_dir: str | Path | None = None):
         self.resource_dir = Path(resource_dir)
+        self.data_dir = Path(data_dir) if data_dir else self._default_data_dir()
         self._sources: list[BookSource] = []
         self._current_path: str | None = None
         # 书源 URL -> 分类检测结果。仅作为本次运行缓存，不改写原始 exploreUrl。
         self.category_checks: dict[str, list[dict]] = {}
+        self.bookshelf: list[dict] = []
+
+    @staticmethod
+    def _default_data_dir() -> Path:
+        """返回与程序安装目录分离的持久化用户数据目录。"""
+        override = os.environ.get("LEGADO_BOOKSOURCE_DATA_DIR")
+        if override:
+            return Path(override)
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / "LegadoBookSourceCheck"
+        return Path.home() / ".legado_booksource_check"
 
     # ── 加载/保存 ──
 
@@ -28,7 +43,94 @@ class SourceService:
             path = self.resource_dir / "bookSource.json"
         self._current_path = str(path)
         self._sources = BookSource.from_json(path)
+        self.load_bookshelf()
         return self._sources
+
+    @property
+    def bookshelf_path(self) -> Path:
+        return self.data_dir / "bookshelf.json"
+
+    def load_bookshelf(self) -> list[dict]:
+        path = self.bookshelf_path
+        legacy_path = self.resource_dir / "bookshelf.json"
+        if not path.exists() and legacy_path.exists():
+            try:
+                self.data_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(legacy_path, path)
+            except OSError:
+                # 旧目录可能只读；此时读取旧文件，首次保存时写入新目录。
+                path = legacy_path
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.bookshelf = data if isinstance(data, list) else []
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            self.bookshelf = []
+        return self.bookshelf
+
+    def save_bookshelf(self):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        path = self.bookshelf_path
+        temp_path = path.with_suffix(".tmp")
+        temp_path.write_text(
+            json.dumps(self.bookshelf, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(path)
+
+    def add_to_bookshelf(self, source: BookSource, book) -> bool:
+        key = (source.bookSourceUrl, book.url)
+        if any((item.get("source_url"), item.get("url")) == key for item in self.bookshelf):
+            return False
+        self.bookshelf.append({
+            "name": book.name, "author": book.author, "intro": book.intro,
+            "url": book.url, "cover_url": book.cover_url,
+            "toc_url": getattr(book, "toc_url", ""),
+            "kind": getattr(book, "kind", ""),
+            "last_chapter": getattr(book, "last_chapter", ""),
+            "word_count": getattr(book, "word_count", ""),
+            "download_urls": getattr(book, "download_urls", ""),
+            "variables": book.variables or {}, "source_url": source.bookSourceUrl,
+            "source_name": source.bookSourceName,
+        })
+        self.save_bookshelf()
+        return True
+
+    def remove_from_bookshelf(self, source_url: str, book_url: str) -> bool:
+        old_count = len(self.bookshelf)
+        self.bookshelf = [item for item in self.bookshelf if
+                          (item.get("source_url"), item.get("url")) !=
+                          (source_url, book_url)]
+        if len(self.bookshelf) != old_count:
+            self.save_bookshelf()
+            return True
+        return False
+
+    def update_bookshelf_state(self, source_url: str, book_url: str,
+                               variables: dict | None = None,
+                               chapter=None, book=None) -> bool:
+        """Persist rule variables and the last reading position outside resources."""
+        for item in self.bookshelf:
+            if (item.get("source_url"), item.get("url")) != (source_url, book_url):
+                continue
+            if variables is not None:
+                item["variables"] = dict(variables)
+            if book is not None:
+                for key, attribute in {
+                    "name": "name", "author": "author", "intro": "intro",
+                    "cover_url": "cover_url", "toc_url": "toc_url", "kind": "kind",
+                    "last_chapter": "last_chapter", "word_count": "word_count",
+                    "download_urls": "download_urls",
+                }.items():
+                    value = getattr(book, attribute, "")
+                    if value:
+                        item[key] = value
+            if chapter is not None:
+                item["reading"] = {
+                    "chapter_url": getattr(chapter, "url", ""),
+                    "chapter_name": getattr(chapter, "name", ""),
+                    "chapter_index": int(getattr(chapter, "index", 0) or 0),
+                }
+            self.save_bookshelf()
+            return True
+        return False
 
     def load_passed(self) -> list[BookSource]:
         """加载已通过测试的书源"""

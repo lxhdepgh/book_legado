@@ -40,8 +40,12 @@ class BookSourceApp:
         )
         page.padding = 0
         page.spacing = 0
-        page.window.min_width = 860
-        page.window.min_height = 640
+        # Desktop uses a phone-like portrait viewport. Mobile platforms use
+        # the physical screen size and safely ignore these desktop defaults.
+        page.window.width = 430
+        page.window.height = 820
+        page.window.min_width = 360
+        page.window.min_height = 600
 
         # 初始化数据
         try:
@@ -55,10 +59,12 @@ class BookSourceApp:
                             bgcolor=ft.Colors.RED_100))
 
         # 创建视图
+        self._discover_view = ReadingView(self.service, discovery_only=True)
         self._reading_view = ReadingView(self.service)
         self._book_source_view = BookSourceView(
             self.service,
             on_imported=self._on_imported,
+            discover_view=self._discover_view,
         )
 
         # 主页容器
@@ -112,9 +118,9 @@ class BookSourceApp:
         if index == 0:
             self._content_container.content = self._book_source_view
         elif index == 1:
-            # 此时 ReadingView 尚未挂载，不能在 refresh_sources 内调用 update。
+            # 此时 ReadingView 尚未挂载，不能调用 update。
             # 更新数据后由下方的 page.update() 一次性完成挂载和渲染。
-            self._reading_view.refresh_sources(update=False)
+            self._reading_view.refresh_bookshelf(update=False)
             self._content_container.content = self._reading_view
 
         self._page.update()

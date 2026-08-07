@@ -11,13 +11,17 @@ from app.services.source_service import SourceService
 class ManageView(ft.Column):
     """书源管理页面"""
 
+    LOAD_BATCH_SIZE = 50
+
     def __init__(self, service: SourceService):
-        super().__init__(spacing=0, scroll=ft.ScrollMode.AUTO, expand=True)
+        super().__init__(spacing=0, scroll=ft.ScrollMode.AUTO, expand=True,
+                         on_scroll=self._on_scroll, scroll_interval=150)
         self.service = service
         self._filtered: list[BookSource] = []
         self._page = 0
         self._selected = set()  # 选中行的索引集合（在 _filtered 中的位置）
         self._select_all = False
+        self._visible_count = self.LOAD_BATCH_SIZE
 
         # ── 顶部控制栏 ──
         self._search_field = ft.TextField(
@@ -31,7 +35,6 @@ class ManageView(ft.Column):
             hint_text="全部分组",
             options=[],
             on_select=self._on_group_filter,
-            width=200,
             height=48,
         )
         self._enabled_filter = ft.Dropdown(
@@ -42,7 +45,6 @@ class ManageView(ft.Column):
                 ft.dropdown.Option("disabled", "仅禁用"),
             ],
             on_select=self._on_enabled_filter,
-            width=140,
             height=48,
         )
 
@@ -53,6 +55,8 @@ class ManageView(ft.Column):
         self._batch_bar = ft.Row(
             visible=False,
             spacing=10,
+            run_spacing=8,
+            wrap=True,
             controls=[
                 ft.Text("已选择 0 项", ref=self._batch_count_ref),
                 ft.FilledTonalButton("启用", icon=ft.Icons.CHECK_CIRCLE_OUTLINE,
@@ -74,7 +78,7 @@ class ManageView(ft.Column):
             data_row_min_height=44,
             data_row_max_height=52,
             column_spacing=20,
-            width=float("inf"),
+            width=760,
             columns=[
                 ft.DataColumn(self._select_all_checkbox),
                 ft.DataColumn(ft.Text("#", size=12), numeric=True),
@@ -101,14 +105,20 @@ class ManageView(ft.Column):
                     ft.Row([
                         ft.Text("书源管理", size=28, weight=ft.FontWeight.BOLD),
                         ft.Container(expand=True),
+                        ft.OutlinedButton(
+                            "全选书源",
+                            icon=ft.Icons.SELECT_ALL,
+                            tooltip="选中当前筛选结果中的全部书源",
+                            on_click=self._select_all_sources,
+                        ),
                         ft.IconButton(ft.Icons.REFRESH, tooltip="刷新",
                                       on_click=self._refresh),
                     ]),
-                    ft.Row([
-                        self._search_field,
-                        self._group_filter,
-                        self._enabled_filter,
-                    ]),
+                    ft.ResponsiveRow([
+                        ft.Container(self._search_field, col={"xs": 12, "sm": 6}),
+                        ft.Container(self._group_filter, col={"xs": 7, "sm": 4}),
+                        ft.Container(self._enabled_filter, col={"xs": 5, "sm": 2}),
+                    ], columns=12, spacing=8, run_spacing=8),
                 ]),
             ),
             # 批量操作栏
@@ -123,9 +133,10 @@ class ManageView(ft.Column):
                 content=ft.Column([
                     ft.Container(
                         expand=True,
-                        content=ft.ListView(
+                        content=ft.Row(
                             controls=[self._table],
-                            expand=True,
+                            scroll=ft.ScrollMode.AUTO,
+                            vertical_alignment=ft.CrossAxisAlignment.START,
                         ),
                     ),
                 ]),
@@ -144,6 +155,7 @@ class ManageView(ft.Column):
     def _refresh(self, e=None):
         """刷新数据"""
         self._filtered = self.service.sources.copy()
+        self._visible_count = self.LOAD_BATCH_SIZE
         self._apply_filters()
         self._render_page()
 
@@ -193,77 +205,93 @@ class ManageView(ft.Column):
 
     def _on_search(self, e):
         self._page = 0
-        self._clear_selection()
+        self._visible_count = self.LOAD_BATCH_SIZE
+        self._clear_selection(render=False)
         self._apply_filters()
         self._render_page()
 
     def _on_group_filter(self, e):
         self._page = 0
-        self._clear_selection()
+        self._visible_count = self.LOAD_BATCH_SIZE
+        self._clear_selection(render=False)
         self._apply_filters()
         self._render_page()
 
     def _on_enabled_filter(self, e):
         self._page = 0
-        self._clear_selection()
+        self._visible_count = self.LOAD_BATCH_SIZE
+        self._clear_selection(render=False)
         self._apply_filters()
         self._render_page()
 
     # ── 渲染表格 ──
 
     def _render_page(self):
-        """渲染当前页数据"""
+        """只渲染当前已触发加载的数据。"""
         total = len(self._filtered)
         start = 0
-        page_data = self._filtered
+        page_data = self._filtered[:self._visible_count]
         all_indices = set(range(total))
         self._select_all_checkbox.value = bool(all_indices) and all_indices.issubset(self._selected)
 
         # 更新表格行
-        rows = []
-        for i, s in enumerate(page_data):
-            idx_in_filtered = start + i
-            is_selected = idx_in_filtered in self._selected
+        self._table.rows = [self._build_row(i, source)
+                            for i, source in enumerate(page_data)]
 
-            rows.append(ft.DataRow(
-                selected=is_selected,
-                cells=[
-                    ft.DataCell(ft.Checkbox(
-                        value=is_selected,
-                        on_change=lambda e, fidx=idx_in_filtered: self._on_row_check(fidx, e),
-                    )),
-                    ft.DataCell(ft.Text(str(start + i + 1), size=11)),
-                    ft.DataCell(
-                        ft.Text(s.display_name, size=13,
-                                weight=ft.FontWeight.W_500 if s.enabled else ft.FontWeight.W_400,
-                                color=ft.Colors.GREY_400 if not s.enabled else None)
-                    ),
-                    ft.DataCell(
-                        ft.Text(s.short_url, size=12,
-                                color=ft.Colors.GREY_600),
-                    ),
-                    ft.DataCell(ft.Text(s.display_group, size=12)),
-                    ft.DataCell(
-                        ft.Switch(
-                            value=s.enabled,
-                            on_change=lambda e, ss=s: self._toggle_enabled(ss),
-                        ),
-                    ),
-                ],
-            ))
+        self._update_status_bar()
 
-        self._table.rows = rows
+        self.update()
 
-        # 更新状态栏
+    def _build_row(self, idx_in_filtered: int, source: BookSource):
+        """构建一行；索引始终指向完整过滤结果，供全选和批处理使用。"""
+        is_selected = idx_in_filtered in self._selected
+        return ft.DataRow(
+            selected=is_selected,
+            cells=[
+                ft.DataCell(ft.Checkbox(
+                    value=is_selected,
+                    on_change=lambda e, idx=idx_in_filtered: self._on_row_check(idx, e),
+                )),
+                ft.DataCell(ft.Text(str(idx_in_filtered + 1), size=11)),
+                ft.DataCell(ft.Text(
+                    source.display_name, size=13,
+                    weight=ft.FontWeight.W_500 if source.enabled else ft.FontWeight.W_400,
+                    color=ft.Colors.GREY_400 if not source.enabled else None,
+                )),
+                ft.DataCell(ft.Text(source.short_url, size=12, color=ft.Colors.GREY_600)),
+                ft.DataCell(ft.Text(source.display_group, size=12)),
+                ft.DataCell(ft.Switch(
+                    value=source.enabled,
+                    on_change=lambda e, selected=source: self._toggle_enabled(selected),
+                )),
+            ],
+        )
+
+    def _on_scroll(self, e):
+        """接近底部时追加下一批，不重建已经显示的行。"""
+        pixels = getattr(e, "pixels", 0) or 0
+        maximum = getattr(e, "max_scroll_extent", 0) or 0
+        if (self._visible_count >= len(self._filtered) or not maximum or
+                maximum - pixels >= 400):
+            return
+        old_count = self._visible_count
+        self._visible_count = min(old_count + self.LOAD_BATCH_SIZE, len(self._filtered))
+        self._table.rows.extend(
+            self._build_row(i, self._filtered[i])
+            for i in range(old_count, self._visible_count)
+        )
+        self._update_status_bar()
+        self.update()
+
+    def _update_status_bar(self):
         stats = self.service.get_statistics()
         self._status_bar.content = ft.Text(
             f"共 {stats['total']} 条 | 启用 {stats['enabled']} 条"
             f" | 禁用 {stats['disabled']} 条 | {stats['groups']} 个分组"
-            f" | 当前过滤: {len(self._filtered)} 条",
+            f" | 当前过滤: {len(self._filtered)} 条"
+            f" | 已加载: {min(self._visible_count, len(self._filtered))} 条",
             size=12, color=ft.Colors.GREY_600,
         )
-
-        self.update()
 
     def _toggle_enabled(self, source: BookSource):
         """切换单个书源的启用状态"""
@@ -277,13 +305,20 @@ class ManageView(ft.Column):
 
     # ── 选择逻辑 ──
 
+    def _select_all_sources(self, _=None):
+        """通过顶部按钮选中完整筛选结果，不受懒加载显示数量限制。"""
+        self._selected = set(range(len(self._filtered)))
+        self._select_all_checkbox.value = bool(self._filtered)
+        self._update_batch_bar(update=False)
+        self._render_page()
+
     def _on_row_check(self, idx_in_filtered, e):
         """显式复选框选择，兼容不触发 DataRow 选择事件的 Flet 版本。"""
         if e.control.value:
             self._selected.add(idx_in_filtered)
         else:
             self._selected.discard(idx_in_filtered)
-        self._update_batch_bar()
+        self._update_batch_bar(update=False)
         self._render_page()
 
     def _on_select_all(self, e):
@@ -294,19 +329,21 @@ class ManageView(ft.Column):
             self._selected.update(range(start, end))
         else:
             self._selected.difference_update(range(start, end))
-        self._update_batch_bar()
+        self._update_batch_bar(update=False)
         self._render_page()
 
-    def _clear_selection(self, e=None):
+    def _clear_selection(self, e=None, render=True):
         self._selected.clear()
-        self._update_batch_bar()
-        self._render_page()
+        self._update_batch_bar(update=not render)
+        if render:
+            self._render_page()
 
-    def _update_batch_bar(self):
+    def _update_batch_bar(self, update=True):
         count = len(self._selected)
         self._batch_bar.visible = count > 0
         self._batch_count_ref.current.value = f"已选择 {count} 项"
-        self.update()
+        if update:
+            self.update()
 
     # ── 批处理操作 ──
 
@@ -333,6 +370,7 @@ class ManageView(ft.Column):
         self._batch_bar.visible = False
         self._apply_filters()
         self._page = 0
+        self._visible_count = self.LOAD_BATCH_SIZE
         try:
             self.service.save()
         except Exception as exc:

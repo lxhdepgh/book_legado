@@ -16,6 +16,14 @@ import re
 import os
 import aiohttp
 
+# Windows consoles commonly default to GBK, while book-source names and error
+# messages may contain emoji or other Unicode characters.  Keep the regression
+# runner from failing after a successful test merely while printing its report.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+
 try:
     from bs4 import BeautifulSoup
     HAS_BS4 = True
@@ -113,7 +121,7 @@ def parse_search_url(search_url: str, base_url: str, keyword: str,
         return None
 
     # ========== 处理 POST 风格: /path,{"body":"...","method":"POST"} ==========
-    if "," in text and ('"body"' in text or '"method"' in text or 'body:' in text):
+    if "," in text and re.search(r",\s*\{", text):
         # 可能是 URL,JSON_CONFIG 格式
         parts = split_post_url(text)
         if parts:
@@ -128,17 +136,23 @@ def parse_search_url(search_url: str, base_url: str, keyword: str,
                 return None
             method = (config.get("method") or "GET").upper()
             body = config.get("body", "")
+            if isinstance(body, (dict, list)):
+                body = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+            elif body is not None and not isinstance(body, str):
+                body = str(body)
             # body 中可能有 {{key}}
             if body:
                 body = body.replace("{{key}}", keyword).replace("{{page}}", str(page))
             headers = config.get("headers")
-            return {
+            request = dict(config)
+            request.update({
                 "url": resolved_url,
                 "method": method,
                 "body": body,
                 "headers": headers,
                 "parse_method": "post_template",
-            }
+            })
+            return request
 
     # ========== 处理 GET 模板 URL ==========
     resolved = resolve_search_url(text, base_url, keyword, page)
@@ -173,10 +187,12 @@ def parse_request_config(config_str: str) -> dict | None:
 
 def split_post_url(text: str) -> tuple | None:
     """分割 POST 风格搜索URL: 'path,{"body":"..."}' → (path, config_json)"""
-    # 找到第一个逗号后的 JSON 起始位置
-    brace_idx = text.find("{")
-    if brace_idx == -1:
+    # 必须定位逗号后的配置对象，不能把 URL 模板 {{page}} 的左花括号
+    # 误判为配置开头。
+    config_match = re.search(r",\s*(\{)", text)
+    if not config_match:
         return None
+    brace_idx = config_match.start(1)
     url_part = text[:brace_idx].strip().rstrip(",")
     config_part = text[brace_idx:]
     return url_part, config_part
@@ -198,6 +214,16 @@ def resolve_search_url(text: str, base_url: str, keyword: str, page: int) -> str
     url = url.replace("{{page+1}}", str(page + 1))
     url = url.replace("{{baseUrl}}", base_url.rstrip("/") + "/")
 
+    # Legado page alternatives: <first-page,second-page,later-pages>.  Once
+    # the requested page exceeds the list, the final alternative is reused.
+    def select_page(match):
+        choices = [item.strip() for item in match.group(1).split(",")]
+        if not choices:
+            return ""
+        return choices[min(max(int(page), 1) - 1, len(choices) - 1)]
+
+    url = re.sub(r"<([^<>]*)>", select_page, url)
+
     # 检查是否还有未替换的 {{...}} 模板 (复杂表达式)
     if "{{" in url and "}}" in url:
         # 简单尝试替换 source.key 为 base_url
@@ -207,6 +233,10 @@ def resolve_search_url(text: str, base_url: str, keyword: str, page: int) -> str
             if "{{" not in url or "}}" not in url:
                 return url  # 替换后没有模板了
         return None  # 仍有复杂模板, 无法处理
+
+    # Legado also uses data: URLs as an internal transport for encoded IDs.
+    if url.startswith("data:"):
+        return url
 
     # 如果是相对路径, 拼接 base_url
     if not (url.startswith("http://") or url.startswith("https://")):
@@ -465,7 +495,8 @@ def pick_test_keyword(source: dict) -> str:
 
 
 async def test_one(source: dict, idx: int, session: aiohttp.ClientSession,
-                   sem: asyncio.Semaphore, timeout: int) -> dict:
+                   sem: asyncio.Semaphore, timeout: int,
+                   search_enabled: bool = True) -> dict:
     """异步测试单个书源 (第1层 + 第2层)"""
     name = source.get("bookSourceName", f"#{idx}")
     raw_url = source.get("bookSourceUrl", "")
@@ -541,6 +572,10 @@ async def test_one(source: dict, idx: int, session: aiohttp.ClientSession,
     # 只有第1层成功才尝试第2层
     if result["status"] != "ok":
         return result
+    if not search_enabled:
+        result["search_status"] = "skip"
+        result["search_method"] = "connect-only"
+        return result
 
     # ---- 第2层: 搜索可用性 ----
     search_url_raw = source.get("searchUrl", "")
@@ -555,18 +590,68 @@ async def test_one(source: dict, idx: int, session: aiohttp.ClientSession,
     keyword = pick_test_keyword(source)
     result["search_keyword"] = keyword
 
+    # Interactive Legado bridges intentionally wait for a human/browser.  They
+    # are supported by the application, but must not block an unattended corpus
+    # regression (some captcha rules wait up to three minutes).
+    interactive_rule_text = json.dumps(source, ensure_ascii=False, default=str)
+    if re.search(r"\b(?:getVerificationCode|webView|startBrowser)\s*\(", interactive_rule_text):
+        result["search_status"] = "js_needed"
+        result["search_method"] = "interactive-browser-or-captcha"
+        result["book_count"] = -1
+        result["error"] = "Engine compatibility: requires interactive browser/captcha input"
+        return result
+
+    # Exercise the exact production request and rule pipeline used by the UI.
+    from app.models.book_source import BookSource
+    from app.services.rule_engine import ReaderEngine, UnsupportedRule
+    from app.services.legado_js import JsBridgeError
+    engine = ReaderEngine(timeout)
+    try:
+        books = await engine.search(BookSource.from_dict(source), keyword, 1)
+        result["search_tried"] = True
+        result["search_method"] = "ReaderEngine.search"
+        result["book_count"] = len(books)
+        result["search_status"] = "ok" if books else "no_results"
+    except asyncio.TimeoutError:
+        result["search_status"] = "timeout"
+        result["book_count"] = -1
+    except aiohttp.ClientResponseError as exc:
+        result["search_status"] = "http_error"
+        result["book_count"] = -1
+        result["error"] = f"Engine search HTTP {exc.status}: {exc.message}"
+    except (UnsupportedRule, JsBridgeError) as exc:
+        result["search_status"] = "js_needed"
+        result["book_count"] = -1
+        result["error"] = f"Engine compatibility: {type(exc).__name__}: {str(exc)[:160]}"
+    except RuntimeError as exc:
+        message = str(exc)
+        if "连接失败" in message or "Server disconnected" in message:
+            result["search_status"] = "http_error"
+        else:
+            result["search_status"] = "error"
+        result["book_count"] = -1
+        result["error"] = f"Engine search: {type(exc).__name__}: {message[:160]}"
+    except Exception as exc:
+        result["search_status"] = "error"
+        result["book_count"] = -1
+        result["error"] = f"Engine search: {type(exc).__name__}: {str(exc)[:160]}"
+    finally:
+        engine.js.close()
+    return result
+
     # 解析 searchUrl
     parsed = parse_search_url(search_url_raw, url, keyword)
     if parsed is None:
-        if (search_url_raw.strip().startswith(("@js:", "<js")) or
-                "java." in search_url_raw or "source." in search_url_raw):
+        if True:
             try:
-                from app.services.legado_js import LegadoJsRuntime, JsContext
-                runtime = LegadoJsRuntime(timeout)
-                js_value = await asyncio.to_thread(
-                    runtime.evaluate, search_url_raw,
-                    JsContext(source=source, key=keyword, page=1, base_url=url),
-                )
+                from app.models.book_source import BookSource
+                from app.services.rule_engine import ReaderEngine
+                engine = ReaderEngine(timeout)
+                try:
+                    js_value = await engine._resolve_rule_url(
+                        search_url_raw, BookSource.from_dict(source), keyword, 1)
+                finally:
+                    engine.js.close()
                 if isinstance(js_value, str):
                     parsed = parse_search_url(js_value, url, keyword)
                 if parsed:
@@ -576,6 +661,7 @@ async def test_one(source: dict, idx: int, session: aiohttp.ClientSession,
             except Exception as exc:
                 result["search_status"] = "js_needed"
                 result["search_method"] = f"JS兼容层未完成: {str(exc)[:70]}"
+                result["error"] = f"JS search URL: {type(exc).__name__}: {str(exc)[:160]}"
                 return result
         elif "{{" in search_url_raw and "}}" in search_url_raw:
             result["search_status"] = "js_needed"
@@ -633,16 +719,20 @@ async def test_one(source: dict, idx: int, session: aiohttp.ClientSession,
                     from app.services.legado_js import LegadoJsRuntime, JsContext, split_js_rule
                     js_rule, remaining_rule = split_js_rule(book_list_rule)
                     runtime = LegadoJsRuntime(timeout)
-                    transformed = await asyncio.to_thread(
-                        runtime.evaluate, js_rule,
-                        JsContext(source=source, key=keyword, page=1,
-                                  result=resp_text, base_url=parsed["url"]),
-                    )
+                    try:
+                        transformed = await asyncio.to_thread(
+                            runtime.evaluate, js_rule,
+                            JsContext(source=source, key=keyword, page=1,
+                                      result=resp_text, base_url=parsed["url"]),
+                        )
+                    finally:
+                        runtime.close()
                     resp_text = transformed if isinstance(transformed, str) else json.dumps(transformed, ensure_ascii=False)
                     content_type = "application/json" if resp_text.lstrip().startswith(("[", "{")) else "text/html"
                 except Exception as exc:
                     result["search_status"] = "js_needed"
                     result["search_method"] += f" + JS兼容层未完成: {str(exc)[:60]}"
+                    result["error"] = f"JS bookList: {type(exc).__name__}: {str(exc)[:160]}"
                     return result
 
             count = extract_by_booklist(resp_text, content_type, remaining_rule)
@@ -740,6 +830,20 @@ async def main():
             timeout = int(sys.argv[3])
         except ValueError:
             pass
+    search_enabled = not (len(sys.argv) >= 5 and
+                          sys.argv[4].strip().lower() in {"connect", "connect-only"})
+    source_offset = 0
+    source_limit = None
+    if len(sys.argv) >= 6:
+        try:
+            source_offset = max(0, int(sys.argv[5]))
+        except ValueError:
+            pass
+    if len(sys.argv) >= 7:
+        try:
+            source_limit = max(1, int(sys.argv[6]))
+        except ValueError:
+            pass
 
     print("=" * 82)
     print("  Legado (阅读) 书源测试 - 第1层(连通) + 第2层(搜索)")
@@ -759,6 +863,11 @@ async def main():
     if not isinstance(sources, list):
         print("\n  错误: JSON 格式不对")
         sys.exit(1)
+
+    partial_run = source_offset > 0 or source_limit is not None
+    if partial_run:
+        end = None if source_limit is None else source_offset + source_limit
+        sources = sources[source_offset:end]
 
     total = len(sources)
     print(f"\n  共 {total} 条书源, 开始测试...\n")
@@ -780,7 +889,24 @@ async def main():
                 "no_results": 0, "http_error": 0, "timeout": 0, "error": 0}
 
     async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-        tasks = [test_one(s, i + 1, session, sem, timeout)
+        async def isolated_test(source, index):
+            try:
+                return await test_one(source, index, session, sem, timeout,
+                                      search_enabled=search_enabled)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return {
+                    "idx": index,
+                    "name": str(source.get("bookSourceName") or "?"),
+                    "status": "err", "status_code": None,
+                    "response_time_ms": None,
+                    "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                    "search_status": "error", "search_keyword": None,
+                    "book_count": -1,
+                }
+
+        tasks = [isolated_test(s, source_offset + i + 1)
                  for i, s in enumerate(sources)]
 
         done = 0
@@ -874,7 +1000,8 @@ async def main():
                 print(f"         {err}")
 
     # ---- 保存通过的书源 ----
-    output_path = save_passed_sources(sources, all_results, json_path)
+    output_path = (None if partial_run else
+                   save_passed_sources(sources, all_results, json_path))
     if output_path:
         c = len([r for r in all_results if r["status"] == "ok"])
         removed = len(all_results) - c
