@@ -21,7 +21,8 @@ from http.cookies import SimpleCookie
 from http.cookiejar import Cookie, CookieJar
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, quote, urljoin, urlsplit
-from urllib.request import HTTPCookieProcessor, HTTPSHandler, ProxyHandler, Request, build_opener
+from urllib.request import (HTTPRedirectHandler, HTTPCookieProcessor, HTTPSHandler,
+                            ProxyHandler, Request, build_opener)
 
 
 class JsRuntimeUnavailable(RuntimeError):
@@ -30,6 +31,11 @@ class JsRuntimeUnavailable(RuntimeError):
 
 class JsBridgeError(RuntimeError):
     pass
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 @dataclass
@@ -52,6 +58,7 @@ class JsContext:
     next_chapter_url: str = ""
     speak_text: str = ""
     speak_speed: int = 0
+    result_html_nodes: bool = False
 
 
 class LegadoJsRuntime:
@@ -184,6 +191,8 @@ class LegadoJsRuntime:
             raise JsRuntimeUnavailable("缺少 quickjs，请执行 pip install quickjs") from exc
 
         source_data = context.source.to_dict() if hasattr(context.source, "to_dict") else dict(context.source)
+        for name in getattr(context.source, "__dataclass_fields__", {}):
+            source_data.setdefault(name, getattr(context.source, name, None))
         raw_headers = source_data.get("header", {}) or {}
         if isinstance(raw_headers, str):
             try:
@@ -196,16 +205,19 @@ class LegadoJsRuntime:
 
         ctx = quickjs.Context()
         ctx.set_memory_limit(128 * 1024 * 1024)
-        ctx.add_callable("__ajax", lambda value: (
-            self._ajax(value, raw_headers, evaluation_base)))
-        ctx.add_callable("__request", lambda value: (
-            self._request_json(value, raw_headers, evaluation_base)))
+        self._thread_state.bridge_error = ""
+        ctx.add_callable("__ajax", lambda value: self._bridge_call(
+            self._ajax, value, raw_headers, evaluation_base))
+        ctx.add_callable("__request", lambda value: self._bridge_call(
+            self._request_json, value, raw_headers, evaluation_base))
         ctx.add_callable("__post", lambda url, body="": self._ajax(
             f'{url},{{"method":"POST","body":{json.dumps(str(body))}}}',
             raw_headers, evaluation_base))
         ctx.add_callable("__md5", lambda value: hashlib.md5(str(value).encode()).hexdigest())
         ctx.add_callable("__digest", self._digest)
-        ctx.add_callable("__hmac", self._hmac)
+        ctx.add_callable("__hmac", lambda value, algorithm, secret, as_base64=False:
+                         self._bridge_call(self._hmac, value, algorithm, secret,
+                                           as_base64))
         ctx.add_callable("__b64decode", self._base64_decode)
         ctx.add_callable("__b64encode", lambda value: base64.b64encode(str(value).encode()).decode())
         ctx.add_callable("__b64bytes", self._base64_bytes)
@@ -213,7 +225,8 @@ class LegadoJsRuntime:
         ctx.add_callable("__bytesstr", self._bytes_to_string)
         ctx.add_callable("__strbytes", self._string_to_bytes)
         ctx.add_callable("__uuid", lambda: str(uuid.uuid4()))
-        ctx.add_callable("__time_format", self._time_format)
+        ctx.add_callable("__time_format", lambda value, pattern, utc=False:
+                         self._bridge_call(self._time_format, value, pattern, utc))
         ctx.add_callable("__num_chapter", self._to_num_chapter)
         ctx.add_callable("__cache_get", self._cache_get)
         ctx.add_callable("__cache_put", self._cache_put)
@@ -229,11 +242,13 @@ class LegadoJsRuntime:
             self._context_get_list(context, rule, content, is_url), ensure_ascii=False))
         ctx.add_callable("__get_elements", lambda rule, content=None: json.dumps(
             self._context_get_elements(context, rule, content), ensure_ascii=False))
-        ctx.add_callable("__put", lambda name, value: self._put(context, name, value))
+        ctx.add_callable("__put", lambda name, value: self._bridge_call(
+            self._put, context, name, value))
         ctx.add_callable("__cookie_get", lambda url: self._cookie_string(str(url)))
         ctx.add_callable("__cookie_set", self.set_cookie)
         ctx.add_callable("__cookie_remove", self.remove_cookie)
-        ctx.add_callable("__crypto", self._crypto)
+        ctx.add_callable("__crypto", lambda *args: self._bridge_call(
+            self._crypto, *args))
         ctx.add_callable("__unsupported", lambda name: self._unsupported(name))
         ctx.add_callable("__css_query", self._css_query)
         ctx.add_callable("__element_op", self._element_operation)
@@ -339,11 +354,14 @@ class LegadoJsRuntime:
         var page = {int(context.page)};
         var result = {result_expression};
         var src = {src_expression};
+        const __resultHtmlNodes = {str(bool(context.result_html_nodes)).lower()};
         var baseUrl = {json.dumps(context.base_url or source_data.get('bookSourceUrl', ''))};
         var title = {json.dumps(context.title or chapter_data.get('title') or chapter_data.get('name') or '')};
         var nextChapterUrl = {json.dumps(context.next_chapter_url or '')};
         var speakText = {json.dumps(context.speak_text or '')};
         var speakSpeed = {int(context.speak_speed or 0)};
+        var __contentChanged = false;
+        var __currentContent = null;
         function escape(value) {{
           let output='';const safe=/[A-Za-z0-9@*_+./-]/;
           for(let i=0;i<String(value).length;i++){{
@@ -403,6 +421,29 @@ class LegadoJsRuntime:
           }});
           return target;
         }}
+        function __javaObject(value) {{
+          if (!value || typeof value !== 'object') return value;
+          if (Array.isArray(value)) {{
+            value.forEach(__javaObject);
+            if (value.some(item => item && typeof item === 'object')) {{
+              Object.defineProperty(value, 'toString', {{enumerable:false,value:function(){{
+                return JSON.stringify(this);
+              }}}});
+            }}
+            return value;
+          }}
+          Object.keys(value).forEach(key => __javaObject(value[key]));
+          if (Object.getPrototypeOf(value) === Object.prototype &&
+              !Object.prototype.hasOwnProperty.call(value, 'toString')) {{
+            Object.defineProperty(value, 'toString', {{enumerable:false,value:function(){{
+              return '{{' + Object.keys(this).map(key =>
+                String(key) + '=' + String(this[key])).join(', ') + '}}';
+            }}}});
+          }}
+          return value;
+        }}
+        result = __javaObject(result);
+        src = __javaObject(src);
         function __responseCookies(headers) {{
           const raw=String((headers||{{}})['set-cookie']||'');const result={{}};
           raw.split(/,(?=[^;,=]+=[^;,]+)/).forEach(cookie=>{{
@@ -423,7 +464,7 @@ class LegadoJsRuntime:
           getLoginHeaderMap: () => {{
             const value=__get('source:loginHeader') || '';
             try {{ return __map(typeof value === 'string' ? JSON.parse(value.replace(/^&/,'')) : value); }}
-            catch (_) {{ return {{}}; }}
+            catch (_) {{ return __map({{}}); }}
           }},
           getLoginInfo: () => __get('source:loginInfo') || '',
           putLoginInfo: value => __put('source:loginInfo', typeof value === 'string' ? value : JSON.stringify(value)),
@@ -431,7 +472,7 @@ class LegadoJsRuntime:
           getLoginInfoMap: () => {{
             const value=__get('source:loginInfo') || '';
             try {{ return __map(typeof value === 'string' ? JSON.parse(value) : value); }}
-            catch (_) {{ return {{}}; }}
+            catch (_) {{ return __map({{}}); }}
           }},
           key: __sourceData.bookSourceUrl || ''
         }});
@@ -484,14 +525,16 @@ class LegadoJsRuntime:
             close: () => undefined
           }};
         }}
-        function __http(method, url, body, headers) {{
+        function __http(method, url, body, headers, followRedirects) {{
           return __response(__request(String(url) + ',' + JSON.stringify({{
-            method: method, body: body == null ? '' : String(body), headers: headers || {{}}
+            method: method, body: body == null ? '' : String(body),
+            headers: headers || {{}}, followRedirects: followRedirects !== false
           }})));
         }}
         function __element(value) {{
           const markup = String(value == null ? '' : value);
           return {{
+            __markup: markup,
             text: () => __element_op(markup, 'text', ''),
             ownText: () => __element_op(markup, 'ownText', ''),
             html: () => __element_op(markup, 'html', ''),
@@ -503,7 +546,8 @@ class LegadoJsRuntime:
             tagName: () => __element_op(markup, 'tagName', ''),
             select: rule => __elements(markup, String(rule)),
             toString: () => markup,
-            valueOf: () => markup
+            valueOf: () => markup,
+            toJSON: () => markup
           }};
         }}
         function __elements(html, selector) {{
@@ -514,12 +558,16 @@ class LegadoJsRuntime:
             html: () => values('html').join(''),
             outerHtml: () => values('outerHtml').join(''),
             attr: name => JSON.parse(__css_query(String(html), query, 'attr', String(name)))[0] || '',
+            hasClass: name => JSON.parse(__css_query(
+              String(html), query, 'attr', 'class')).some(value =>
+                String(value).split(/\\s+/).includes(String(name))),
             size: () => values('outerHtml').length,
             isEmpty: () => values('outerHtml').length === 0,
             first: () => __element(values('outerHtml')[0] || ''),
             last: () => __element(values('outerHtml').slice(-1)[0] || ''),
             get: index => __element(values('outerHtml')[Number(index)] || ''),
-            eq: index => __element(values('outerHtml')[Number(index)] || ''),
+            eq: index => __elements(
+              values('outerHtml')[Number(index)] || '', '*'),
             eachText: () => values('text'),
             eachAttr: name => JSON.parse(__css_query(String(html), query, 'attr', String(name))),
             select: child => __elements(values('outerHtml').join(''), String(child)),
@@ -539,11 +587,27 @@ class LegadoJsRuntime:
           values.html = () => values.map(value => value.html()).join('');
           values.outerHtml = () => values.map(value => value.outerHtml()).join('');
           values.attr = name => values.length ? values[0].attr(name) : '';
+          values.hasClass = name => values.some(value => value.hasClass(name));
           values.first = () => values.length ? values[0] : null;
           values.get = index => values[Number(index)] || null;
+          values.eq = index => __elementList(
+            values[Number(index)] ? [values[Number(index)].outerHtml()] : []);
+          values.select = child => {{
+            const selected = __elements(
+              values.map(value => value.outerHtml()).join(''), String(child));
+            return __elementList(Array.from({{length:selected.length}},
+              (_unused,index) => selected[index].outerHtml()));
+          }};
           values.size = () => values.length;
           values.isEmpty = () => values.length === 0;
           values.toArray = () => Array.from(values);
+          // Rhino exposes Java List/Elements methods through the prototype;
+          // `for (i in elements)` therefore visits record indexes only.
+          // Direct assignments above are enumerable in QuickJS, so hide them.
+          ['text','html','outerHtml','attr','hasClass','first','get','eq',
+           'select','size','isEmpty','toArray'].forEach(name =>
+            Object.defineProperty(values,name,{{value:values[name],writable:true,
+              configurable:true,enumerable:false}}));
           return values;
         }}
         function __domNode(handle) {{
@@ -561,6 +625,7 @@ class LegadoJsRuntime:
           api.parents=()=>__domNodes(JSON.parse(__dom_parents(api.__handle)));
           api.remove=()=>{{__dom_remove(api.__handle);return api}};
           api.toString=()=>api.outerHtml();api.valueOf=()=>api.outerHtml();
+          api.toJSON=()=>api.outerHtml();
           return api;
         }}
         function __domNodes(input) {{
@@ -570,6 +635,8 @@ class LegadoJsRuntime:
             handles.forEach((h,i)=>api[i]=__domNode(h));api.length=handles.length;
           }};
           api.text=()=>handles.map(h=>__dom_op(h,'text','')).join(' ');
+          api.hasClass=name=>handles.some(h=>String(
+            __dom_op(h,'attr','class')).split(/\\s+/).includes(String(name)));
           api.html=()=>handles.map(h=>__dom_op(h,'html','')).join('');
           api.outerHtml=()=>handles.map(h=>__dom_op(h,'outerHtml','')).join('');
           api.attr=name=>handles.length?__dom_op(handles[0],'attr',String(name)):'';
@@ -577,7 +644,8 @@ class LegadoJsRuntime:
           api.first=()=>handles.length?__domNode(handles[0]):null;
           api.last=()=>handles.length?__domNode(handles[handles.length-1]):null;
           api.get=index=>handles[Number(index)]?__domNode(handles[Number(index)]):null;
-          api.eq=api.get;api.eachText=()=>handles.map(h=>__dom_op(h,'text',''));
+          api.eq=index=>__domNodes(handles[Number(index)]?[handles[Number(index)]]:[]);
+          api.eachText=()=>handles.map(h=>__dom_op(h,'text',''));
           api.eachAttr=name=>handles.map(h=>__dom_op(h,'attr',String(name)));
           api.select=child=>__domNodes(handles.flatMap(
             h=>JSON.parse(__dom_query(h,String(child)))));
@@ -611,19 +679,24 @@ class LegadoJsRuntime:
             toString: () => __dom_op(root,'outerHtml','')
           }};
         }}
+        if (__resultHtmlNodes && Array.isArray(result)) {{
+          result = __elementList(result);
+        }} else if (__resultHtmlNodes && typeof result === 'string') {{
+          result = __element(result);
+        }}
         function __jsoupConnect(url) {{
-          const state={{url:String(url),headers:{{}},data:{{}},method:'GET'}};
+          const state={{url:String(url),headers:{{}},data:{{}},method:'GET',followRedirects:true}};
           const api={{
             header:(name,value)=>{{state.headers[String(name)]=String(value);return api;}},
             headers:value=>{{Object.assign(state.headers,value || {{}});return api;}},
             userAgent:value=>{{state.headers['User-Agent']=String(value);return api;}},
             timeout:()=>api,ignoreContentType:()=>api,ignoreHttpErrors:()=>api,
-            followRedirects:()=>api,maxBodySize:()=>api,
+            followRedirects:value=>{{state.followRedirects=Boolean(value);return api;}},maxBodySize:()=>api,
             data:(name,value)=>{{state.data[String(name)]=String(value);return api;}},
             method:value=>{{state.method=String(value).toUpperCase();return api;}},
             execute:()=>__http(state.method,state.url,
               Object.keys(state.data).map(k=>encodeURIComponent(k)+'='+encodeURIComponent(state.data[k])).join('&'),
-              state.headers),
+              state.headers,state.followRedirects),
             get:()=>{{const response=api.execute();return __document(response.body(),response.url());}},
             post:()=>{{state.method='POST';const response=api.execute();return __document(response.body(),response.url());}}
           }};
@@ -777,6 +850,7 @@ class LegadoJsRuntime:
         Packages.io.legado.app.model.analyzeRule.AnalyzeRule = ()=>({{
           cacheFile:url=>__ajax(String(url))
         }});
+        globalThis.Packages = Packages;
         function JavaImporter() {{
           const target = {{}};
           target.importPackage = (...packages) => {{
@@ -802,24 +876,41 @@ class LegadoJsRuntime:
         var java = {{
           ajax: value => __ajax(String(value)),
           getString: (rule, content, isUrl) =>
-            __get_string(String(rule), content, Boolean(isUrl)),
-          getElement: rule => __element(__get_string(String(rule))),
+            __get_string(String(rule), content === undefined && __contentChanged
+              ? __currentContent : content, Boolean(isUrl)),
+          getElement: rule => {{
+            const values=JSON.parse(__get_elements(
+              String(rule), __contentChanged ? __currentContent : undefined));
+            const markup=String(values[0] || '');
+            if (/<[A-Za-z][^>]*>/.test(markup)) {{
+              const root=__dom_parse(markup);
+              const handles=JSON.parse(__dom_query(root,'*'));
+              if(handles.length) return __domNode(handles[0]);
+            }}
+            return __element(markup);
+          }},
           getStringList: (rule, content, isUrl) =>
-            JSON.parse(__get_list(String(rule), content, Boolean(isUrl))),
+            JSON.parse(__get_list(String(rule),
+              content === undefined && __contentChanged ? __currentContent : content,
+              Boolean(isUrl))),
           getElements: (rule, content) =>
-            __elementList(JSON.parse(__get_elements(String(rule), content))),
+            __elementList(JSON.parse(__get_elements(String(rule),
+              content === undefined && __contentChanged ? __currentContent : content))),
           setContent: (value, parent) => {{
-            src = String(value == null ? '' : value); result = src;
+            __currentContent = String(value == null ? '' : value);
+            __contentChanged = true;
             if (parent != null && String(parent)) {{ baseUrl=String(parent); java.url=baseUrl; }}
-            return src;
+            return __currentContent;
           }},
           get: name => __get(String(name)),
           put: (name, value) => __put(String(name), value),
           get: (value, headers) => (headers !== undefined || /^https?:\\/\\//i.test(String(value)))
-            ? __http('GET', value, '', headers)
+            ? __response(__request(String(value) + ',' + JSON.stringify({{
+                method:'GET', headers:headers || {{}}, followRedirects:false
+              }})))
             : __get(String(value)),
-          post: (url, body, headers) => __http('POST', url, body, headers),
-          head: (url, headers) => __http('HEAD', url, '', headers),
+          post: (url, body, headers) => __http('POST', url, body, headers, false),
+          head: (url, headers) => __http('HEAD', url, '', headers, false),
           ajaxAll: urls => Array.from(urls || []).map(url => __response(__request(String(url)))),
           getStrResponse: value => __response(__request(String(value || java.ruleUrl || baseUrl))),
           getByteArray: value => __response(__request(String(value || java.ruleUrl || baseUrl))).bodyAsBytes(),
@@ -872,8 +963,13 @@ class LegadoJsRuntime:
           tripleDESEncodeBase64Str: (value, key, mode, padding, iv) =>
             __crypto('encryptStr', 'DESede/' + String(mode || 'CBC') + '/' + String(padding || 'PKCS5Padding'), JSON.stringify(key), JSON.stringify(iv || ''), JSON.stringify(value)),
           randomUUID: () => __uuid(),
-          timeFormat: (value, pattern) => __time_format(value, String(pattern || 'yyyy-MM-dd HH:mm:ss'), false),
-          timeFormatUTC: (value, pattern) => __time_format(value, String(pattern || 'yyyy-MM-dd HH:mm:ss'), true),
+          timeFormat: (value, pattern) => __time_format(
+            value instanceof Date ? value.getTime() : value,
+            String(pattern || 'yyyy-MM-dd HH:mm:ss'), false),
+          timeFormatUTC: (value, pattern, offset) => __time_format(
+            value instanceof Date ? value.getTime() : value,
+            String(pattern || 'yyyy-MM-dd HH:mm:ss'),
+            offset === undefined ? true : Number(offset)),
           toNumChapter: value => __num_chapter(String(value)),
           t2s: value => __t2s(String(value)),
           htmlFormat: value => __html_format(String(value)),
@@ -930,7 +1026,13 @@ class LegadoJsRuntime:
         java.headerMap = __map({json.dumps(raw_headers if isinstance(raw_headers, dict) else {}, ensure_ascii=False)});
         java.webViewUA = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36';
         java.getWebViewUA = () => java.webViewUA;
-        java.androidId = java.deviceID = {json.dumps(self.device_id)};
+        const __deviceId = {json.dumps(self.device_id)};
+        const __deviceValue = () => __deviceId;
+        __deviceValue.toString = () => __deviceId;
+        __deviceValue.valueOf = () => __deviceId;
+        __deviceValue.toJSON = () => __deviceId;
+        __deviceValue[Symbol.toPrimitive] = () => __deviceId;
+        java.androidId = java.deviceID = __deviceValue;
         java = new Proxy(java, {{
           get: (target, name) => Object.prototype.hasOwnProperty.call(target, name)
             ? target[name]
@@ -1015,6 +1117,19 @@ class LegadoJsRuntime:
         }});
         """
         clean = self._clean_script(script)
+        # Rhino book-source scripts frequently redeclare injected context
+        # globals at top level (``let page = java.get('page')``). QuickJS
+        # rejects a lexical declaration over our bootstrap ``var`` bindings.
+        # A plain assignment preserves Rhino's effective value and scope.
+        context_names = {
+            "key", "page", "result", "src", "baseUrl", "title",
+            "nextChapterUrl", "speakText", "speakSpeed", "book", "chapter",
+            "source", "java", "cache", "infoMap", "Packages",
+        }
+        for context_name in context_names:
+            clean = re.sub(
+                rf"(?m)^(\s*)(?:let|const)\s+{re.escape(context_name)}\s*=",
+                rf"\1{context_name} =", clean)
         if context.response_data is not None:
             clean += """
             ;JSON.stringify((function(value){
@@ -1026,7 +1141,18 @@ class LegadoJsRuntime:
                 status:200, url:String(baseUrl)};
             })(result))
             """
-        js_lib = self._resolve_js_lib(source_data.get("jsLib", ""))
+        js_lib = self._clean_script(
+            self._resolve_js_lib(source_data.get("jsLib", "")))
+        # Rhino allows a later top-level ``var`` declaration to reuse a name
+        # introduced by a library's top-level ``let``/``const``. QuickJS
+        # rejects the combined program before execution. Treat the later var
+        # as an assignment, matching Rhino's effective shared-scope behavior.
+        lexical_names = set(re.findall(
+            r"(?m)^\s*(?:let|const)\s+([A-Za-z_$][\w$]*)", js_lib))
+        for lexical_name in lexical_names:
+            clean = re.sub(
+                rf"(?m)^(\s*)var\s+{re.escape(lexical_name)}\s*=",
+                rf"\1{lexical_name} =", clean)
         try:
             value = ctx.eval(bootstrap + "\n" + js_lib + "\n" + clean)
             self._sync_context_objects(ctx, context)
@@ -1034,7 +1160,25 @@ class LegadoJsRuntime:
                 return json.loads(value.json())
             return value
         except Exception as exc:
-            raise JsBridgeError(str(exc)) from exc
+            bridge_error = str(getattr(self._thread_state, "bridge_error", "") or "")
+            detail = str(exc)
+            location = re.search(r"<input>:(\d+)", detail)
+            if location:
+                rule_line = int(location.group(1)) - (
+                    bootstrap.count("\n") + js_lib.count("\n") + 2)
+                if rule_line > 0:
+                    detail = f"{detail.rstrip()}\nRule line: {rule_line}"
+            if bridge_error and bridge_error not in detail:
+                detail = f"{detail.rstrip()}\nBridge: {bridge_error}"
+            raise JsBridgeError(detail) from exc
+
+    def _bridge_call(self, function, *args):
+        """Preserve Python callback failures hidden by QuickJS as generic errors."""
+        try:
+            return function(*args)
+        except Exception as exc:
+            self._thread_state.bridge_error = f"{type(exc).__name__}: {exc}"
+            raise
 
     @staticmethod
     def _external_rule_root(content):
@@ -1057,7 +1201,9 @@ class LegadoJsRuntime:
         if isinstance(content, bool):
             is_url, content = content, None
         if content is None:
-            return context.get_string(str(rule)) if context.get_string else ""
+            if context.get_string:
+                return context.get_string(str(rule))
+            content = context.result
         root, kind = self._external_rule_root(content)
         return extract_value(root, str(rule), kind,
                              context.base_url if is_url else "")
@@ -1070,7 +1216,9 @@ class LegadoJsRuntime:
         if content is None:
             if context.get_string_list:
                 return context.get_string_list(str(rule))
-            return ([context.get_string(str(rule))] if context.get_string else [])
+            if context.get_string:
+                return [context.get_string(str(rule))]
+            content = context.result
         root, kind = self._external_rule_root(content)
         return extract_values(root, str(rule), kind,
                               context.base_url if is_url else "")
@@ -1080,7 +1228,9 @@ class LegadoJsRuntime:
         if content is None:
             if context.get_elements:
                 return context.get_elements(str(rule))
-            return context.get_string_list(str(rule)) if context.get_string_list else []
+            if context.get_string_list:
+                return context.get_string_list(str(rule))
+            content = context.result
         root, kind = self._external_rule_root(content)
         return [str(item) for item in evaluate(root, str(rule), kind)]
 
@@ -1097,6 +1247,12 @@ class LegadoJsRuntime:
             if target is None:
                 continue
             values = state.get(name) or {}
+            # A remote script may shadow one of Rhino's global context names
+            # (for example ``var source = url``).  Legado simply discards that
+            # temporary global when the evaluation ends; it never attempts to
+            # copy string/array properties back into the Kotlin model object.
+            if not isinstance(values, dict):
+                continue
             if name == "book":
                 for legado_name, python_name in {
                     "bookUrl": "url", "tocUrl": "toc_url",
@@ -1153,6 +1309,21 @@ class LegadoJsRuntime:
             r"\s*(\[[^\]\r\n]+\])\s*=>",
             r"\1(\2)=>", value,
         )
+        # Rhino permits a function parameter to be redeclared with let/const;
+        # QuickJS treats that as an early syntax error. Assignment preserves
+        # Rhino's effective value while allowing the library to compile.
+        def normalize_parameters(match):
+            header, params, body = match.group(1), match.group(2), match.group(3)
+            for parameter in re.findall(r"[A-Za-z_$][\w$]*", params):
+                body = re.sub(
+                    rf"\b(?:let|const)\s+{re.escape(parameter)}\s*=",
+                    f"{parameter} =", body)
+            return header + body
+
+        value = re.sub(
+            r"(function\s+[A-Za-z_$][\w$]*\s*\(([^)]*)\)\s*\{)"
+            r"([\s\S]*?)(?=\r?\nfunction\s+[A-Za-z_$]|\Z)",
+            normalize_parameters, value)
         value = value.replace("\u200b", "").replace("\ufeff", "")
         # Normalize a common community-source typo only where the character is
         # being used as a JavaScript statement terminator.
@@ -1200,7 +1371,12 @@ class LegadoJsRuntime:
         number = float(value)
         if abs(number) < 100_000_000_000:
             number *= 1000
-        moment = datetime.fromtimestamp(number / 1000, timezone.utc if utc else None)
+        numeric_offset = (not isinstance(utc, bool) and
+                          isinstance(utc, (int, float)))
+        if numeric_offset:
+            number += float(utc)
+        moment = datetime.fromtimestamp(
+            number / 1000, timezone.utc if utc or numeric_offset else None)
         source_pattern = str(pattern or "yyyy-MM-dd HH:mm:ss")
         fmt = source_pattern
         for java, python in (("yyyy", "%Y"), ("MM", "%m"), ("dd", "%d"),
@@ -1307,7 +1483,8 @@ class LegadoJsRuntime:
 
     @classmethod
     def _hmac(cls, value, algorithm, secret, as_base64=False) -> str:
-        name = cls._hash_name(str(algorithm).replace("HMAC", "")) or "sha1"
+        name = cls._hash_name(re.sub(
+            r"^hmac", "", str(algorithm), flags=re.I)) or "sha1"
         result = hmac.new(str(secret).encode(), str(value).encode(), name).digest()
         return base64.b64encode(result).decode() if as_base64 else result.hex()
 
@@ -1818,15 +1995,20 @@ class LegadoJsRuntime:
             raise JsBridgeError("JS HTTP runtime has been closed")
         try:
             request_opener = None
-            if proxy:
-                proxy = str(proxy).strip()
-                proxy = proxy if "://" in proxy else "http://" + proxy
+            if proxy or config.get("followRedirects") is False:
+                handlers = [HTTPCookieProcessor(self.cookies)]
+                if config.get("followRedirects") is False:
+                    handlers.append(_NoRedirectHandler())
                 ssl_context = ssl.create_default_context()
                 ssl_context.check_hostname = False
                 ssl_context.verify_mode = ssl.CERT_NONE
-                request_opener = build_opener(
-                    HTTPCookieProcessor(self.cookies), HTTPSHandler(context=ssl_context),
-                    ProxyHandler({"http": proxy, "https": proxy}))
+                handlers.append(HTTPSHandler(context=ssl_context))
+            if proxy:
+                proxy = str(proxy).strip()
+                proxy = proxy if "://" in proxy else "http://" + proxy
+                handlers.append(ProxyHandler({"http": proxy, "https": proxy}))
+            if proxy or config.get("followRedirects") is False:
+                request_opener = build_opener(*handlers)
             with self._open_with_retry(request, config.get("retry", 0), request_opener) as response:
                 raw = b"" if method == "HEAD" else response.read()
                 charset = config.get("charset") or response.headers.get_content_charset() or "utf-8"

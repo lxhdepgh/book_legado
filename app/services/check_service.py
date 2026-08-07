@@ -6,7 +6,9 @@ import json
 import re
 import aiohttp
 
-from test_book_sources_async import parse_search_url, test_one
+from test_book_sources_async import (classify_js_bridge_error, parse_search_url,
+                                     test_one)
+from app.services.legado_js import JsBridgeError
 from app.services.rule_engine import (UnsupportedRule, _resolve_explore_url,
                                       resolve_explore_categories, select_nodes)
 from app.services.reading_engine import LegadoReadingEngine
@@ -32,6 +34,11 @@ async def _engine_search_check(source, timeout: int) -> dict:
         return {"search_status": "js_needed", "book_count": None,
                 "search_keyword": keyword, "search_method": "interactive-required",
                 "search_error": str(exc)}
+    except JsBridgeError as exc:
+        return {"search_status": classify_js_bridge_error(str(exc)),
+                "book_count": None, "search_keyword": keyword,
+                "search_method": "python-legado-engine",
+                "search_error": str(exc)[:240]}
     except asyncio.TimeoutError:
         return {"search_status": "timeout", "book_count": None,
                 "search_keyword": keyword, "search_method": "python-legado-engine",

@@ -38,6 +38,7 @@ class BookSource:
     ruleContent: dict = field(default_factory=dict)
     ruleToc: dict = field(default_factory=dict)
     ruleExplore: dict = field(default_factory=dict)
+    ruleReview: dict = field(default_factory=dict)
 
     # 高级
     concurrentRate: str = ""

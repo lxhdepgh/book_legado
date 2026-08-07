@@ -59,6 +59,8 @@ class ReadingView(ft.Column):
         self._category_load_id = 0
         self._chapter_visible_count = 0
         self._has_more = True
+        self._book_detail_dialog = None
+        self._detail_book = None
         self._source = ft.Dropdown(label="书源", on_select=self._source_changed)
         self._keyword = ft.TextField(label="书名或关键词", expand=True, on_submit=self._search)
         self._search_btn = ft.Button("搜索", icon=ft.Icons.SEARCH, on_click=self._search)
@@ -528,7 +530,7 @@ class ReadingView(ft.Column):
             if self._has_more:
                 self._result_page += 1
             self._append_book_controls(added_books)
-            self._status.value = f"找到 {len(self.books)} 本书，点击书籍加载目录"
+            self._status.value = f"找到 {len(self.books)} 本书，点击书籍查看详情"
             self._tabs.selected_index = 0
         except Exception as exc:
             self._show_error(exc)
@@ -568,8 +570,86 @@ class ReadingView(ft.Column):
                 ft.Icons.BOOKMARK_ADD_OUTLINED, tooltip="加入书架",
                 on_click=lambda e, selected=book: self._add_to_bookshelf(selected),
             ),
-            on_click=lambda e, selected=book: self._add_to_bookshelf(selected),
+            on_click=lambda e, selected=book: self._show_book_detail(selected),
         )
+
+    def _show_book_detail(self, book):
+        if not self.current_source:
+            return
+        self._detail_book = book
+        self._book_detail_dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(book.name or "书籍详情"),
+            content=ft.Container(
+                width=420, height=220,
+                content=ft.Column([
+                    ft.ProgressRing(), ft.Text("正在加载书籍详情…"),
+                ], alignment=ft.MainAxisAlignment.CENTER,
+                   horizontal_alignment=ft.CrossAxisAlignment.CENTER)),
+            actions=[ft.TextButton("关闭", on_click=self._close_book_detail)],
+        )
+        self.page.show_dialog(self._book_detail_dialog)
+        self.page.run_task(self._load_book_detail, book, self.current_source)
+
+    async def _load_book_detail(self, book, source):
+        error = ""
+        try:
+            await self.engine.book_info(source, book)
+            if book.cover_url and getattr(source, "coverDecodeJs", ""):
+                book.cover_url = await self.engine.decode_cover(source, book.cover_url)
+        except Exception as exc:
+            error = str(exc)
+        if self._detail_book is not book or self._book_detail_dialog is None:
+            return
+        cover = (ft.Image(
+            src=book.cover_url, width=110, height=150, fit=ft.BoxFit.COVER,
+            error_content=ft.Icon(ft.Icons.BROKEN_IMAGE, size=48))
+                 if book.cover_url else
+                 ft.Container(
+                     width=110, height=150, alignment=ft.Alignment.CENTER,
+                     content=ft.Icon(ft.Icons.MENU_BOOK, size=54)))
+        metadata = [
+            ("作者", book.author), ("分类", book.kind),
+            ("字数", book.word_count), ("最新章节", book.last_chapter),
+        ]
+        meta_controls = [
+            ft.Text(f"{label}：{value}", selectable=True)
+            for label, value in metadata if value
+        ] or [ft.Text("暂无其他书籍信息", color=ft.Colors.GREY_600)]
+        controls = [
+            ft.Row(
+                [cover, ft.Column(meta_controls, expand=True, spacing=7)],
+                vertical_alignment=ft.CrossAxisAlignment.START),
+            ft.Divider(),
+            ft.Text("简介", weight=ft.FontWeight.BOLD),
+            ft.Text(book.intro or "暂无简介", selectable=True),
+        ]
+        if error:
+            controls.append(ft.Text(
+                f"完整详情加载失败，已显示搜索结果中的信息。\n{error}",
+                color=ft.Colors.ORANGE_700, size=12))
+        self._book_detail_dialog.title = ft.Text(book.name or "书籍详情")
+        self._book_detail_dialog.content = ft.Container(
+            width=420, height=430,
+            content=ft.ListView(controls=controls, spacing=8))
+        self._book_detail_dialog.actions = [
+            ft.TextButton("关闭", on_click=self._close_book_detail),
+            ft.Button(
+                "加入书架", icon=ft.Icons.BOOKMARK_ADD_OUTLINED,
+                on_click=lambda e, selected=book:
+                self._add_detail_to_bookshelf(selected)),
+        ]
+        self._book_detail_dialog.update()
+
+    def _add_detail_to_bookshelf(self, book):
+        self._add_to_bookshelf(book)
+        self._close_book_detail(None)
+
+    def _close_book_detail(self, _):
+        if self._book_detail_dialog:
+            self.page.pop_dialog()
+        self._book_detail_dialog = None
+        self._detail_book = None
 
     async def _decode_book_cover(self, book, image):
         try:
@@ -795,7 +875,7 @@ class ReadingView(ft.Column):
                     *rendered,
                 ])
             else:
-                self._title.value = chapter.name
+                self._title.value = content.title or chapter.name
                 self._content_host.controls = rendered
                 self._continuous_loaded = {chapter.url}
                 self._auto_scroll_armed = True

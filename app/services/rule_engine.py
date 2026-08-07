@@ -16,7 +16,8 @@ from bs4 import BeautifulSoup
 
 from test_book_sources_async import (encode_url, jsonpath_get, parse_search_url,
                                      simplify_legado_selector, usable_non_js_rule)
-from app.services.legado_js import LegadoJsRuntime, JsContext, split_js_rule
+from app.services.legado_js import (JsBridgeError, JsContext, LegadoJsRuntime,
+                                    split_js_rule)
 from app.services.legado_rule_parser import RuleParseError, evaluate, split_balanced
 from app.services.request_compat import escape_form, escape_url_query
 
@@ -311,6 +312,10 @@ def _is_pagination_item(name: str, url: str) -> bool:
     ))
 
 
+def _is_action_url(url: str) -> bool:
+    return str(url or "").strip().lower().startswith(("javascript:", "void("))
+
+
 def _java_replacement(value: str) -> str:
     """Translate Java/Rhino ``$1`` capture references for Python ``re``."""
     return re.sub(r"\$(\d+)", r"\\g<\1>", str(value or ""))
@@ -336,7 +341,7 @@ def extract_values(node, rule: str, kind: str, base_url: str = "") -> list[str]:
     captured = _capture_value(node, rule)
     if captured is not None:
         value = captured.strip()
-        if base_url and value.startswith(("/", "./", "../", "//")):
+        if base_url and value.startswith(("/", "./", "../", "//", "#")):
             value = urljoin(base_url, value)
         return [value] if value else []
     for candidate in _rule_candidates(rule):
@@ -356,7 +361,7 @@ def extract_values(node, rule: str, kind: str, base_url: str = "") -> list[str]:
                 except re.error:
                     pass
             value = value.strip()
-            if base_url and value and value.startswith(("/", "./", "../", "//")):
+            if base_url and value and value.startswith(("/", "./", "../", "//", "#")):
                 value = urljoin(base_url, value)
             if value:
                 values.append(value)
@@ -385,7 +390,7 @@ def extract_value(node, rule: str, kind: str, base_url: str = "") -> str:
     captured = _capture_value(node, rule)
     if captured is not None:
         captured = captured.strip()
-        if base_url and captured.startswith(("/", "./", "../", "//")):
+        if base_url and captured.startswith(("/", "./", "../", "//", "#")):
             captured = urljoin(base_url, captured)
         return captured
     if _is_js(rule):
@@ -411,7 +416,8 @@ def extract_value(node, rule: str, kind: str, base_url: str = "") -> str:
     candidates = _rule_candidates(rule) or [rule]
     value = ""
     for candidate in candidates:
-        value = _extract_single_value(node, candidate, kind)
+        value = _extract_single_value(node, candidate, kind,
+                                      first_only=bool(base_url))
         if value:
             break
     # 智能字段回退。
@@ -429,23 +435,29 @@ def extract_value(node, rule: str, kind: str, base_url: str = "") -> str:
                 value = target.get("title") or target.get_text(" ", strip=True)
     value = value.strip()
     url_hint = any(key in rule.lower() for key in ("url", "href", "src"))
-    relative_hint = value.startswith(("/", "./", "../", "//"))
+    relative_hint = value.startswith(("/", "./", "../", "//", "#"))
     if base_url and value and (url_hint or relative_hint) and not value.startswith(("data:", "javascript:")):
         value = urljoin(base_url, value)
     return value
 
 
-def _extract_single_value(node, rule: str, kind: str) -> str:
+def _extract_single_value(node, rule: str, kind: str,
+                          first_only: bool = False) -> str:
     selector_rule = rule.split("##", 1)[0]
     value = ""
+    # Older Legado sources often use a bare attribute name (``onclick``,
+    # ``href`` or ``style``) to read that attribute from the current element.
+    if (kind == "html" and hasattr(node, "get") and
+            re.fullmatch(r"[A-Za-z_:][-A-Za-z0-9_:.]*", selector_rule.strip())):
+        value = str(node.get(selector_rule.strip()) or "")
     try:
-        values = evaluate(node, selector_rule, kind)
+        values = [] if value else evaluate(node, selector_rule, kind)
     except RuleParseError:
         values = []
     if values:
         rendered = [item.get_text(" ", strip=True) if hasattr(item, "get_text")
                     else str(item) for item in values]
-        value = "\n".join(rendered) if "&&" in selector_rule else rendered[0]
+        value = rendered[0] if first_only else "\n".join(rendered)
     # 常见 ##正则替换：正文前是提取规则，此处至少完成删除匹配项。
     if "##" in rule:
         pieces = rule.split("##")
@@ -495,16 +507,23 @@ class ReaderEngine:
         async with state["lock"]:
             now = time.monotonic()
             if "/" not in raw:
-                delay = state["last"] + window - now
-                if delay > 0:
-                    await asyncio.sleep(delay)
+                target = state["last"] + window
+                # Windows timers can wake asyncio.sleep early. Re-check the
+                # monotonic deadline so concurrentRate is a real lower bound.
+                while now < target:
+                    await asyncio.sleep(target - now)
+                    now = time.monotonic()
                 state["last"] = time.monotonic()
                 return
             starts = state["starts"]
             while starts and now - starts[0] >= window:
                 starts.popleft()
             while len(starts) >= count:
-                await asyncio.sleep(max(0.001, window - (now - starts[0])))
+                # Leave a small Windows scheduler margin so the caller's
+                # observable request start cannot slip below the configured
+                # window when earlier waiters resume late.
+                await asyncio.sleep(max(
+                    0.001, window + 0.005 - (now - starts[0])))
                 now = time.monotonic()
                 while starts and now - starts[0] >= window:
                     starts.popleft()
@@ -668,12 +687,15 @@ class ReaderEngine:
             return value[:marker].strip(), value[marker:].strip()
         marker = value.find("<js>")
         if marker > 0 and "</js>" in value[marker:]:
-            return value[:marker].strip(), value[marker:value.find("</js>", marker) + 5].strip()
+            # Keep the complete suffix. Legado rules may contain several JS,
+            # regex and selector stages and each stage consumes the previous result.
+            return value[:marker].strip(), value[marker:].strip()
         return value, ""
 
     def _field_value(self, node, rule: str, kind: str, source, base_url: str,
                      key: str = "", page: int = 1, book=None, chapter=None,
-                     raw_result=None) -> str:
+                     raw_result=None, title: str = "",
+                     next_chapter_url: str = "") -> str:
         rule = rule or ""
         put_rule = ""
         put_marker = rule.find("@put:")
@@ -683,18 +705,30 @@ class ReaderEngine:
         if "{{" in rule and "{{@@" not in rule:
             def render_expression(match):
                 expression = match.group(1).strip()
-                if expression.startswith(("$", "@Json:", "@JSON:", "//",
-                                          "@XPath:", "@xpath:", "@CSS:", "@css:")):
+                lowered_expression = expression.lower()
+                if expression.startswith("@@"):
+                    return extract_value(
+                        node, expression[2:], kind, base_url)
+                if (expression.startswith("@") and not
+                        lowered_expression.startswith((
+                            "@js:", "@json:", "@xpath:", "@css:"))):
+                    return extract_value(
+                        node, expression[1:], kind, base_url)
+                if (expression.startswith(("$", "//")) or
+                        lowered_expression.startswith(("@json:", "@xpath:", "@css:"))):
                     return extract_value(node, expression, kind, base_url)
                 context = JsContext(
                     source=source, key=key, page=page,
                     result=raw_result if raw_result is not None else (
-                        json.dumps(node, ensure_ascii=False) if kind == "json" else str(node)),
+                        node if kind == "json" else str(node)),
                     base_url=base_url, variables=self.js_variables,
                     get_string=lambda nested: extract_value(node, nested, kind, base_url),
                     get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
                     get_elements=lambda nested: [str(item) for item in evaluate(node, nested, kind)],
-                    book=book, chapter=chapter,
+                    book=book, chapter=chapter, title=title,
+                    next_chapter_url=next_chapter_url,
+                    result_html_nodes=(raw_result is None and kind == "html" and
+                                       hasattr(node, "select")),
                 )
                 # Rhino/Legado evaluates template bodies as scripts, so forms
                 # such as ``{{key; java.put('k', key)}}`` are valid and return
@@ -703,9 +737,20 @@ class ReaderEngine:
                 return "" if value is None else str(value)
 
             rendered = re.sub(r"\{\{([\s\S]*?)\}\}", render_expression, rule)
-            if rule.strip().startswith(("@js:", "<js>")):
+            if (rule.strip().startswith(("@js:", "<js>")) or
+                    rendered.find("@js:") > 0):
                 rule = rendered
             else:
+                js_marker = rendered.find("<js>")
+                if js_marker >= 0 and "</js>" in rendered[js_marker:]:
+                    literal, stages = rendered[:js_marker], rendered[js_marker:]
+                    value = self._field_value(
+                        node, stages, kind, source, base_url, key, page,
+                        book, chapter, literal)
+                    if put_rule:
+                        self._put_rule_values(node, put_rule, kind, source, base_url,
+                                              key, page, book, chapter, raw_result)
+                    return value.strip()
                 pieces = rendered.split("##")
                 value = pieces[0]
                 if len(pieces) > 1 and pieces[1]:
@@ -725,7 +770,7 @@ class ReaderEngine:
             script, remaining = stripped_rule[:end], stripped_rule[end:].strip()
             script_body = script[4:-5].strip()
             initial_result = raw_result if raw_result is not None else (
-                json.dumps(node, ensure_ascii=False) if kind == "json" else str(node))
+                node if kind == "json" else str(node))
             if script_body.startswith("##"):
                 transformed = _apply_regex_suffix(str(initial_result), script_body)
                 if not remaining:
@@ -739,7 +784,8 @@ class ReaderEngine:
                     transformed_kind = "html"
                 return self._field_value(
                     transformed_root, remaining, transformed_kind, source, base_url,
-                    key, page, book, chapter, transformed_text)
+                    key, page, book, chapter, transformed_text, title,
+                    next_chapter_url)
             context = JsContext(
                 source=source, key=key, page=page,
                 result=initial_result,
@@ -747,7 +793,10 @@ class ReaderEngine:
                 get_string=lambda nested: extract_value(node, nested, kind, base_url),
                 get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
                 get_elements=lambda nested: [str(item) for item in evaluate(node, nested, kind)],
-                book=book, chapter=chapter,
+                book=book, chapter=chapter, title=title,
+                next_chapter_url=next_chapter_url,
+                result_html_nodes=(raw_result is None and kind == "html" and
+                                   hasattr(node, "select")),
             )
             transformed = self.js.evaluate(script, context)
             if not remaining:
@@ -765,62 +814,103 @@ class ReaderEngine:
                 transformed_kind = "html"
             return self._field_value(
                 transformed_root, remaining, transformed_kind, source, base_url,
-                key, page, book, chapter, transformed_text,
+                key, page, book, chapter, transformed_text, title,
+                next_chapter_url,
             )
         get_matches = list(re.finditer(r"@get:\{([^{}]+)\}", rule))
         if get_matches:
             value = re.sub(
                 r"@get:\{([^{}]+)\}",
                 lambda match: str(self.js_variables.get(match.group(1), "")), rule)
-            pieces = value.split("##")
-            value = pieces[0]
-            if len(pieces) >= 2 and pieces[1]:
-                try:
-                    value = re.sub(pieces[1], _java_replacement(
-                        pieces[2] if len(pieces) > 2 else ""), value)
-                except re.error:
-                    pass
-            if put_rule:
-                self._put_rule_values(node, put_rule, kind, source, base_url,
-                                      key, page, book, chapter, raw_result)
-            return value.strip()
+            if value.strip().startswith("@js:"):
+                # @get is preprocessing inside a JavaScript stage, not the
+                # terminal value of the field rule. Continue into the normal
+                # JS pipeline after interpolation.
+                rule = value
+            else:
+                pieces = value.split("##")
+                value = pieces[0]
+                if len(pieces) >= 2 and pieces[1]:
+                    try:
+                        value = re.sub(pieces[1], _java_replacement(
+                            pieces[2] if len(pieces) > 2 else ""), value)
+                    except re.error:
+                        pass
+                if put_rule:
+                    self._put_rule_values(node, put_rule, kind, source, base_url,
+                                          key, page, book, chapter, raw_result)
+                return value.strip()
 
-        post_regex = ""
-        if "</js>" in rule:
-            closing = rule.find("</js>") + 5
-            if rule[closing:].lstrip().startswith("##"):
-                post_regex = rule[closing:].strip()
-                rule = rule[:closing]
         selector, post_js = self._field_parts(rule)
-        if post_js.startswith("<js>") and post_js.endswith("</js>"):
-            body = post_js[4:-5].strip()
-            if body.startswith("##"):
-                post_regex, post_js = body, ""
-        if post_js and "##" in post_js:
-            post_js, regex_body = post_js.split("##", 1)
-            post_regex = "##" + regex_body
         value = ((raw_result if raw_result is not None else node)
                  if not selector and post_js else extract_value(node, selector, kind, base_url))
-        if post_regex and not post_js:
-            value = _apply_regex_suffix(value, post_regex)
-        if post_js:
-            context = JsContext(
-                source=source, key=key, page=page, result=value, base_url=base_url,
-                variables=self.js_variables,
-                get_string=lambda nested: extract_value(node, nested, kind, base_url),
-                get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
-                get_elements=lambda nested: [str(item) for item in evaluate(node, nested, kind)],
-                book=book, chapter=chapter,
-            )
-            transformed = self.js.evaluate(post_js, context)
-            value = "" if transformed is None else str(transformed)
-            if post_regex:
-                value = _apply_regex_suffix(value, post_regex)
+        remaining = post_js.strip()
+        while remaining:
+            if remaining.startswith("<js>") and "</js>" in remaining:
+                end = remaining.find("</js>") + 5
+                script = remaining[:end]
+                remaining = remaining[end:].strip()
+                body = script[4:-5].strip()
+                if body.startswith("##"):
+                    value = _apply_regex_suffix(str(value), body)
+                    continue
+                context = JsContext(
+                    source=source, key=key, page=page, result=value,
+                    base_url=base_url, variables=self.js_variables,
+                    get_string=lambda nested: extract_value(node, nested, kind, base_url),
+                    get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
+                    get_elements=lambda nested: [str(item) for item in evaluate(node, nested, kind)],
+                    book=book, chapter=chapter, title=title,
+                    next_chapter_url=next_chapter_url,
+                    result_html_nodes=(not selector and raw_result is None and kind == "html" and
+                                       hasattr(node, "select")),
+                )
+                transformed = self.js.evaluate(script, context)
+                value = "" if transformed is None else transformed
+                continue
+            if remaining.startswith("@js:"):
+                script, regex_suffix = remaining, ""
+                if "##" in remaining:
+                    script, regex_body = remaining.split("##", 1)
+                    regex_suffix = "##" + regex_body
+                context = JsContext(
+                    source=source, key=key, page=page, result=value,
+                    base_url=base_url, variables=self.js_variables,
+                    get_string=lambda nested: extract_value(node, nested, kind, base_url),
+                    get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
+                    get_elements=lambda nested: [str(item) for item in evaluate(node, nested, kind)],
+                    book=book, chapter=chapter, title=title,
+                    next_chapter_url=next_chapter_url,
+                    result_html_nodes=(not selector and raw_result is None and kind == "html" and
+                                       hasattr(node, "select")),
+                )
+                value = self.js.evaluate(script, context)
+                if regex_suffix:
+                    value = _apply_regex_suffix(
+                        "" if value is None else str(value), regex_suffix)
+                remaining = ""
+                continue
+            # A selector after JavaScript analyzes the transformed payload.
+            transformed_text = (value if isinstance(value, str) else
+                                json.dumps(value, ensure_ascii=False))
+            try:
+                transformed_root = json.loads(transformed_text)
+                transformed_kind = "json"
+            except (json.JSONDecodeError, TypeError):
+                transformed_root = BeautifulSoup(str(transformed_text), "html.parser")
+                transformed_kind = "html"
+            value = self._field_value(
+                transformed_root, remaining, transformed_kind, source, base_url,
+                key, page, book, chapter, transformed_text, title,
+                next_chapter_url)
+            remaining = ""
         if base_url and isinstance(value, str) and value.startswith(("/", "./", "../", "//")):
             value = urljoin(base_url, value)
         if put_rule:
             self._put_rule_values(node, put_rule, kind, source, base_url,
                                   key, page, book, chapter, raw_result)
+        if value is None:
+            return ""
         return value if isinstance(value, str) else str(value)
 
     def _put_rule_values(self, node, put_rule: str, kind: str, source,
@@ -849,7 +939,7 @@ class ReaderEngine:
                                           base_url if with_base else "", key, page)
                 if value or not primary:
                     return value
-            except (UnsupportedRule, RuleParseError):
+            except (UnsupportedRule, RuleParseError, JsBridgeError):
                 pass
             return self._field_value(node, fallback, kind, source,
                                      base_url if with_base else "", key, page)
@@ -905,6 +995,110 @@ class ReaderEngine:
             return str(rule or ""), ""
         return str(rule or "")[:marker].strip(), str(rule or "")[marker + 5:].strip()
 
+    async def _list_rule_pipeline(self, text: str, content_type: str, rule: str,
+                                  source, base_url: str, key: str = "",
+                                  page: int = 1) -> tuple[list, str]:
+        """Run every selector/JS stage in a Legado list rule in order."""
+        value = str(rule or "").strip()
+        def js_context_result(rule_text):
+            try:
+                root = (json.loads(text) if "json" in (content_type or "").lower()
+                        else BeautifulSoup(text, "html.parser"))
+                root_kind = "json" if isinstance(root, (dict, list)) else "html"
+                return [str(item) for item in evaluate(
+                    root, str(rule_text), root_kind)]
+            except (json.JSONDecodeError, RuleParseError, TypeError, ValueError):
+                return []
+
+        reverse = value.startswith("-")
+        if value.startswith(("-", "+")):
+            value = value[1:].strip()
+        nodes, kind = [], "html"
+        while True:
+            if ("json" in (content_type or "").lower() and
+                    not str(text or "").strip()):
+                nodes, kind = [], "json"
+                break
+            js_rule, remaining = split_js_rule(value)
+            if js_rule:
+                transformed = await asyncio.to_thread(
+                    self.js.evaluate, js_rule,
+                    JsContext(source=source, key=key, page=page, result=text,
+                              base_url=base_url, variables=self.js_variables,
+                              get_elements=js_context_result))
+                text = (transformed if isinstance(transformed, str) else
+                        json.dumps(transformed, ensure_ascii=False))
+                content_type = ("application/json" if isinstance(transformed, (dict, list))
+                                or text.lstrip().startswith(("{", "[")) else "text/html")
+                value = remaining
+                if value:
+                    continue
+                if (isinstance(transformed, list) and transformed and
+                        all(isinstance(item, dict) and "__markup" in item
+                            for item in transformed)):
+                    transformed = [str(item["__markup"]) for item in transformed]
+                if (isinstance(transformed, list) and transformed and
+                        all(isinstance(item, str) and item.lstrip().startswith("<")
+                            for item in transformed)):
+                    nodes = [BeautifulSoup(item, "html.parser").find()
+                             for item in transformed]
+                    nodes = [item for item in nodes if item is not None]
+                    kind = "html"
+                    break
+                root, kind = ((json.loads(text), "json") if "json" in content_type else
+                              (BeautifulSoup(text, "html.parser"), "html"))
+                nodes = root if isinstance(root, list) else [root]
+                break
+
+            if "json" in (content_type or "").lower() or text.lstrip().startswith(("{", "[")):
+                try:
+                    root, kind = json.loads(text), "json"
+                except json.JSONDecodeError:
+                    root, kind = BeautifulSoup(text, "html.parser"), "html"
+            else:
+                root, kind = BeautifulSoup(text, "html.parser"), "html"
+            selector, suffix = self._field_parts(value)
+            nodes = evaluate(root, selector, kind) if selector else (
+                root if isinstance(root, list) else [root])
+            if not suffix:
+                break
+            if suffix.startswith("<js>") and "</js>" in suffix:
+                end = suffix.find("</js>") + 5
+                script, value = suffix[:end], suffix[end:].strip()
+            else:
+                script, value = suffix, ""
+            stage_result = [str(item) for item in nodes] if kind == "html" else nodes
+            transformed = await asyncio.to_thread(
+                self.js.evaluate, script,
+                JsContext(source=source, key=key, page=page, result=stage_result,
+                          base_url=base_url, variables=self.js_variables,
+                          result_html_nodes=kind == "html"))
+            text = (transformed if isinstance(transformed, str) else
+                    json.dumps(transformed, ensure_ascii=False))
+            content_type = ("application/json" if isinstance(transformed, (dict, list))
+                            or text.lstrip().startswith(("{", "[")) else "text/html")
+            if value:
+                continue
+            if (isinstance(transformed, list) and transformed and
+                    all(isinstance(item, dict) and "__markup" in item
+                        for item in transformed)):
+                transformed = [str(item["__markup"]) for item in transformed]
+            if (isinstance(transformed, list) and transformed and
+                    all(isinstance(item, str) and item.lstrip().startswith("<")
+                        for item in transformed)):
+                nodes = [BeautifulSoup(item, "html.parser").find()
+                         for item in transformed]
+                nodes = [item for item in nodes if item is not None]
+                kind = "html"
+                break
+            root, kind = ((json.loads(text), "json") if "json" in content_type else
+                          (BeautifulSoup(text, "html.parser"), "html"))
+            nodes = root if isinstance(root, list) else [root]
+            break
+        if reverse:
+            nodes.reverse()
+        return nodes, kind
+
     async def search(self, source, keyword: str, page: int = 1) -> list[BookItem]:
         raw = await self._resolve_rule_url(source.searchUrl, source, keyword, page)
         req = parse_search_url(raw, source.bookSourceUrl, keyword, page)
@@ -914,21 +1108,13 @@ class ReaderEngine:
         text, ctype, final_url = await self._request(req, source)
         rules = source.ruleSearch or {}
         list_rule = rules.get("bookList", "")
-        js_rule, remaining_rule = split_js_rule(list_rule)
-        if js_rule:
-            transformed = await asyncio.to_thread(
-                self.js.evaluate, js_rule,
-                JsContext(source=source, key=keyword, page=page, result=text,
-                          base_url=final_url, variables=self.js_variables),
-            )
-            text = transformed if isinstance(transformed, str) else json.dumps(transformed, ensure_ascii=False)
-            ctype = "application/json" if text.lstrip().startswith(("[", "{")) else "text/html"
-            list_rule = remaining_rule
         list_rule, list_put = self._list_rule_parts(list_rule)
-        nodes, kind = select_nodes(text, ctype, list_rule)
+        nodes, kind = await self._list_rule_pipeline(
+            text, ctype, list_rule, source, final_url, keyword, page)
         books = self._books_from_nodes(
             nodes, kind, rules, final_url, source, keyword, page, list_put)
-        return [b for b in books if b.name and b.url and not _is_pagination_item(b.name, b.url)]
+        return [b for b in books if b.name and b.url and not _is_action_url(b.url)
+                and not _is_pagination_item(b.name, b.url)]
 
     async def explore(self, source, category: ExploreCategory, page: int = 1) -> list[BookItem]:
         # Legado conditional paging, e.g. /list/<,index_{{page}}.html>, must be
@@ -965,24 +1151,14 @@ class ReaderEngine:
         rules = dict(source.ruleSearch or {})
         rules.update({key: value for key, value in (source.ruleExplore or {}).items() if value})
         list_rule = rules.get("bookList", "")
-        js_rule, remaining_rule = split_js_rule(list_rule)
-        if js_rule:
-            transformed = await asyncio.to_thread(
-                self.js.evaluate, js_rule,
-                JsContext(source=source, page=page, result=text,
-                          base_url=final_url, variables=self.js_variables),
-            )
-            text = (transformed if isinstance(transformed, str) else
-                    json.dumps(transformed, ensure_ascii=False))
-            ctype = ("application/json" if text.lstrip().startswith(("[", "{"))
-                     else "text/html")
-            list_rule = remaining_rule
         list_rule, list_put = self._list_rule_parts(list_rule)
-        nodes, kind = select_nodes(text, ctype, list_rule)
+        nodes, kind = await self._list_rule_pipeline(
+            text, ctype, list_rule, source, final_url, "", page)
         books = self._books_from_nodes(
             nodes, kind, rules, final_url, source, "", page, list_put)
         return [book for book in books
-                if book.name and book.url and not _is_pagination_item(book.name, book.url)]
+                if book.name and book.url and not _is_action_url(book.url)
+                and not _is_pagination_item(book.name, book.url)]
 
     async def _render_templates(self, value: str, source, key: str = "",
                                 page: int = 1) -> str:
@@ -1029,7 +1205,8 @@ class ReaderEngine:
                               base_url=source.bookSourceUrl,
                               variables=self.js_variables),
                 )
-                return str(result or "")
+                return await self._render_templates(
+                    str(result or ""), source, key, page)
             break
         # AnalyzeUrl executes JS stages embedded after a normal request rule.
         # The preceding text is exposed as `result`; this is commonly used to
@@ -1044,7 +1221,8 @@ class ReaderEngine:
                           base_url=source.bookSourceUrl,
                           variables=self.js_variables),
             )
-            return str(result or "")
+            return await self._render_templates(
+                str(result or ""), source, key, page)
         marker_pos = rendered.find("<js>")
         if marker_pos > 0:
             end = rendered.find("</js>", marker_pos)
@@ -1058,8 +1236,10 @@ class ReaderEngine:
                               base_url=source.bookSourceUrl,
                               variables=self.js_variables),
                 )
-                return suffix.replace("@result", str(result or "")) if suffix else str(result or "")
-        return rendered
+                value = (suffix.replace("@result", str(result or ""))
+                         if suffix else str(result or ""))
+                return await self._render_templates(value, source, key, page)
+        return await self._render_templates(rendered, source, key, page)
 
     async def chapters(self, source, book: BookItem) -> list[ChapterItem]:
         init = (source.ruleBookInfo or {}).get("init", "")

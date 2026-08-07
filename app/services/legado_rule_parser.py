@@ -317,21 +317,49 @@ def xpath_values(root: Any, rule: str) -> list[Any]:
 
 
 def _selection_indices(expression: str, length: int) -> list[int]:
-    if expression.startswith(":") or expression.endswith(":"):
-        start_text, _, end_text = expression.partition(":")
-        start = int(start_text) if start_text else None
-        end = int(end_text) if end_text else None
-        return list(range(length))[slice(start, end)]
+    """Expand Legado's inclusive index, range, step and comma syntax."""
+    if length <= 0:
+        return []
+
+    def normalized(value: int | None, default: int) -> int:
+        if value is None:
+            return default
+        value = value + length if value < 0 else value
+        return min(max(value, 0), length - 1)
+
     result = []
-    for token in expression.split(":"):
-        token = token.strip()
-        if not re.fullmatch(r"-?\d+", token):
+    for item in expression.split(","):
+        item = item.strip()
+        if not item:
             continue
-        index = int(token)
-        if index < 0:
-            index += length
-        if 0 <= index < length and index not in result:
-            result.append(index)
+        if ":" not in item:
+            if not re.fullmatch(r"-?\d+", item):
+                continue
+            raw_index = int(item)
+            index = raw_index + length if raw_index < 0 else raw_index
+            if 0 <= index < length and index not in result:
+                result.append(index)
+            continue
+        parts = item.split(":")
+        if len(parts) not in (2, 3) or any(
+                value and not re.fullmatch(r"-?\d+", value.strip())
+                for value in parts):
+            continue
+        start_value = int(parts[0]) if parts[0].strip() else None
+        end_value = int(parts[1]) if parts[1].strip() else None
+        start = normalized(start_value, 0)
+        end = normalized(end_value, length - 1)
+        raw_step = int(parts[2]) if len(parts) == 3 and parts[2].strip() else 1
+        step = (raw_step if raw_step > 0 else
+                raw_step + length if -raw_step < length else 1)
+        if start == end or step >= length:
+            indexes = [start]
+        else:
+            indexes = (range(start, end + 1, step) if end >= start else
+                       range(start, end - 1, -step))
+        for index in indexes:
+            if index not in result:
+                result.append(index)
     return result
 
 
@@ -340,8 +368,7 @@ def _jsoup_part(part: str) -> tuple[str, str, bool]:
     part = re.sub(r"\[\^([^\]]+)\]", r"[class^=\1]", part)
     part = re.sub(r"\)(?=[A-Za-z][\w-]*(?:[.#\[]|@|$))", ") ", part)
     selection, exclude = "", False
-    match = re.search(
-        r"\[(!?)((?:-?\d*:-?\d*)|(?:-?\d+(?::-?\d+)*))\]$", part)
+    match = re.search(r"\[(!?)([-\d,:\s]+)\]$", part)
     if match:
         exclude = match.group(1) == "!"
         selection, part = match.group(2), part[:match.start()]
@@ -367,6 +394,17 @@ def _jsoup_part(part: str) -> tuple[str, str, bool]:
 
 
 _VALUE_NAMES = {"text", "textnodes", "owntext", "html", "all"}
+_HTML_TAG_NAMES = {
+    "a", "abbr", "address", "article", "aside", "audio", "b", "blockquote",
+    "body", "br", "button", "canvas", "caption", "code", "col", "dd",
+    "details", "div", "dl", "dt", "em", "figcaption", "figure", "footer",
+    "form", "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hr",
+    "html", "i", "iframe", "img", "input", "label", "legend", "li", "link",
+    "main", "meta", "nav", "ol", "option", "p", "picture", "pre", "script",
+    "section", "select", "small", "source", "span", "strong", "style", "sub",
+    "summary", "sup", "table", "tbody", "td", "textarea", "tfoot", "th",
+    "thead", "time", "title", "tr", "track", "u", "ul", "video",
+}
 
 
 def jsoup_values(root: Any, rule: str) -> list[Any]:
@@ -395,8 +433,13 @@ def jsoup_values(root: Any, rule: str) -> list[Any]:
                       rule[5:].strip())
     parts = split_balanced(rule, "@")
     attr = ""
-    if len(parts) > 1 and (parts[-1].lower() in _VALUE_NAMES or
-                           re.fullmatch(r"(?:attr\.)?[\w:-]+", parts[-1])):
+    terminal = parts[-1].lower() if parts else ""
+    if terminal in _VALUE_NAMES:
+        attr = parts.pop()
+    elif len(parts) > 1 and (
+            terminal.startswith("attr.") or
+            (terminal not in _HTML_TAG_NAMES and
+             re.fullmatch(r"[\w:-]+", parts[-1]))):
         attr = parts.pop()
     if force_css:
         parts = ["@".join(parts)]
@@ -428,8 +471,19 @@ def jsoup_values(root: Any, rule: str) -> list[Any]:
                            n.find_all(string=True, recursive=False)
                            if str(text).strip()) for n in contexts]
     if lowered == "owntext": return [" ".join(n.find_all(string=True, recursive=False)).strip() for n in contexts]
-    if lowered == "html": return [n.decode_contents() for n in contexts]
-    if lowered == "all": return [str(n) for n in contexts]
+    if lowered == "html":
+        rendered = []
+        for node in contexts:
+            clone = BeautifulSoup(str(node), "html.parser")
+            for unwanted in clone.select("script, style"):
+                unwanted.decompose()
+            target = clone.find(True)
+            rendered.append(str(target) if target is not None else "")
+        combined = "\n".join(value for value in rendered if value)
+        return [combined] if combined else []
+    if lowered == "all":
+        combined = "\n".join(str(node) for node in contexts)
+        return [combined] if combined else []
     name = attr[5:] if lowered.startswith("attr.") else attr
     return [_attr(n, name) for n in contexts if n.has_attr(name)]
 
@@ -443,6 +497,13 @@ def json_values(root: Any, rule: str) -> list[Any]:
     try:
         from jsonpath_ng.ext import parse
         values = [match.value for match in parse(expression or "$").find(root)]
+        # Jayway accepts dot-wildcard on arrays (``$.items.*``), while
+        # jsonpath-ng only returns array children for bracket wildcard.
+        if not values and ".*" in expression:
+            bracket_expression = re.sub(r"\.\*(?=\.|\[|$)", "[*]", expression)
+            if bracket_expression != expression:
+                values = [match.value for match in
+                          parse(bracket_expression).find(root)]
     except Exception:
         values = jsonpath_get(root, rule)
     return values[0] if len(values) == 1 and isinstance(values[0], list) else values

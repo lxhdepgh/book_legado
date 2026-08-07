@@ -36,6 +36,19 @@ REQUEST_TIMEOUT = 15
 DEFAULT_TEST_KEYWORD = "仙"
 
 
+def classify_js_bridge_error(message: str) -> str:
+    """Separate missing engine APIs from source-script/network failures."""
+    text = str(message or "")
+    lowered = text.lower()
+    if "bridge:" in lowered and any(token in lowered for token in (
+            "network", "urlerror", "timeout", "ssl", "connection")):
+        return "http_error"
+    if any(token in text for token in ("暂不支持", "interactive browser",
+                                        "verification-code", "未配置网页交互")):
+        return "js_needed"
+    return "parse_error"
+
+
 # ========== URL 工具函数 ==========
 
 def clean_url(raw_url: str) -> str | None:
@@ -619,10 +632,14 @@ async def test_one(source: dict, idx: int, session: aiohttp.ClientSession,
         result["search_status"] = "http_error"
         result["book_count"] = -1
         result["error"] = f"Engine search HTTP {exc.status}: {exc.message}"
-    except (UnsupportedRule, JsBridgeError) as exc:
+    except UnsupportedRule as exc:
         result["search_status"] = "js_needed"
         result["book_count"] = -1
         result["error"] = f"Engine compatibility: {type(exc).__name__}: {str(exc)[:160]}"
+    except JsBridgeError as exc:
+        result["search_status"] = classify_js_bridge_error(str(exc))
+        result["book_count"] = -1
+        result["error"] = f"Engine script: {type(exc).__name__}: {str(exc)[:240]}"
     except RuntimeError as exc:
         message = str(exc)
         if "连接失败" in message or "Server disconnected" in message:
