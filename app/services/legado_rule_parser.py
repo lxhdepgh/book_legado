@@ -5,6 +5,7 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 from bs4 import BeautifulSoup, Tag
@@ -74,7 +75,8 @@ def split_balanced(value: str, separator: str) -> list[str]:
     return [part for part in parts if part]
 
 
-def _path_steps(rule: str) -> list[tuple[str, str]]:
+@lru_cache(maxsize=2048)
+def _path_steps(rule: str) -> tuple[tuple[str, str], ...]:
     rule = rule.strip()
     if rule.startswith("."):
         rule = rule[1:]
@@ -98,10 +100,11 @@ def _path_steps(rule: str) -> list[tuple[str, str]]:
             i += 1
         step = rule[start:i].strip()
         if step: result.append((axis, step))
-    return result
+    return tuple(result)
 
 
-def _step_parts(step: str) -> tuple[str, list[str]]:
+@lru_cache(maxsize=2048)
+def _step_parts(step: str) -> tuple[str, tuple[str, ...]]:
     tag = step.split("[", 1)[0].strip() or "*"
     predicates, quote, depth, start = [], "", 0, -1
     for i, char in enumerate(step[len(tag):], len(tag)):
@@ -114,7 +117,7 @@ def _step_parts(step: str) -> tuple[str, list[str]]:
         elif char == "]":
             depth -= 1
             if depth == 0 and start >= 0: predicates.append(step[start:i].strip())
-    return tag, predicates
+    return tag, tuple(predicates)
 
 
 def _attr(node: Tag, name: str) -> str:

@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import flet as ft
 
 from app.models.book_source import BookSource
@@ -12,6 +13,7 @@ class ManageView(ft.Column):
     """书源管理页面"""
 
     LOAD_BATCH_SIZE = 50
+    SEARCH_DEBOUNCE_SECONDS = 0.18
 
     def __init__(self, service: SourceService):
         super().__init__(spacing=0, scroll=ft.ScrollMode.AUTO, expand=True,
@@ -22,6 +24,7 @@ class ManageView(ft.Column):
         self._selected = set()  # 选中行的索引集合（在 _filtered 中的位置）
         self._select_all = False
         self._visible_count = self.LOAD_BATCH_SIZE
+        self._search_generation = 0
 
         # ── 顶部控制栏 ──
         self._search_field = ft.TextField(
@@ -156,12 +159,12 @@ class ManageView(ft.Column):
         """刷新数据"""
         self._filtered = self.service.sources.copy()
         self._visible_count = self.LOAD_BATCH_SIZE
-        self._apply_filters()
+        self._apply_filters(update_groups=True)
         self._render_page()
 
     # ── 过滤 ──
 
-    def _apply_filters(self):
+    def _apply_filters(self, update_groups=False):
         """应用当前过滤条件"""
         kw = self._search_field.value or ""
         group = self._group_filter.value or ""
@@ -172,11 +175,7 @@ class ManageView(ft.Column):
 
         if kw:
             kw_lower = kw.lower()
-            result = [s for s in result
-                      if kw_lower in s.bookSourceName.lower()
-                      or kw_lower in s.bookSourceUrl.lower()
-                      or kw_lower in (s.bookSourceGroup or "").lower()
-                      or kw_lower in (s.bookSourceComment or "").lower()]
+            result = [s for s in result if kw_lower in s.search_text]
 
         if group:
             result = [s for s in result if s.bookSourceGroup == group]
@@ -189,7 +188,8 @@ class ManageView(ft.Column):
         self._filtered = result
 
         # 更新分组过滤选项
-        self._update_group_options()
+        if update_groups:
+            self._update_group_options()
 
     def _update_group_options(self):
         current_val = self._group_filter.value
@@ -204,6 +204,20 @@ class ManageView(ft.Column):
         self._group_filter.update()
 
     def _on_search(self, e):
+        self._search_generation += 1
+        generation = self._search_generation
+        if self.page is not None:
+            self.page.run_task(self._apply_search_after_delay, generation)
+            return
+        self._apply_search()
+
+    async def _apply_search_after_delay(self, generation):
+        """Collapse rapid keystrokes into one table rebuild."""
+        await asyncio.sleep(self.SEARCH_DEBOUNCE_SECONDS)
+        if generation == self._search_generation:
+            self._apply_search()
+
+    def _apply_search(self):
         self._page = 0
         self._visible_count = self.LOAD_BATCH_SIZE
         self._clear_selection(render=False)
@@ -368,7 +382,7 @@ class ManageView(ft.Column):
         """批量修改后重建过滤列表、分页并持久化。"""
         self._selected.clear()
         self._batch_bar.visible = False
-        self._apply_filters()
+        self._apply_filters(update_groups=True)
         self._page = 0
         self._visible_count = self.LOAD_BATCH_SIZE
         try:
