@@ -84,6 +84,8 @@ class CheckView(ft.Column):
                     detail += f" · 翻页失败 {broken_pages}"
             if result.get("tag_check_timeout"):
                 detail += " · 标签检测超过 60 秒（保留启用）"
+            if result.get("tag_check_js_skipped"):
+                detail += " · JS 分类需在阅读页单独验证"
             if result.get("auto_disabled"):
                 detail += f" · 已自动停用（{result.get('disable_reason', '不可用')}）"
             elif result.get("check_state") == "unknown":

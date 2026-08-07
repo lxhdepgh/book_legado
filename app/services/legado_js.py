@@ -14,6 +14,8 @@ import ssl
 import time
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -67,6 +69,13 @@ class LegadoJsRuntime:
     # Context objects are created/evaluated concurrently in different threads.
     # Network work remains concurrent; only native JS execution is serialized.
     _QUICKJS_LOCK = threading.RLock()
+    # QuickJS binds its native runtime data to the first Python thread that
+    # enters it.  A lock is not sufficient: sequential calls from different
+    # asyncio worker threads still trip ``runtime_data->thread_state`` on
+    # Windows.  Keep every Context operation on one process-wide thread.
+    _QUICKJS_EXECUTOR = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="legado-quickjs")
+    _QUICKJS_THREAD = threading.local()
 
     def __init__(self, timeout: int = 15, state_dir: str | Path | None = None):
         self.timeout = timeout
@@ -181,6 +190,21 @@ class LegadoJsRuntime:
         return result if isinstance(result, dict) else {}
 
     def evaluate(self, script: str, context: JsContext):
+        if getattr(self._QUICKJS_THREAD, "active", False):
+            # A Python callback made by QuickJS may evaluate another rule.
+            # Running it inline avoids deadlocking the single worker.
+            return self._evaluate_serialized(script, context)
+        return self._QUICKJS_EXECUTOR.submit(
+            self._evaluate_on_quickjs_thread, script, context).result()
+
+    def _evaluate_on_quickjs_thread(self, script: str, context: JsContext):
+        self._QUICKJS_THREAD.active = True
+        try:
+            return self._evaluate_serialized(script, context)
+        finally:
+            self._QUICKJS_THREAD.active = False
+
+    def _evaluate_serialized(self, script: str, context: JsContext):
         with self._QUICKJS_LOCK:
             return self._evaluate_locked(script, context)
 
@@ -1171,6 +1195,10 @@ class LegadoJsRuntime:
             if bridge_error and bridge_error not in detail:
                 detail = f"{detail.rstrip()}\nBridge: {bridge_error}"
             raise JsBridgeError(detail) from exc
+        finally:
+            # Do not let an exception traceback release the native Context on
+            # the caller's thread; QuickJS requires destruction on its owner.
+            del ctx
 
     def _bridge_call(self, function, *args):
         """Preserve Python callback failures hidden by QuickJS as generic errors."""
@@ -1296,6 +1324,7 @@ class LegadoJsRuntime:
                         pass
 
     @staticmethod
+    @lru_cache(maxsize=2048)
     def _clean_script(script: str) -> str:
         value = script.strip()
         if value.startswith("@js:"):
@@ -2048,6 +2077,7 @@ class LegadoJsRuntime:
             raise JsBridgeError(f"JS network error: {exc.reason}") from None
 
 
+@lru_cache(maxsize=2048)
 def split_js_rule(rule: str) -> tuple[str | None, str]:
     """返回 JS 预处理脚本和其后的普通解析规则。"""
     value = (rule or "").strip()

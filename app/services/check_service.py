@@ -18,6 +18,12 @@ CHECK_CONCURRENCY = 80
 TAG_PAGE_CONCURRENCY = 80
 JS_CHECK_CONCURRENCY = 4
 SOURCE_TAG_TIMEOUT = 60
+# The CPython quickjs extension can abort the whole Windows process when a
+# Python bridge callback fails inside a large, cancellable batch.  Bulk checks
+# must never take the desktop app down, so native JS rules are reported as
+# needing interactive verification.  JS remains available in the reader,
+# where execution is scoped to one user action.
+SAFE_BULK_CHECK_NO_NATIVE_JS = True
 
 
 async def _engine_search_check(source, timeout: int) -> dict:
@@ -75,21 +81,28 @@ def _category_request(source, raw_url: str, page: int) -> dict:
 
 
 async def _fetch_tag_page(source, category, page, session, global_sem, source_sem,
-                          timeout, engine=None) -> dict:
+                          timeout, get_engine=None, prepared_rules=None,
+                          prepared_headers=None) -> dict:
     result = {"page": page, "valid": False, "status_code": None,
               "item_count": 0, "content_type": "", "error": None,
               "attempts": 0, "persistent_rate_limit": False}
     try:
-        rules = dict(getattr(source, "ruleSearch", None) or {})
-        rules.update({k: v for k, v in
-                      (getattr(source, "ruleExplore", None) or {}).items() if v})
+        rules = prepared_rules
+        if rules is None:
+            rules = dict(getattr(source, "ruleSearch", None) or {})
+            rules.update({k: v for k, v in
+                          (getattr(source, "ruleExplore", None) or {}).items() if v})
         dynamic = any((
             str(getattr(source, "header", "") or "").strip().startswith(("@js:", "<js>")),
             str(category.url or "").strip().startswith(("@js:", "<js>")),
             "java." in str(category.url or "") or "source." in str(category.url or ""),
             str(rules.get("bookList", "")).strip().startswith(("@js:", "<js>")),
         ))
-        if dynamic and engine is not None:
+        if dynamic and get_engine is not None:
+            if SAFE_BULK_CHECK_NO_NATIVE_JS:
+                result["error"] = "JS 规则已跳过（请在阅读页单独验证）"
+                return result
+            engine = await get_engine()
             async with global_sem, source_sem:
                 books = await asyncio.wait_for(
                     engine.explore(source, category, page), timeout=timeout + 3)
@@ -99,7 +112,7 @@ async def _fetch_tag_page(source, category, page, session, global_sem, source_se
                 result["error"] = "规则引擎解析结果为 0"
             return result
         request = _category_request(source, category.url, page)
-        headers = _source_headers(source)
+        headers = dict(prepared_headers) if prepared_headers is not None else _source_headers(source)
         request_headers = request.get("headers") or {}
         if isinstance(request_headers, str):
             try: request_headers = json.loads(request_headers)
@@ -113,12 +126,14 @@ async def _fetch_tag_page(source, category, page, session, global_sem, source_se
             kwargs["data"] = request.get("body") or ""
             headers.setdefault("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
         body = ""
+        final_url = request["url"]
         for attempt in range(3):
             result["attempts"] = attempt + 1
             async with global_sem, source_sem:
                 async with session.request(method, request["url"], **kwargs) as response:
                     result["status_code"] = response.status
                     result["content_type"] = response.headers.get("Content-Type", "")
+                    final_url = str(response.url)
                     body = await response.text(errors="replace")
                     retry_after = response.headers.get("Retry-After", "")
             if result["status_code"] != 429:
@@ -138,10 +153,13 @@ async def _fetch_tag_page(source, category, page, session, global_sem, source_se
         nodes, _ = select_nodes(body, result["content_type"], list_rule)
         result["item_count"] = len(nodes)
         result["valid"] = len(nodes) > 0
-        if not result["valid"] and engine is not None:
+        if not result["valid"] and get_engine is not None:
+            engine = await get_engine()
             async with global_sem, source_sem:
                 books = await asyncio.wait_for(
-                    engine.explore(source, category, page), timeout=timeout + 3)
+                    engine.explore_document(
+                        source, body, result["content_type"], final_url, page),
+                    timeout=timeout + 3)
             result["item_count"] = len(books)
             result["valid"] = bool(books)
             if books:
@@ -165,12 +183,25 @@ async def _fetch_tag_page(source, category, page, session, global_sem, source_se
 
 async def check_categories(source, session, sem, timeout=10):
     """Validate every tag and, when paged, validate its second page as well."""
-    engine = LegadoReadingEngine(timeout=timeout)
-    try:
-        categories = await resolve_explore_categories(source, engine.js)
-    except Exception:
-        engine.js.close()
-        raise
+    # Static category definitions need no rule engine.  Most sources finish on
+    # the fast parser, so defer the comparatively expensive engine allocation
+    # until a fallback is actually required.
+    categories = await resolve_explore_categories(source)
+    engine = None
+    engine_lock = asyncio.Lock()
+
+    async def get_engine():
+        nonlocal engine
+        if engine is None:
+            async with engine_lock:
+                if engine is None:
+                    engine = LegadoReadingEngine(timeout=timeout)
+        return engine
+
+    rules = dict(getattr(source, "ruleSearch", None) or {})
+    rules.update({k: v for k, v in
+                  (getattr(source, "ruleExplore", None) or {}).items() if v})
+    headers = _source_headers(source)
 
     # Keep high concurrency across different sources, but never burst several
     # tag/page requests at the same site. This is the main trigger for 429s.
@@ -181,7 +212,7 @@ async def check_categories(source, session, sem, timeout=10):
                             re.search(r"<[^<>]*,[^<>]*>", category.url)) else [1])
         page_results = await asyncio.gather(*(
             _fetch_tag_page(source, category, page, session, sem, source_sem,
-                            timeout, engine)
+                            timeout, get_engine, rules, headers)
             for page in pages
         ))
         first = page_results[0]
@@ -202,7 +233,8 @@ async def check_categories(source, session, sem, timeout=10):
     try:
         return await asyncio.gather(*(check_one(category) for category in categories))
     finally:
-        engine.js.close()
+        if engine is not None:
+            engine.js.close()
 
 
 async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12, on_result=None):
@@ -221,25 +253,50 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12, on_r
             search_rule = source.searchUrl or ""
             uses_js = (search_rule.strip().startswith(("@js:", "<js>")) or
                        "java." in search_rule or "source." in search_rule)
+            source_data = source.to_dict()
+            book_list_uses_js = str((source.ruleSearch or {}).get(
+                "bookList") or "").strip().startswith(("@js:", "<js>"))
+            if SAFE_BULK_CHECK_NO_NATIVE_JS and book_list_uses_js:
+                source_data = dict(source_data)
+                source_data["ruleSearch"] = dict(source.ruleSearch or {})
+                source_data["ruleSearch"]["bookList"] = ""
+            # Category validation is independent from connectivity/search.
+            # Start it now so network waits overlap instead of adding together.
+            dynamic_explore = str(source.exploreUrl or "").strip().startswith(
+                ("@js:", "<js>"))
+            tag_check_js_skipped = bool(
+                SAFE_BULK_CHECK_NO_NATIVE_JS and dynamic_explore)
+            category_task = None
+            category_task_start = 0.0
+            if (source.enabledExplore and source.exploreUrl and
+                    not tag_check_js_skipped):
+                category_task_start = asyncio.get_running_loop().time()
+                category_task = asyncio.create_task(check_categories(
+                    source, session, tag_sem, min(timeout, 8)))
             if uses_js:
                 async with js_sem:
-                    result = await test_one(source.to_dict(), index, session,
+                    result = await test_one(source_data, index, session,
                                             source_sem, timeout)
             else:
-                result = await test_one(source.to_dict(), index, session,
+                result = await test_one(source_data, index, session,
                                         source_sem, timeout)
-            if uses_js and result.get("search_status") in {
+            if SAFE_BULK_CHECK_NO_NATIVE_JS and (uses_js or book_list_uses_js):
+                result.update(search_status="js_needed", book_count=None,
+                              search_method="interactive-required",
+                              search_error="批量检测已跳过原生 JS，请在阅读页单独验证")
+            elif uses_js and result.get("search_status") in {
                     "js_needed", "parse_error", "error", "no_results"}:
                 async with js_sem:
                     result.update(await _engine_search_check(source, timeout))
             # Tag validation is independent: a source can have broken search but valid explore.
             result["tag_check_timeout"] = False
-            if source.enabledExplore and source.exploreUrl:
+            result["tag_check_js_skipped"] = tag_check_js_skipped
+            if category_task is not None:
                 try:
+                    elapsed = category_task.get_loop().time() - category_task_start
+                    remaining = max(0.001, SOURCE_TAG_TIMEOUT - elapsed)
                     result["category_results"] = await asyncio.wait_for(
-                        check_categories(source, session, tag_sem, min(timeout, 8)),
-                        timeout=SOURCE_TAG_TIMEOUT,
-                    )
+                        category_task, timeout=remaining)
                 except asyncio.TimeoutError:
                     result["category_results"] = []
                     result["tag_check_timeout"] = True

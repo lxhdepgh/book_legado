@@ -3,7 +3,23 @@ Legado 书源数据模型
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
+from urllib.parse import urlparse
+
+
+@lru_cache(maxsize=4096)
+def _short_url(value: str) -> str:
+    try:
+        parsed = urlparse(value)
+        return parsed.netloc or value[:40]
+    except Exception:
+        return value[:40]
+
+
+@lru_cache(maxsize=4096)
+def _search_text(name: str, url: str, group: str, comment: str) -> str:
+    return "\n".join((name, url, group, comment)).lower()
 
 
 @dataclass
@@ -50,7 +66,9 @@ class BookSource:
     @classmethod
     def from_dict(cls, data: dict) -> BookSource:
         """从 JSON 字典创建 BookSource 实例"""
-        field_names = {f.name for f in cls.__dataclass_fields__.values()}
+        # This mapping is already keyed by field name; rebuilding a set for
+        # every imported source adds avoidable startup work.
+        field_names = cls.__dataclass_fields__
         kwargs = {k: v for k, v in data.items() if k in field_names}
         return cls(**kwargs)
 
@@ -91,12 +109,17 @@ class BookSource:
 
     @property
     def short_url(self) -> str:
-        from urllib.parse import urlparse
-        try:
-            parsed = urlparse(self.bookSourceUrl)
-            return parsed.netloc or self.bookSourceUrl[:40]
-        except Exception:
-            return self.bookSourceUrl[:40]
+        return _short_url(self.bookSourceUrl)
+
+    @property
+    def search_text(self) -> str:
+        """Lower-cased text reused by management-page searches."""
+        return _search_text(
+            self.bookSourceName,
+            self.bookSourceUrl,
+            self.bookSourceGroup or "",
+            self.bookSourceComment or "",
+        )
 
     def __str__(self) -> str:
         return f"[{'+' if self.enabled else '-'}] {self.bookSourceName} ({self.display_group})"

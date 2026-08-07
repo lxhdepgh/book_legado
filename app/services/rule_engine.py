@@ -1146,6 +1146,12 @@ class ReaderEngine:
             request = {"url": _resolve_explore_url(category_url, source.bookSourceUrl, page),
                        "method": "GET"}
         text, ctype, final_url = await self._request(request, source)
+        return await self.explore_document(
+            source, text, ctype, final_url, page)
+
+    async def explore_document(self, source, text: str, ctype: str,
+                               final_url: str, page: int = 1) -> list[BookItem]:
+        """Parse an already downloaded explore page with the full rule engine."""
         # Legado permits explore fields to inherit the search rules. Many sources
         # only override one or two explore fields instead of duplicating the map.
         rules = dict(source.ruleSearch or {})

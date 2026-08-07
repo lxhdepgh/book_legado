@@ -76,13 +76,13 @@
       "chapterUrl": "//a/@href"
     },
     "ruleExplore": {
-      "author": "//li[@class='four']/text()",
-      "bookList": "//div[@class='clearfix rec_rullist']/ul",
-      "bookUrl": "//li[@class='two']/a/@href",
-      "kind": "@js:\nvar tag  = java.getString(\"//li[@class='sev']/span/a/text()\")\nvar views=  java.getString(\"//li[@class='diyhot']/text()\")\ntag+\",👀\"+views",
-      "lastChapter": "//li[@class='three']/a/text()",
-      "name": "//li[@class='two']/a/text()",
-      "wordCount": "//li[@class='five']/text()@js:result+\"字\""
+      "author": "",
+      "bookList": "li:has(span.s2 > a)",
+      "bookUrl": ".s2 a@href",
+      "kind": ".fenleibt@text",
+      "lastChapter": "",
+      "name": ".s2 a@text##^\\[[^]]+\\]\\s*",
+      "wordCount": ".five@text"
     },
     "bookSourceType": 0
   },
