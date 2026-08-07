@@ -72,6 +72,8 @@ class ReadingView(ft.Column):
         self._detail_book = None
         self._book_open_generation = 0
         self._book_open_task = None
+        self._section = "shelf"
+        self._detail_resume = None
         self._bookshelf_update_task = None
         self._bookshelf_layout = "list"
         self._bookshelf_query = ft.TextField(
@@ -155,8 +157,11 @@ class ReadingView(ft.Column):
         self._content_host = ft.Column(spacing=12)
         self._prev_chapter_btn = ft.Button("上一章", icon=ft.Icons.CHEVRON_LEFT,
                                            disabled=True, on_click=self._previous_chapter)
-        self._directory_btn = ft.Button("目录", icon=ft.Icons.MENU_BOOK,
+        self._directory_btn = ft.Button("章节", icon=ft.Icons.FORMAT_LIST_NUMBERED,
                                         on_click=self._show_directory)
+        self._reader_bookshelf_btn = ft.Button(
+            "书架", icon=ft.Icons.HOME_OUTLINED,
+            on_click=self._back_to_shelf)
         self._next_chapter_btn = ft.Button("下一章", icon=ft.Icons.CHEVRON_RIGHT,
                                            disabled=True, on_click=self._next_chapter)
         self._reader_progress = ft.Text(
@@ -171,8 +176,10 @@ class ReadingView(ft.Column):
         self._reader_toolbar = ft.Container(
             padding=ft.Padding(6, 2, 6, 2),
             content=ft.Row([
+                ft.IconButton(ft.Icons.HOME_OUTLINED, tooltip="回到书架",
+                              on_click=self._back_to_shelf),
                 self._top_prev_btn,
-                ft.IconButton(ft.Icons.MENU_BOOK, tooltip="目录",
+                ft.IconButton(ft.Icons.ARROW_BACK, tooltip="书籍详情与章节",
                               on_click=self._show_directory),
                 self._reader_progress,
                 ft.IconButton(ft.Icons.TEXT_DECREASE, tooltip="减小字号",
@@ -184,7 +191,8 @@ class ReadingView(ft.Column):
             ], spacing=0),
         )
         self._reader_nav = ft.Row(
-            [self._prev_chapter_btn, self._directory_btn, self._next_chapter_btn],
+            [self._reader_bookshelf_btn, self._prev_chapter_btn,
+             self._directory_btn, self._next_chapter_btn],
             alignment=ft.MainAxisAlignment.CENTER,
             wrap=True,
         )
@@ -193,18 +201,43 @@ class ReadingView(ft.Column):
             controls=[self._title, ft.Divider(), self._content_host,
                       ft.Divider(), self._reader_nav],
         )
-        self._tabs = ft.Tabs(length=3, expand=True, content=ft.Column(expand=True, controls=[
-            ft.TabBar(tabs=[ft.Tab(label="书架"), ft.Tab(label="目录"), ft.Tab(label="阅读")]),
-            ft.TabBarView(expand=True, controls=[
-                self._bookshelf_host,
-                ft.Column(expand=True, spacing=0, controls=[
-                    self._directory_toolbar, ft.Divider(height=1), self._chapters,
-                ]),
-                ft.Column(expand=True, spacing=0, controls=[
-                    self._reader_toolbar, ft.Divider(height=1), self._reader,
-                ]),
-            ]),
-        ]))
+        self._detail_title = ft.Text("书籍详情", size=22, weight=ft.FontWeight.BOLD,
+                                     expand=True)
+        self._detail_author = ft.Text("", color=ft.Colors.GREY_700)
+        self._detail_intro = ft.Text("", max_lines=4,
+                                     overflow=ft.TextOverflow.ELLIPSIS)
+        self._detail_cover = ft.Container(
+            width=76, height=104, alignment=ft.Alignment.CENTER,
+            content=ft.Icon(ft.Icons.BOOK, size=42))
+        self._detail_continue_btn = ft.Button(
+            "继续阅读", icon=ft.Icons.PLAY_ARROW, disabled=True,
+            on_click=self._continue_from_detail)
+        self._shelf_page = ft.Column(
+            expand=True, spacing=0, visible=True,
+            controls=[self._bookshelf_host])
+        self._detail_page = ft.Column(
+            expand=True, spacing=0, visible=False, controls=[
+                ft.Container(padding=ft.Padding(4, 2, 8, 2), content=ft.Row([
+                    ft.IconButton(ft.Icons.ARROW_BACK, tooltip="返回书架",
+                                  on_click=self._back_to_shelf),
+                    self._detail_title,
+                    self._detail_continue_btn,
+                ])),
+                ft.Container(padding=ft.Padding(12, 4, 12, 10), content=ft.Row([
+                    self._detail_cover,
+                    ft.Column([self._detail_author, self._detail_intro],
+                              expand=True, spacing=6),
+                ], vertical_alignment=ft.CrossAxisAlignment.START)),
+                ft.Divider(height=1), self._directory_toolbar,
+                ft.Divider(height=1), self._chapters,
+            ])
+        self._reader_page = ft.Column(
+            expand=True, spacing=0, visible=False, controls=[
+                self._reader_toolbar, ft.Divider(height=1), self._reader,
+            ])
+        self._section_host = ft.Stack(
+            expand=True,
+            controls=[self._shelf_page, self._detail_page, self._reader_page])
         self._source.col = {"xs": 12, "sm": 5}
         self._keyword.col = {"xs": 8, "sm": 5}
         self._search_btn.col = {"xs": 4, "sm": 2}
@@ -220,12 +253,14 @@ class ReadingView(ft.Column):
         if discovery_only:
             self.controls = [discovery_header, self._discover]
         else:
+            self._page_title = ft.Text(
+                "我的书架", size=28, weight=ft.FontWeight.BOLD)
             self.controls = [
                 ft.Container(padding=12, content=ft.Column([
-                    ft.Text("我的书架", size=28, weight=ft.FontWeight.BOLD),
+                    self._page_title,
                     self._status,
                 ])),
-                self._tabs,
+                self._section_host,
             ]
 
     def did_mount(self):
@@ -608,7 +643,7 @@ class ReadingView(ft.Column):
                 "，固定榜单无后续分页" if not supports_paging else "，已加载全部结果"
             )
             self._status.value = f"{category.title}：找到 {len(self.books)} 本书{paging_text}"
-            self._tabs.selected_index = 0
+            self._show_section("shelf")
         except Exception as exc:
             self._show_error(exc)
             self._has_more = False
@@ -638,7 +673,7 @@ class ReadingView(ft.Column):
                 self._result_page += 1
             self._append_book_controls(added_books)
             self._status.value = f"找到 {len(self.books)} 本书，点击书籍查看详情"
-            self._tabs.selected_index = 0
+            self._show_section("shelf")
         except Exception as exc:
             self._show_error(exc)
             self._has_more = False
@@ -1084,25 +1119,10 @@ class ReadingView(ft.Column):
         if self._book_open_task and not self._book_open_task.done():
             self._book_open_task.cancel()
         reading = self.service.reading_state(item)
-        has_progress = bool(
-            reading and (reading.get("chapter_url") or
-                         reading.get("chapter_name") or
-                         int(reading.get("last_read_at") or 0) > 0))
-        if has_progress:
-            # Legado opens a progressed book as a reader first; cached content
-            # can replace the placeholder without waiting for a network TOC.
-            self._tabs.selected_index = 2
-            self._title.value = reading.get("chapter_name") or book.name
-            self._content_host.controls = [ft.Row([
-                ft.ProgressRing(width=22, height=22),
-                ft.Text("正在恢复上次阅读位置…"),
-            ])]
-            self._status.value = f"正在继续阅读《{book.name}》"
-            self.update()
-        else:
-            self._show_shelf_book_detail(book)
+        self._detail_resume = reading
+        self._show_shelf_book_detail(book)
         self._book_open_task = self.page.run_task(
-            self._run_chapters, book, reading if has_progress else None,
+            self._run_chapters, book, reading,
             False, generation)
 
     def _reset_book_session(self, book_name=""):
@@ -1136,29 +1156,63 @@ class ReadingView(ft.Column):
             button.disabled = True
 
     def _show_shelf_book_detail(self, book):
-        """Show stored metadata immediately while a new book loads its TOC."""
+        """Enter the combined book-info/catalog page before loading its TOC."""
         self._detail_book = book
-        controls = [
-            ft.Text(book.author or "作者未知", weight=ft.FontWeight.BOLD),
-            ft.Text(book.intro or "暂无简介", selectable=True),
-            ft.Divider(),
-            ft.Row([ft.ProgressRing(width=22, height=22),
-                    ft.Text("正在加载目录…")]),
-        ]
-        self._book_detail_dialog = ft.AlertDialog(
-            modal=True, title=ft.Text(book.name or "书籍详情"),
-            content=ft.Container(
-                width=420, height=260,
-                content=ft.ListView(controls=controls, spacing=10)),
-            actions=[ft.TextButton("取消", on_click=self._cancel_shelf_open)],
-        )
-        self.page.show_dialog(self._book_detail_dialog)
+        self._detail_title.value = book.name or "书籍详情"
+        self._detail_author.value = " · ".join(
+            value for value in [book.author, getattr(self.current_source,
+                                                     "bookSourceName", "")]
+            if value) or "作者未知"
+        self._detail_intro.value = book.intro or "暂无简介"
+        self._detail_cover.content = (
+            ft.Image(src=book.cover_url, width=76, height=104,
+                     fit=ft.BoxFit.COVER,
+                     error_content=ft.Icon(ft.Icons.BROKEN_IMAGE))
+            if book.cover_url else ft.Icon(ft.Icons.BOOK, size=42))
+        self._detail_continue_btn.disabled = True
+        self._detail_continue_btn.text = (
+            "继续阅读" if self._detail_resume else "开始阅读")
+        self._directory_status.value = f"《{book.name}》· 正在加载目录…"
+        self._show_section("detail")
+        self._status.value = f"正在打开《{book.name}》"
+        self.update()
 
     def _cancel_shelf_open(self, _):
         self._book_open_generation += 1
         if self._book_open_task and not self._book_open_task.done():
             self._book_open_task.cancel()
-        self._close_book_detail(None)
+        self._back_to_shelf(None)
+
+    def _show_section(self, section):
+        self._section = section
+        self._shelf_page.visible = section == "shelf"
+        self._detail_page.visible = section == "detail"
+        self._reader_page.visible = section == "reader"
+        if hasattr(self, "_page_title"):
+            self._page_title.value = {
+                "shelf": "我的书架",
+                "detail": "书籍详情",
+                "reader": "阅读",
+            }.get(section, "我的书架")
+
+    def _back_to_shelf(self, _):
+        self._persist_scroll_position()
+        self._book_open_generation += 1
+        if self._book_open_task and not self._book_open_task.done():
+            self._book_open_task.cancel()
+        self._show_section("shelf")
+        self._render_bookshelf()
+        self.update()
+
+    def _continue_from_detail(self, _):
+        chapter = self._resume_chapter(self._detail_resume)
+        if chapter is None:
+            chapter = next((item for item in self.chapters
+                            if not item.is_volume and item.url), None)
+        if chapter is not None and not self._reading_loading:
+            offset = (float((self._detail_resume or {}).get("scroll_offset") or 0)
+                      if self._resume_chapter(self._detail_resume) is chapter else 0)
+            self.page.run_task(self._run_content, chapter, False, offset)
 
     def _append_book_controls(self, books):
         """追加新结果，只替换列表末尾的翻页提示。"""
@@ -1269,6 +1323,8 @@ class ReadingView(ft.Column):
         except Exception as exc:
             if self._is_current_book_open(book, open_generation):
                 self._show_error(exc)
+                self._directory_status.value = (
+                    f"《{book.name}》目录加载失败，可点击刷新重试")
         self.update()
 
     def _is_current_book_open(self, book, open_generation):
@@ -1285,11 +1341,22 @@ class ReadingView(ft.Column):
         self._apply_directory_filter()
         self._directory_status.value = (
             f"{book.name} · {len(chapters)} 章 · {state_text}")
+        self._detail_title.value = book.name or "书籍详情"
+        self._detail_author.value = " · ".join(
+            value for value in [book.author, getattr(self.current_source,
+                                                     "bookSourceName", "")]
+            if value) or "作者未知"
+        self._detail_intro.value = book.intro or "暂无简介"
+        if book.cover_url:
+            self._detail_cover.content = ft.Image(
+                src=book.cover_url, width=76, height=104,
+                fit=ft.BoxFit.COVER,
+                error_content=ft.Icon(ft.Icons.BROKEN_IMAGE))
         self._status.value = (f"《{book.name}》共 {len(chapters)} 章，"
                               f"已加载 {self._chapter_visible_count} 章")
-        self._tabs.selected_index = 1
-        if self._detail_book is book and self._book_detail_dialog is not None:
-            self._close_book_detail(None)
+        self._show_section("detail")
+        self._detail_continue_btn.disabled = not any(
+            not item.is_volume and item.url for item in chapters)
         if (self.current_source is not None and
                 hasattr(self.service, "update_bookshelf_state")):
             self.service.update_bookshelf_state(
@@ -1452,7 +1519,7 @@ class ReadingView(ft.Column):
             self._update_chapter_navigation()
             self._status.value = (f"{chapter.name} · 已从缓存打开"
                                   if content_from_cache else chapter.name)
-            self._tabs.selected_index = 2
+            self._show_section("reader")
         except Exception as exc:
             self._show_error(exc)
         finally:
@@ -1570,7 +1637,7 @@ class ReadingView(ft.Column):
             self.page.run_task(self._run_content, chapter, False)
 
     def _show_directory(self, _):
-        self._tabs.selected_index = 1
+        self._show_section("detail")
         self.update()
 
     def _on_reader_scroll(self, event):

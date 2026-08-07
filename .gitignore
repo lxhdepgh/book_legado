@@ -1,0 +1,33 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual/local dependency directories
+.testdeps/
+.venv/
+venv/
+env/
+
+# Build and packaging output
+build/
+dist/
+wheelhouse/
+*.spec
+
+# IDE and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Runtime/user data must stay outside source control
+bookshelf.json
+reader-cache/
+edge-webview-profile/
+
+# Temporary files and logs produced by tools
+*.tmp
+*.log

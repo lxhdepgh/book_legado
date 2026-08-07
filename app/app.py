@@ -25,7 +25,7 @@ class BookSourceApp:
         self._page: ft.Page | None = None
 
         # 当前选中的底栏索引
-        self._current_index = 0
+        self._current_index = 1
 
     def build(self, page: ft.Page):
         """构建应用 (flet.app target)"""
@@ -69,14 +69,14 @@ class BookSourceApp:
 
         # 主页容器
         content = ft.Container(
-            content=self._book_source_view,
+            content=self._reading_view,
             expand=True,
         )
         self._content_container = content
 
         # 底栏导航
         nav_bar = ft.NavigationBar(
-            selected_index=0,
+            selected_index=1,
             on_change=self._on_nav_change,
             destinations=[
                 ft.NavigationBarDestination(
