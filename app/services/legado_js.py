@@ -1033,7 +1033,13 @@ class LegadoJsRuntime:
             return match ? (match[1] == null ? match[0] : match[1]) : null;
           }},
           connect: value => __response(__request(String(value))),
-          startBrowser: (url, title) => __response(__browser(String(url || baseUrl), String(title || ''))),
+          // Legado's startBrowser is fire-and-forget. It must not enter the
+          // blocking WebView bridge used by startBrowserAwait; content rules
+          // commonly call it and then return the same direct media URL.
+          startBrowser: (url, _title) => __response(JSON.stringify({{
+            body: '', headers: {{}}, status: 200,
+            url: String(url || baseUrl)
+          }})),
           startBrowserAwait: (url, title) => __response(__browser(String(url || baseUrl), String(title || ''))),
           createSymmetricCrypto: (transformation, key, iv) => ({{
             decryptStr: value => __crypto('decryptStr', String(transformation), JSON.stringify(key), JSON.stringify(iv || ''), JSON.stringify(value)),

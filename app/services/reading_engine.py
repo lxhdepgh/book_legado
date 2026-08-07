@@ -1028,8 +1028,22 @@ class LegadoReadingEngine(ReaderEngine):
         if document_title:
             chapter.name = document_title
         document.image_style = str(content_rule.get("imageStyle") or "")
+        await self._apply_media_headers(document, source)
         await self._load_protected_images(document, source)
         return document
+
+    async def _apply_media_headers(self, document: ChapterContent, source):
+        """Give audio/video requests the headers Legado sends for the source."""
+        media = [block for block in document.blocks
+                 if block.kind in {"audio", "video"}]
+        if not media:
+            return
+        source_headers = await self._resolved_source_headers(
+            source, getattr(source, "bookSourceUrl", ""))
+        for block in media:
+            merged = dict(source_headers)
+            merged.update(block.headers or {})
+            block.headers = merged
 
     async def _load_protected_images(self, document: ChapterContent, source):
         """Flet Image has no request-header API; fetch protected images as bytes."""

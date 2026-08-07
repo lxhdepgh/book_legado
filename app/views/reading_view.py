@@ -14,6 +14,7 @@ import flet_webview as ftw
 from app.services.rule_engine import (UnsupportedRule, parse_explore_categories,
                                       resolve_explore_categories, BookItem)
 from app.services.reading_engine import LegadoReadingEngine
+from app.services.reading_cache import ReadingCache
 from app.services.desktop_browser import EdgeCdpSession
 
 
@@ -25,6 +26,7 @@ class ReadingView(ft.Column):
     def __init__(self, service, discovery_only=False):
         super().__init__(spacing=0, expand=True)
         self.service = service
+        self.reading_cache = ReadingCache(service.data_dir)
         self.discovery_only = discovery_only
         self.engine = LegadoReadingEngine(
             webview_fetcher=self._fetch_with_webview,
@@ -43,6 +45,11 @@ class ReadingView(ft.Column):
         self._webview_delay = 0
         self._webview_source_regex = ""
         self._current_chapter = None
+        self._current_book = None
+        self._pending_scroll_offset = 0.0
+        self._pending_scroll_ratio = 0.0
+        self._scroll_save_generation = 0
+        self._font_size = 16
         self._reading_loading = False
         self._prefetch_task = None
         self._chapter_cache = {}
@@ -58,9 +65,43 @@ class ReadingView(ft.Column):
         self._loading_more = False
         self._category_load_id = 0
         self._chapter_visible_count = 0
+        self._visible_chapters = []
+        self._directory_reversed = False
         self._has_more = True
         self._book_detail_dialog = None
         self._detail_book = None
+        self._book_open_generation = 0
+        self._book_open_task = None
+        self._bookshelf_update_task = None
+        self._bookshelf_layout = "list"
+        self._bookshelf_query = ft.TextField(
+            hint_text="搜索书名或作者", prefix_icon=ft.Icons.SEARCH,
+            dense=True, height=42, expand=True,
+            on_change=self._filter_bookshelf)
+        self._bookshelf_sort = ft.Dropdown(
+            value="read", width=150, dense=True,
+            options=[
+                ft.dropdown.Option("read", "最近阅读"),
+                ft.dropdown.Option("update", "最近更新"),
+                ft.dropdown.Option("name", "书名"),
+                ft.dropdown.Option("combined", "综合排序"),
+                ft.dropdown.Option("manual", "手动排序"),
+            ], on_select=self._filter_bookshelf)
+        self._bookshelf_group = ft.Dropdown(
+            value="__all__", width=130, dense=True,
+            options=[ft.dropdown.Option("__all__", "全部")],
+            on_select=self._filter_bookshelf)
+        self._bookshelf_layout_btn = ft.IconButton(
+            ft.Icons.GRID_VIEW, tooltip="切换列表/网格",
+            on_click=self._toggle_bookshelf_layout)
+        self._bookshelf_refresh_btn = ft.IconButton(
+            ft.Icons.REFRESH, tooltip="刷新书架目录",
+            on_click=self._refresh_all_books)
+        self._bookshelf_query.col = {"xs": 12, "sm": 5}
+        self._bookshelf_group.col = {"xs": 4, "sm": 2}
+        self._bookshelf_sort.col = {"xs": 4, "sm": 3}
+        self._bookshelf_layout_btn.col = {"xs": 2, "sm": 1}
+        self._bookshelf_refresh_btn.col = {"xs": 2, "sm": 1}
         self._source = ft.Dropdown(label="书源", on_select=self._source_changed)
         self._keyword = ft.TextField(label="书名或关键词", expand=True, on_submit=self._search)
         self._search_btn = ft.Button("搜索", icon=ft.Icons.SEARCH, on_click=self._search)
@@ -75,9 +116,40 @@ class ReadingView(ft.Column):
         self._category_host = ft.Column(spacing=0)
         self._discover = ft.Column(expand=True, spacing=0, controls=[self._category_host, self._results])
         self._bookshelf = ft.ListView(expand=True, spacing=4)
+        self._bookshelf_grid = ft.GridView(
+            expand=True, max_extent=190, child_aspect_ratio=0.72,
+            spacing=8, run_spacing=8)
+        self._bookshelf_host = ft.Column(
+            expand=True, spacing=0, controls=[
+                ft.Container(padding=ft.Padding(8, 4, 8, 4), content=ft.ResponsiveRow([
+                    self._bookshelf_query, self._bookshelf_group,
+                    self._bookshelf_sort,
+                    self._bookshelf_layout_btn, self._bookshelf_refresh_btn,
+                ], columns=12, spacing=6, run_spacing=4)),
+                ft.Divider(height=1), self._bookshelf,
+            ])
         self._chapters = ft.ListView(
             expand=True, spacing=2, on_scroll=self._on_chapter_scroll,
             scroll_interval=200,
+        )
+        self._directory_status = ft.Text("尚未打开书籍", size=12, expand=True)
+        self._directory_query = ft.TextField(
+            hint_text="搜索章节", prefix_icon=ft.Icons.SEARCH,
+            dense=True, height=42, expand=True,
+            on_change=self._filter_directory)
+        self._directory_reverse_btn = ft.IconButton(
+            ft.Icons.SWAP_VERT, tooltip="倒序/正序",
+            on_click=self._toggle_directory_order)
+        self._directory_toolbar = ft.Container(
+            padding=ft.Padding(8, 2, 8, 2),
+            content=ft.Column([
+                ft.Row([
+                    self._directory_status,
+                    ft.IconButton(ft.Icons.REFRESH, tooltip="刷新目录",
+                                  on_click=self._refresh_directory),
+                ]),
+                ft.Row([self._directory_query, self._directory_reverse_btn]),
+            ], spacing=2),
         )
         self._title = ft.Text("正文", size=22, weight=ft.FontWeight.BOLD)
         self._content_host = ft.Column(spacing=12)
@@ -87,6 +159,30 @@ class ReadingView(ft.Column):
                                         on_click=self._show_directory)
         self._next_chapter_btn = ft.Button("下一章", icon=ft.Icons.CHEVRON_RIGHT,
                                            disabled=True, on_click=self._next_chapter)
+        self._reader_progress = ft.Text(
+            "未选择章节", size=12, expand=True, text_align=ft.TextAlign.CENTER)
+        self._top_prev_btn = ft.IconButton(
+            ft.Icons.CHEVRON_LEFT, tooltip="上一章", disabled=True,
+            on_click=self._previous_chapter)
+        self._top_next_btn = ft.IconButton(
+            ft.Icons.CHEVRON_RIGHT, tooltip="下一章", disabled=True,
+            on_click=self._next_chapter)
+        self._font_size_label = ft.Text(str(self._font_size), size=12)
+        self._reader_toolbar = ft.Container(
+            padding=ft.Padding(6, 2, 6, 2),
+            content=ft.Row([
+                self._top_prev_btn,
+                ft.IconButton(ft.Icons.MENU_BOOK, tooltip="目录",
+                              on_click=self._show_directory),
+                self._reader_progress,
+                ft.IconButton(ft.Icons.TEXT_DECREASE, tooltip="减小字号",
+                              on_click=lambda e: self._change_font_size(-1)),
+                self._font_size_label,
+                ft.IconButton(ft.Icons.TEXT_INCREASE, tooltip="增大字号",
+                              on_click=lambda e: self._change_font_size(1)),
+                self._top_next_btn,
+            ], spacing=0),
+        )
         self._reader_nav = ft.Row(
             [self._prev_chapter_btn, self._directory_btn, self._next_chapter_btn],
             alignment=ft.MainAxisAlignment.CENTER,
@@ -99,7 +195,15 @@ class ReadingView(ft.Column):
         )
         self._tabs = ft.Tabs(length=3, expand=True, content=ft.Column(expand=True, controls=[
             ft.TabBar(tabs=[ft.Tab(label="书架"), ft.Tab(label="目录"), ft.Tab(label="阅读")]),
-            ft.TabBarView(expand=True, controls=[self._bookshelf, self._chapters, self._reader]),
+            ft.TabBarView(expand=True, controls=[
+                self._bookshelf_host,
+                ft.Column(expand=True, spacing=0, controls=[
+                    self._directory_toolbar, ft.Divider(height=1), self._chapters,
+                ]),
+                ft.Column(expand=True, spacing=0, controls=[
+                    self._reader_toolbar, ft.Divider(height=1), self._reader,
+                ]),
+            ]),
         ]))
         self._source.col = {"xs": 12, "sm": 5}
         self._keyword.col = {"xs": 8, "sm": 5}
@@ -137,6 +241,9 @@ class ReadingView(ft.Column):
         if self._verification_future and not self._verification_future.done():
             self._verification_future.cancel()
         self._cancel_prefetch(clear_cache=True)
+        if self._book_open_task and not self._book_open_task.done():
+            self._book_open_task.cancel()
+        self._persist_scroll_position()
 
     async def _get_verification_code(self, image, source):
         """Display the image captcha requested by java.getVerificationCode()."""
@@ -676,10 +783,50 @@ class ReadingView(ft.Column):
             self.update()
 
     def _render_bookshelf(self):
-        self._bookshelf.controls = [self._shelf_control(item)
-                                    for item in self.service.bookshelf]
+        query = str(self._bookshelf_query.value or "").strip().lower()
+        groups = sorted({str(item.get("groupName") or "").strip()
+                         for item in self.service.bookshelf
+                         if str(item.get("groupName") or "").strip()})
+        group_value = self._bookshelf_group.value or "__all__"
+        self._bookshelf_group.options = [
+            ft.dropdown.Option("__all__", "全部"),
+            ft.dropdown.Option("__unread__", "未读"),
+            ft.dropdown.Option("__error__", "更新失败"),
+            ft.dropdown.Option("__none__", "未分组"),
+            *[ft.dropdown.Option(group, group) for group in groups],
+        ]
+        items = [item for item in self.service.bookshelf if not query or query in
+                 f"{item.get('name', '')} {item.get('author', '')}".lower()]
+        if group_value == "__unread__":
+            items = [item for item in items if
+                     int(item.get("totalChapterNum", 0) or 0) -
+                     int(item.get("durChapterIndex", 0) or 0) - 1 > 0]
+        elif group_value == "__error__":
+            items = [item for item in items if item.get("updateError")]
+        elif group_value == "__none__":
+            items = [item for item in items if not item.get("groupName")]
+        elif group_value != "__all__":
+            items = [item for item in items
+                     if item.get("groupName") == group_value]
+        sort_mode = self._bookshelf_sort.value or "read"
+        if sort_mode == "name":
+            items.sort(key=lambda item: str(item.get("name") or "").casefold())
+        elif sort_mode == "update":
+            items.sort(key=lambda item: int(item.get("latestChapterTime", 0) or 0),
+                       reverse=True)
+        elif sort_mode == "manual":
+            items.sort(key=lambda item: int(item.get("order", 0) or 0))
+        elif sort_mode == "combined":
+            items.sort(key=lambda item: max(
+                int(item.get("durChapterTime", 0) or 0),
+                int(item.get("latestChapterTime", 0) or 0)), reverse=True)
+        else:
+            items.sort(key=lambda item: int((self.service.reading_state(item) or {}).get(
+                "last_read_at") or 0), reverse=True)
+        self._bookshelf.controls = [self._shelf_control(item) for item in items]
+        self._bookshelf_grid.controls = [self._shelf_grid_control(item) for item in items]
         if not self.service.bookshelf:
-            self._bookshelf.controls = [ft.Container(
+            empty = ft.Container(
                 padding=32,
                 content=ft.Column([
                     ft.Icon(ft.Icons.MENU_BOOK, size=52, color=ft.Colors.GREY_400),
@@ -687,47 +834,331 @@ class ReadingView(ft.Column):
                     ft.Text("请到“书源 → 找书”中选择书籍并加入书架",
                             color=ft.Colors.GREY_600),
                 ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-            )]
-        self._status.value = f"书架中有 {len(self.service.bookshelf)} 本书"
+            )
+            self._bookshelf.controls = [empty]
+            self._bookshelf_grid.controls = [empty]
+        self._status.value = (f"书架中有 {len(self.service.bookshelf)} 本书"
+                              + (f"，当前显示 {len(items)} 本" if query else ""))
+
+    def _filter_bookshelf(self, _):
+        self._render_bookshelf()
+        self.update()
+
+    def _toggle_bookshelf_layout(self, _):
+        self._bookshelf_layout = (
+            "grid" if self._bookshelf_layout == "list" else "list")
+        content = (self._bookshelf_grid
+                   if self._bookshelf_layout == "grid" else self._bookshelf)
+        self._bookshelf_host.controls[-1] = content
+        self._bookshelf_layout_btn.icon = (
+            ft.Icons.VIEW_LIST if self._bookshelf_layout == "grid"
+            else ft.Icons.GRID_VIEW)
+        self.update()
 
     def _shelf_control(self, item):
+        reading = self.service.reading_state(item) or {}
+        details = list(filter(None, [item.get("author"), item.get("source_name")]))
+        if reading.get("chapter_name"):
+            details.append(f"上次读到：{reading['chapter_name']}")
+        if reading.get("scroll_ratio"):
+            details.append(f"本章 {float(reading['scroll_ratio']):.0%}")
+        unread = max(0, int(item.get("totalChapterNum", 0) or 0) -
+                     int(item.get("durChapterIndex", 0) or 0) - 1)
+        if unread:
+            details.append(f"未读 {unread} 章")
+        if item.get("updateError"):
+            details.append("更新失败")
         return ft.ListTile(
             leading=(ft.Image(src=item.get("cover_url"), width=42, height=56,
                               fit=ft.BoxFit.COVER)
                      if item.get("cover_url") else ft.Icon(ft.Icons.BOOK)),
             title=ft.Text(item.get("name") or "未命名"),
-            subtitle=ft.Text(" · ".join(filter(None, [item.get("author"),
-                                                       item.get("source_name")]))),
-            trailing=ft.IconButton(
-                ft.Icons.DELETE_OUTLINE, tooltip="移出书架",
-                on_click=lambda e, selected=item: self._remove_shelf_item(selected),
-            ),
+            subtitle=ft.Text(" · ".join(details)),
+            trailing=ft.Row([
+                ft.Container(
+                    visible=unread > 0, padding=ft.Padding(7, 2, 7, 2),
+                    border_radius=12, bgcolor=ft.Colors.BLUE_100,
+                    content=ft.Text(str(unread), size=11)),
+                ft.IconButton(
+                    ft.Icons.MORE_VERT, tooltip="书籍管理",
+                    on_click=lambda e, selected=item: self._show_shelf_manage(selected)),
+            ], tight=True),
             on_click=lambda e, selected=item: self._open_shelf_item(selected),
         )
 
+    def _shelf_grid_control(self, item):
+        reading = self.service.reading_state(item) or {}
+        unread = max(0, int(item.get("totalChapterNum", 0) or 0) -
+                     int(item.get("durChapterIndex", 0) or 0) - 1)
+        cover = (ft.Image(src=item.get("cover_url"), height=150,
+                          width=float("inf"), fit=ft.BoxFit.COVER)
+                 if item.get("cover_url") else
+                 ft.Container(height=150, alignment=ft.Alignment.CENTER,
+                              content=ft.Icon(ft.Icons.BOOK, size=54)))
+        return ft.Card(content=ft.Container(
+            padding=8, on_click=lambda e, selected=item: self._open_shelf_item(selected),
+            content=ft.Column([
+                ft.Stack([cover, ft.Container(
+                    visible=unread > 0, right=4, top=4, padding=5,
+                    border_radius=12, bgcolor=ft.Colors.BLUE_100,
+                    content=ft.Text(str(unread), size=11))]),
+                ft.Text(item.get("name") or "未命名", max_lines=2,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                        weight=ft.FontWeight.BOLD),
+                ft.Text(reading.get("chapter_name") or item.get("author") or "",
+                        size=11, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                ft.Row([ft.Text(item.get("source_name") or "", size=10, expand=True,
+                                max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                        ft.IconButton(ft.Icons.MORE_VERT, icon_size=18,
+                                      on_click=lambda e, selected=item:
+                                      self._show_shelf_manage(selected))], spacing=0),
+            ], spacing=4)))
+
     def _remove_shelf_item(self, item):
         self.service.remove_from_bookshelf(item.get("source_url", ""), item.get("url", ""))
+        self.reading_cache.remove_book(
+            item.get("source_url", ""), item.get("url", ""))
         self._render_bookshelf()
         self.update()
 
-    def _open_shelf_item(self, item):
+    def _confirm_remove_shelf_item(self, item):
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("移出书架"),
+            content=ft.Text(f"确定将《{item.get('name') or '未命名'}》移出书架吗？"),
+            actions=[
+                ft.TextButton("取消", on_click=lambda e: self.page.pop_dialog()),
+                ft.Button(
+                    "移出", color=ft.Colors.RED,
+                    on_click=lambda e, selected=item:
+                    self._remove_shelf_item_confirmed(selected)),
+            ],
+        )
+        self.page.show_dialog(dialog)
+
+    def _remove_shelf_item_confirmed(self, item):
+        self.page.pop_dialog()
+        self._remove_shelf_item(item)
+
+    def _show_shelf_manage(self, item):
+        reading = self.service.reading_state(item) or {}
+        unread = max(0, int(item.get("totalChapterNum", 0) or 0) -
+                     int(item.get("durChapterIndex", 0) or 0) - 1)
+        group_input = ft.TextField(
+            label="分组", value=str(item.get("groupName") or ""),
+            hint_text="留空表示未分组")
+        dialog = ft.AlertDialog(
+            modal=True, title=ft.Text(item.get("name") or "书籍管理"),
+            content=ft.Container(width=400, content=ft.Column([
+                ft.Text(f"作者：{item.get('author') or '未知'}"),
+                ft.Text(f"书源：{item.get('source_name') or '未知'}"),
+                ft.Text(f"阅读进度：{reading.get('chapter_name') or '尚未阅读'}"),
+                ft.Text(f"目录：{item.get('totalChapterNum', 0)} 章 · 未读 {unread} 章"),
+                group_input,
+                ft.Text(item.get("updateError") or "", color=ft.Colors.RED_600,
+                        visible=bool(item.get("updateError"))),
+            ], tight=True, spacing=8)),
+            actions=[
+                ft.TextButton("关闭", on_click=lambda e: self.page.pop_dialog()),
+                ft.TextButton("清除缓存", on_click=lambda e, selected=item:
+                              self._clear_shelf_cache(selected)),
+                ft.TextButton("保存分组", on_click=lambda e, selected=item,
+                              field=group_input: self._save_shelf_group(selected, field)),
+                ft.TextButton("刷新目录", on_click=lambda e, selected=item:
+                              self._refresh_one_from_dialog(selected)),
+                ft.Button("移出书架", color=ft.Colors.RED,
+                          on_click=lambda e, selected=item:
+                          self._remove_from_manage(selected)),
+            ])
+        self.page.show_dialog(dialog)
+
+    def _save_shelf_group(self, item, field):
+        self.service.update_bookshelf_options(
+            item.get("source_url", ""), item.get("url", ""),
+            groupName=str(field.value or "").strip())
+        self.page.pop_dialog()
+        self._render_bookshelf()
+        self.update()
+
+    def _clear_shelf_cache(self, item):
+        self.reading_cache.remove_book(
+            item.get("source_url", ""), item.get("url", ""))
+        self.page.pop_dialog()
+        self._status.value = f"《{item.get('name') or ''}》缓存已清除"
+        self.update()
+
+    def _remove_from_manage(self, item):
+        self.page.pop_dialog()
+        self._remove_shelf_item(item)
+
+    def _refresh_one_from_dialog(self, item):
+        self.page.pop_dialog()
+        self.page.run_task(self._refresh_shelf_item, item, True)
+
+    def _refresh_all_books(self, _):
+        if self._bookshelf_update_task and not self._bookshelf_update_task.done():
+            return
+        self._bookshelf_update_task = self.page.run_task(
+            self._run_refresh_bookshelf)
+
+    async def _run_refresh_bookshelf(self):
+        candidates = [item for item in list(self.service.bookshelf)
+                      if item.get("canUpdate", True)]
+        self._bookshelf_refresh_btn.disabled = True
+        try:
+            for index, item in enumerate(candidates, 1):
+                self._status.value = (
+                    f"正在刷新书架 {index}/{len(candidates)}："
+                    f"{item.get('name') or '未命名'}")
+                self.update()
+                await self._refresh_shelf_item(item, False)
+        finally:
+            self._bookshelf_refresh_btn.disabled = False
+            self._render_bookshelf()
+            self.update()
+
+    async def _refresh_shelf_item(self, item, show_result=False):
         source = next((source for source in self.service.sources
                        if source.bookSourceUrl == item.get("source_url")), None)
         if source is None:
-            self._status.value = "原书源已被删除，无法加载这本书"
-            self.update()
+            self.service.update_bookshelf_check(
+                item.get("source_url", ""), item.get("url", ""),
+                error="原书源已删除")
             return
-        self.current_source = source
-        book = BookItem(
+        book = self._book_from_shelf(item)
+        update_engine = LegadoReadingEngine(state_dir=self.service.data_dir)
+        try:
+            chapters = await update_engine.chapters(source, book)
+            latest = next((chapter.name for chapter in reversed(chapters)
+                           if not chapter.is_volume), "")
+            await asyncio.to_thread(
+                self.reading_cache.save_catalog,
+                source.bookSourceUrl, book.url, chapters)
+            self.service.update_bookshelf_state(
+                source.bookSourceUrl, book.url,
+                variables=getattr(book, "variables", {}) or update_engine.js_variables,
+                book=book)
+            self.service.update_bookshelf_check(
+                source.bookSourceUrl, book.url,
+                latest_title=latest, total_chapters=len(chapters))
+            if show_result:
+                self._status.value = f"《{book.name}》目录已更新，共 {len(chapters)} 章"
+        except Exception as exc:
+            self.service.update_bookshelf_check(
+                source.bookSourceUrl, book.url, error=str(exc))
+            if show_result:
+                self._show_error(exc)
+        finally:
+            update_engine.js.close()
+            if show_result:
+                self._render_bookshelf()
+                self.update()
+
+    @staticmethod
+    def _book_from_shelf(item):
+        return BookItem(
             name=item.get("name", ""), author=item.get("author", ""),
             intro=item.get("intro", ""), url=item.get("url", ""),
             cover_url=item.get("cover_url", ""), toc_url=item.get("toc_url", ""),
             kind=item.get("kind", ""), last_chapter=item.get("last_chapter", ""),
             word_count=item.get("word_count", ""),
             download_urls=item.get("download_urls", ""),
-            variables=item.get("variables") or {},
+            variables=item.get("variables") or {})
+
+    def _open_shelf_item(self, item):
+        # Persist the old book before replacing any of its context. Previously
+        # the second book became current first, so the first book's chapter was
+        # accidentally saved into the second one's progress record.
+        self._persist_scroll_position()
+        source = next((source for source in self.service.sources
+                       if source.bookSourceUrl == item.get("source_url")), None)
+        if source is None:
+            self._status.value = "原书源已被删除，无法加载这本书"
+            self.update()
+            return
+        self._reset_book_session(book_name=item.get("name") or "")
+        self.current_source = source
+        book = self._book_from_shelf(item)
+        self._book_open_generation += 1
+        generation = self._book_open_generation
+        if self._book_open_task and not self._book_open_task.done():
+            self._book_open_task.cancel()
+        reading = self.service.reading_state(item)
+        has_progress = bool(
+            reading and (reading.get("chapter_url") or
+                         reading.get("chapter_name") or
+                         int(reading.get("last_read_at") or 0) > 0))
+        if has_progress:
+            # Legado opens a progressed book as a reader first; cached content
+            # can replace the placeholder without waiting for a network TOC.
+            self._tabs.selected_index = 2
+            self._title.value = reading.get("chapter_name") or book.name
+            self._content_host.controls = [ft.Row([
+                ft.ProgressRing(width=22, height=22),
+                ft.Text("正在恢复上次阅读位置…"),
+            ])]
+            self._status.value = f"正在继续阅读《{book.name}》"
+            self.update()
+        else:
+            self._show_shelf_book_detail(book)
+        self._book_open_task = self.page.run_task(
+            self._run_chapters, book, reading if has_progress else None,
+            False, generation)
+
+    def _reset_book_session(self, book_name=""):
+        self._cancel_prefetch(clear_cache=True)
+        self._reading_loading = False
+        self.engine.current_book = None
+        self.engine.js_variables.clear()
+        self._current_book = None
+        self._current_chapter = None
+        self.chapters = []
+        self._visible_chapters = []
+        self._continuous_loaded.clear()
+        self._pending_scroll_offset = 0.0
+        self._pending_scroll_ratio = 0.0
+        self._chapters.controls.clear()
+        # Internal state and visible state must change together. A book without
+        # cache may wait on the network, but it must never expose the previous
+        # book's directory, content or navigation while waiting.
+        self._directory_query.value = ""
+        self._directory_status.value = (
+            f"《{book_name}》目录尚未加载" if book_name else "尚未打开书籍")
+        self._title.value = book_name or "正文"
+        self._content_host.controls = [ft.Container(
+            padding=24, alignment=ft.Alignment.CENTER,
+            content=ft.Text(
+                f"《{book_name}》正文尚未加载" if book_name else "尚未打开正文",
+                color=ft.Colors.GREY_600))]
+        self._reader_progress.value = "未加载章节"
+        for button in (self._prev_chapter_btn, self._next_chapter_btn,
+                       self._top_prev_btn, self._top_next_btn):
+            button.disabled = True
+
+    def _show_shelf_book_detail(self, book):
+        """Show stored metadata immediately while a new book loads its TOC."""
+        self._detail_book = book
+        controls = [
+            ft.Text(book.author or "作者未知", weight=ft.FontWeight.BOLD),
+            ft.Text(book.intro or "暂无简介", selectable=True),
+            ft.Divider(),
+            ft.Row([ft.ProgressRing(width=22, height=22),
+                    ft.Text("正在加载目录…")]),
+        ]
+        self._book_detail_dialog = ft.AlertDialog(
+            modal=True, title=ft.Text(book.name or "书籍详情"),
+            content=ft.Container(
+                width=420, height=260,
+                content=ft.ListView(controls=controls, spacing=10)),
+            actions=[ft.TextButton("取消", on_click=self._cancel_shelf_open)],
         )
-        self.page.run_task(self._run_chapters, book)
+        self.page.show_dialog(self._book_detail_dialog)
+
+    def _cancel_shelf_open(self, _):
+        self._book_open_generation += 1
+        if self._book_open_task and not self._book_open_task.done():
+            self._book_open_task.cancel()
+        self._close_book_detail(None)
 
     def _append_book_controls(self, books):
         """追加新结果，只替换列表末尾的翻页提示。"""
@@ -782,26 +1213,131 @@ class ReadingView(ft.Column):
     def _load_book(self, book):
         self.page.run_task(self._run_chapters, book)
 
-    async def _run_chapters(self, book):
+    def _refresh_directory(self, _):
+        if self._current_book is not None:
+            self.page.run_task(
+                self._run_chapters, self._current_book, None, True)
+
+    async def _run_chapters(self, book, resume=None, force_refresh=False,
+                            open_generation=None):
+        if (open_generation is not None and
+                open_generation != self._book_open_generation):
+            return
+        self._current_book = book
+        if resume and resume.get("font_size") is not None:
+            self._font_size = max(13, min(28, int(resume["font_size"])))
+            self._font_size_label.value = str(self._font_size)
+        if not force_refresh:
+            cached = await asyncio.to_thread(
+                self.reading_cache.load_catalog,
+                self.current_source.bookSourceUrl, book.url)
+            if not self._is_current_book_open(book, open_generation):
+                return
+            if cached:
+                self.engine.current_book = book
+                self.engine.js_variables.update(getattr(book, "variables", {}) or {})
+                self._apply_chapters(book, cached, "已从本地缓存加载")
+                resume_chapter = self._resume_chapter(resume)
+                if resume_chapter is not None:
+                    await self._run_content(
+                        resume_chapter, False,
+                        float((resume or {}).get("scroll_offset") or 0),
+                        open_generation)
+                else:
+                    self.update()
+                return
         self._set_busy(f"正在加载《{book.name}》目录…")
         try:
             self._cancel_prefetch(clear_cache=True)
-            self.chapters = await self.engine.chapters(self.current_source, book)
+            chapters = await self.engine.chapters(self.current_source, book)
+            if not self._is_current_book_open(book, open_generation):
+                return
+            await asyncio.to_thread(
+                self.reading_cache.save_catalog,
+                self.current_source.bookSourceUrl, book.url, chapters)
             self.service.update_bookshelf_state(
                 self.current_source.bookSourceUrl, book.url,
                 variables=getattr(book, "variables", {}) or self.engine.js_variables,
                 book=book)
-            self._current_chapter = None
-            self._continuous_loaded.clear()
-            self._chapters.controls.clear()
-            self._chapter_visible_count = 0
-            self._append_chapter_controls()
-            self._status.value = (f"《{book.name}》共 {len(self.chapters)} 章，"
-                                  f"已加载 {self._chapter_visible_count} 章")
-            self._tabs.selected_index = 1
+            self._apply_chapters(book, chapters, "目录已刷新")
+            resume_chapter = self._resume_chapter(resume)
+            if resume_chapter is not None:
+                await self._run_content(
+                    resume_chapter, False,
+                    float((resume or {}).get("scroll_offset") or 0),
+                    open_generation)
         except Exception as exc:
-            self._show_error(exc)
+            if self._is_current_book_open(book, open_generation):
+                self._show_error(exc)
         self.update()
+
+    def _is_current_book_open(self, book, open_generation):
+        if open_generation is not None and open_generation != self._book_open_generation:
+            return False
+        return self._current_book is book
+
+    def _apply_chapters(self, book, chapters, state_text):
+        self.chapters = chapters
+        self._current_chapter = None
+        self._continuous_loaded.clear()
+        self._chapters.controls.clear()
+        self._chapter_visible_count = 0
+        self._apply_directory_filter()
+        self._directory_status.value = (
+            f"{book.name} · {len(chapters)} 章 · {state_text}")
+        self._status.value = (f"《{book.name}》共 {len(chapters)} 章，"
+                              f"已加载 {self._chapter_visible_count} 章")
+        self._tabs.selected_index = 1
+        if self._detail_book is book and self._book_detail_dialog is not None:
+            self._close_book_detail(None)
+        if (self.current_source is not None and
+                hasattr(self.service, "update_bookshelf_state")):
+            self.service.update_bookshelf_state(
+                self.current_source.bookSourceUrl, book.url,
+                total_chapters=len(chapters))
+
+    def _filter_directory(self, _):
+        self._apply_directory_filter()
+        self.update()
+
+    def _toggle_directory_order(self, _):
+        self._directory_reversed = not self._directory_reversed
+        self._apply_directory_filter()
+        self.update()
+
+    def _apply_directory_filter(self):
+        keyword = str(self._directory_query.value or "").strip().lower()
+        visible = [chapter for chapter in self.chapters
+                   if not keyword or keyword in chapter.name.lower()]
+        self._visible_chapters = list(reversed(visible)) if self._directory_reversed else visible
+        self._chapters.controls.clear()
+        self._chapter_visible_count = 0
+        self._append_chapter_controls()
+        suffix = f" · 筛选 {len(visible)} 章" if keyword else ""
+        direction = " · 倒序" if self._directory_reversed else ""
+        if self._current_book is not None:
+            self._directory_status.value = (
+                f"{self._current_book.name} · {len(self.chapters)} 章{suffix}{direction}")
+
+    def _resume_chapter(self, reading):
+        """Resolve a saved position after refreshing the book directory."""
+        if not reading or not self.chapters:
+            return None
+        chapter_url = str(reading.get("chapter_url") or "")
+        if chapter_url:
+            chapter = next((item for item in self.chapters
+                            if item.url == chapter_url and not item.is_volume), None)
+            if chapter is not None:
+                return chapter
+        try:
+            index = int(reading.get("chapter_index", -1))
+        except (TypeError, ValueError):
+            return None
+        if 0 <= index < len(self.chapters):
+            chapter = self.chapters[index]
+            if not chapter.is_volume and chapter.url:
+                return chapter
+        return None
 
     def _chapter_control(self, chapter):
         locked = chapter.is_vip and not chapter.is_pay
@@ -832,16 +1368,16 @@ class ReadingView(ft.Column):
     def _append_chapter_controls(self):
         old_count = self._chapter_visible_count
         self._chapter_visible_count = min(
-            old_count + self.DIRECTORY_BATCH_SIZE, len(self.chapters))
+            old_count + self.DIRECTORY_BATCH_SIZE, len(self._visible_chapters))
         self._chapters.controls.extend(
-            self._chapter_control(self.chapters[i])
+            self._chapter_control(self._visible_chapters[i])
             for i in range(old_count, self._chapter_visible_count)
         )
 
     def _on_chapter_scroll(self, event):
         pixels = getattr(event, "pixels", 0) or 0
         maximum = getattr(event, "max_scroll_extent", 0) or 0
-        if (self._chapter_visible_count >= len(self.chapters) or not maximum or
+        if (self._chapter_visible_count >= len(self._visible_chapters) or not maximum or
                 maximum - pixels >= 320):
             return
         self._append_chapter_controls()
@@ -852,9 +1388,17 @@ class ReadingView(ft.Column):
     def _load_content(self, chapter):
         self.page.run_task(self._run_content, chapter, False)
 
-    async def _run_content(self, chapter, append=False):
+    async def _run_content(self, chapter, append=False, restore_offset=0.0,
+                           open_generation=None):
+        if (open_generation is not None and
+                open_generation != self._book_open_generation):
+            return
         if self._reading_loading or chapter.is_volume:
             return
+        if self._current_chapter is not None and self._current_chapter is not chapter:
+            self._persist_scroll_position()
+            self._pending_scroll_offset = 0.0
+            self._pending_scroll_ratio = 0.0
         self._cancel_prefetch()
         self._reading_loading = True
         self._set_busy(f"正在加载 {chapter.name}…")
@@ -864,9 +1408,24 @@ class ReadingView(ft.Column):
                 next_chapter_url = next((item.url for item in self.chapters[chapter.index + 1:]
                                          if not item.is_volume and item.url), "")
             content = self._chapter_cache.pop(chapter.url, None)
+            content_from_cache = content is not None
+            if content is None and self._current_book is not None:
+                content = await asyncio.to_thread(
+                    self.reading_cache.load_content,
+                    self.current_source.bookSourceUrl,
+                    self._current_book.url, chapter.url)
+                content_from_cache = content is not None
             if content is None:
                 content = await self.engine.content_document(
                     self.current_source, chapter, next_chapter_url)
+                if self._current_book is not None:
+                    await asyncio.to_thread(
+                        self.reading_cache.save_content,
+                        self.current_source.bookSourceUrl,
+                        self._current_book.url, chapter.url, content)
+            if (open_generation is not None and
+                    open_generation != self._book_open_generation):
+                return
             rendered = self._render_content(content)
             if append:
                 self._content_host.controls.extend([
@@ -891,7 +1450,8 @@ class ReadingView(ft.Column):
                     variables=current_book.variables, chapter=chapter,
                     book=current_book)
             self._update_chapter_navigation()
-            self._status.value = chapter.name
+            self._status.value = (f"{chapter.name} · 已从缓存打开"
+                                  if content_from_cache else chapter.name)
             self._tabs.selected_index = 2
         except Exception as exc:
             self._show_error(exc)
@@ -901,7 +1461,9 @@ class ReadingView(ft.Column):
         if self._current_chapter is chapter:
             self._prefetch_task = self.page.run_task(self._prefetch_next_chapters, chapter)
         if not append:
-            await self._reader.scroll_to(offset=0, duration=150)
+            target_offset = max(0.0, float(restore_offset or 0))
+            self._pending_scroll_offset = target_offset
+            await self._reader.scroll_to(offset=target_offset, duration=150)
 
     def _cancel_prefetch(self, clear_cache=False):
         if self._prefetch_task and not self._prefetch_task.done():
@@ -943,6 +1505,11 @@ class ReadingView(ft.Column):
                 if cache_size + size > self.PREFETCH_CACHE_LIMIT:
                     break
                 self._chapter_cache[candidate.url] = document
+                if self._current_book is not None:
+                    await asyncio.to_thread(
+                        self.reading_cache.save_content,
+                        source.bookSourceUrl, self._current_book.url,
+                        candidate.url, document)
                 cache_size += size
         except asyncio.CancelledError:
             raise
@@ -968,8 +1535,29 @@ class ReadingView(ft.Column):
         return None
 
     def _update_chapter_navigation(self):
-        self._prev_chapter_btn.disabled = self._adjacent_chapter(-1) is None
-        self._next_chapter_btn.disabled = self._adjacent_chapter(1) is None
+        previous_disabled = self._adjacent_chapter(-1) is None
+        next_disabled = self._adjacent_chapter(1) is None
+        self._prev_chapter_btn.disabled = previous_disabled
+        self._next_chapter_btn.disabled = next_disabled
+        self._top_prev_btn.disabled = previous_disabled
+        self._top_next_btn.disabled = next_disabled
+        if self._current_chapter in self.chapters:
+            position = self.chapters.index(self._current_chapter) + 1
+            self._reader_progress.value = (
+                f"{position}/{len(self.chapters)} · {self._current_chapter.name}")
+        else:
+            self._reader_progress.value = "未选择章节"
+
+    def _change_font_size(self, delta):
+        new_size = max(13, min(28, self._font_size + int(delta)))
+        if new_size == self._font_size:
+            return
+        self._font_size = new_size
+        self._font_size_label.value = str(new_size)
+        for control in self._content_host.controls:
+            if getattr(control, "data", None) == "reader-text":
+                control.size = new_size
+        self.update()
 
     def _previous_chapter(self, _):
         chapter = self._adjacent_chapter(-1)
@@ -988,23 +1576,52 @@ class ReadingView(ft.Column):
     def _on_reader_scroll(self, event):
         pixels = getattr(event, "pixels", 0) or 0
         maximum = getattr(event, "max_scroll_extent", 0) or 0
-        if not maximum:
+        if self._current_chapter is None:
             return
-        distance = maximum - pixels
-        if distance > 500:
-            self._auto_scroll_armed = True
+        self._pending_scroll_offset = max(0.0, float(pixels))
+        self._pending_scroll_ratio = (
+            min(1.0, self._pending_scroll_offset / float(maximum))
+            if maximum else 0.0)
+        self._scroll_save_generation += 1
+        self.page.run_task(
+            self._save_scroll_position_after_delay,
+            self._scroll_save_generation)
+
+    async def _save_scroll_position_after_delay(self, generation):
+        await asyncio.sleep(0.5)
+        if generation == self._scroll_save_generation:
+            self._persist_scroll_position()
+
+    def _persist_scroll_position(self):
+        if (self._current_chapter is None or self._current_book is None or
+                self.current_source is None):
             return
-        if distance < 180 and self._auto_scroll_armed and not self._reading_loading:
-            chapter = self._adjacent_chapter(1)
-            if chapter and chapter.url not in self._continuous_loaded:
-                self._auto_scroll_armed = False
-                self.page.run_task(self._run_content, chapter, True)
+        text_length = sum(
+            len(str(control.value or ""))
+            for control in self._content_host.controls
+            if getattr(control, "data", None) == "reader-text")
+        # Legado persists the first visible character position. Flet exposes
+        # pixels, so use the scroll ratio to retain the same layout-independent
+        # semantic position, while also keeping the exact desktop pixel offset.
+        chapter_pos = int(text_length * self._pending_scroll_ratio)
+        self.service.update_bookshelf_state(
+            self.current_source.bookSourceUrl,
+            self._current_book.url,
+            chapter=self._current_chapter,
+            scroll_offset=self._pending_scroll_offset,
+            scroll_ratio=self._pending_scroll_ratio,
+            font_size=self._font_size,
+            chapter_pos=chapter_pos,
+            total_chapters=len(self.chapters))
 
     def _render_content(self, document):
         controls = []
         for block in document.blocks:
             if block.kind == "text":
-                controls.append(ft.Text(str(block.value), selectable=True, size=16))
+                text = ft.Text(
+                    str(block.value), selectable=True, size=self._font_size)
+                text.data = "reader-text"
+                controls.append(text)
             elif block.kind == "image":
                 controls.append(ft.Image(
                     src=block.value, fit=ft.BoxFit.CONTAIN,

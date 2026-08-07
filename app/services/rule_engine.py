@@ -1181,8 +1181,25 @@ class ReaderEngine:
                           base_url=source.bookSourceUrl,
                           variables=self.js_variables),
             )
-            rendered = rendered[:match.start()] + str(result or "") + rendered[match.end():]
+            rendered = (rendered[:match.start()] +
+                        self._template_result_text(result) +
+                        rendered[match.end():])
         return rendered
+
+    @staticmethod
+    def _template_result_text(result) -> str:
+        """Keep numeric zero in URL templates without changing other falsey values.
+
+        The previous ``str(result or "")`` behavior intentionally rendered
+        ``None``, ``False`` and empty containers as blank text.  JavaScript
+        pagination expressions, however, commonly produce numeric zero on the
+        first page.  Handle only that numeric case to avoid broad compatibility
+        changes in existing source rules.
+        """
+        if (isinstance(result, (int, float)) and
+                not isinstance(result, bool) and result == 0):
+            return "0"
+        return str(result or "")
 
     async def _resolve_rule_url(self, value: str, source, key: str = "",
                                 page: int = 1) -> str:

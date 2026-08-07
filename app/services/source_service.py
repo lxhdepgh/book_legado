@@ -63,9 +63,75 @@ class SourceService:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             self.bookshelf = data if isinstance(data, list) else []
+            changed = False
+            for item in self.bookshelf:
+                changed = self._migrate_bookshelf_item(item) or changed
+            if changed and path == self.bookshelf_path:
+                self.save_bookshelf()
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             self.bookshelf = []
         return self.bookshelf
+
+    @staticmethod
+    def _migrate_bookshelf_item(item: dict) -> bool:
+        """Add Legado-compatible book/progress fields without dropping old data."""
+        changed = False
+        aliases = {
+            "bookUrl": item.get("url", ""),
+            "tocUrl": item.get("toc_url", ""),
+            "origin": item.get("source_url", ""),
+            "originName": item.get("source_name", ""),
+            "latestChapterTitle": item.get("last_chapter", ""),
+            "totalChapterNum": 0,
+            "lastCheckTime": 0,
+            "lastCheckCount": 0,
+            "canUpdate": True,
+            "order": 0,
+            "group": 0,
+            "groupName": "",
+            "latestChapterTime": 0,
+        }
+        reading = item.get("reading") or {}
+        if not reading and (item.get("durChapterTitle") or item.get("durChapterTime")):
+            reading = {
+                "chapter_url": "",
+                "chapter_name": item.get("durChapterTitle") or "",
+                "chapter_index": int(item.get("durChapterIndex", 0) or 0),
+                "chapter_pos": int(item.get("durChapterPos", 0) or 0),
+                "scroll_offset": 0.0,
+                "scroll_ratio": 0.0,
+                "font_size": 16,
+                "last_read_at": int(item.get("durChapterTime", 0) or 0) // 1000,
+            }
+            item["reading"] = reading
+            changed = True
+        aliases.update({
+            "durChapterIndex": int(reading.get("chapter_index", 0) or 0),
+            "durChapterPos": int(reading.get("chapter_pos", 0) or 0),
+            "durChapterTime": int(reading.get("last_read_at", 0) or 0) * 1000,
+            "durChapterTitle": reading.get("chapter_name") or None,
+        })
+        for key, value in aliases.items():
+            if key not in item:
+                item[key] = value
+                changed = True
+        return changed
+
+    @staticmethod
+    def reading_state(item: dict) -> dict | None:
+        """Return one normalized progress object for old and Legado-style data."""
+        reading = dict(item.get("reading") or {})
+        if not reading and not (item.get("durChapterTitle") or item.get("durChapterTime")):
+            return None
+        reading.setdefault("chapter_url", "")
+        reading.setdefault("chapter_name", item.get("durChapterTitle") or "")
+        reading.setdefault("chapter_index", int(item.get("durChapterIndex", 0) or 0))
+        reading.setdefault("chapter_pos", int(item.get("durChapterPos", 0) or 0))
+        reading.setdefault("last_read_at", int(item.get("durChapterTime", 0) or 0) // 1000)
+        reading.setdefault("scroll_offset", 0.0)
+        reading.setdefault("scroll_ratio", 0.0)
+        reading.setdefault("font_size", 16)
+        return reading
 
     def save_bookshelf(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -89,6 +155,17 @@ class SourceService:
             "download_urls": getattr(book, "download_urls", ""),
             "variables": book.variables or {}, "source_url": source.bookSourceUrl,
             "source_name": source.bookSourceName,
+            # Legado Book entity aliases.  Keep the existing snake_case keys so
+            # old bookshelf files and callers remain compatible.
+            "bookUrl": book.url, "tocUrl": getattr(book, "toc_url", ""),
+            "origin": source.bookSourceUrl, "originName": source.bookSourceName,
+            "latestChapterTitle": getattr(book, "last_chapter", ""),
+            "totalChapterNum": 0, "lastCheckTime": int(time.time() * 1000),
+            "lastCheckCount": 0, "durChapterTitle": None,
+            "durChapterIndex": 0, "durChapterPos": 0,
+            "durChapterTime": 0, "canUpdate": True, "order": 0,
+            "group": 0,
+            "groupName": "", "latestChapterTime": 0,
         })
         self.save_bookshelf()
         return True
@@ -103,9 +180,49 @@ class SourceService:
             return True
         return False
 
+    def update_bookshelf_check(self, source_url: str, book_url: str, *,
+                               latest_title: str = "",
+                               total_chapters: int | None = None,
+                               error: str = "") -> bool:
+        """Persist one Legado-style bookshelf refresh result."""
+        for item in self.bookshelf:
+            if (item.get("source_url"), item.get("url")) != (source_url, book_url):
+                continue
+            old_total = int(item.get("totalChapterNum", 0) or 0)
+            new_total = old_total if total_chapters is None else max(
+                0, int(total_chapters))
+            item["lastCheckTime"] = int(time.time() * 1000)
+            item["lastCheckCount"] = max(0, new_total - old_total)
+            item["totalChapterNum"] = new_total
+            if latest_title:
+                item["latestChapterTitle"] = latest_title
+                item["last_chapter"] = latest_title
+                item["latestChapterTime"] = int(time.time() * 1000)
+            item["updateError"] = str(error or "")
+            self.save_bookshelf()
+            return True
+        return False
+
+    def update_bookshelf_options(self, source_url: str, book_url: str, **options) -> bool:
+        allowed = {"canUpdate", "group", "groupName", "order"}
+        for item in self.bookshelf:
+            if (item.get("source_url"), item.get("url")) != (source_url, book_url):
+                continue
+            for key, value in options.items():
+                if key in allowed:
+                    item[key] = value
+            self.save_bookshelf()
+            return True
+        return False
+
     def update_bookshelf_state(self, source_url: str, book_url: str,
                                variables: dict | None = None,
-                               chapter=None, book=None) -> bool:
+                               chapter=None, book=None,
+                               scroll_offset: float | None = None,
+                               scroll_ratio: float | None = None,
+                               font_size: int | None = None,
+                               chapter_pos: int | None = None,
+                               total_chapters: int | None = None) -> bool:
         """Persist rule variables and the last reading position outside resources."""
         for item in self.bookshelf:
             if (item.get("source_url"), item.get("url")) != (source_url, book_url):
@@ -123,11 +240,37 @@ class SourceService:
                     if value:
                         item[key] = value
             if chapter is not None:
+                previous = item.get("reading") or {}
+                same_chapter = (previous.get("chapter_url") ==
+                                getattr(chapter, "url", ""))
+                now = int(time.time())
+                resolved_pos = int(
+                    chapter_pos if chapter_pos is not None else
+                    previous.get("chapter_pos", item.get("durChapterPos", 0))
+                    if same_chapter else 0)
                 item["reading"] = {
                     "chapter_url": getattr(chapter, "url", ""),
                     "chapter_name": getattr(chapter, "name", ""),
                     "chapter_index": int(getattr(chapter, "index", 0) or 0),
+                    "scroll_offset": float(
+                        scroll_offset if scroll_offset is not None else
+                        previous.get("scroll_offset", 0) if same_chapter else 0),
+                    "scroll_ratio": float(
+                        scroll_ratio if scroll_ratio is not None else
+                        previous.get("scroll_ratio", 0) if same_chapter else 0),
+                    "chapter_pos": resolved_pos,
+                    "font_size": int(
+                        font_size if font_size is not None else
+                        previous.get("font_size", 16)),
+                    "last_read_at": now,
                 }
+                # These are the canonical progress fields used by Legado.
+                item["durChapterTitle"] = getattr(chapter, "name", "") or None
+                item["durChapterIndex"] = int(getattr(chapter, "index", 0) or 0)
+                item["durChapterPos"] = resolved_pos
+                item["durChapterTime"] = now * 1000
+            if total_chapters is not None:
+                item["totalChapterNum"] = max(0, int(total_chapters))
             self.save_bookshelf()
             return True
         return False
