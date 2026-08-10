@@ -58,19 +58,30 @@ SUPPORTED_JAVA_APIS = {
     "aesBase64DecodeToString", "aesDecodeToByteArray", "aesDecodeToString",
     "aesEncodeToBase64ByteArray", "aesEncodeToBase64String",
     "aesEncodeToByteArray", "aesEncodeToString", "ajax", "ajaxAll",
+    "aesDecodeArgsBase64Str", "aesEncodeArgsBase64Str",
     "androidId", "base64Decode", "base64DecodeToByteArray", "base64Encode",
-    "bytesToStr", "connect", "createSymmetricCrypto", "desEncodeToBase64String",
+    "bytesToStr", "cacheFile", "connect", "createAsymmetricCrypto", "createSign",
+    "createSymmetricCrypto", "deleteFile",
+    "desBase64DecodeToString", "desDecodeToString", "desEncodeToBase64String",
+    "desEncodeToString", "digestBase64Str", "downloadFile",
     "deviceID", "digestHex", "encodeURI", "get", "getBook", "getCookie",
-    "getByteArray", "getElement", "getElements", "getInputStream",
-    "getStrResponse", "getString", "getStringList",
+    "getByteArray", "getElement", "getElements", "getFile", "getInputStream",
+    "getSource", "getStrResponse", "getString", "getStringList",
     "getVerificationCode", "getWebViewUA", "head", "headerMap",
+    "get7zByteArrayContent", "get7zStringContent", "getRarByteArrayContent",
+    "getRarStringContent", "getTxtInFolder", "getZipByteArrayContent",
+    "getZipStringContent",
     "hexDecodeToByteArray", "hexDecodeToString", "hexEncodeToString", "htmlFormat",
     "importScript", "initUrl", "key", "lang", "log", "longToast", "md5Encode",
     "md5Encode16", "post", "put", "queryBase64TTF", "queryTTF", "randomUUID",
-    "redirectUrl", "refreshExplore", "refreshTocUrl", "replaceFont", "ruleUrl",
-    "setBaseUrl", "setContent", "startBrowser", "startBrowserAwait", "strToBytes",
+    "readFile", "readTxtFile", "redirectUrl", "refreshExplore", "refreshTocUrl",
+    "replaceFont", "ruleUrl",
+    "s2t", "setBaseUrl", "setContent", "startBrowser", "startBrowserAwait", "strToBytes",
     "t2s", "timeFormat", "timeFormatUTC", "toNumChapter", "toast",
-    "tripleDESEncodeBase64Str", "url", "webView", "webViewUA",
+    "un7zFile", "unArchiveFile", "unrarFile", "unzipFile", "utf8ToGbk",
+    "tripleDESDecodeArgsBase64Str", "tripleDESDecodeStr",
+    "tripleDESEncodeArgsBase64Str", "tripleDESEncodeBase64Str", "url",
+    "webView", "webViewUA",
 }
 SUPPORTED_OBJECT_APIS = {
     "source": {"getKey", "getSource", "getHeaderMap", "getVariable",
@@ -158,7 +169,15 @@ def _validate_regex_field(field_path: str, value: str) -> None:
             pattern = pattern[2:]
         pattern = pattern.split("##", 1)[0]
     if pattern:
-        re.compile(pattern)
+        try:
+            from app.services.java_regex import compile_pattern
+            compile_pattern(pattern)
+        except re.error:
+            if field_path.endswith(".replaceRegex"):
+                # Historical AnalyzeRule deliberately catches invalid regex
+                # and applies the pattern as a literal String replacement.
+                return
+            raise
 
 
 def _validate_rule_syntax(rule: str) -> None:

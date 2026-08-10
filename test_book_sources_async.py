@@ -784,6 +784,11 @@ async def test_one(source: dict, idx: int, session: aiohttp.ClientSession,
     return result
 
 
+# This is a corpus-check worker called by the CLI and check service, not an
+# independently collectable pytest case (its parameters are runtime inputs).
+test_one.__test__ = False
+
+
 def _shorten_err(err: str) -> str:
     for kw, short in [
         ("SSLEOFError", "SSL EOF"), ("UNEXPECTED_EOF", "SSL EOF"),

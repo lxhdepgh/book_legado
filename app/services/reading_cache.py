@@ -84,7 +84,8 @@ class ReadingCache:
                     dict(item.get("headers") or {}), str(item.get("title") or "")))
             return ChapterContent(
                 blocks=blocks, title=str(data.get("title") or ""),
-                image_style=str(data.get("image_style") or ""))
+                image_style=str(data.get("image_style") or ""),
+                raw_content=str(data.get("raw_content") or ""))
         except (TypeError, ValueError, binascii.Error):
             return None
 
@@ -104,6 +105,7 @@ class ReadingCache:
             "saved_at": int(time.time()),
             "title": document.title,
             "image_style": document.image_style,
+            "raw_content": document.raw_content,
             "blocks": blocks,
         })
         self._prune()

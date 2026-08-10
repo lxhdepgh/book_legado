@@ -1,7 +1,8 @@
 """Legado-compatible request parameter encoding helpers."""
 from __future__ import annotations
 
-from urllib.parse import urlsplit, urlunsplit
+import re
+from urllib.parse import quote_plus, urlsplit, urlunsplit
 
 
 _ESCAPE_SAFE = frozenset(
@@ -45,3 +46,29 @@ def escape_url_query(url: str) -> str:
         return str(url)
     return urlunsplit((parts.scheme, parts.netloc, parts.path,
                        escape_form(parts.query), parts.fragment))
+
+
+def encode_form_fields(value: str, charset: str = "utf-8") -> str:
+    """Match AnalyzeUrl.analyzeFields/URLEncoder for ordinary form fields."""
+    normalized = str(charset or "utf-8")
+    if normalized.lower() in {"gbk", "gb2312", "gb_2312-80"}:
+        normalized = "gb18030"
+    fields: list[str] = []
+    for field in str(value).split("&"):
+        name, separator, item = field.partition("=")
+        if not separator:
+            fields.append(name)
+            continue
+        # Legado preserves values which already contain URL encoding.
+        encoded = item if re.search(r"%[0-9a-fA-F]{2}", item) else quote_plus(
+            item, safe="", encoding=normalized, errors="replace")
+        fields.append(f"{name}={encoded}")
+    return "&".join(fields)
+
+
+def encode_url_query_fields(url: str, charset: str = "utf-8") -> str:
+    parts = urlsplit(str(url))
+    if not parts.query:
+        return str(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                       encode_form_fields(parts.query, charset), parts.fragment))

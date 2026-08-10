@@ -6,9 +6,11 @@ import ast
 import aiohttp
 import base64
 from dataclasses import dataclass, field
+import html
 from http.cookies import SimpleCookie
 import json
 import re
+import time
 from urllib.parse import urljoin, urlsplit
 from yarl import URL
 
@@ -16,11 +18,27 @@ from bs4 import BeautifulSoup
 
 from test_book_sources_async import parse_request_config, parse_search_url
 from app.services.legado_js import JsContext, split_js_rule
-from app.services.legado_rule_parser import evaluate
+from app.services.legado_rule_parser import evaluate, parse_json_smart, parse_markup
+from app.services.java_regex import search as java_regex_search, sub as java_regex_sub
+from app.services.source_rule import compile_rule_program
 from app.services.rule_engine import (BookItem, ChapterItem, ReaderEngine,
                                       _apply_regex_suffix,
-                                      _java_replacement, extract_value,
+                                      _format_book_author,
+                                      _format_book_intro,
+                                      _format_book_name,
+                                      _format_word_count,
+                                      _book_type,
+                                      _legado_value_string,
+                                      extract_value,
                                       extract_values)
+
+
+class TocEmptyError(RuntimeError):
+    """Historical TocEmptyException observable equivalent."""
+
+
+class ContentEmptyError(RuntimeError):
+    """Historical ContentEmptyException observable equivalent."""
 
 
 
@@ -40,10 +58,94 @@ class ChapterContent:
     blocks: list[ContentBlock] = field(default_factory=list)
     title: str = ""
     image_style: str = ""
+    raw_content: str = ""
 
     @property
     def plain_text(self) -> str:
         return "\n".join(str(block.value) for block in self.blocks if block.kind == "text")
+
+
+def _replace_rule_value(rule, name, default=None):
+    return (rule.get(name, default) if isinstance(rule, dict)
+            else getattr(rule, name, default))
+
+
+def _apply_purify_rules(value: str, rules) -> str:
+    """Apply historical ReplaceRule records in database order."""
+    result = str(value)
+    for rule in rules or []:
+        if not _replace_rule_value(rule, "isEnabled", True):
+            continue
+        pattern = str(_replace_rule_value(rule, "pattern", "") or "")
+        if not pattern:
+            continue
+        replacement = str(_replace_rule_value(rule, "replacement", "") or "")
+        try:
+            candidate = (java_regex_sub(pattern, replacement, result)
+                         if _replace_rule_value(rule, "isRegex", True)
+                         else result.replace(pattern, replacement))
+        except re.error:
+            continue
+        result = candidate
+    return result
+
+
+def chapter_display_title(chapter: ChapterItem, title_rules=None,
+                          use_replace: bool = True) -> str:
+    """Python port of BookChapter.getDisplayTitle's rule-visible portion."""
+    title = re.sub(r"[\r\n]+", "", str(chapter.name or ""))
+    if use_replace:
+        for rule in title_rules or []:
+            before = title
+            title = _apply_purify_rules(title, [rule])
+            # Legado refuses a title rule that erases the entire title.
+            if not title.strip():
+                title = before
+    return title
+
+
+def process_book_content(value: str, book: BookItem | None,
+                         chapter: ChapterItem) -> tuple[str, str]:
+    """Port ContentProcessor stages used by the desktop reader.
+
+    The desktop page already renders the chapter title above the content, so
+    this corresponds to ContentProcessor.getContent(includeTitle=false).
+    """
+    config = dict(getattr(book, "read_config", {}) or {}) if book else {}
+    use_replace = bool(config.get("useReplaceRule", True))
+    title_rules = config.get("titleReplaceRules") or []
+    content_rules = config.get("contentReplaceRules") or []
+    display_title = chapter_display_title(chapter, title_rules, use_replace)
+    result = str(value)
+
+    # ContentProcessor first removes a leading copy of the raw chapter title;
+    # if purification changed that title, it tries the displayed form second.
+    book_name = re.escape(str(getattr(book, "name", "") or ""))
+    for candidate in dict.fromkeys((str(chapter.name or ""), display_title)):
+        if not candidate:
+            continue
+        title_pattern = re.escape(candidate)
+        title_pattern = re.sub(r"(?:\\ |\s)+", r"\\s*", title_pattern)
+        prefix = rf"^(?:\s|\p{{P}}|{book_name})*{title_pattern}\s*"
+        match = java_regex_search(prefix, result)
+        if match:
+            result = result[match.end():]
+            break
+
+    if use_replace and content_rules:
+        result = "\n".join(line.strip() for line in result.splitlines())
+        result = _apply_purify_rules(result, content_rules)
+
+    # Kotlin trims <= U+0020 and the ideographic space and discards blanks.
+    lines = [line.strip("\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09"
+                        "\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13"
+                        "\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d"
+                        "\x1e\x1f\x20　") for line in result.splitlines()]
+    lines = [line for line in lines if line]
+    indent = str(config.get("paragraphIndent", "") or "")
+    if indent:
+        lines = [indent + line for line in lines]
+    return "\n".join(lines), display_title
 
 
 _MEDIA_EXTENSIONS = {
@@ -88,6 +190,37 @@ def _resolve_rule_url(value: str, base_url: str) -> str:
     return urljoin(base_url, value)
 
 
+_CONTENT_IMAGE_PATTERN = re.compile(
+    r'<img[^>]*\ssrc\s*=\s*"([^"{>]*\{(?:[^{}]|\{[^}>]+\})+\})"[^>]*>|'
+    r'<img[^>]*\sdata-[^=>]*=\s*"([^">]*)"[^>]*>|'
+    r'<img[^>]*\ssrc\s*=\s*"([^">]*)"[^>]*>', re.I)
+
+
+def _format_content_page(value: str, redirect_url: str) -> str:
+    """Port BookContent's per-page HtmlFormatter.formatKeepImg pipeline."""
+    text = str(value or "")
+    text = re.sub(r"(?:&nbsp;)+", " ", text)
+    text = re.sub(r"&ensp;|&emsp;", " ", text)
+    text = re.sub(r"&thinsp;|&zwnj;|&zwj;", "", text)
+    text = re.sub(r"</?(?:div|p|br|hr|h\d|article|dd|dl)[^>]*>", "\n", text)
+    text = re.sub(r"<!--[^>]*-->", "", text)
+    text = re.sub(r"</?(?!img)[a-zA-Z]+(?=[ >])[^<>]*>", "", text)
+    text = re.sub(r"\s*\n+\s*", "\n　　", text)
+    text = re.sub(r"^[\n\s]+", "　　", text)
+    text = re.sub(r"[\n\s]+$", "", text)
+
+    def image_tag(match: re.Match) -> str:
+        source = match.group(1) or match.group(2) or match.group(3) or ""
+        suffix = ""
+        option = re.search(r"\s*,\s*(?=\{)", source)
+        if match.group(1) and option:
+            suffix = "," + source[option.end():]
+            source = source[:option.start()]
+        return f'<img src="{urljoin(redirect_url, source) + suffix}">'
+
+    return html.unescape(_CONTENT_IMAGE_PATTERN.sub(image_tag, text))
+
+
 def _media_kind(url: str, hinted: str = "") -> str:
     if hinted in _MEDIA_EXTENSIONS:
         return hinted
@@ -100,9 +233,12 @@ def _media_kind(url: str, hinted: str = "") -> str:
 
 def parse_content_blocks(value: str, base_url: str) -> ChapterContent:
     """Parse mixed HTML and direct media URLs while retaining document order."""
-    document = ChapterContent()
+    document = ChapterContent(raw_content=str(value or ""))
 
     def append_text(text: str):
+        # BookContent delays HTML4 unescaping until after HTML structure has
+        # been formatted, so escaped tags remain visible text rather than nodes.
+        text = html.unescape(text or "")
         text = re.sub(r"[ \t\r\f\v]+", " ", text or "")
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         if text:
@@ -125,24 +261,15 @@ def parse_content_blocks(value: str, base_url: str) -> ChapterContent:
                 document.blocks.append(ContentBlock(kind, url, headers))
             return document
 
-    if "<" in value and ">" in value:
-        soup = BeautifulSoup(re.sub(r"<br\s*/?>", "\n", value, flags=re.I), "html.parser")
-        media_tags = soup.find_all(["img", "audio", "video", "source"])
-        for tag in media_tags:
-            src = tag.get("src") or tag.get("data-src") or tag.get("data-original")
-            if not src:
-                continue
-            preceding = "".join(str(item) for item in tag.previous_siblings)
-            append_text(BeautifulSoup(preceding, "html.parser").get_text("\n", strip=True))
-            for sibling in list(tag.previous_siblings):
-                sibling.extract()
-            hinted = "image" if tag.name == "img" else tag.name
-            url, headers = _media_request(src, base_url)
-            kind = _media_kind(url, hinted if hinted != "source" else "")
-            if kind:
-                document.blocks.append(ContentBlock(kind, url, headers, tag.get("title", "")))
-            tag.extract()
-        append_text(soup.get_text("\n", strip=True))
+    image_tags = list(re.finditer(r'<img\s+src="([^"]*)">', value, flags=re.I))
+    if image_tags:
+        cursor = 0
+        for match in image_tags:
+            append_text(value[cursor:match.start()])
+            url, headers = _media_request(match.group(1), base_url)
+            document.blocks.append(ContentBlock("image", url, headers))
+            cursor = match.end()
+        append_text(value[cursor:])
     else:
         text_lines = []
         for line in value.splitlines():
@@ -172,9 +299,11 @@ def _apply_replace_regex(value: str, rule: str) -> str:
     if not pattern:
         return value
     try:
-        return re.sub(pattern, _java_replacement(replacement), value, flags=re.I)
+        return java_regex_sub(pattern, replacement, value, flags=re.I)
     except re.error:
-        return value
+        # AnalyzeRule.replaceRegex falls back to Kotlin String.replace when
+        # the source supplied an invalid regular expression.
+        return value.replace(pattern, replacement)
 
 
 class LegadoReadingEngine(ReaderEngine):
@@ -185,6 +314,7 @@ class LegadoReadingEngine(ReaderEngine):
         super().__init__(timeout, state_dir=state_dir)
         self.webview_fetcher = webview_fetcher
         self.verification_fetcher = verification_fetcher
+        self.current_chapters: list[ChapterItem] = []
 
     async def _replace_content_stages(self, value: str, rule: str, source,
                                       chapter, context=None) -> str:
@@ -229,11 +359,24 @@ class LegadoReadingEngine(ReaderEngine):
             result = _apply_replace_regex(result, regex_stage)
         return result.strip()
 
+    async def _save_current_catalog(self, source) -> None:
+        if (self.state_dir is None or not self.current_chapters or
+                not getattr(self, "current_book", None)):
+            return
+        from app.services.reading_cache import ReadingCache
+        try:
+            await asyncio.to_thread(
+                ReadingCache(self.state_dir).save_catalog,
+                source.bookSourceUrl, self.current_book.url,
+                self.current_chapters)
+        except OSError:
+            pass
+
     def _bind_interaction(self, source, loop):
         if self.webview_fetcher:
-            self.js.browser_fetcher = lambda url, _title="": (
+            self.js.browser_fetcher = lambda url, _title="", options=None: (
                 asyncio.run_coroutine_threadsafe(
-                    self.webview_fetcher(url, source), loop).result())
+                    self.webview_fetcher(url, source, options or {}), loop).result())
         if self.verification_fetcher:
             self.js.verification_code_provider = lambda image: (
                 asyncio.run_coroutine_threadsafe(
@@ -307,7 +450,8 @@ class LegadoReadingEngine(ReaderEngine):
             if not login_check or not self.last_response:
                 return response
             response_url = str(self.last_response.get("url") or request.get("url") or response[2])
-            aiohttp_cookies = self.cookie_jar.filter_cookies(URL(response_url))
+            aiohttp_cookies = self._cookie_jar_for_source(source).filter_cookies(
+                URL(response_url))
             cookie_header = "; ".join(
                 f"{name}={morsel.value}" for name, morsel in aiohttp_cookies.items())
             self.js.import_cookie_header(response_url, cookie_header)
@@ -333,9 +477,9 @@ class LegadoReadingEngine(ReaderEngine):
                 headers = data.get("headers") or {}
                 ctype = str(headers.get("content-type") or response[1]).split(";", 1)[0]
                 self.last_response = data
-                self._import_js_cookies(str(data.get("url") or response_url))
+                self._import_js_cookies(str(data.get("url") or response_url), source)
                 return str(data.get("body", "")), ctype, str(data.get("url") or response[2])
-            self._import_js_cookies(response_url)
+            self._import_js_cookies(response_url, source)
             return response
         except aiohttp.ClientResponseError as exc:
             if exc.status == 403 and self.webview_fetcher:
@@ -357,7 +501,7 @@ class LegadoReadingEngine(ReaderEngine):
             if cookie:
                 parsed = SimpleCookie()
                 parsed.load(cookie)
-                self.cookie_jar.update_cookies(
+                self._cookie_jar_for_source(source).update_cookies(
                     {name: morsel.value for name, morsel in parsed.items()},
                     response_url=URL(final_url))
                 self.js.import_cookie_header(final_url, cookie)
@@ -374,11 +518,11 @@ class LegadoReadingEngine(ReaderEngine):
             return body, content_type, final_url
         return str(value or ""), "text/html", str(url)
 
-    def _import_js_cookies(self, url: str) -> None:
+    def _import_js_cookies(self, url: str, source=None) -> None:
         parsed = SimpleCookie()
         parsed.load(self.js.export_cookie_header(url))
         if parsed:
-            self.cookie_jar.update_cookies(
+            self._cookie_jar_for_source(source).update_cookies(
                 {name: morsel.value for name, morsel in parsed.items()},
                 response_url=URL(url),
             )
@@ -411,7 +555,7 @@ class LegadoReadingEngine(ReaderEngine):
             return []
         script = (
             "@js:(function(){var ui=eval('(' + source.loginUi + ')');"
-            "return JSON.stringify({ui:ui,values:infoMap});})()"
+            "return JSON.stringify({ui:ui,values:source.getLoginInfoMap()});})()"
         )
         value = await asyncio.to_thread(
             self.js.evaluate, script,
@@ -456,11 +600,25 @@ class LegadoReadingEngine(ReaderEngine):
         login = str(getattr(source, "loginUrl", "") or "")
         return (ui.startswith("[") and bool(login.strip())) or bool(cls.login_target(source))
 
+    @staticmethod
+    def _login_script(source) -> str:
+        value = str(getattr(source, "loginUrl", "") or "")
+        if value.startswith("@js:"):
+            return value[4:]
+        if value.startswith("<js>"):
+            end = value.rfind("<")
+            return value[4:end] if end >= 4 else value[4:]
+        return value
+
     async def execute_login_action(self, source, action: str = "",
                                    values: dict | None = None):
-        """Execute a loginUi action in the same scope as source.loginUrl."""
-        values_json = json.dumps(values or {}, ensure_ascii=False)
-        login_url = str(getattr(source, "loginUrl", "") or "").strip()
+        """Execute a loginUi button without persisting its current fields."""
+        if re.match(r"^https?://", str(action or ""), flags=re.I):
+            if self.webview_fetcher:
+                return await self.webview_fetcher(str(action), source)
+            self.js._start_browser(str(action), "")
+            return None
+        login_url = self._login_script(source).strip()
         # A source without a custom login UI uses its URL as a browser login.
         target = self.login_target(source)
         if not action and target:
@@ -468,10 +626,7 @@ class LegadoReadingEngine(ReaderEngine):
                 raise RuntimeError("该书源需要网页登录，但当前平台未配置网页交互")
             return await self.webview_fetcher(target, source)
         script = "@js:" + (
-            f"var __values={values_json};"
-            "Object.keys(__values).forEach(function(k){infoMap[k]=__values[k]});"
-            "infoMap.save();"
-            "var __login=String(source.loginUrl||'').trim();"
+            f"var __login={json.dumps(login_url, ensure_ascii=False)};"
             "if(__login && !/^https?:\\/\\//i.test(__login)){eval(__login);}" 
             f"eval({json.dumps(str(action or ''), ensure_ascii=False)});"
         )
@@ -479,10 +634,34 @@ class LegadoReadingEngine(ReaderEngine):
         try:
             return await asyncio.to_thread(
                 self.js.evaluate, script,
-                JsContext(source=source,
+                JsContext(source=source, result=dict(values or {}),
                           base_url=getattr(source, "bookSourceUrl", ""),
                           variables=self.js_variables),
             )
+        finally:
+            self._unbind_interaction()
+
+    async def submit_login(self, source, values: dict | None = None):
+        """Port SourceLoginDialog OK: persist fields, then invoke login()."""
+        values = dict(values or {})
+        if not values:
+            return await asyncio.to_thread(
+                self.js.evaluate, "@js:source.removeLoginInfo()",
+                JsContext(source=source, variables=self.js_variables))
+        payload = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+        login_js = self._login_script(source).strip()
+        script = (
+            "@js:source.putLoginInfo(" + json.dumps(payload, ensure_ascii=False) + ");\n" +
+            login_js + "\nif(typeof login==='function'){login.apply(this);}" +
+            "else{throw('Function login not implements!!!')}"
+        )
+        self._bind_interaction(source, asyncio.get_running_loop())
+        try:
+            return await asyncio.to_thread(
+                self.js.evaluate, script,
+                JsContext(source=source,
+                          base_url=getattr(source, "bookSourceUrl", ""),
+                          variables=self.js_variables))
         finally:
             self._unbind_interaction()
 
@@ -522,33 +701,36 @@ class LegadoReadingEngine(ReaderEngine):
     def _root(text: str, content_type: str):
         if "json" in (content_type or "").lower() or text.lstrip().startswith(("{", "[")):
             try:
-                return json.loads(text), "json"
+                return parse_json_smart(text), "json"
             except json.JSONDecodeError:
                 pass
-        return BeautifulSoup(text, "html.parser"), "html"
+        return parse_markup(text, content_type), "html"
 
     def _strict_value(self, node, rule: str, kind: str, source, base_url: str,
                       book=None, chapter=None, raw_result=None,
-                      is_url: bool = False, collect_all: bool = False) -> str:
+                      is_url: bool = False, collect_all: bool = False,
+                      unescape_html: bool = True) -> str:
         if not rule:
             return ""
         if "{{" in rule or "@get:" in rule or "@put:" in rule:
             value = self._field_value(node, rule, kind, source, base_url,
                                       book=book, chapter=chapter,
-                                      raw_result=raw_result)
+                                      raw_result=raw_result,
+                                      unescape_html=unescape_html)
             if is_url:
                 value = _resolve_rule_url(value, base_url)
             return value
-        selector, post_js = self._field_parts(rule)
+        selector, post_js = self._field_parts(rule, kind)
         if post_js:
             value = self._field_value(node, rule, kind, source, base_url,
                                       book=book, chapter=chapter,
-                                      raw_result=raw_result)
+                                      raw_result=raw_result,
+                                      unescape_html=unescape_html)
             if is_url:
                 value = _resolve_rule_url(value, base_url)
             return value
         if kind == "json" and "{" in rule:
-            return extract_value(node, rule, kind, base_url)
+            return extract_value(node, rule, kind, base_url, unescape_html)
         selector_parts = selector.split("##")
         selector = selector_parts[0]
         regex_suffix = ("##" + "##".join(selector_parts[1:])
@@ -557,10 +739,7 @@ class LegadoReadingEngine(ReaderEngine):
             initial = raw_result if raw_result is not None else (
                 json.dumps(node, ensure_ascii=False) if kind == "json" else str(node))
             return _apply_regex_suffix(str(initial), regex_suffix).strip()
-        try:
-            values = evaluate(node, selector, kind)
-        except Exception:
-            values = []
+        values = evaluate(node, selector, kind)
         if not values:
             return ""
         if collect_all:
@@ -571,27 +750,30 @@ class LegadoReadingEngine(ReaderEngine):
                     # retain paragraph boundaries just like Legado getString.
                     value = item.get_text("\n", strip=True)
                 else:
-                    value = str(item)
+                    value = _legado_value_string(item)
                 if value.strip():
                     rendered.append(value.strip())
-            return _apply_regex_suffix("\n".join(rendered), regex_suffix).strip()
+            value = _apply_regex_suffix("\n".join(rendered), regex_suffix).strip()
+            return html.unescape(value) if unescape_html else value
         first = values[0]
         if is_url and hasattr(first, "get"):
             value = (first.get("href") or first.get("src") or
                      first.get("data-src") or first.get("value") or "")
         else:
-            value = first.get_text(" ", strip=True) if hasattr(first, "get_text") else str(first)
+            value = (first.get_text(" ", strip=True) if hasattr(first, "get_text")
+                     else _legado_value_string(first))
         if regex_suffix:
             value = _apply_regex_suffix(value, regex_suffix)
         if is_url:
             value = _resolve_rule_url(value, base_url)
-        return value.strip()
+        value = value.strip()
+        return html.unescape(value) if unescape_html else value
 
     def _next_page_values(self, node, rule: str, kind: str, source,
                           base_url: str, book=None, chapter=None,
                           raw_result=None, next_chapter_url="") -> list[str]:
         """Evaluate a Legado next-page rule without collapsing URL arrays."""
-        selector, post_js = self._field_parts(rule)
+        selector, post_js = self._field_parts(rule, kind)
         if post_js:
             result = self._field_value(
                 node, rule, kind, source, base_url, book=book,
@@ -599,10 +781,7 @@ class LegadoReadingEngine(ReaderEngine):
                 title=getattr(chapter, "name", "") if chapter else "",
                 next_chapter_url=next_chapter_url)
         elif selector:
-            try:
-                values = extract_values(node, selector, kind, base_url)
-            except Exception:
-                values = []
+            values = extract_values(node, selector, kind, base_url)
             result = values if len(values) != 1 else (values[0] if values else "")
         else:
             result = raw_result if raw_result is not None else node
@@ -632,8 +811,34 @@ class LegadoReadingEngine(ReaderEngine):
         return urls
 
     async def _list_nodes(self, text: str, content_type: str, rule: str, source,
-                          base_url: str, book=None, chapter=None) -> tuple[list, str]:
+                          base_url: str, book=None, chapter=None,
+                          preserve_element: bool = False) -> tuple[list, str]:
+        def element_kind(item) -> str:
+            if isinstance(item, dict) or (
+                    isinstance(item, list) and
+                    (not item or all(isinstance(entry, dict) for entry in item))):
+                return "json"
+            if isinstance(item, str):
+                try:
+                    parse_json_smart(item)
+                    return "json"
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return "html"
+
         value = (rule or "").strip()
+        if not value:
+            return [], self._root(text, content_type)[1]
+        original_text = text
+        try:
+            parse_json_smart(text)
+            analyzer_kind = "json"
+        except (json.JSONDecodeError, TypeError):
+            analyzer_kind = "json" if (
+                "json" in (content_type or "").lower() and not text.strip()
+            ) else "html"
+        current_result = text
+        pending_root = None
         reverse = value.startswith("-")
         if value.startswith(("-", "+")):
             value = value[1:].strip()
@@ -643,28 +848,43 @@ class LegadoReadingEngine(ReaderEngine):
             if js_rule:
                 transformed = await asyncio.to_thread(
                     self.js.evaluate, js_rule,
-                    JsContext(source=source, result=text, base_url=base_url,
+                    JsContext(source=source, result=current_result,
+                              base_url=base_url, src=original_text,
                               variables=self.js_variables, book=book, chapter=chapter),
                 )
+                current_result = transformed
                 text = transformed if isinstance(transformed, str) else json.dumps(
                     transformed, ensure_ascii=False)
-                content_type = ("application/json" if isinstance(transformed, (dict, list))
-                                or text.lstrip().startswith(("{", "[")) else "text/html")
                 value = remaining
+                if preserve_element and not value:
+                    return transformed, element_kind(transformed)
                 if value:
+                    program = compile_rule_program(
+                        value, is_json=analyzer_kind == "json")
+                    if program.stages and program.stages[0].mode != "js":
+                        root, kind, _ = self._payload_for_compiled_stage(
+                            transformed, value, analyzer_kind)
+                        pending_root = (root, kind)
                     continue
                 root, kind = self._root(text, content_type)
                 nodes = root if isinstance(root, list) else [root]
                 break
 
-            root, kind = self._root(text, content_type)
-            selector, suffix = self._field_parts(value)
-            try:
-                nodes = evaluate(root, selector, kind) if selector else (
-                    root if isinstance(root, list) else [root])
-            except Exception:
-                nodes = []
+            if pending_root is not None:
+                root, kind = pending_root
+                pending_root = None
+            else:
+                root, kind = self._root(text, content_type)
+            selector, suffix = self._field_parts(value, kind)
+            nodes = evaluate(root, selector, kind) if selector else (
+                root if isinstance(root, list) else [root])
             if not suffix:
+                if preserve_element:
+                    program = compile_rule_program(
+                        value, is_json=analyzer_kind == "json")
+                    terminal_mode = program.stages[-1].mode if program.stages else "default"
+                    return ((nodes[0] if len(nodes) == 1 else nodes), "json") \
+                        if terminal_mode == "json" else (nodes, kind)
                 break
 
             # Execute one post-selector JS stage, then continue parsing its
@@ -680,13 +900,20 @@ class LegadoReadingEngine(ReaderEngine):
                 self.js.evaluate, script,
                 JsContext(source=source, result=js_result, base_url=base_url,
                           variables=self.js_variables, book=book, chapter=chapter,
-                          src=text, result_html_nodes=kind == "html"),
+                          src=original_text, result_html_nodes=kind == "html"),
             )
+            current_result = transformed
             text = transformed if isinstance(transformed, str) else json.dumps(
                 transformed, ensure_ascii=False)
-            content_type = ("application/json" if isinstance(transformed, (dict, list))
-                            or text.lstrip().startswith(("{", "[")) else "text/html")
+            if preserve_element and not value:
+                return transformed, element_kind(transformed)
             if value:
+                program = compile_rule_program(
+                    value, is_json=analyzer_kind == "json")
+                if program.stages and program.stages[0].mode != "js":
+                    root, kind, _ = self._payload_for_compiled_stage(
+                        transformed, value, analyzer_kind)
+                    pending_root = (root, kind)
                 continue
             if (isinstance(transformed, list) and transformed and
                     all(isinstance(item, dict) and "__markup" in item
@@ -700,18 +927,16 @@ class LegadoReadingEngine(ReaderEngine):
                 nodes = [item for item in nodes if item is not None]
                 kind = "html"
                 break
+            if isinstance(transformed, dict) or (
+                    isinstance(transformed, list) and
+                    all(isinstance(item, dict) for item in transformed)):
+                nodes = (transformed if isinstance(transformed, list)
+                         else [transformed])
+                kind = "json"
+                break
             root, kind = self._root(text, content_type)
             nodes = root if isinstance(root, list) else [root]
             break
-        if not nodes and kind == "html":
-            for selector in (".mulu_list li", ".chapter-list li", "#list dd",
-                             "main li:has(a[href*='/book/'])",
-                             "li:has(a[href*='/book/'])", "[class*='chapter'] li",
-                             "a[href*='/chapter/']",
-                             "a[href*='/book/']"):
-                nodes = root.select(selector)
-                if len(nodes) >= 2:
-                    break
         if reverse:
             nodes.reverse()
         return nodes, kind
@@ -725,131 +950,144 @@ class LegadoReadingEngine(ReaderEngine):
             self._field_value(root, init, kind, source, final_url,
                               book=book, raw_result=text)
             return root, kind, text
-        nodes, kind = await self._list_nodes(
-            text, content_type, init, source, final_url, book=book)
-        if nodes:
-            root = nodes[0]
-            text = (json.dumps(root, ensure_ascii=False)
-                    if kind == "json" else str(root))
+        root, kind = await self._list_nodes(
+            text, content_type, init, source, final_url, book=book,
+            preserve_element=True)
+        if root is None:
+            raise AssertionError("内容不可空（Content cannot be null）")
+        if kind == "json":
+            text = root if isinstance(root, str) else json.dumps(
+                root, ensure_ascii=False)
+        elif isinstance(root, (list, tuple)):
+            text = "\n".join(str(item) for item in root)
+        else:
+            text = str(root)
         return root, kind, text
 
-    def _apply_book_info(self, source, book, root, kind, raw_text, base_url):
+    def _apply_book_info(self, source, book, root, kind, raw_text, base_url,
+                         redirect_url=None, original_body=None,
+                         can_rename: bool = True):
         rules = source.ruleBookInfo or {}
-        mappings = {
-            "author": "author", "intro": "intro", "coverUrl": "cover_url",
-            "kind": "kind", "lastChapter": "last_chapter",
-            "wordCount": "word_count", "downloadUrls": "download_urls",
+        redirect_url = redirect_url or base_url
+        original_body = raw_text if original_body is None else original_body
+
+        kind_rule = rules.get("kind")
+        if kind_rule:
+            try:
+                value = self._strict_value(
+                    root, kind_rule, kind, source, redirect_url, book=book,
+                    raw_result=raw_text, collect_all=True)
+                values = [item for item in value.splitlines() if item]
+                if values:
+                    book.kind = ",".join(values)
+            except Exception:
+                pass
+
+        cover_rule = rules.get("coverUrl")
+        if cover_rule:
+            try:
+                value = self._strict_value(
+                    root, cover_rule, kind, source, redirect_url, book=book,
+                    raw_result=raw_text, is_url=True)
+                if value:
+                    book.cover_url = value
+            except Exception:
+                pass
+        optional_formatters = {
+            "intro": ("intro", _format_book_intro),
+            "wordCount": ("word_count", _format_word_count),
+            "lastChapter": ("latest_chapter_title", str),
         }
-        for rule_name, attribute in mappings.items():
+        for rule_name, (attribute, formatter) in optional_formatters.items():
             rule = rules.get(rule_name)
             if not rule:
                 continue
-            value = self._strict_value(
-                root, rule, kind, source, base_url, book=book,
-                raw_result=raw_text, is_url=rule_name in {"coverUrl", "downloadUrls"})
+            try:
+                value = formatter(self._strict_value(
+                    root, rule, kind, source, redirect_url, book=book,
+                    raw_result=raw_text))
+            except Exception:
+                continue
             if value:
                 setattr(book, attribute, value)
-        rename = str(rules.get("canReName") or "").strip().lower()
+                if rule_name == "lastChapter":
+                    book.last_chapter = value
+        rename = can_rename and bool(str(rules.get("canReName") or "").strip())
         if rules.get("name"):
-            value = self._strict_value(
-                root, rules["name"], kind, source, base_url,
-                book=book, raw_result=raw_text)
-            if value and (not book.name or rename in {"1", "true", "rename"}):
+            value = _format_book_name(self._strict_value(
+                root, rules["name"], kind, source, redirect_url,
+                book=book, raw_result=raw_text))
+            if value and (not book.name or rename):
                 book.name = value
+        if rules.get("author"):
+            value = _format_book_author(self._strict_value(
+                root, rules["author"], kind, source, redirect_url,
+                book=book, raw_result=raw_text))
+            if value and (not book.author or rename):
+                book.author = value
+
+        if book.type & 128:
+            rule = rules.get("downloadUrls")
+            urls = self._next_page_values(
+                root, rule, kind, source, redirect_url, book=book,
+                raw_result=raw_text) if rule else []
+            if not urls:
+                raise RuntimeError("下载链接为空")
+            book.download_urls = urls
+        else:
+            rule = rules.get("tocUrl")
+            value = self._strict_value(
+                root, rule, kind, source, redirect_url, book=book,
+                raw_result=raw_text, is_url=True) if rule else ""
+            book.toc_url = value or base_url
+            if book.toc_url == base_url:
+                book.toc_html = original_body
         book.variables = dict(self.js_variables)
 
     async def book_info(self, source, book: BookItem) -> BookItem:
         """Load book-detail rules without fetching the table of contents."""
         self.js_variables.update(getattr(book, "variables", {}) or {})
-        detail_text, detail_type, detail_url = await self._request_value(
-            book.url, source, source.bookSourceUrl)
+        book.type = _book_type(source)
+        if book.info_html:
+            detail_text, detail_url = book.info_html, book.url
+            detail_type = ("application/json" if detail_text.lstrip().startswith(
+                ("{", "[")) else "text/html")
+        else:
+            detail_text, detail_type, detail_url = await self._request_value(
+                book.url, source, source.bookSourceUrl)
+        original_body = detail_text
         detail_root, detail_kind, detail_text = await self._initialize_detail(
             source, book, detail_text, detail_type, detail_url)
         self._apply_book_info(
-            source, book, detail_root, detail_kind, detail_text, detail_url)
+            source, book, detail_root, detail_kind, detail_text, book.url,
+            detail_url, original_body)
         self.current_book = book
         return book
 
-    @staticmethod
-    def _automatic_next_page(root, base_url: str, content_page: bool = False) -> str:
-        """Conservative fallback for sources which omit a next-page rule."""
-        if not hasattr(root, "find_all"):
-            return ""
-        candidates = []
-        for anchor in root.find_all("a", href=True):
-            label = re.sub(r"\s+", "", anchor.get_text(" ", strip=True))
-            rel = " ".join(anchor.get("rel", []))
-            classes = anchor.get("class", [])
-            class_text = " ".join(classes) if isinstance(classes, list) else str(classes)
-            ident = f"{anchor.get('id', '')} {class_text}".lower()
-            page_label = bool(re.fullmatch(
-                r"(?:下一页|下页|下一頁|下頁|继续阅读|繼續閱讀|›|»|>)", label))
-            is_next = ((rel.lower() == "next" and not content_page) or page_label or
-                       bool(re.search(r"(?:^|[-_])(next|page-next)(?:$|[-_])", ident)))
-            if not is_next:
-                continue
-            # A chapter-navigation link must never be merged into the current chapter.
-            if content_page and re.search(r"下一章|下章|后一章|後一章", label):
-                continue
-            raw_href = anchor.get("href", "").strip()
-            href = urljoin(base_url, raw_href)
-            if raw_href and not raw_href.lower().startswith(("javascript:", "#")):
-                candidates.append(href)
-        return candidates[0] if candidates else ""
-
     async def chapters(self, source, book: BookItem) -> list[ChapterItem]:
         self.js_variables.update(getattr(book, "variables", {}) or {})
-        detail_text, detail_type, detail_url = await self._request_value(
-            book.url, source, source.bookSourceUrl)
-        detail_root, detail_kind, detail_text = await self._initialize_detail(
-            source, book, detail_text, detail_type, detail_url)
-        info_rule = source.ruleBookInfo or {}
-        self._apply_book_info(
-            source, book, detail_root, detail_kind, detail_text, detail_url)
+        book.type = _book_type(source)
+        detail_url = book.url
+        if not book.toc_url:
+            if book.info_html:
+                detail_text, detail_url = book.info_html, book.url
+                detail_type = ("application/json" if detail_text.lstrip().startswith(
+                    ("{", "[")) else "text/html")
+            else:
+                detail_text, detail_type, detail_url = await self._request_value(
+                    book.url, source, source.bookSourceUrl)
+            original_body = detail_text
+            detail_root, detail_kind, detail_text = await self._initialize_detail(
+                source, book, detail_text, detail_type, detail_url)
+            self._apply_book_info(
+                source, book, detail_root, detail_kind, detail_text, book.url,
+                detail_url, original_body)
         toc_rule = source.ruleToc or {}
-        list_rule = toc_rule.get("chapterList") or ".chapter-list li||#list li||.listmain dd||main li"
-        toc_url_rule = info_rule.get("tocUrl", "")
-        toc_url = self._strict_value(
-            detail_root, toc_url_rule, detail_kind, source, detail_url,
-            book=book, raw_result=detail_text, is_url=True,
-        ) if toc_url_rule else detail_url
-        if isinstance(toc_url, str) and toc_url.strip().lower().startswith(
-                ("javascript:", "void(")):
-            toc_url = ""
-        # Some legacy sources mistakenly use the chapter-list selector as
-        # tocUrl. Legado keeps parsing the detail document in that case; do not
-        # navigate into the first chapter and then search for a TOC there.
-        if toc_url_rule and toc_url and toc_url != detail_url:
-            try:
-                detail_nodes = evaluate(detail_root, list_rule.lstrip("+-").strip(),
-                                        detail_kind)
-            except Exception:
-                detail_nodes = []
-            chapter_url_rule = toc_rule.get("chapterUrl") or (
-                "url||href||chapterUrl" if detail_kind == "json" else "a@href")
-            detail_chapter_urls = set()
-            for node in detail_nodes[:50]:
-                if getattr(node, "name", "") == "a" and node.get("href"):
-                    value = urljoin(detail_url, node.get("href"))
-                else:
-                    value = self._strict_value(
-                        node, chapter_url_rule, detail_kind, source,
-                        detail_url, book=book, is_url=True)
-                if value:
-                    detail_chapter_urls.add(value)
-            if toc_url in detail_chapter_urls:
-                toc_url = detail_url
-        if toc_url_rule and not toc_url and detail_kind == "html":
-            anchor = (detail_root.select_one("a[href*='/chapters/']") or
-                      next((a for a in detail_root.find_all("a", href=True)
-                            if "全部章节" in a.get_text() or "所有章节" in a.get_text()), None))
-            if anchor is not None:
-                toc_url = urljoin(detail_url, anchor.get("href", ""))
-        if isinstance(toc_url, str) and toc_url.strip().lower().startswith(
-                ("javascript:", "void(")):
-            toc_url = ""
-        toc_url = toc_url or detail_url
-        book.toc_url = toc_url
+        list_rule = str(toc_rule.get("chapterList") or "")
+        reverse_rule = list_rule.startswith("-")
+        if list_rule.startswith(("-", "+")):
+            list_rule = list_rule[1:].strip()
+        toc_url = book.toc_url or book.url
         pre_update = str(toc_rule.get("preUpdateJs") or "").strip()
         if pre_update:
             if not pre_update.startswith(("@js:", "<js>")):
@@ -864,49 +1102,36 @@ class LegadoReadingEngine(ReaderEngine):
                 self._unbind_interaction()
             toc_url = book.toc_url or toc_url
         chapters, visited_pages = [], set()
-        pending_pages = [toc_url]
-        for _ in range(30):
-            if not pending_pages:
-                break
-            current_page = pending_pages.pop(0)
+        prefetched_toc = None
+        if toc_url == book.url and book.toc_html:
+            toc_type = ("application/json" if book.toc_html.lstrip().startswith(
+                ("{", "[")) else "text/html")
+            prefetched_toc = (book.toc_html, toc_type, toc_url)
+        pending_pages = [(toc_url, prefetched_toc, True)]
+        while pending_pages:
+            current_page, prefetched, discover_next = pending_pages.pop(0)
             current_key = _media_request(current_page, detail_url)[0]
             if not current_key or current_key in visited_pages:
                 continue
             visited_pages.add(current_key)
-            text, ctype, final_url = await self._request_value(
-                current_page, source, detail_url)
+            text, ctype, final_url = (prefetched if prefetched is not None else
+                await self._request_value(current_page, source, detail_url))
             nodes, kind = await self._list_nodes(
                 text, ctype, list_rule, source, final_url, book=book)
-            for node in nodes:
+            for page_index, node in enumerate(nodes):
                 name = self._strict_value(
-                    node, toc_rule.get("chapterName") or
-                    ("name||title" if kind == "json" else "a@text||.title@text"),
+                    node, str(toc_rule.get("chapterName") or ""),
                     kind, source, final_url, book=book)
                 url = self._strict_value(
-                    node, toc_rule.get("chapterUrl") or
-                    ("url||href||chapterUrl" if kind == "json" else "a@href"),
+                    node, str(toc_rule.get("chapterUrl") or ""),
                     kind, source, final_url, book=book, is_url=True)
-                if isinstance(url, str) and url.strip().lower().startswith(
-                        ("javascript:", "void(")):
-                    url = ""
-                if kind == "html" and hasattr(node, "get_text"):
-                    anchor = node if getattr(node, "name", "") == "a" else node.find("a", href=True)
-                    if not name:
-                        name = node.get_text(" ", strip=True)
-                    if (anchor is not None and
-                            (not url or url.lstrip().startswith("<") or
-                             re.search(r"%3[cC](?:li|a|div)", url))):
-                        url = urljoin(final_url, anchor.get("href", ""))
-                        option_match = re.search(
-                            r'(,\s*\{[\s\S]*\})(?:###)?$',
-                            str(toc_rule.get("chapterUrl") or ""))
-                        if option_match:
-                            url += option_match.group(1)
                 if isinstance(url, str) and url.strip().lower().startswith(
                         ("javascript:", "void(")):
                     url = ""
                 chapter = ChapterItem(
                     name=name, url=url,
+                    base_url=final_url,
+                    book_url=book.url,
                     tag=self._field_value(node, toc_rule.get("updateTime", ""), kind,
                                           source, final_url, book=book)
                     if toc_rule.get("updateTime") else "",
@@ -922,7 +1147,9 @@ class LegadoReadingEngine(ReaderEngine):
                 chapter.is_vip = truthy("isVip")
                 chapter.is_pay = truthy("isPay")
                 if chapter.name:
-                    chapter.url = chapter.url or ("" if chapter.is_volume else final_url)
+                    chapter.url = chapter.url or (
+                        chapter.name + str(page_index)
+                        if chapter.is_volume else final_url)
                     chapter.variables = dict(self.js_variables)
                     chapters.append(chapter)
 
@@ -930,106 +1157,212 @@ class LegadoReadingEngine(ReaderEngine):
             next_rule = toc_rule.get("nextTocUrl", "")
             next_urls = (self._next_page_values(
                 page_root, next_rule, page_kind, source, final_url,
-                book=book, raw_result=text) if next_rule else [
-                    self._automatic_next_page(page_root, final_url)
-                ])
+                book=book, raw_result=text)
+                if next_rule and discover_next else [])
+            accepted = []
+            pending_keys = {
+                _media_request(item[0], final_url)[0] for item in pending_pages}
             for next_url in next_urls:
                 key = _media_request(next_url, final_url)[0]
-                if (key and key not in visited_pages and
-                        all(_media_request(item, final_url)[0] != key
-                            for item in pending_pages)):
-                    pending_pages.append(next_url)
+                if key and key not in visited_pages and key not in pending_keys:
+                    accepted.append(next_url)
+                    pending_keys.add(key)
+            if len(accepted) == 1:
+                pending_pages.append((accepted[0], None, True))
+            elif accepted:
+                responses = await asyncio.gather(*(
+                    self._request_value(item, source, detail_url)
+                    for item in accepted))
+                pending_pages.extend(
+                    (item, response, False)
+                    for item, response in zip(accepted, responses))
 
+        if not chapters:
+            raise TocEmptyError("chapter list is empty")
+        if not reverse_rule:
+            chapters.reverse()
         unique, seen = [], set()
         for chapter in chapters:
-            key = (chapter.name, chapter.url)
+            key = chapter.url
             # Legado trusts ruleToc.chapterList. A source may intentionally
             # expose pages as readable entries (reviews, image sets, etc.);
             # filtering names such as "第001页" changes source semantics.
             if key in seen:
                 continue
             seen.add(key)
-            chapter.index = len(unique)
             unique.append(chapter)
+        reverse_toc = bool((getattr(book, "read_config", {}) or {}).get(
+            "reverseToc", False))
+        if not reverse_toc:
+            unique.reverse()
+        for index, chapter in enumerate(unique):
+            chapter.index = index
+        format_js = str(toc_rule.get("formatJs") or "").strip()
+        if format_js:
+            if not format_js.startswith(("@js:", "<js>")):
+                format_js = "@js:" + format_js
+            format_context = JsContext(
+                source=source, base_url=toc_url,
+                variables=self.js_variables, book=book,
+            )
+            for index, chapter in enumerate(unique, 1):
+                format_context.index = index
+                format_context.chapter = chapter
+                format_context.title = chapter.name
+                format_context.result = chapter.name
+                try:
+                    value = await asyncio.to_thread(
+                        self.js.evaluate, format_js, format_context)
+                except Exception:
+                    # Legado logs formatJs failures and keeps the original title.
+                    continue
+                if value is not None:
+                    chapter.name = str(value)
+        now = int(time.time() * 1000)
+        previous_total = book.total_chapter_num
+        if unique:
+            book.latest_chapter_title = unique[-1].name
+            current = (unique[book.dur_chapter_index]
+                       if 0 <= book.dur_chapter_index < len(unique) else unique[-1])
+            book.dur_chapter_title = current.name
+        if previous_total < len(unique):
+            book.last_check_count = len(unique) - previous_total
+            book.latest_chapter_time = now
+        book.last_check_time = now
         book.total_chapter_num = len(unique)
         self.current_book = book
+        self.current_chapters = unique
         return unique
 
     async def content_document(self, source, chapter: ChapterItem,
-                               next_chapter_url: str = "") -> ChapterContent:
+                               next_chapter_url: str = "",
+                               need_save: bool = True) -> ChapterContent:
         self.js_variables.update(getattr(chapter, "variables", {}) or {})
+        if not next_chapter_url and self.current_chapters:
+            following = next((item.url for item in self.current_chapters
+                              if item.index == chapter.index + 1), "")
+            next_chapter_url = following or next((
+                item.url for item in self.current_chapters if item.index == 0), "")
         content_rule = source.ruleContent or {}
-        rule = content_rule.get("content") or ".content@html||#content@html||article@html||main@html"
+        rule = str(content_rule.get("content") or "")
+        # WebBook.getContentAwait bypasses BookContent entirely in these two
+        # historical branches, including title parsing and persistence.
+        if not rule:
+            return ChapterContent(
+                blocks=[ContentBlock("text", chapter.url)], raw_content=chapter.url)
+        if chapter.is_volume and chapter.url.startswith(chapter.name):
+            return ChapterContent(
+                blocks=[ContentBlock("text", chapter.tag or "")],
+                raw_content=chapter.tag or "")
         next_rule = content_rule.get("nextContentUrl", "")
-        pending_urls, visited, parts = [chapter.url], set(), []
+        # A single next URL is a chain and is followed recursively. Multiple
+        # URLs are independent pages: Legado requests them concurrently,
+        # preserves declaration order, and does not discover another level.
+        pending_urls, visited, parts = [(chapter.url, None, True)], set(), []
         document_title = ""
         replace_context = None
         next_chapter_key = _media_request(next_chapter_url, chapter.url)[0] if next_chapter_url else ""
-        for _ in range(20):
-            if not pending_urls:
-                break
-            current_url = pending_urls.pop(0)
+        while pending_urls:
+            current_url, prefetched, discover_next = pending_urls.pop(0)
             current_key = _media_request(current_url, chapter.url)[0]
-            if (not current_key or current_key in visited or
-                    next_chapter_key and current_key == next_chapter_key):
+            if not current_key or current_key in visited:
                 continue
             visited.add(current_key)
-            text, ctype, final_url = await self._request_value(
-                current_url, source, chapter.url, request_defaults={
-                    "webJs": content_rule.get("webJs", ""),
-                    "sourceRegex": content_rule.get("sourceRegex", ""),
-                })
+            request_defaults = {
+                "webJs": content_rule.get("webJs", ""),
+                "sourceRegex": content_rule.get("sourceRegex", ""),
+            }
+            text, ctype, final_url = (prefetched if prefetched is not None else
+                await self._request_value(
+                    current_url, source, chapter.url,
+                    request_defaults=request_defaults))
             root, kind = self._root(text, ctype)
             if replace_context is None:
                 replace_context = (root, kind, final_url)
             if not document_title and content_rule.get("title"):
-                document_title = self._strict_value(
-                    root, content_rule["title"], kind, source, final_url,
-                    book=getattr(self, "current_book", None), chapter=chapter,
-                    raw_result=text)
+                try:
+                    document_title = self._strict_value(
+                        root, content_rule["title"], kind, source, final_url,
+                        book=getattr(self, "current_book", None), chapter=chapter,
+                        raw_result=text)
+                except Exception:
+                    document_title = ""
+                if document_title:
+                    chapter.name = document_title
+                    await self._save_current_catalog(source)
             value = self._strict_value(
                 root, rule, kind, source, final_url,
                 book=getattr(self, "current_book", None), chapter=chapter,
-                raw_result=text, collect_all=True)
-            if not value and kind == "html":
-                target = None
-                for selector in ("#chapterContent", ".content_txt", ".read-article",
-                                 ".read-content", "article", "main"):
-                    target = root.select_one(selector)
-                    if target is not None and len(target.get_text(strip=True)) >= 80:
-                        break
-                if target is not None:
-                    value = target.get_text("\n", strip=True)
+                raw_result=text, collect_all=True, unescape_html=False)
+            value = _format_content_page(value, final_url)
             if value:
                 parts.append(value)
             next_urls = (self._next_page_values(
                 root, next_rule, kind, source, final_url,
                 book=getattr(self, "current_book", None), chapter=chapter,
-                raw_result=text, next_chapter_url=next_chapter_url) if next_rule else [
-                    self._automatic_next_page(root, final_url, content_page=True)
-                ])
+                raw_result=text, next_chapter_url=next_chapter_url)
+                if next_rule and discover_next else [])
+            accepted = []
+            pending_keys = {
+                _media_request(item[0], final_url)[0] for item in pending_urls}
             for next_url in next_urls:
                 key = _media_request(next_url, final_url)[0]
                 if (key and key not in visited and key != next_chapter_key and
-                        all(_media_request(item, final_url)[0] != key for item in pending_urls)):
-                    pending_urls.append(next_url)
+                        key not in pending_keys):
+                    accepted.append(next_url)
+                    pending_keys.add(key)
+            if len(accepted) == 1:
+                pending_urls.append((accepted[0], None, True))
+            elif accepted:
+                responses = await asyncio.gather(*(
+                    self._request_value(
+                        item, source, chapter.url,
+                        request_defaults=request_defaults)
+                    for item in accepted))
+                pending_urls.extend(
+                    (item, response, False)
+                    for item, response in zip(accepted, responses))
 
         joined = "\n".join(parts)
         replace_rule = str(content_rule.get("replaceRegex", "") or "").strip()
         joined = await self._replace_content_stages(
             joined, replace_rule, source, chapter, replace_context)
-        # Common navigation notice, also used by the source shown in the UI.
-        joined = re.sub(
-            r"[（(]?\s*本章未完[，,、 ]*请点击下[一]?页继续阅读\s*[）)]?",
-            "", joined, flags=re.I,
-        )
+        book_content = joined
+        joined, display_title = process_book_content(
+            joined, getattr(self, "current_book", None), chapter)
+        if not chapter.is_volume and not joined.strip():
+            raise ContentEmptyError("chapter content is empty")
         document = parse_content_blocks(joined, chapter.url)
-        document.title = document_title
-        if document_title:
-            chapter.name = document_title
+        # WebBook.getContent returns BookContent's string.  The block list is
+        # the later ContentProcessor/UI projection and may have purify rules.
+        document.raw_content = book_content
+        document.title = display_title
         document.image_style = str(content_rule.get("imageStyle") or "")
         await self._apply_media_headers(document, source)
         await self._load_protected_images(document, source)
+        if self.state_dir is not None and getattr(self, "current_book", None):
+            from app.services.reading_cache import ReadingCache
+            cache = ReadingCache(self.state_dir)
+            # Updating a parsed title is a chapter-database side effect and is
+            # independent of needSave in fixed BookContent.
+            await self._save_current_catalog(source)
+            if need_save:
+                try:
+                    cached_document = ChapterContent(
+                        blocks=[ContentBlock(
+                            block.kind, block.value, dict(block.headers), block.title)
+                            for block in document.blocks],
+                        title=document.title, image_style=document.image_style,
+                        raw_content=document.raw_content)
+                    await self._load_protected_images(
+                        cached_document, source, cache_all=True)
+                    await asyncio.to_thread(
+                        cache.save_content, source.bookSourceUrl,
+                        self.current_book.url, chapter.url, cached_document)
+                except Exception:
+                    # BookHelp.saveContent catches persistence failures and
+                    # still returns the successfully parsed chapter.
+                    pass
         return document
 
     async def _apply_media_headers(self, document: ChapterContent, source):
@@ -1045,7 +1378,8 @@ class LegadoReadingEngine(ReaderEngine):
             merged.update(block.headers or {})
             block.headers = merged
 
-    async def _load_protected_images(self, document: ChapterContent, source):
+    async def _load_protected_images(self, document: ChapterContent, source,
+                                     cache_all: bool = False):
         """Flet Image has no request-header API; fetch protected images as bytes."""
         source_headers = await self._resolved_source_headers(
             source, getattr(source, "bookSourceUrl", ""))
@@ -1053,7 +1387,7 @@ class LegadoReadingEngine(ReaderEngine):
             "imageDecode", "") or "").strip()
         protected = [block for block in document.blocks
                      if block.kind == "image" and
-                     (block.headers or source_headers or image_decode) and
+                     (cache_all or block.headers or source_headers or image_decode) and
                      isinstance(block.value, str)]
         if not protected:
             return
@@ -1064,7 +1398,7 @@ class LegadoReadingEngine(ReaderEngine):
         connector = aiohttp.TCPConnector(ssl=False, limit=4)
         async with aiohttp.ClientSession(
                 headers=headers, connector=connector,
-                cookie_jar=self.cookie_jar, timeout=timeout) as session:
+                cookie_jar=self._cookie_jar_for_source(source), timeout=timeout) as session:
             semaphore = asyncio.Semaphore(4)
 
             async def load(block):
@@ -1100,13 +1434,16 @@ class LegadoReadingEngine(ReaderEngine):
                     )
                     if isinstance(decoded, list):
                         block.value = bytes((int(item) & 255) for item in decoded)
+                    else:
+                        block.value = b""
                 except Exception:
-                    # Keep the downloaded bytes so a permissive decoder can still
-                    # display sources whose optional imageDecode is outdated.
-                    pass
+                    # ImageUtils.decode uses runCatching(...).getOrNull(): a
+                    # thrown script or non-ByteArray result is a decode failure.
+                    block.value = b""
 
     async def content(self, source, chapter: ChapterItem,
-                      next_chapter_url: str = "") -> str:
+                      next_chapter_url: str = "",
+                      need_save: bool = True) -> str:
         """Compatibility API for callers that only understand plain text."""
         return (await self.content_document(
-            source, chapter, next_chapter_url)).plain_text
+            source, chapter, next_chapter_url, need_save)).raw_content

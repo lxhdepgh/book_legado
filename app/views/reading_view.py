@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import re
 import uuid
 
@@ -44,6 +45,9 @@ class ReadingView(ft.Column):
         self._webview_script = ""
         self._webview_delay = 0
         self._webview_source_regex = ""
+        self._webview_override_regex = ""
+        self._webview_html = ""
+        self._webview_initial_url = ""
         self._current_chapter = None
         self._current_book = None
         self._pending_scroll_offset = 0.0
@@ -155,15 +159,6 @@ class ReadingView(ft.Column):
         )
         self._title = ft.Text("正文", size=22, weight=ft.FontWeight.BOLD)
         self._content_host = ft.Column(spacing=12)
-        self._prev_chapter_btn = ft.Button("上一章", icon=ft.Icons.CHEVRON_LEFT,
-                                           disabled=True, on_click=self._previous_chapter)
-        self._directory_btn = ft.Button("章节", icon=ft.Icons.FORMAT_LIST_NUMBERED,
-                                        on_click=self._show_directory)
-        self._reader_bookshelf_btn = ft.Button(
-            "书架", icon=ft.Icons.HOME_OUTLINED,
-            on_click=self._back_to_shelf)
-        self._next_chapter_btn = ft.Button("下一章", icon=ft.Icons.CHEVRON_RIGHT,
-                                           disabled=True, on_click=self._next_chapter)
         self._reader_progress = ft.Text(
             "未选择章节", size=12, expand=True, text_align=ft.TextAlign.CENTER)
         self._top_prev_btn = ft.IconButton(
@@ -190,16 +185,9 @@ class ReadingView(ft.Column):
                 self._top_next_btn,
             ], spacing=0),
         )
-        self._reader_nav = ft.Row(
-            [self._reader_bookshelf_btn, self._prev_chapter_btn,
-             self._directory_btn, self._next_chapter_btn],
-            alignment=ft.MainAxisAlignment.CENTER,
-            wrap=True,
-        )
         self._reader = ft.ListView(
             expand=True, scroll_interval=200, on_scroll=self._on_reader_scroll,
-            controls=[self._title, ft.Divider(), self._content_host,
-                      ft.Divider(), self._reader_nav],
+            controls=[self._title, ft.Divider(), self._content_host],
         )
         self._detail_title = ft.Text("书籍详情", size=22, weight=ft.FontWeight.BOLD,
                                      expand=True)
@@ -340,9 +328,13 @@ class ReadingView(ft.Column):
         self._webview_future = loop.create_future()
         self._webview_marker = f"__LEGADO_HTML_{uuid.uuid4().hex}__"
         options = options or {}
-        self._webview_script = str(options.get("webJs") or "")
+        self._webview_script = str(options.get("webJs") or
+                                   options.get("javaScript") or "")
         self._webview_delay = int(options.get("webViewDelayTime") or 0)
         self._webview_source_regex = str(options.get("sourceRegex") or "")
+        self._webview_override_regex = str(options.get("overrideUrlRegex") or "")
+        self._webview_html = str(options.get("html") or "")
+        self._webview_initial_url = str(url)
         if self.page.platform == ft.PagePlatform.WINDOWS:
             self._desktop_webview = EdgeCdpSession(
                 self.service.data_dir / "edge-webview-profile")
@@ -386,6 +378,9 @@ class ReadingView(ft.Column):
             self._webview_script = ""
             self._webview_delay = 0
             self._webview_source_regex = ""
+            self._webview_override_regex = ""
+            self._webview_html = ""
+            self._webview_initial_url = ""
 
     def _webview_page_ended(self, _):
         if self._webview and not self._webview_capture_pending:
@@ -403,9 +398,12 @@ class ReadingView(ft.Column):
             return
         try:
             response = await self._desktop_webview.capture(
-                self._webview_script, self._webview_delay)
+                self._webview_script, self._webview_delay,
+                self._webview_html, self._webview_source_regex,
+                self._webview_override_regex)
             html = response.get("body", "")
-            waiting_for_source = not self._webview_source_ready(html)
+            waiting_for_source = bool(self._webview_source_regex and
+                                      not response.get("source"))
             if ("Just a moment" in html or "challenge-platform" in html or
                     waiting_for_source):
                 self._status.value = "网页验证尚未完成，请完成验证后再次读取页面"
@@ -422,6 +420,12 @@ class ReadingView(ft.Column):
         if not self._webview or not self._webview_future:
             return
         try:
+            if self._webview_html:
+                html_value, self._webview_html = self._webview_html, ""
+                await self._webview.run_javascript(
+                    "document.open();document.write(" +
+                    json.dumps(html_value, ensure_ascii=False) +
+                    ");document.close()")
             if self._webview_script:
                 script, self._webview_script = self._webview_script, ""
                 await self._webview.run_javascript(script)
@@ -429,21 +433,34 @@ class ReadingView(ft.Column):
                     await asyncio.sleep(max(0, self._webview_delay) / 1000)
             # The extension does not return JS values, so use its console event
             # as the same kind of bridge that Legado exposes to WebView scripts.
-            script = (
-                "console.log('" + self._webview_marker + "' + "
-                "btoa(unescape(encodeURIComponent(document.documentElement.outerHTML))))"
-            )
+            script = ("console.log('" + self._webview_marker + "' + btoa(unescape("
+                      "encodeURIComponent(JSON.stringify({html:document.documentElement.outerHTML,"
+                      "url:location.href,resources:performance.getEntriesByType('resource')"
+                      ".map(e=>e.name)})))))")
             await self._webview.run_javascript(script)
         finally:
             self._webview_capture_pending = False
 
-    def _webview_source_ready(self, html):
-        if not self._webview_source_regex:
-            return True
-        try:
-            return re.search(self._webview_source_regex, html) is not None
-        except re.error:
-            return True
+    def _select_webview_payload(self, payload):
+        from app.services.java_regex import compile_pattern
+        html = str(payload.get("html") or "")
+        final_url = str(payload.get("url") or self._webview_initial_url)
+        result = {"body": html, "headers": {"content-type": "text/html"},
+                  "status": 200, "url": final_url}
+        if self._webview_source_regex:
+            pattern = compile_pattern(self._webview_source_regex)
+            matched = next((str(item) for item in payload.get("resources") or []
+                            if pattern.fullmatch(str(item))), "")
+            if not matched:
+                return None
+            result.update(body=matched, source=matched,
+                          url=self._webview_initial_url or final_url)
+        if self._webview_override_regex:
+            if not compile_pattern(self._webview_override_regex).fullmatch(final_url):
+                return None
+            result.update(body=final_url, overrideUrl=final_url,
+                          url=self._webview_initial_url or final_url)
+        return result
 
     async def _webview_console_message(self, event):
         message = getattr(event, "message", "") or ""
@@ -451,17 +468,19 @@ class ReadingView(ft.Column):
                 self._webview_marker):
             return
         try:
-            html = base64.b64decode(message[len(self._webview_marker):]).decode("utf-8")
-        except (ValueError, UnicodeDecodeError):
+            payload = json.loads(base64.b64decode(
+                message[len(self._webview_marker):]).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             return
-        waiting_for_source = not self._webview_source_ready(html)
+        response = self._select_webview_payload(payload)
+        html = str(payload.get("html") or "")
+        waiting_for_source = response is None
         if ("Just a moment" in html or "challenge-platform" in html or
                 waiting_for_source):
             self._status.value = "网页验证尚未完成，请完成验证后点击“读取当前页面”"
             self.update()
             return
-        final_url = await self._webview.get_current_url() or ""
-        self._webview_future.set_result((html, "text/html", final_url))
+        self._webview_future.set_result(response)
         self.page.pop_dialog()
 
     def _webview_resource_error(self, event):
@@ -1151,8 +1170,7 @@ class ReadingView(ft.Column):
                 f"《{book_name}》正文尚未加载" if book_name else "尚未打开正文",
                 color=ft.Colors.GREY_600))]
         self._reader_progress.value = "未加载章节"
-        for button in (self._prev_chapter_btn, self._next_chapter_btn,
-                       self._top_prev_btn, self._top_next_btn):
+        for button in (self._top_prev_btn, self._top_next_btn):
             button.disabled = True
 
     def _show_shelf_book_detail(self, book):
@@ -1604,8 +1622,6 @@ class ReadingView(ft.Column):
     def _update_chapter_navigation(self):
         previous_disabled = self._adjacent_chapter(-1) is None
         next_disabled = self._adjacent_chapter(1) is None
-        self._prev_chapter_btn.disabled = previous_disabled
-        self._next_chapter_btn.disabled = next_disabled
         self._top_prev_btn.disabled = previous_disabled
         self._top_next_btn.disabled = next_disabled
         if self._current_chapter in self.chapters:
@@ -1653,6 +1669,17 @@ class ReadingView(ft.Column):
         self.page.run_task(
             self._save_scroll_position_after_delay,
             self._scroll_save_generation)
+        if not maximum:
+            return
+        distance = float(maximum) - float(pixels)
+        if distance > 500:
+            self._auto_scroll_armed = True
+            return
+        if distance < 180 and self._auto_scroll_armed and not self._reading_loading:
+            chapter = self._adjacent_chapter(1)
+            if chapter and chapter.url not in self._continuous_loaded:
+                self._auto_scroll_armed = False
+                self.page.run_task(self._run_content, chapter, True)
 
     async def _save_scroll_position_after_delay(self, generation):
         await asyncio.sleep(0.5)
@@ -1683,6 +1710,12 @@ class ReadingView(ft.Column):
 
     def _render_content(self, document):
         controls = []
+        image_style = str(document.image_style or "").upper()
+        current_book = getattr(self.engine, "current_book", None)
+        configured_style = str((getattr(current_book, "read_config", {}) or {}).get(
+            "imageStyle", "") or "").upper()
+        if configured_style:
+            image_style = configured_style
         for block in document.blocks:
             if block.kind == "text":
                 text = ft.Text(
@@ -1690,10 +1723,9 @@ class ReadingView(ft.Column):
                 text.data = "reader-text"
                 controls.append(text)
             elif block.kind == "image":
-                controls.append(ft.Image(
-                    src=block.value, fit=ft.BoxFit.CONTAIN,
-                    error_content=ft.Text("图片加载失败"),
-                ))
+                options = self._image_render_options(image_style, self._font_size)
+                controls.append(ft.Image(src=block.value,
+                    error_content=ft.Text("图片加载失败"), **options))
             elif block.kind == "audio":
                 player = fta.Audio(src=block.value, autoplay=False)
                 controls.append(ft.Card(content=ft.Container(padding=12, content=ft.Column([
@@ -1713,6 +1745,16 @@ class ReadingView(ft.Column):
                     aspect_ratio=16 / 9, controls=ftv.AdaptiveVideoControls(),
                 ))
         return controls
+
+    @staticmethod
+    def _image_render_options(image_style, font_size):
+        """Map Book.imgStyleDefault/FULL/TEXT to the desktop renderer."""
+        style = str(image_style or "").upper()
+        if style == "FULL":
+            return {"width": float("inf"), "fit": ft.BoxFit.FIT_WIDTH}
+        if style == "TEXT":
+            return {"height": float(font_size), "fit": ft.BoxFit.CONTAIN}
+        return {"fit": ft.BoxFit.SCALE_DOWN}
 
     def _set_busy(self, text):
         self._status.value = text

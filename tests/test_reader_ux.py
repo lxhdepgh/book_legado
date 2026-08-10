@@ -1,8 +1,9 @@
 import unittest
+import flet as ft
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch, PropertyMock
 
 from app.models.book_source import BookSource
 from app.services.reading_cache import ReadingCache
@@ -28,10 +29,56 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
     async def test_reader_toolbar_keeps_navigation_and_font_controls_visible(self):
         self.assertEqual(len(self.view._reader_toolbar.content.controls), 8)
         self.assertEqual(self.view._font_size, 16)
-        self.assertIn(self.view._reader_bookshelf_btn,
-                      self.view._reader_nav.controls)
-        self.assertIn(self.view._directory_btn,
-                      self.view._reader_nav.controls)
+        self.assertEqual(len(self.view._reader.controls), 3)
+        self.assertIs(self.view._reader.controls[0], self.view._title)
+        self.assertIs(self.view._reader.controls[2], self.view._content_host)
+        self.assertFalse(hasattr(self.view, "_reader_nav"))
+
+    async def test_image_style_maps_default_full_and_text_layout(self):
+        self.assertEqual(ReadingView._image_render_options("DEFAULT", 18),
+                         {"fit": ft.BoxFit.SCALE_DOWN})
+        full = ReadingView._image_render_options("full", 18)
+        self.assertEqual(full["fit"], ft.BoxFit.FIT_WIDTH)
+        self.assertEqual(full["width"], float("inf"))
+        text = ReadingView._image_render_options("TEXT", 18)
+        self.assertEqual(text, {"height": 18.0, "fit": ft.BoxFit.CONTAIN})
+
+    async def test_webview_sniffer_matches_full_resource_and_override_urls(self):
+        self.view._webview_initial_url = "https://host/start"
+        self.view._webview_source_regex = r"https://cdn/.+\.m3u8"
+        self.view._webview_override_regex = ""
+        result = self.view._select_webview_payload({
+            "html": "<main>page</main>", "url": "https://host/page",
+            "resources": ["https://cdn/video.m3u8"]})
+        self.assertEqual(result["source"], "https://cdn/video.m3u8")
+        self.assertEqual(result["body"], "https://cdn/video.m3u8")
+        self.assertEqual(result["url"], "https://host/start")
+
+        self.view._webview_source_regex = ""
+        self.view._webview_override_regex = r"https://host/final/\d+"
+        result = self.view._select_webview_payload({
+            "html": "", "url": "https://host/final/42", "resources": []})
+        self.assertEqual(result["overrideUrl"], "https://host/final/42")
+
+    async def test_reader_scroll_at_bottom_loads_next_chapter_once(self):
+        first = ChapterItem("one", "https://source/1", index=0)
+        second = ChapterItem("two", "https://source/2", index=1)
+        self.view.chapters = [first, second]
+        self.view._current_chapter = first
+        self.view._continuous_loaded = {first.url}
+        scheduled = []
+        page = SimpleNamespace(
+            run_task=lambda function, *args: scheduled.append((function, args)))
+
+        event = SimpleNamespace(pixels=950, max_scroll_extent=1000)
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=page):
+            self.view._on_reader_scroll(event)
+            self.view._on_reader_scroll(event)
+
+        chapter_loads = [args for function, args in scheduled
+                         if function == self.view._run_content]
+        self.assertEqual(chapter_loads, [(second, True)])
 
     async def test_mobile_hierarchy_combines_detail_and_catalog(self):
         self.assertEqual(self.view._section, "shelf")

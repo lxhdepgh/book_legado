@@ -2,6 +2,7 @@
 Legado 书源数据模型
 """
 from __future__ import annotations
+import json
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
@@ -29,11 +30,11 @@ class BookSource:
     bookSourceName: str = ""
     bookSourceUrl: str = ""
     bookSourceGroup: str = ""
-    bookSourceType: int = 2
+    bookSourceType: int = 0
     bookSourceComment: str = ""
     enabled: bool = True
-    enabledCookieJar: bool = False
-    enabledExplore: bool = False
+    enabledCookieJar: bool = True
+    enabledExplore: bool = True
     customOrder: int = 0
     lastUpdateTime: int = 0
     respondTime: int = 180000
@@ -70,6 +71,18 @@ class BookSource:
         # every imported source adds avoidable startup work.
         field_names = cls.__dataclass_fields__
         kwargs = {k: v for k, v in data.items() if k in field_names}
+        # Legado's rule deserializers accept both a JSON object and a JSON
+        # primitive containing the serialized object.  Older/shared sources
+        # commonly use the latter form.
+        for name in ("ruleSearch", "ruleBookInfo", "ruleContent", "ruleToc",
+                     "ruleExplore", "ruleReview"):
+            value = kwargs.get(name)
+            if isinstance(value, str):
+                try:
+                    decoded = json.loads(value)
+                except (TypeError, json.JSONDecodeError):
+                    decoded = None
+                kwargs[name] = decoded if isinstance(decoded, dict) else {}
         return cls(**kwargs)
 
     def to_dict(self) -> dict:

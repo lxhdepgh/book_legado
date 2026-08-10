@@ -1,39 +1,184 @@
 import asyncio
+import aiohttp
+from aiohttp import web
+import base64
+import hashlib
 import json
 import gzip
 import hmac
+import math
+import re
 import threading
 import time
+import zipfile
 from io import BytesIO
 from email.message import Message
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 import unittest
+from datetime import datetime
+from decimal import Decimal
 from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from yarl import URL
 
 from bs4 import BeautifulSoup
 from PIL import Image
 
 from app.models.book_source import BookSource
-from app.services.legado_rule_parser import evaluate
+from app.services.legado_rule_parser import (JavaDateValue, _jsoup_html_markup,
+                                              _selection_indices,
+                                              evaluate, parse_markup,
+                                              select_jsoup,
+                                              split_rule_expression)
 from app.services.compat_audit import audit_source_corpus
 from app.services.desktop_browser import EdgeCdpSession
+from app.services.icu_charset import detect_charset
 from app.services.legado_js import JsBridgeError, JsContext, LegadoJsRuntime
-from app.services.request_compat import escape_form, escape_url_query, legado_escape
-from app.services.reading_engine import (LegadoReadingEngine, _legado_truthy,
-                                         parse_content_blocks)
+from app.services.request_compat import (encode_form_fields,
+                                         encode_url_query_fields, escape_form,
+                                         escape_url_query, legado_escape)
+from app.services.reading_engine import (ContentEmptyError, LegadoReadingEngine,
+                                         TocEmptyError, _legado_truthy,
+                                         _apply_replace_regex,
+                                         _format_content_page,
+                                         chapter_display_title,
+                                         parse_content_blocks,
+                                         process_book_content)
 from app.services.source_service import SourceService
+from app.services.source_rule import compile_rule_program
+from app.services.custom_url import CustomUrl
+from app.services.java_regex import search as java_regex_search, sub as java_regex_sub
 from app.services.rule_engine import (BookItem, ChapterItem, ReaderEngine,
+                                      merge_search_items,
                                       parse_explore_categories,
                                       resolve_explore_categories, select_nodes)
 from app.services.rule_engine import extract_value
+from app.services.search_model import SearchBookStore, SearchModel
+from app.services.reading_cache import ReadingCache
 from test_book_sources_async import classify_js_bridge_error, parse_search_url
 
 
+class SearchModelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_search_model_paging_bounded_workers_merge_and_persist(self):
+        active = 0
+        maximum = 0
+        calls = []
+
+        async def search_one(source, key, page):
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            calls.append((source, key, page))
+            await asyncio.sleep(0.01)
+            active -= 1
+            return [BookItem(
+                "Key", author="A", url=f"url-{source}-{page}",
+                origin=f"source-{source}", origin_order=int(source))]
+
+        with TemporaryDirectory() as directory:
+            store = SearchBookStore(Path(directory) / "search.sqlite3")
+            updates = []
+            lifecycle = []
+            model = SearchModel(
+                search_one, thread_count=2, store=store,
+                on_update=lambda books: updates.append(list(books)),
+                on_start=lambda: lifecycle.append("start"),
+                on_finish=lambda empty: lifecycle.append(("finish", empty)))
+            first = await model.search(10, "Key", [1, 2, 3, 4])
+            second = await model.search(10, "ignored")
+
+            self.assertEqual(maximum, 2)
+            self.assertEqual([page for _, _, page in calls], [1] * 4 + [2] * 4)
+            self.assertEqual(model.page, 2)
+            self.assertEqual(first[0].origin_set(),
+                             ["source-1", "source-2", "source-3", "source-4"])
+            self.assertEqual(second[0].origin_set(),
+                             ["source-1", "source-2", "source-3", "source-4"])
+            self.assertIsNotNone(store.get("url-4-2"))
+            self.assertEqual(store.first_by_name_author("Key", "A").origin_order, 1)
+            self.assertGreaterEqual(len(updates), 9)
+            self.assertEqual(lifecycle,
+                             ["start", ("finish", False),
+                              "start", ("finish", False)])
+
+    async def test_new_search_id_cancels_old_generation(self):
+        started = asyncio.Event()
+
+        async def search_one(source, key, page):
+            if key == "old":
+                started.set()
+                await asyncio.sleep(10)
+            return [BookItem(key, url=f"{key}-{source}", origin=str(source))]
+
+        model = SearchModel(search_one, thread_count=1)
+        old = asyncio.create_task(model.search(1, "old", [1]))
+        await started.wait()
+        fresh = await model.search(2, "new", [2])
+        with self.assertRaises(asyncio.CancelledError):
+            await old
+        self.assertEqual([(item.name, item.url) for item in fresh],
+                         [("new", "new-2")])
+        self.assertEqual(model.search_id, 2)
+
+
 class RuleParserTests(unittest.TestCase):
+    def test_content_page_formats_html_images_before_global_replace(self):
+        formatted = _format_content_page(
+            '<p>A&nbsp;B</p><!--x--><i>C</i>'
+            '<img src="fallback.jpg" data-src="../image.jpg">'
+            '<img src="asset.png, {\"headers\":{\"X\":\"1\"}}">',
+            "https://example.test/book/chapter/1")
+        self.assertEqual(
+            formatted,
+            '　　A B\n　　C<img src="https://example.test/book/image.jpg">'
+            '<img src="https://example.test/book/chapter/asset.png,'
+            '{\"headers\":{\"X\":\"1\"}}">')
+
+    def test_search_model_merge_origin_precision_and_rank_order(self):
+        existing = [
+            BookItem("Key", author="A", origin="s1", url="u1"),
+            BookItem("Key Story", author="B", origin="s1", url="u2"),
+            BookItem("Other", author="C", origin="s1", url="u3"),
+        ]
+        incoming = [
+            BookItem("Key", author="A", origin="s2", url="u4"),
+            BookItem("Key", author="D", origin="s3", url="u5"),
+            BookItem("Key Story", author="B", origin="s2", url="u6"),
+            BookItem("Noise", author="Z", origin="s4", url="u7"),
+        ]
+        merged = merge_search_items(existing, incoming, "Key")
+        self.assertEqual([(item.name, item.author, item.origin_set()) for item in merged], [
+            ("Key", "A", ["s1", "s2"]), ("Key", "D", ["s3"]),
+            ("Key Story", "B", ["s1", "s2"]), ("Other", "C", ["s1"]),
+            ("Noise", "Z", ["s4"]),
+        ])
+        precise = merge_search_items([], incoming, "Key", precision=True)
+        self.assertEqual([(item.name, item.author) for item in precise],
+                         [("Key", "A"), ("Key", "D"), ("Key Story", "B")])
+
+    def test_content_processor_title_duplicate_and_purify_order(self):
+        chapter = ChapterItem("[广告] 第一章", "https://source/chapter/1")
+        book = BookItem("书名", read_config={
+            "useReplaceRule": True,
+            "titleReplaceRules": [{
+                "pattern": r"^\[广告\]\s*", "replacement": "",
+                "isRegex": True, "isEnabled": True}],
+            "contentReplaceRules": [{
+                "pattern": "广告词", "replacement": "正文",
+                "isRegex": False, "isEnabled": True}],
+            "paragraphIndent": "　　",
+        })
+        content, title = process_book_content(
+            "书名 [广告] 第一章\n  第一段  \n广告词", book, chapter)
+        self.assertEqual(title, "第一章")
+        self.assertEqual(content, "　　第一段\n　　正文")
+        self.assertEqual(chapter_display_title(chapter, [{
+            "pattern": ".*", "replacement": "", "isRegex": True}]),
+                         "[广告] 第一章")
+
     def test_get_element_select_remove_mutates_parent_html(self):
         runtime = LegadoJsRuntime()
         source = SimpleNamespace(to_dict=lambda: {},
@@ -52,6 +197,142 @@ class RuleParserTests(unittest.TestCase):
 
         self.assertNotIn("drop", value)
         self.assertIn("<span>keep</span>", value)
+
+    def test_html_terminal_removes_script_and_style_from_shared_dom(self):
+        root = BeautifulSoup(
+            "<main><p>text</p><script>bad()</script><style>.x{}</style></main>",
+            "html.parser")
+        rendered = evaluate(root, "main@html", "html")
+        self.assertEqual(rendered, ["<main>\n <p>text</p>\n</main>"])
+        self.assertEqual(root.select("script, style"), [])
+
+    def test_jsoup_abs_attribute_uses_response_base_url(self):
+        root = BeautifulSoup('<a href="../chapter/1">one</a>', "html.parser")
+        self.assertEqual(
+            extract_value(root, "a@abs:href", "html",
+                          "https://example.com/book/index.html"),
+            "https://example.com/chapter/1")
+
+    def test_jsoup_indices_are_applied_per_parent_element(self):
+        root = BeautifulSoup(
+            "<section><ul><li>A0</li><li>A1</li></ul>"
+            "<ul><li>B0</li><li>B1</li></ul></section>", "html.parser")
+        self.assertEqual(evaluate(root, "ul@li.0@text", "html"), ["A0", "B0"])
+        self.assertEqual(evaluate(root, "ul@li!0@text", "html"), ["A1", "B1"])
+        self.assertEqual(evaluate(root, "ul@li[-1:0]@text", "html"),
+                         ["A1", "A0", "B1", "B0"])
+
+    def test_jsoup_elements_single_index_truth_table(self):
+        cases = {
+            "0,0,-1,9,-9": [0, 4],
+            "1:3:2": [1, 3],
+            "3:1:2": [3, 1],
+            "-1:0": [4, 3, 2, 1, 0],
+            "10:-10": [4, 3, 2, 1, 0],
+            "0:4:-1": [0, 4],
+            "0:4:-5": [0, 1, 2, 3, 4],
+            "::": [0, 1, 2, 3, 4],
+            "0:4:10": [0],
+        }
+        for expression, expected in cases.items():
+            self.assertEqual(_selection_indices(expression, 5), expected,
+                             expression)
+
+    def test_jsoup_text_own_text_and_text_nodes_whitespace(self):
+        root = BeautifulSoup(
+            "<div id='x'> A\t<span>B</span>C<div>D\n E</div>"
+            "<br>F&nbsp;G<script>hidden</script>\u200b\u00ad</div>",
+            "html.parser")
+        self.assertEqual(evaluate(root, "#x@text", "html"), ["A BC D E F\u00a0G"])
+        self.assertEqual(evaluate(root, "#x@ownText", "html"), ["A C F\u00a0G"])
+
+        nodes = BeautifulSoup("<p>  A  <b>x</b>\u00a0B\u00a0 </p>", "html.parser")
+        self.assertEqual(evaluate(nodes, "p@textNodes", "html"), ["A\n\u00a0B\u00a0"])
+
+    def test_javascript_element_text_and_data_match_jsoup_nodes(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://x")
+        try:
+            value = runtime.evaluate(
+                '@js:var e=java.getElement("#x");[e.text(),e.ownText(),e.data()]',
+                JsContext(source=source,
+                          result=("<div id='x'>A<span>B</span>C"
+                                  "<script>if (a < b) x()</script></div>"),
+                          base_url="https://x"))
+        finally:
+            runtime.close()
+        self.assertEqual(value, ["ABC", "AC", "if (a < b) x()"])
+
+    def test_jsoup_html_serialization_uses_html_void_tags(self):
+        root = BeautifulSoup(
+            '<div><img src="x"><br><input disabled></div>', "html.parser")
+        self.assertEqual(evaluate(root, "div@html", "html"),
+                         ['<div>\n <img src="x">\n <br><input disabled>\n</div>'])
+
+    def test_jsoup_outer_html_matches_fixed_pretty_print_and_entities(self):
+        root = parse_markup(
+            '<div id="X" data-v="A B" class="a:b"> t '
+            '<span>A</span><span>B</span><p>P<b>Q</b></p>'
+            '<img disabled=""><svg><foreignObject><path/></foreignObject></svg>'
+            '<media:content url="u" />&nbsp;</div>')
+        self.assertEqual(
+            _jsoup_html_markup(root.select_one("div")),
+            '<div id="X" data-v="A B" class="a:b">\n'
+            ' t <span>A</span><span>B</span>\n'
+            ' <p>P<b>Q</b></p><img disabled>\n'
+            ' <svg>\n'
+            '  <foreignObject>\n'
+            '   <path />\n'
+            '  </foreignObject>\n'
+            ' </svg><media:content url="u" />&nbsp;\n'
+            '</div>')
+
+    def test_tolerant_xml_recovery_matches_fixed_jsoup(self):
+        cases = {
+            '<?xml version="1.0"?><root><A><b>1</A><c>2</root>':
+                '<root><A><b>1</b></A><c>2</c></root>',
+            '<?xml version="1.0"?><root><a x=1><b>2</root>':
+                '<root><a x="1"><b>2</b></a></root>',
+            '<?xml version="1.0"?><root>before<br/>after &bogus;</root>':
+                '<root>before<br />after &amp;bogus;</root>',
+            '<?xml version="1.0"?><root><!-- open <a> --><?pi x?><x></root>':
+                '<root><!-- open <a> --><?pi x?><x></x></root>',
+            '<?xml version="1.0"?><root a="1>2" a="later" A="upper">x</root>':
+                '<root a="1>2" A="upper">x</root>',
+        }
+        for markup, expected in cases.items():
+            with self.subTest(markup=markup):
+                root = parse_markup(markup, "application/xml")
+                self.assertEqual(_jsoup_html_markup(root.select_one("root")), expected)
+
+    def test_jsoup_contains_is_case_insensitive_and_matches_use_jsoup_text(self):
+        root = BeautifulSoup(
+            "<div id='a'>Alpha<span>Beta</span></div>"
+            "<div id='b'><span>alpha</span></div>", "html.parser")
+        self.assertEqual([node["id"] for node in evaluate(
+            root, "div:contains(ALPHABETA)", "html")], ["a"])
+        self.assertEqual([node["id"] for node in evaluate(
+            root, "div:containsOwn(ALPHA)", "html")], ["a"])
+        self.assertEqual([node["id"] for node in evaluate(
+            root, r"div:matchesOwn(^Alpha$)", "html")], ["a"])
+        self.assertEqual([node["id"] for node in evaluate(
+            root, "div:not(:contains(BETA))", "html")], ["b"])
+        self.assertEqual([node["id"] for node in evaluate(
+            root, "div:not(:containsOwn(ALPHA))", "html")], ["b"])
+
+    def test_jsoup_namespace_selectors_match_colon_named_tags(self):
+        root = BeautifulSoup(
+            '<rss><media:content id="a"></media:content>'
+            '<x:content id="b"></x:content><content id="c"></content></rss>',
+            "html.parser")
+        self.assertEqual(
+            [node["id"] for node in evaluate(root, "media|content", "html")],
+            ["a"],
+        )
+        self.assertEqual(
+            [node["id"] for node in evaluate(root, "*|content", "html")],
+            ["a", "b", "c"],
+        )
 
     def test_java_get_elements_for_in_only_visits_numeric_records(self):
         runtime = LegadoJsRuntime()
@@ -120,6 +401,23 @@ class RuleParserTests(unittest.TestCase):
                                    ".bookbox")
         self.assertEqual((nodes, kind), ([], "html"))
 
+    def test_invalid_list_selector_propagates_from_parser(self):
+        with self.assertRaises(Exception):
+            select_nodes("<div>x</div>", "text/html", "[invalid")
+
+    def test_failed_list_rule_does_not_infer_book_cards(self):
+        html = "".join(
+            f'<li class="book-item"><a href="/{index}">Book</a></li>'
+            for index in range(4))
+        nodes, kind = select_nodes(html, "text/html", ".missing")
+        self.assertEqual((nodes, kind), ([], "html"))
+
+    def test_failed_field_rule_does_not_guess_anchor_or_image(self):
+        node = BeautifulSoup('<div><a href="/guessed">Text</a>'
+                             '<img src="/cover.jpg"></div>', "html.parser").div
+        self.assertEqual(extract_value(node, ".missing@href", "html"), "")
+        self.assertEqual(extract_value(node, ".missing@src", "html"), "")
+
     def test_charset_escape_matches_legado_utf16_parameter_encoding(self):
         self.assertEqual(legado_escape("书😀 a"), "%u4E66%uD83D%uDE00%20a")
         self.assertEqual(escape_form("q=书 源&empty="),
@@ -127,6 +425,14 @@ class RuleParserTests(unittest.TestCase):
         self.assertEqual(
             escape_url_query("https://source/search?q=书 源&page=1"),
             "https://source/search?q=%u4E66%20%u6E90&page=1")
+
+    def test_url_encoder_uses_declared_charset_and_preserves_encoded_values(self):
+        self.assertEqual(encode_form_fields("q=书 源&done=%CA%E9", "gbk"),
+                         "q=%CA%E9+%D4%B4&done=%CA%E9")
+        self.assertEqual(
+            encode_url_query_fields("https://source/search?q=书 源&page=1", "gbk"),
+            "https://source/search?q=%CA%E9+%D4%B4&page=1",
+        )
 
     def test_fallback_rule_short_circuits_after_first_nonempty_branch(self):
         soup = BeautifulSoup('<p class="ok">value</p>', "html.parser")
@@ -137,6 +443,33 @@ class RuleParserTests(unittest.TestCase):
         soup = BeautifulSoup('<i>A</i><b>C</b>', "html.parser")
         values = evaluate(soup, 'i@text&&em@text||b@text', "html")
         self.assertEqual(values, ["A", "C"])
+
+        # RuleAnalyzer uses the first outside operator as elementsType. A
+        # leading successful fallback therefore prevents the later && branch.
+        values = evaluate(soup, 'i@text||em@text&&b@text', "html")
+        self.assertEqual(values, ["A"])
+
+    def test_rule_analyzer_code_and_rule_balancing_differ_on_escapes(self):
+        self.assertEqual(
+            split_rule_expression(
+                r"$.x[?(@.v=='a\'&&b')]||$.fallback", ("&&", "||"), True),
+            ([r"$.x[?(@.v=='a\'&&b')]", "$.fallback"], "||"),
+        )
+        with self.assertRaises(Exception):
+            split_rule_expression(
+                r"div[a='a\'&&b']||span", ("&&", "||"), False)
+
+    def test_regex_chain_ampersands_are_not_balanced(self):
+        with self.assertRaises(Exception):
+            evaluate("a&&b", ":(a&&b)", "html")
+
+    def test_jsoup_at_chain_uses_rule_balancing(self):
+        root = BeautifulSoup(
+            '<div data-key="a@b"><span>value</span></div>', "html.parser")
+        self.assertEqual(
+            evaluate(root, "div[data-key='a@b']@span@text", "html"),
+            ["value"],
+        )
 
     def test_get_string_joins_matches_but_url_mode_uses_first(self):
         root = BeautifulSoup('<a href="/1">A</a><a href="/2">B</a>',
@@ -159,13 +492,153 @@ class RuleParserTests(unittest.TestCase):
             extract_value(records[0], "https://source/chapter/$1", "html"),
             "https://source/chapter/101")
 
+    def test_regex_triple_hash_returns_only_first_transformed_match(self):
+        root = BeautifulSoup('<p>before ID:42 after ID:99</p>', "html.parser")
+
+        self.assertEqual(
+            extract_value(root, r'p@text##ID:(\d+)##$1###', "html"),
+            "42",
+        )
+        self.assertEqual(
+            extract_value(root, r'p@text##missing##x###', "html"),
+            "",
+        )
+
+    def test_java_regex_named_groups_linebreak_and_absolute_end(self):
+        match = java_regex_search(r"(?<word>book)\Rend\z", "book\r\nend")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group("word"), "book")
+        self.assertEqual(java_regex_sub(
+            r"(?<left>A)-(?<right>B)", "${right}${left}", "A-B"), "BA")
+
+    def test_java_regex_quote_backreference_whitespace_and_replacement_escaping(self):
+        self.assertIsNotNone(java_regex_search(r"\Qa+b?\E", "x a+b? y"))
+        self.assertIsNotNone(java_regex_search(
+            r"(?<x>ab)\k<x>\h\v", "abab \n"))
+        self.assertEqual(java_regex_sub(r"(A)", r"\$1-$1-\\", "A"),
+                         "$1-A-\\")
+
+    def test_java_regex_unicode_properties_use_python_unicode_database(self):
+        self.assertEqual(java_regex_search(r"\p{L}+", "123书Ab").group(0), "书Ab")
+        self.assertEqual(java_regex_search(r"\p{P}+", "word，。!").group(0), "，。!")
+        self.assertEqual(java_regex_search(r"\p{IsHan}+", "A书籍B").group(0), "书籍")
+        self.assertEqual(java_regex_search(r"\P{N}+", "12章A").group(0), "章A")
+
+    def test_java_regex_contiguous_match_anchor(self):
+        from app.services.java_regex import finditer as java_regex_finditer
+        matches = [item.group(0) for item in java_regex_finditer(r"\G\d,?", "1,2,3x4")]
+        self.assertEqual(matches, ["1,", "2,", "3"])
+        self.assertEqual(java_regex_sub(r"\G\d,?", "x", "1,2,3x4"), "xxxx4")
+
+    def test_java_regex_character_class_intersection(self):
+        self.assertEqual(
+            java_regex_search(r"[a-z&&[^aeiou]]+", "aei-book").group(0), "b")
+        self.assertEqual(
+            java_regex_search(r"[\p{L}&&[^\p{Lu}]]+", "ABC书abc").group(0),
+            "书abc")
+
+    def test_java_regex_inline_java_flags(self):
+        self.assertIsNotNone(java_regex_search(r"(?iu)ä", "Ä"))
+        self.assertIsNotNone(java_regex_search(r"(?d)^.$", "\r"))
+        self.assertIsNotNone(java_regex_search(r"(?U)\w+", "书籍"))
+
+    def test_java_regex_group_zero_null_group_and_invalid_reference(self):
+        self.assertEqual(java_regex_sub(r"(a)", "$0", "a"), "a")
+        self.assertEqual(java_regex_sub(r"(a)?b", "$1", "b"), "")
+        with self.assertRaises(re.error):
+            java_regex_sub(r"(a)", "$2", "a")
+
+    def test_java_regex_zero_length_and_canonical_equivalence(self):
+        self.assertEqual(java_regex_sub(r"", "-", "ab"), "-a-b-")
+        self.assertEqual(java_regex_sub(r"(?=b)", "-", "ab"), "a-b")
+        self.assertIsNotNone(java_regex_search("(?c)å", "a\u030a"))
+        self.assertIsNotNone(java_regex_search("(?c)a\u030a", "å"))
+
+    def test_jayway_regex_literal_and_function_chains(self):
+        data = {
+            "items": [{"name": "Alpha"}, {"name": "beta"}],
+            "numbers": [1, 2, 3],
+        }
+        self.assertEqual(
+            evaluate(data, r"$.items[?(@.name =~ /^a/i)].name", "json"),
+            ["Alpha"],
+        )
+        self.assertEqual(
+            evaluate(data, "$.numbers.append(4).length()", "json"), [4])
+        self.assertEqual(
+            evaluate(data, "$.numbers.concat([4,5]).sum()", "json"), [15.0])
+
+    def test_jayway_collection_filter_operators(self):
+        data = {"items": [
+            {"id": 1, "tags": ["x", "y"]},
+            {"id": 2, "tags": []},
+            {"id": 3, "tags": ["z"]},
+        ]}
+        self.assertEqual(evaluate(
+            data, "$.items[?(@.id in [1,3])].id", "json"), [1, 3])
+        self.assertEqual(evaluate(
+            data, "$.items[?(@.id nin [1,3])].id", "json"), [2])
+        self.assertEqual(evaluate(
+            data, "$.items[?(@.tags subsetof ['x','y'])].id", "json"), [1, 2])
+        self.assertEqual(evaluate(
+            data, "$.items[?(@.tags anyof ['x'])].id", "json"), [1])
+        self.assertEqual(evaluate(
+            data, "$.items[?(@.tags noneof ['x','y'])].id", "json"), [2, 3])
+        self.assertEqual(evaluate(
+            data, "$.items[?(@.tags size 0)].id", "json"), [2])
+        self.assertEqual(evaluate(
+            data, "$.items[?(@.tags empty true)].id", "json"), [2])
+
+    def test_jayway_functions_can_be_intermediate_path_stages(self):
+        data = {
+            "object": {"first": 1, "second": 2},
+            "items": [{"name": "A"}, {"name": "B"}],
+            "numbers": [1, 2],
+        }
+        self.assertEqual(evaluate(data, "$.object.keys()[0]", "json"), [])
+        self.assertEqual(evaluate(data, "$.items.first().name", "json"), ["A"])
+        self.assertEqual(evaluate(data, "$.items.last().name", "json"), ["B"])
+        self.assertEqual(evaluate(
+            data, '$.items.append({"name":"C"})[-1].name', "json"), ["C"])
+        self.assertEqual(evaluate(
+            data, "$.numbers.append(3).index(-1)", "json"), [3])
+
+    def test_jayway_compound_predicate_precedence_and_truthiness(self):
+        data = {"items": [
+            {"id": 1, "ok": False, "name": "Alpha"},
+            {"id": 2, "ok": False, "name": "beta"},
+            {"id": 3, "ok": True, "name": "Alpine"},
+            {"id": 4, "name": "missing-ok"},
+        ]}
+        self.assertEqual(evaluate(
+            data, "$.items[?(@.id >= 2 && @.ok == true)].id", "json"), [3])
+        self.assertEqual(evaluate(
+            data, "$.items[?(@.id == 1 || @.id == 3)].id", "json"), [1, 3])
+        self.assertEqual(evaluate(
+            data, "$.items[?((@.id >= 2 && @.ok == true) || @.id == 1)].id",
+            "json"), [1, 3])
+        # A bare path is an existence predicate in Jayway, even when false.
+        self.assertEqual(evaluate(data, "$.items[?(@.ok)].id", "json"), [1, 2, 3])
+        self.assertEqual(evaluate(
+            data, r"$.items[?(@.name =~ /^Al/i && @.id != 1)].id", "json"), [3])
+        self.assertEqual(evaluate(
+            data, "$.items[?(@['id'] >= 3)].name", "json"),
+            ["Alpine", "missing-ok"])
+
+    def test_jayway_definite_and_indefinite_array_results_keep_shape(self):
+        data = {"items": [{"tags": ["x", "y"]}]}
+        self.assertEqual(evaluate(data, "$.items[0].tags", "json"), ["x", "y"])
+        self.assertEqual(evaluate(data, "$.items[*].tags", "json"), [["x", "y"]])
+        self.assertEqual(evaluate(data, "$.items[?(@.tags)].tags", "json"),
+                         [["x", "y"]])
+
     def test_complete_source_corpus_loads_and_javascript_compiles(self):
         audit = audit_source_corpus(Path("resource/bookSource.json"))
-        self.assertEqual(audit.source_count, 1127)
+        self.assertEqual(audit.source_count, 1066)
         self.assertEqual(audit.model_count, audit.source_count)
         self.assertGreater(audit.script_count, 1400)
-        self.assertGreater(audit.rule_count, 24900)
-        self.assertGreater(audit.regex_count, 450)
+        self.assertGreater(audit.rule_count, 23000)
+        self.assertGreater(audit.regex_count, 400)
         self.assertEqual(audit.syntax_issues, [])
         self.assertEqual(audit.rule_syntax_issues, [])
         self.assertEqual(audit.unknown_rule_fields, [])
@@ -181,6 +654,27 @@ class RuleParserTests(unittest.TestCase):
         self.assertEqual(source.ruleReview["reviewList"], ".review")
         self.assertEqual(source.to_dict()["ruleReview"]["content"], ".text@text")
 
+    def test_book_source_accepts_legacy_string_encoded_rule_objects(self):
+        source = BookSource.from_dict({
+            "bookSourceName": "source",
+            "bookSourceUrl": "https://source",
+            "ruleSearch": '{"bookList":"$.data[*]","name":"$.name"}',
+            "ruleToc": "not-json",
+        })
+
+        self.assertEqual(source.ruleSearch["bookList"], "$.data[*]")
+        self.assertEqual(source.ruleSearch["name"], "$.name")
+        self.assertEqual(source.ruleToc, {})
+
+    def test_book_source_missing_fields_use_legado_defaults(self):
+        source = BookSource.from_dict({
+            "bookSourceName": "source", "bookSourceUrl": "https://source",
+        })
+
+        self.assertEqual(source.bookSourceType, 0)
+        self.assertTrue(source.enabledExplore)
+        self.assertTrue(source.enabledCookieJar)
+
     def test_base64_decode_accepts_urlsafe_value_without_padding(self):
         self.assertEqual(LegadoJsRuntime._base64_decode("eyJhIjoxfQ"), '{"a":1}')
 
@@ -193,6 +687,48 @@ class RuleParserTests(unittest.TestCase):
             })},
         )
         self.assertEqual(runtime.evaluate("@js:helper()", JsContext(source=source)), 7)
+
+    def test_js_lib_json_ignores_inline_values_like_shared_js_scope(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source",
+            "jsLib": json.dumps({"inline": "var leakedFromMap=9;"}),
+        })
+        self.assertEqual(runtime.evaluate(
+            "@js:typeof leakedFromMap", JsContext(source=source)), "undefined")
+
+    def test_js_lib_state_is_shared_across_rule_evaluations(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source",
+            "jsLib": "var sharedCount=0;function nextShared(){return ++sharedCount;}",
+        })
+        self.assertEqual(runtime.evaluate(
+            "@js:nextShared()", JsContext(source=source)), 1)
+        self.assertEqual(runtime.evaluate(
+            "@js:nextShared()", JsContext(source=source)), 2)
+
+    def test_js_lib_closure_identity_survives_rule_evaluations(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source",
+            "jsLib": (
+                "function counter(){let value=0;return ()=>++value;}"
+                "const nextValue=counter();"
+            ),
+        })
+        self.assertEqual(runtime.evaluate(
+            "@js:nextValue()", JsContext(source=source)), 1)
+        self.assertEqual(runtime.evaluate(
+            "@js:nextValue()", JsContext(source=source)), 2)
+
+    def test_rule_lexical_scope_is_fresh_over_shared_js_lib(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source", "jsLib": "const helper=1;"})
+        for _ in range(2):
+            self.assertEqual(runtime.evaluate(
+                "@js:let local=helper+1;local", JsContext(source=source)), 2)
 
     def test_empty_login_maps_keep_java_map_methods(self):
         runtime = LegadoJsRuntime()
@@ -402,7 +938,7 @@ class RuleParserTests(unittest.TestCase):
             "[escape('书 A'),unescape('%u4E66%20A'),java.encodeURI('https://x/a b?q=书') ]",
             JsContext(source=source))
         self.assertEqual(value, ["%u4E66%20A", "书 A",
-                                 "https://x/a%20b?q=%E4%B9%A6"])
+                                 "https%3A%2F%2Fx%2Fa+b%3Fq%3D%E4%B9%A6"])
 
     def test_js_http_bridge_decodes_data_uri_and_type_as_hex(self):
         runtime = LegadoJsRuntime()
@@ -482,13 +1018,18 @@ class RuleParserTests(unittest.TestCase):
         chapter_value = runtime.evaluate(
             '@js:var before=[chapter.title,chapter.chapterUrl,chapter.baseUrl];'
             'chapter.title="new title";chapter.bookUrl=book.bookUrl;'
-            'chapter.resourceUrl="https://cdn/audio";chapter.isVolume=true;before;',
+            'chapter.resourceUrl="https://cdn/audio";chapter.isVolume=true;'
+            'chapter.startFragmentId="start";chapter.endFragmentId="end";'
+            'book.latestChapterTitle="latest";before;',
             JsContext(source=source, book=book, chapter=chapter))
         self.assertEqual(chapter_value,
                          ["old title", "chapter/1", "https://source/book/"])
         self.assertEqual(chapter.name, "new title")
         self.assertEqual(chapter.book_url, "https://source/new")
         self.assertEqual(chapter.resource_url, "https://cdn/audio")
+        self.assertEqual(chapter.start_fragment_id, "start")
+        self.assertEqual(chapter.end_fragment_id, "end")
+        self.assertEqual(book.latest_chapter_title, "latest")
         self.assertTrue(chapter.is_volume)
 
     def test_cookie_store_set_get_and_remove(self):
@@ -506,6 +1047,24 @@ class RuleParserTests(unittest.TestCase):
         ))
         self.assertEqual(runtime.export_cookie_header("https://example.com/"), "")
 
+    def test_cookie_store_persists_and_does_not_invent_secure_attribute(self):
+        source = SimpleNamespace(
+            to_dict=lambda: {"bookSourceUrl": "https://example.com"})
+        with TemporaryDirectory() as directory:
+            first = LegadoJsRuntime(state_dir=directory)
+            first.evaluate(
+                '@js:cookie.setCookie(baseUrl,"sid=abc; Path=/");',
+                JsContext(source=source, base_url="https://example.com/book"))
+            self.assertEqual(first.export_cookie_header(
+                "http://example.com/next"), "sid=abc")
+            second = LegadoJsRuntime(state_dir=directory)
+            self.assertEqual(second.export_cookie_header(
+                "https://example.com/next"), "sid=abc")
+            second.remove_cookie("https://example.com/")
+            third = LegadoJsRuntime(state_dir=directory)
+            self.assertEqual(third.export_cookie_header(
+                "https://example.com/next"), "")
+
     def test_cookie_map_and_memory_cache_aliases(self):
         runtime = LegadoJsRuntime()
         source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://example.com"})
@@ -516,14 +1075,15 @@ class RuleParserTests(unittest.TestCase):
         )
         self.assertEqual(value, [3, "a=1; b=x"])
 
-    def test_font_replacement_bridge_matches_glyph_signatures(self):
+    def test_font_replacement_requires_query_ttf_objects_like_historical_api(self):
         runtime = LegadoJsRuntime()
         runtime.font_store["wrong"] = ({ord("x"): ("shape-a",)}, {})
         runtime.font_store["right"] = ({}, {("shape-a",): ord("中")})
         source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
         value = runtime.evaluate(
             '@js:java.replaceFont("x!","wrong","right")', JsContext(source=source))
-        self.assertEqual(value, "中!")
+        self.assertEqual(value, "x!")
+        self.assertEqual(runtime._replace_font("x!", "wrong", "right"), "中!")
 
     def test_packages_java_importer_crypto_and_collections(self):
         runtime = LegadoJsRuntime()
@@ -549,6 +1109,172 @@ class RuleParserTests(unittest.TestCase):
         )
         self.assertEqual(value[:3], ["正文", 2, "b"])
         self.assertEqual(value[3], 36)
+
+    def test_java_importer_constructor_and_official_hmac_support_classes(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var api=new JavaImporter(Packages.javax.crypto.Mac,
+              Packages.javax.crypto.spec.SecretKeySpec,
+              Packages.java.net.URLEncoder,Packages.java.lang.String,
+              Packages.android.util.Base64,
+              Packages.javax.xml.bind.DatatypeConverter);
+            with(api){
+              var mac=Mac.getInstance('HmacSHA1');
+              mac.init(new SecretKeySpec(String('key').getBytes('UTF-8'),'HmacSHA1'));
+              var signature=mac.doFinal(String('data').getBytes('UTF-8'));
+              [Base64.encodeToString(signature,Base64.NO_WRAP),
+               URLEncoder.encode('a b','UTF-8'),
+               DatatypeConverter.printHexBinary(signature)];
+            }''', JsContext(source=source))
+        self.assertEqual(value, ["EEFSxb/coHvGM+69RhmfAlXJ9J0=", "a+b",
+                                 "104152C5BFDCA07BC633EEBD46199F0255C9F49D"])
+
+    def test_java_collection_iterator_stream_and_mutation_semantics(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var list=new Packages.java.util.ArrayList();
+            list.add('a');list.add('c');list.add(1,'b');
+            var iterator=list.iterator(),visited=[];
+            while(iterator.hasNext()){
+              var item=iterator.next();visited.push(item);if(item==='b')iterator.remove();
+            }
+            var mapped=list.stream().map(function(x){return x+x})
+              .collect(Packages.java.util.stream.Collectors.toList());
+            var set=new Packages.java.util.HashSet(['x','x']);
+            [visited,list.toArray(),mapped,set.add('x'),set.add('y'),set.toArray(),
+             Object.keys(list)];''', JsContext(source=source))
+        self.assertEqual(value, [["a", "b", "c"], ["a", "c"], ["aa", "cc"],
+                                 False, True, ["x", "y"], ["0", "1"]])
+
+    def test_java_exception_hierarchy_and_boxed_parse_helpers(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var caught;
+            try { throw new Packages.java.lang.IllegalArgumentException('bad'); }
+            catch(e) { caught=[e instanceof Packages.java.lang.RuntimeException,
+              e instanceof Packages.java.lang.Exception,
+              e instanceof Packages.java.lang.Throwable,e.getMessage(),String(e)]; }
+            [caught,Packages.java.lang.Integer.parseInt('ff',16),
+             Packages.java.lang.Long.parseLong('9223372036854775807').toString(),
+             Packages.java.lang.Boolean.parseBoolean('TRUE')];''',
+            JsContext(source=source))
+        self.assertEqual(value, [[True, True, True, "bad",
+                                 "java.lang.IllegalArgumentException: bad"],
+                                 255, "9223372036854776000", True])
+
+    def test_rhino_boxed_primitives_long_precision_and_hidden_class(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var L=Packages.java.lang.Long,I=Packages.java.lang.Integer,
+                B=Packages.java.lang.Boolean,Byte=Packages.java.lang.Byte;
+            var boxed=L.valueOf('9223372036854775807'),numberError=false;
+            try{Byte.valueOf('128')}catch(e){numberError=[
+              e instanceof Packages.java.lang.NumberFormatException,
+              e.javaException instanceof Packages.java.lang.NumberFormatException]}
+            [typeof L.parseLong('7'),boxed.toString(),boxed+'',boxed.longValue().toString(),
+             L.MAX_VALUE.toString(),I.valueOf(7) instanceof I,I.parseInt('7') instanceof I,
+             I.valueOf(7)==7,I.valueOf(7)===7,B.valueOf('false').booleanValue(),
+             B.valueOf(true) instanceof B,Byte.valueOf('127').byteValue(),numberError,
+             I.valueOf(7).getClass(),I.TYPE];''',
+            JsContext(source=source))
+        self.assertEqual(value, [
+            "number", "9223372036854775807", "9223372036854776000",
+            "9223372036854776000", "9223372036854776000", True, False,
+            True, False, False, True, 127, [False, True], None, None,
+        ])
+
+    def test_rhino_error_stack_and_null_undefined_boundaries(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source",
+            "jsLib": "const sharedError=new Error('shared');"})
+        expression = (
+            "@js:[typeof new Error('x').stack,"
+            "(function(){try{throw new Error('boom')}catch(e){return typeof e.stack}})(),"
+            "(function(){try{null.x}catch(e){return e.name+'|'+typeof e.stack}})(),"
+            "String(undefined),String(null),undefined==null,undefined===null,"
+            "sharedError instanceof Error]"
+        )
+        expected = ["undefined", "undefined", "TypeError|string",
+                    "undefined", "null", True, False, True]
+        self.assertEqual(runtime.evaluate(expression, JsContext(source=source)), expected)
+        self.assertEqual(runtime.evaluate(expression, JsContext(source=source)), expected)
+
+    def test_jsoup_traversal_range_form_data_parser_and_quirks(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var doc=org.jsoup.Jsoup.parse("<form action='/go'><input name='a' value='1'>"
+              +"<input name='c' checked></form><p>x<b>y</b></p>","https://host/base");
+            var p=doc.selectFirst('p'),order=[];
+            p.traverse(function(node,depth){order.push(node.nodeName()+'@'+depth)});
+            var data=doc.forms().get(0).formData().map(function(item){return item.toString()});
+            var range=p.sourceRange();
+            p.filter({head:function(node){return node.nodeName()==='b'?
+              org.jsoup.select.NodeFilter.FilterResult.REMOVE:
+              org.jsoup.select.NodeFilter.FilterResult.CONTINUE}});
+            [range.toString(),range.isTracked(),order.join(','),data.join(','),p.text(),
+             doc.quirksMode(),String(doc.parser()).startsWith('org.jsoup.parser.Parser@')];''',
+            JsContext(source=source))
+        self.assertEqual(value, [
+            "-1,-1:-1--1,-1:-1", False, "p@0,#text@1,b@1,#text@2",
+            "a=1,c=", "x", "noQuirks", True])
+
+    def test_jsoup_node_filter_and_form_element_follow_1162_long_tail(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var doc=org.jsoup.Jsoup.parse("<form id=f><input name=r type=reset value=R>"
+              +"<input name=file type=file value=F><button name=b value=B></button>"
+              +"<button name=x type=button value=X></button><input name=c type=checkbox checked>"
+              +"<select name=s multiple><option value=one>1</option><option value=two>2</option></select>"
+              +"</form><input form=f name=outside value=O>"
+              +"<p><span><em>x</em></span><b>y</b><i>z</i></p>","https://host/");
+            var log=[],p=doc.selectFirst('p');
+            p.filter({head:function(n,d){log.push('h:'+n.nodeName()+d);
+              if(n.nodeName()==='span')return org.jsoup.select.NodeFilter.FilterResult.SKIP_CHILDREN;
+              if(n.nodeName()==='b')return org.jsoup.select.NodeFilter.FilterResult.SKIP_ENTIRELY;
+              if(n.nodeName()==='i')return org.jsoup.select.NodeFilter.FilterResult.REMOVE;
+              return org.jsoup.select.NodeFilter.FilterResult.CONTINUE},
+              tail:function(n,d){log.push('t:'+n.nodeName()+d);return 'CONTINUE'}});
+            var form=doc.forms().first();
+            [form.elements().size(),form.formData().map(x=>x.toString()).join(','),
+             log.join(','),p.text(),p.select('i').size()];''', JsContext(source=source))
+        self.assertEqual(value, [
+            6, "r=R,file=F,c=on,s=one",
+            "h:p0,h:span1,t:span1,h:b1,h:i1,t:p0", "xy", 0])
+
+    def test_symmetric_crypto_supports_android_jca_legacy_algorithms(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            function roundTrip(transformation,key,iv){
+              var crypto=java.createSymmetricCrypto(transformation,key,iv);
+              return crypto.decryptStr(crypto.encryptBase64('legacy'));
+            }
+            [roundTrip('Blowfish/CBC/PKCS5Padding','12345678','abcdefgh'),
+             roundTrip('RC2/ECB/PKCS5Padding','12345678',null),
+             roundTrip('RC4','12345678',null)];''', JsContext(source=source))
+        self.assertEqual(value, ["legacy", "legacy", "legacy"])
+
+    def test_symmetric_crypto_rejects_invalid_aes_key_instead_of_padding_it(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        with self.assertRaises(Exception):
+            runtime.evaluate(
+                "@js:java.createSymmetricCrypto('AES/ECB/PKCS5Padding','short').encryptBase64('x')",
+                JsContext(source=source))
 
     def test_hutool_gzip_and_android_helpers(self):
         runtime = LegadoJsRuntime()
@@ -579,7 +1305,7 @@ class RuleParserTests(unittest.TestCase):
             output.toByteArray();''',
             JsContext(source=source, result=stream.getvalue()),
         )
-        decoded = Image.open(BytesIO(bytes(value)))
+        decoded = Image.open(BytesIO(bytes(item & 255 for item in value)))
         self.assertEqual(decoded.size, (4, 5))
 
     def test_android_canvas_can_reassemble_bitmap_slices(self):
@@ -598,7 +1324,7 @@ class RuleParserTests(unittest.TestCase):
             target.compress(Bitmap.CompressFormat.PNG,100,output);
             output.toByteArray();''',
             JsContext(source=source, result=stream.getvalue()))
-        decoded = Image.open(BytesIO(bytes(value))).convert("RGBA")
+        decoded = Image.open(BytesIO(bytes(item & 255 for item in value))).convert("RGBA")
         self.assertEqual(decoded.size, (4, 4))
         self.assertEqual(decoded.getpixel((1, 1))[:3], (255, 0, 0))
 
@@ -639,9 +1365,15 @@ class RuleParserTests(unittest.TestCase):
             '''@js:
             var bytes=java.getByteArray("https://source/data");
             var stream=java.getInputStream("https://source/data");
-            [bytes,stream.available(),stream.read(),stream.readAllBytes()];
+            var first=stream.read(),remaining=stream.readAllBytes(),after=stream.available();
+            stream.reset();var buffer=[0,0,0,0],count=stream.read(buffer,1,2);
+            stream.mark(10);var marked=stream.read();stream.reset();var replay=stream.read();
+            var eof=false;try{stream.skipNBytes(2)}catch(e){eof=e instanceof Packages.java.io.EOFException}
+            [bytes,3,first,remaining,after,count,buffer,marked,replay,eof];
             ''', JsContext(source=source))
-        self.assertEqual(value, [[65, 66, 67], 3, 65, [66, 67]])
+        self.assertEqual(value, [
+            [65, 66, 67], 3, 65, [66, 67], 0, 2, [0, 65, 66, 0],
+            67, 67, True])
 
     def test_browser_source_state_and_collection_compatibility(self):
         runtime = LegadoJsRuntime()
@@ -669,7 +1401,7 @@ class RuleParserTests(unittest.TestCase):
     def test_start_browser_is_non_blocking_for_media_content_rules(self):
         runtime = LegadoJsRuntime()
         calls = []
-        runtime.browser_fetcher = lambda url, title: calls.append((url, title))
+        runtime.browser_starter = lambda url, title: calls.append((url, title))
         source = SimpleNamespace(
             bookSourceUrl="https://source",
             to_dict=lambda: {"bookSourceUrl": "https://source"},
@@ -677,12 +1409,12 @@ class RuleParserTests(unittest.TestCase):
         value = runtime.evaluate(
             '''@js:
             var response=java.startBrowser("https://media/video.m3u8","播放");
-            [response.url(),"直链:\\nhttps://media/video.m3u8"];''',
+            [response===undefined,"直链:\\nhttps://media/video.m3u8"];''',
             JsContext(source=source),
         )
-        self.assertEqual(value[0], "https://media/video.m3u8")
+        self.assertTrue(value[0])
         self.assertIn("https://media/video.m3u8", value[1])
-        self.assertEqual(calls, [])
+        self.assertEqual(calls, [("https://media/video.m3u8", "播放")])
 
         rendered = runtime.evaluate(
             "@js:java.startBrowser(result,title);"
@@ -691,9 +1423,53 @@ class RuleParserTests(unittest.TestCase):
                       title="视频"),
         )
         document = parse_content_blocks(rendered, "https://source/chapter")
+        self.assertEqual(calls[-1], ("https://media/video.m3u8", "视频"))
         self.assertEqual(document.blocks[-1].kind, "video")
         self.assertEqual(document.blocks[-1].value,
                          "https://media/video.m3u8")
+
+    def test_webview_bridge_preserves_html_js_and_capture_options(self):
+        runtime = LegadoJsRuntime()
+        calls = []
+
+        def fetch(url, title, options):
+            calls.append((url, title, options))
+            if options.get("sourceRegex"):
+                return {"body": "https://cdn/a.jpg", "source": "https://cdn/a.jpg",
+                        "url": url}
+            if options.get("overrideUrlRegex"):
+                return {"body": "https://host/final/42",
+                        "overrideUrl": "https://host/final/42", "url": url}
+            return {"body": "rendered", "url": url}
+
+        runtime.browser_fetcher = fetch
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:[
+              java.webView('<p>seed</p>','https://host/base','document.body.innerText'),
+              java.webViewGetSource(null,'https://host/page',null,'src="([^"]+)"'),
+              java.webViewGetOverrideUrl('', 'https://host/start', '', 'https://host/final/[0-9]+')
+            ]''', JsContext(source=source))
+        self.assertEqual(value, ["rendered", "https://cdn/a.jpg", "https://host/final/42"])
+        self.assertEqual(calls[0][2]["html"], "<p>seed</p>")
+        self.assertEqual(calls[0][2]["javaScript"], "document.body.innerText")
+        self.assertEqual(calls[1][2]["sourceRegex"], 'src="([^"]+)"')
+        self.assertEqual(calls[2][2]["overrideUrlRegex"], "https://host/final/[0-9]+")
+
+    def test_ajax_and_connect_return_error_stack_like_js_extensions(self):
+        runtime = LegadoJsRuntime()
+
+        def fail(*_args):
+            raise OSError("network-down")
+
+        runtime._request_json = fail
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            "@js:var a=java.ajax('https://host/fail');"
+            "var c=java.connect('https://host/fail');"
+            "[a.indexOf('network-down')>=0,c.body().indexOf('network-down')>=0,c.url()]",
+            JsContext(source=source))
+        self.assertEqual(value, [True, True, "https://host/fail"])
 
     def test_chapter_is_vip_method_uses_python_chapter_state(self):
         runtime = LegadoJsRuntime()
@@ -722,18 +1498,37 @@ class RuleParserTests(unittest.TestCase):
             first_id = first.device_id
             first.evaluate(
                 '@js:source.setVariable("state");source.putLoginHeader("{\\"A\\":\\"B\\"}");'
-                'cache.putFile("sort",{value:9});infoMap.choice="selected";infoMap.save()',
+                'cache.putFile("sort","9");cache.put("persist","value",60);'
+                'cache.putMemory("memory",{value:7});'
+                'infoMap.choice="selected";infoMap.save()',
                 JsContext(source=source, variables={}),
             )
             second = LegadoJsRuntime(state_dir=directory)
             value = second.evaluate(
                 '@js:[source.getVariable(),source.getLoginHeaderMap().A,'
-                'cache.getFile("sort").value,java.deviceID,infoMap.choice,'
+                'cache.getFile("sort"),cache.get("persist"),cache.getFromMemory("memory"),'
+                'java.deviceID,infoMap.choice,'
                 'java.androidId(),java.deviceID(),String(java.androidId)]',
                 JsContext(source=source, variables={}),
             )
-            self.assertEqual(value, ["state", "B", 9, first_id, "selected",
+            self.assertEqual(value, ["state", "B", "9", "value", None,
+                                     first_id, "selected",
                                      first_id, first_id, first_id])
+
+    def test_cache_expiry_removes_database_and_file_entries(self):
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            with patch("app.services.legado_js.time.time", return_value=100.0):
+                runtime._cache_put("db", json.dumps("value"), 1)
+                runtime._file_cache_put("file", json.dumps("value"), 1)
+            with patch("app.services.legado_js.time.time", return_value=102.0):
+                self.assertEqual(runtime._cache_get("db"), "")
+                self.assertEqual(runtime._file_cache_get("file"), "")
+            runtime._MEMORY_CACHE_LIMIT = 5
+            runtime._memory_cache_put("old", "123")
+            runtime._memory_cache_put("new", "456")
+            self.assertEqual(runtime._memory_cache_get("old"), "")
+            self.assertEqual(runtime._memory_cache_get("new"), "456")
 
     def test_symmetric_crypto_supports_string_and_byte_operations(self):
         runtime = LegadoJsRuntime()
@@ -760,6 +1555,25 @@ class RuleParserTests(unittest.TestCase):
             JsContext(source=source))
         self.assertEqual(value, 0)
 
+    def test_rhino_global_this_completion_and_date_timezone_surface(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            implicitRhinoValue=7;
+            [this.Packages===Packages,typeof globalThis,implicitRhinoValue,
+             new Date(0).getHours(),new Date(0).getTimezoneOffset(),
+             new Date(0).toString()];''', JsContext(source=source))
+        offset = runtime._timezone_offset_minutes(0)
+        self.assertEqual(value[:3], [True, "undefined", 7])
+        self.assertEqual(value[3], (offset // 60) % 24)
+        self.assertEqual(value[4], -offset)
+        self.assertEqual(value[5], runtime._date_to_string(0))
+        self.assertEqual(runtime.evaluate(
+            "@js:1;2;", JsContext(source=source)), 2)
+        self.assertIsNone(runtime.evaluate(
+            "@js:var declaredOnly=1;", JsContext(source=source)))
+
     def test_time_chapter_number_and_list_bridges(self):
         runtime = LegadoJsRuntime()
         source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
@@ -784,6 +1598,198 @@ class RuleParserTests(unittest.TestCase):
             '@js:java.timeFormatUTC(new Date(0),"yyyy-MM-dd HH",28800000)',
             JsContext(source=source))
         self.assertEqual(value, "1970-01-01 08")
+
+    def test_js_extensions_base64_android_flags_and_time_signature(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            "@js:[java.base64Encode('a',0),java.base64Encode('a',1|2|8),"
+            "java.base64Decode('YQ',8),java.base64DecodeToByteArray('',0),"
+            "java.timeFormat(0,'ss'),java.utf8ToGbk('汉')]",
+            JsContext(source=source),
+        )
+        self.assertEqual(value[:4], ["YQ==\n", "YQ", "a", None])
+        self.assertEqual(value[4], datetime.fromtimestamp(0).strftime("%Y/%m/%d %H:%M"))
+        self.assertEqual(value[5], "汉".encode("gb18030").decode("utf-8", errors="replace"))
+
+    def test_js_extensions_ajax_list_concurrency_and_connect_header_overload(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        calls = []
+        active = 0
+        maximum_active = 0
+        lock = threading.Lock()
+
+        def request(value, _headers=None, _base=None):
+            nonlocal active, maximum_active
+            calls.append(value)
+            with lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            time.sleep(0.04)
+            with lock:
+                active -= 1
+            url = str(value).split(",", 1)[0]
+            return json.dumps({"body": url, "headers": {}, "status": 200, "url": url})
+
+        runtime._request_json = request
+        value = runtime.evaluate(
+            "@js:var all=java.ajaxAll(['u1','u2','u3']);"
+            "var one=java.ajax(['first','ignored']);"
+            "var response=java.connect('target','{\\\"X-Test\\\":\\\"yes\\\"}');"
+            "[all.map(x=>x.body()),one,response.body()]",
+            JsContext(source=source),
+        )
+        self.assertEqual(value, [["u1", "u2", "u3"], "first", "target"])
+        self.assertEqual(maximum_active, 3)
+        self.assertTrue(any('"X-Test":"yes"' in call for call in calls))
+
+    def test_inherited_js_encode_utils_digest_and_symmetric_helpers(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            """@js:
+            var des=java.desEncodeToBase64String('content','12345678',
+              'DES/CBC/PKCS5Padding','87654321');
+            var triple=java.tripleDESEncodeBase64Str('content','123456789012345678901234',
+              'CBC','PKCS5Padding','12345678');
+            var crypto=java.createSymmetricCrypto('AES/CBC/PKCS5Padding',
+              '1234567890abcdef','abcdef1234567890');
+            [java.digestBase64Str('abc','SHA-256'),
+             java.desBase64DecodeToString(des,'12345678','DES/CBC/PKCS5Padding','87654321'),
+             java.tripleDESDecodeStr(triple,'123456789012345678901234','CBC','PKCS5Padding','12345678'),
+             crypto.encryptHex('a')];""",
+            JsContext(source=source),
+        )
+        self.assertEqual(value[:3], [
+            base64.b64encode(hashlib.sha256(b"abc").digest()).decode(),
+            "content", "content",
+        ])
+        self.assertRegex(value[3], r"^[0-9a-f]{32}$")
+
+    def test_inherited_js_encode_utils_rsa_and_signature_objects(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            """@js:
+            var rsa=java.createAsymmetricCrypto('RSA/ECB/PKCS1Padding');
+            var publicCipher=rsa.encryptBase64('public-data');
+            var privateCipher=rsa.encryptHex('private-data',false);
+            var signer=java.createSign('SHA256withRSA');
+            var signature=signer.sign('message');
+            var signatureHex=signer.signHex('message');
+            var oaep=java.createAsymmetricCrypto('RSA/ECB/OAEPWithSHA-256AndMGF1Padding');
+            var oaepCipher=oaep.encryptBase64('oaep-sha256');
+            var raw=java.createAsymmetricCrypto('RSA/ECB/NoPadding');
+            var rawCipher=raw.encrypt([1,2,3]);
+            var rawPlain=raw.decrypt(rawCipher,false);
+            [rsa.decryptStr(publicCipher,false),rsa.decryptStr(privateCipher,true),
+             signer.verify('message',signature),signer.verify('other',signature),
+             signer.verify('message',signatureHex),oaep.decryptStr(oaepCipher,false),
+             rawPlain.slice(-3)];""",
+            JsContext(source=source),
+        )
+        self.assertEqual(value, ["public-data", "private-data", True, False, True,
+                                 "oaep-sha256", [1, 2, 3]])
+
+    def test_symmetric_crypto_null_key_is_random_and_object_local(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            """@js:
+            var first=java.createSymmetricCrypto('AES/CBC/PKCS5Padding',null,null);
+            var second=java.createSymmetricCrypto('AES/CBC/PKCS5Padding',null,null);
+            var a=first.encryptBase64('content'),b=second.encryptBase64('content');
+            [a!==b,first.decryptStr(a),second.decryptStr(b)];""",
+            JsContext(source=source),
+        )
+        self.assertEqual(value, [True, "content", "content"])
+
+    def test_rhino_sleep_and_java_thread_sleep_are_blocking(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        started = time.perf_counter()
+        value = runtime.evaluate(
+            "@js:sleep(20);Packages.java.lang.Thread.sleep(20);'done'",
+            JsContext(source=source),
+        )
+        self.assertEqual(value, "done")
+        self.assertGreaterEqual(time.perf_counter() - started, 0.035)
+
+    def test_js_extensions_html_format_ports_format_keep_img(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            "@js:java.htmlFormat(' <div>A&nbsp;&nbsp;<span>B</span><br> ' +"
+            "'C&thinsp;<img class=\\\"x\\\" data-src=\\\"/lazy\\\" src=\\\"/old\\\"></div> ')",
+            JsContext(source=source),
+        )
+        self.assertEqual(value, "　　A B\n　　C<img src=\"/lazy\">")
+
+    def test_query_ttf_returns_historical_query_object_methods(self):
+        from fontTools.fontBuilder import FontBuilder
+        from fontTools.pens.ttGlyphPen import TTGlyphPen
+
+        builder = FontBuilder(1000, isTTF=True)
+        builder.setupGlyphOrder([".notdef", "A"])
+        builder.setupCharacterMap({65: "A"})
+        empty_pen = TTGlyphPen(None)
+        glyph_pen = TTGlyphPen(None)
+        glyph_pen.moveTo((100, 0))
+        glyph_pen.lineTo((500, 800))
+        glyph_pen.lineTo((900, 0))
+        glyph_pen.closePath()
+        builder.setupGlyf({".notdef": empty_pen.glyph(), "A": glyph_pen.glyph()})
+        builder.setupHorizontalMetrics({".notdef": (1000, 0), "A": (1000, 0)})
+        builder.setupHorizontalHeader(ascent=800, descent=-200)
+        builder.setupNameTable({"familyName": "RuleFont", "styleName": "Regular"})
+        builder.setupOS2(sTypoAscender=800, sTypoDescender=-200,
+                         usWinAscent=800, usWinDescent=200)
+        builder.setupPost()
+        builder.setupMaxp()
+        output = BytesIO()
+        builder.save(output)
+        encoded = base64.b64encode(output.getvalue()).decode()
+
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            "@js:var font=java.queryBase64TTF('" + encoded + "');"
+            "var glyph=font.getGlyfByCode(65);"
+            "[font.getNameById(1),font.inLimit(65),font.inLimit(66),glyph.length>0,"
+            "font.getCodeByGlyf(glyph),font.codeToGlyph.get('65'),"
+            "java.queryBase64TTF('')]",
+            JsContext(source=source),
+        )
+        self.assertEqual(value[:5], ["RuleFont", True, False, True, 65])
+        self.assertEqual(value[5], runtime._font_operation(
+            next(iter(runtime.font_store)), "glyph", "65"))
+        self.assertIsNone(value[6])
+
+    def test_js_url_matches_historical_fields_including_origin_quirk(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            "@js:var a=java.toURL('/p?a=hello+world','https://host:8080/base');"
+            "var b=java.toURL('https://host/plain');"
+            "[a.host,a.pathname,a.searchParams.get('a'),a.origin,"
+            "Object.prototype.hasOwnProperty.call(a,'href'),b.searchParams]",
+            JsContext(source=source),
+        )
+        self.assertEqual(value, [
+            "host", "/p", "hello world",
+            "https://host:https://host:8080/p?a=hello+world:8080", False, None,
+        ])
+
+    def test_to_num_chapter_only_rewrites_the_historical_title_pattern(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            "@js:[java.toNumChapter('前言十二'),java.toNumChapter('卷一 第１２ 章 后'),"
+            "java.toNumChapter('第未知章'),java.toNumChapter(null)]",
+            JsContext(source=source),
+        )
+        self.assertEqual(value, ["前言十二", "卷一 第12章 后", "第-1章", None])
 
     def test_jsoup_bridge_supports_select_text_and_attribute(self):
         runtime = LegadoJsRuntime()
@@ -842,6 +1848,125 @@ class RuleParserTests(unittest.TestCase):
             [contains,d.text(),list.size(),String(d).includes('<i>')];''',
             JsContext(source=source))
         self.assertEqual(value, [True, "A", 1, False])
+
+    def test_jsoup_document_element_and_elements_long_tail_methods(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var d=org.jsoup.Jsoup.parse('<main><p id="a" class="x">A</p><p>B</p><input></main>');
+            var first=d.getElementById('a'), second=first.nextElementSibling();
+            var before=[first.id(),first.className(),first.childrenSize(),
+              first.elementSiblingIndex(),second.previousElementSibling().id(),
+              first.siblingElements().size(),d.getElementsByTag('p').size(),
+              d.getElementsByClass('x').size(),d.getElementsByAttribute('id').size()];
+            first.attr('data-v','1').addClass('y').removeClass('x').toggleClass('z');
+            second.text('C').tagName('section');
+            d.select('input').val('V');
+            d.select('section').html('<b>D</b>');
+            [before,first.attr('data-v'),first.className(),second.tagName(),
+             second.child(0).tagName(),d.select('input').val(),d.text()];''',
+            JsContext(source=source))
+        self.assertEqual(value, [
+            ["a", "x", 0, 0, "a", 2, 2, 1, 1],
+            "1", "y z", "section", "b", "V", "A D",
+        ])
+
+    def test_jsoup_object_views_filter_and_wrap_mutations(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var d=org.jsoup.Jsoup.parse('<main><div id="a" class="x y" data-k="v"> A <span>B</span><!--c--></div><script>raw</script><p>C</p></main>');
+            var e=d.select('#a').first(),attrs=e.attributes(),dataset=e.dataset();
+            var before=[attrs.get('id'),attrs.hasKeyIgnoreCase('ID'),dataset.get('k'),
+              e.classNames().contains('y'),e.classNames().size(),e.textNodes().size(),
+              e.textNodes().get(0).getWholeText(),d.select('script').dataNodes().get(0).getWholeData(),
+              e.comments().get(0).getData(),e.is('div#a'),e.closest('main').tagName(),
+              e.selectFirst('span').text(),e.select('div#a').size(),
+              d.select('div,p').not('.x').text(),e.getElementsByTag('div').size(),
+              e.getElementsByClass('X').size(),e.getElementsByAttribute('DATA-K').size(),
+              e.getElementsByAttributeValue('data-k','V').size(),
+              e.getElementsContainingText('B').size(),
+              e.getElementsMatchingOwnText('^A$').size()];
+            attrs.put('title','T');dataset.put('k','w');
+            e.prependText('P').appendText('Q');e.appendElement('i').text('I');
+            e.wrap('<section class="w"><article></article></section>');
+            var wrapped=d.select('section.w > article > div#a').size();
+            d.select('article').unwrap();
+            [before,e.attr('title'),e.attr('data-k'),wrapped,
+             d.select('section.w > div#a').size(),d.select('div,p').is('p')];''',
+            JsContext(source=source))
+        self.assertEqual(value, [
+            ["a", True, "v", True, 2, 1, " A ", "raw", "c",
+             True, "main", "B", 1, "C", 1, 1, 1, 1, 2, 1],
+            "T", "w", 1, 1, True,
+        ])
+
+    def test_jsoup_html_mutation_uses_element_fragment_context(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var d=org.jsoup.Jsoup.parse('<table><tbody></tbody></table><select></select>');
+            d.select('tbody').html('<tr><td>A</td></tr>');
+            d.select('tr').append('<td>B</td>');
+            d.select('select').append('<option value="1">One</option>');
+            [d.select('tbody > tr').size(),d.select('tr > td').eachText(),
+             d.select('option').val(),d.select('table').text()];''',
+            JsContext(source=source))
+        self.assertEqual(value, [1, ["A", "B"], "1", "A B"])
+
+    def test_jsoup_css_xpath_tag_and_url_long_tail(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var d=org.jsoup.Jsoup.parse('<main><section><p class="x">A</p><p class="x">B</p></section><a href="../c">C</a></main>',
+              'https://example.test/a/b');
+            var second=d.select('p').get(1),found=d.selectXpath('//section/p[2]').first();
+            [second.cssSelector(),found===second,second.tag().getName(),
+             second.tag().normalName(),second.tag().isBlock(),second.baseUri(),
+             d.select('a').first().absUrl('href'),d.expectFirst('main').tagName(),
+             d.tagName(),d.nodeName()];''',
+            JsContext(source=source))
+        self.assertEqual(value, [
+            "html > body > main > section > p.x:nth-child(2)", True,
+            "p", "p", True, "https://example.test/a/b",
+            "https://example.test/c", "main", "#root", "#document",
+        ])
+
+    def test_jsoup_document_output_settings_are_observable(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var d=org.jsoup.Jsoup.parse('<div title="<">&nbsp;<p>A</p><br></div>');
+            var out=d.outputSettings();out.prettyPrint(false);
+            var compact=d.select('div').outerHtml();
+            out.prettyPrint(true).indentAmount(2);
+            var indented=d.select('div').outerHtml().includes('\\n  <p>');
+            out.prettyPrint(false).syntax(org.jsoup.nodes.Document.OutputSettings.Syntax.xml)
+              .escapeMode(org.jsoup.nodes.Entities.EscapeMode.xhtml);
+            [compact,indented,d.select('div').outerHtml(),out.syntax(),out.escapeMode()];''',
+            JsContext(source=source))
+        self.assertEqual(value, [
+            '<div title="<">&nbsp;<p>A</p><br></div>', True,
+            '<div title="&lt;">&#xa0;<p>A</p><br /></div>', "xml", "xhtml",
+        ])
+
+    def test_jsoup_node_insertions_move_shared_identity(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var d=org.jsoup.Jsoup.parse('<main><div id="a"><i>A</i></div><section id="b"><b>B</b></section></main>');
+            var a=d.getElementById('a'),b=d.getElementById('b'),i=a.child(0),bold=b.child(0);
+            b.prependChild(i);bold.appendTo(a);a.insertChildren(0,b.children());
+            [i.parent().id(),bold.parent().id(),a.children().eachText(),b.childrenSize(),
+             d.select('i').first()===i,d.select('i').first().__handle===i.__handle];''',
+            JsContext(source=source))
+        self.assertEqual(value, ["a", "a", ["A", "B"], 0, True, True])
 
     def test_jsoup_matches_and_matches_own_are_regex_filters(self):
         markup = ('<div><a href="/1"><span>下一页</span></a>'
@@ -1055,12 +2180,135 @@ class RuleParserTests(unittest.TestCase):
             var encoded=java.aesEncodeToBase64String("content",key,transformation,iv);
             var encodedBytes=java.aesEncodeToBase64ByteArray("content",key,transformation,iv);
             [java.aesBase64DecodeToString(encoded,key,transformation,iv),
+             java.aesEncodeToString(encoded,key,transformation,iv),
              java.bytesToStr(encodedBytes),
              java.aesBase64DecodeToByteArray(encoded,key,transformation,iv)];''',
             JsContext(source=source))
-        self.assertEqual(value[0], "content")
-        self.assertTrue(value[1])
-        self.assertEqual(bytes(value[2]), b"content")
+        self.assertEqual(value[:2], ["content", "content"])
+        self.assertTrue(value[2])
+        self.assertEqual(bytes(item & 255 for item in value[3]), b"content")
+
+    def test_java_byte_arrays_use_signed_values_and_round_trip_as_unsigned_bytes(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            "@js:[java.hexDecodeToByteArray('80ff7f'),"
+            "java.strToBytes('ÿ','ISO-8859-1'),"
+            "java.bytesToStr([-1],'ISO-8859-1')]",
+            JsContext(source=source),
+        )
+        self.assertEqual(value, [[-128, -1, 127], [-1], "ÿ"])
+
+    def test_js_extensions_s2t_and_zip_content_overloads(self):
+        output = BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("folder/test.txt", "\u9605\u8bfb".encode("gb18030"))
+            archive.writestr("folder/skipped.txt", b"skipped")
+        archive_hex = output.getvalue().hex()
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            "@js:[java.s2t('\\u6c49\\u9f99'),"
+            f"java.getZipStringContent('{archive_hex}','folder/test.txt','gb18030'),"
+            f"java.getZipByteArrayContent('{archive_hex}','folder/test.txt'),"
+            f"java.getZipByteArrayContent('{archive_hex}','folder/skipped.txt')]",
+            JsContext(source=source),
+        )
+        self.assertEqual(value[:2], ["\u6f22\u9f8d", "\u9605\u8bfb"])
+        self.assertEqual(bytes(item & 255 for item in value[2]), "\u9605\u8bfb".encode("gb18030"))
+        self.assertIsNone(value[3])
+
+    def test_js_extensions_download_and_external_cache_file_operations(self):
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+            value = runtime.evaluate(
+                """@js:
+                var missing=java.downloadFile('e99885e8afbb','https://host/book.txt');
+                var path=java.downloadFile('e99885e8afbb','https://host/book.txt,{"type":"txt"}');
+                var file=java.getFile(path);
+                var before=[path,file.exists(),java.readTxtFile(path),java.readFile(path)];
+                var removed=java.deleteFile(path);
+                [missing,before,removed,file.exists()];""",
+                JsContext(source=source),
+            )
+            self.assertEqual(value[0], "")
+            self.assertRegex(value[1][0], r"^/[0-9a-f]{16}\.txt$")
+            self.assertEqual(value[1][1:3], [True, "\u9605\u8bfb"])
+            self.assertEqual(bytes(item & 255 for item in value[1][3]), "\u9605\u8bfb".encode())
+            self.assertEqual(value[2:], [True, False])
+
+    def test_import_script_uri_provider_and_blank_content_failure(self):
+        runtime = LegadoJsRuntime()
+        runtime.uri_reader = lambda uri: "var imported='" + uri + "';"
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        self.assertEqual(runtime.evaluate(
+            "@js:java.importScript('content://scripts/main.js')",
+            JsContext(source=source)), "var imported='content://scripts/main.js';")
+        runtime.uri_reader = lambda _uri: "  "
+        with self.assertRaises(Exception):
+            runtime.evaluate("@js:java.importScript('content://scripts/empty.js')",
+                             JsContext(source=source))
+
+    def test_js_extensions_unarchive_and_consume_text_folder(self):
+        output = BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("a.txt", "A")
+            archive.writestr("b.txt", "B")
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+            value = runtime.evaluate(
+                "@js:var zip=java.downloadFile('" + output.getvalue().hex() +
+                "','https://host/files.zip,{\"type\":\"zip\"}');var folder=java.unzipFile(zip);"
+                "[folder,java.getTxtInFolder(folder),java.getFile(folder).exists()]",
+                JsContext(source=source),
+            )
+            self.assertRegex(value[0], r"^ArchiveTemp\\[0-9a-f]{16}$")
+            self.assertEqual(value[1], "A\nB")
+            self.assertFalse(value[2])
+
+    def test_js_extensions_7z_content_and_directory_extraction(self):
+        import py7zr
+
+        output = BytesIO()
+        with py7zr.SevenZipFile(output, "w") as archive:
+            archive.writestr("\u4e03\u538b\u7f29".encode(), "book.txt")
+        archive_hex = output.getvalue().hex()
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+            value = runtime.evaluate(
+                "@js:var data='" + archive_hex + "';"
+                "var path=java.downloadFile(data,'https://host/book.7z,{\"type\":\"7z\"}');"
+                "var folder=java.un7zFile(path);"
+                "[java.get7zStringContent(data,'book.txt','utf-8'),"
+                "java.get7zByteArrayContent(data,'book.txt'),"
+                "java.readTxtFile(folder+'\\\\book.txt')]",
+                JsContext(source=source),
+            )
+            self.assertEqual(value[0], "\u4e03\u538b\u7f29")
+            self.assertEqual(bytes(item & 255 for item in value[1]), "\u4e03\u538b\u7f29".encode())
+            self.assertEqual(value[2], "\u4e03\u538b\u7f29")
+
+    def test_js_extensions_rar_content_and_directory_extraction(self):
+        fixture = Path("base_history/rarfile/test/files/rar3-subdirs.rar")
+        archive_hex = fixture.read_bytes().hex()
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+            value = runtime.evaluate(
+                "@js:var data='" + archive_hex + "';"
+                "var path=java.downloadFile(data,'https://host/book.rar,{\"type\":\"rar\"}');"
+                "var folder=java.unrarFile(path);"
+                "[java.getRarStringContent(data,'sub/dir1/file1.txt','utf-8'),"
+                "java.getRarByteArrayContent(data,'sub/dir2/file2.txt'),"
+                "java.readTxtFile(folder+'\\\\sub\\\\dir1\\\\file1.txt')]",
+                JsContext(source=source),
+            )
+            self.assertEqual(value[0], "file1\n")
+            self.assertEqual(bytes(item & 255 for item in value[1]), b"file2\n")
+            self.assertEqual(value[2], "file1\n")
 
     def test_request_config_after_page_template(self):
         request = parse_search_url(
@@ -1161,6 +2409,417 @@ class RuleParserTests(unittest.TestCase):
         data = {"items": [{"ok": True, "id": 1}, {"ok": False, "id": 2}]}
         self.assertEqual(evaluate(data, "$.items[?(@.ok == true)].id", "json"), [1])
 
+    def test_jsonpath_values_use_java_json_string_forms(self):
+        data = {"enabled": True, "disabled": False, "missing": None,
+                "item": {"id": 1, "name": "书"}}
+        self.assertEqual(extract_value(data, "$.enabled", "json"), "true")
+        self.assertEqual(extract_value(data, "$.disabled", "json"), "false")
+        self.assertEqual(extract_value(data, "$.missing", "json"), "")
+        self.assertEqual(extract_value(data, "$.item", "json"),
+                         "{id=1, name=书}")
+        self.assertEqual(extract_value(data, "status={{$.enabled}}", "json"),
+                         "status=true")
+
+    def test_json_smart_numeric_types_order_and_container_text(self):
+        raw = ('{"b":1,"2":"x","a":3,"1":"y",'
+               '"large":2147483648,"huge":9223372036854775807,'
+               '"too":9223372036854775808,"decimal":1.25,'
+               '"precise":1.234567890123456789,"exp":1e3,'
+               '"array":[1,"x",true,null,{"z":2}]}')
+        root, kind = LegadoReadingEngine._root(raw, "application/json")
+        self.assertEqual(kind, "json")
+        self.assertEqual(list(root)[:4], ["b", "2", "a", "1"])
+        self.assertIsInstance(root["large"], int)
+        self.assertIsInstance(root["too"], int)
+        self.assertIsInstance(root["decimal"], float)
+        self.assertEqual(root["precise"], Decimal("1.234567890123456789"))
+        self.assertEqual(root["exp"], 1000.0)
+        self.assertEqual(extract_value(root, "$.array", "json"),
+                         "1\nx\ntrue\nnull\n{z=2}")
+        self.assertTrue(extract_value(root, "$", "json").startswith(
+            "{b=1, 2=x, a=3, 1=y, large=2147483648"))
+
+    def test_balanced_embedded_jsonpath_allows_closing_brace_in_filter(self):
+        data = {"items": [{"text": "}"}, {"text": "other"}]}
+        self.assertEqual(
+            extract_value(data, "value={$.items[?(@.text == '}')].text}", "json"),
+            "value=}")
+
+    def test_get_string_unescapes_html4_after_jsonpath_pipeline(self):
+        data = {"title": "A &amp; B &#x4E66;", "path": "/a?x=1&amp;y=2"}
+        self.assertEqual(extract_value(data, "$.title", "json"), "A & B 书")
+        self.assertEqual(extract_value(data, "{$.title}", "json"), "A & B 书")
+        self.assertEqual(extract_value(data, "$.path", "json", "https://host/base"),
+                         "https://host/a?x=1&y=2")
+
+    def test_jsoup_attribute_results_drop_empty_values_and_duplicates(self):
+        root = BeautifulSoup(
+            '<a href="/same">A</a><a href="/same">B</a><a href="">C</a>'
+            '<a>D</a><a href="/next">E</a>', "html.parser")
+        self.assertEqual(evaluate(root, "a@href", "html"), ["/same", "/next"])
+
+    def test_xpath_element_string_is_markup_not_python_object_repr(self):
+        root = BeautifulSoup('<main><p class="x">正文<b>粗体</b></p></main>',
+                             "html.parser")
+        value = extract_value(root, "//p[@class='x']", "html")
+        self.assertIn('<p class="x">', value)
+        self.assertIn("正文", value)
+        self.assertNotIn("Element at 0x", value)
+        fragment = parse_markup("<p>fragment</p>")
+        self.assertEqual(evaluate(
+            fragment, "/html/body/p/text()", "html"), ["fragment"])
+        cell = parse_markup("<td>cell</td>")
+        self.assertEqual(evaluate(
+            cell, "/html/body/text()", "html"), ["cell"])
+        self.assertEqual(evaluate(
+            cell, "/html/body/table/tr/td/text()", "html"), [])
+        row = parse_markup("<tr><td>row</td></tr>")
+        self.assertEqual(evaluate(
+            row, "/html/body/text()", "html"), ["row"])
+        self.assertEqual(evaluate(
+            row, "/html/body/table/tr/td/text()", "html"), [])
+
+    def test_xpath_jsoupxpath_node_tests(self):
+        root = parse_markup(
+            '<div id="x">A<b>B</b>C 12.5 kg</div>')
+        self.assertEqual(evaluate(root, "//div/html()", "html"),
+                         ["A<b>B</b>C 12.5 kg"])
+        self.assertEqual(evaluate(root, "//div/outerHtml()", "html"),
+                         ['<div id="x">A<b>B</b>C 12.5 kg</div>'])
+        self.assertEqual(evaluate(root, "//div/allText()", "html"),
+                         ["ABC 12.5 kg"])
+        self.assertEqual(evaluate(root, "//div/num()", "html"), [12.5])
+
+    def test_html5_tree_repair_matches_fixed_jsoup_structure(self):
+        table = parse_markup("<table><tr><td>A<td>B</table>")
+        self.assertEqual(
+            [node.get_text() for node in select_jsoup(table, "table > tbody > tr > td")],
+            ["A", "B"])
+        blocks = parse_markup("<p>one<div>two</div>three")
+        self.assertEqual([node.get_text() for node in select_jsoup(
+            blocks, "body > p, body > div")], ["one", "two"])
+        items = parse_markup("<ul><li>one<li>two</ul>")
+        self.assertEqual([node.get_text() for node in select_jsoup(
+            items, "li:nth-child(2)")], ["two"])
+
+    def test_compound_wildcard_namespace_matches_fixed_jsoup(self):
+        root = parse_markup(
+            "<div><span>A</span><x:span>B</x:span>"
+            "<p><x:span>C</x:span></p></div>")
+        self.assertEqual([node.get_text() for node in select_jsoup(
+            root, "div > *|span")], ["A", "B"])
+
+    def test_jsoup_selector_escape_and_empty_group_quirks(self):
+        root = parse_markup(
+            '<div id="a:b" class="x+y 123" data-v="A:B C">One</div>'
+            '<p data-v="A B">Two</p><span>Three</span>')
+        self.assertEqual([node.get_text() for node in select_jsoup(
+            root, r"#a\:b")], ["One"])
+        self.assertEqual(select_jsoup(root, r"#a\3A b"), [])
+        self.assertEqual(select_jsoup(root, r".\31 23"), [])
+        self.assertEqual(select_jsoup(root, r"[data-v=A\:B\ C]"), [])
+        self.assertEqual([node.get_text() for node in select_jsoup(
+            root, "[data-v=A B]")], ["Two"])
+        self.assertEqual([node.get_text() for node in select_jsoup(
+            root, "div,,span")], ["One", "Three"])
+
+    def test_jsoup_class_and_attribute_selectors_ignore_case(self):
+        root = parse_markup('<main><div class="Mixed" data-v="AbCd">A</div></main>')
+        for selector in (
+                ".mixed", ".MIXED", "[data-v=abcd]", "[data-v^=AB]",
+                "[data-v$=CD]", "[data-v*=BC]"):
+            with self.subTest(selector=selector):
+                self.assertEqual([node.name for node in select_jsoup(root, selector)],
+                                 ["div"])
+
+    def test_jsoup_attribute_regex_balancing_and_invalid_eq(self):
+        root = parse_markup(
+            '<main data-num="x12y" data-v="A]B"><section data-v="AbC">A</section>'
+            '<section data-v="a]b">B</section></main>')
+        cases = {
+            r"[data-num~=\d+]": ["main"],
+            r"[data-v~=[A-Z]]": ["main", "section"],
+            r"[data-v~=A\]B]": ["main"],
+            r"[data-v~=[^\]]+]": ["main", "section", "section"],
+            "[^data-]": ["main", "section", "section"],
+        }
+        for selector, expected in cases.items():
+            with self.subTest(selector=selector):
+                self.assertEqual([node.name for node in select_jsoup(root, selector)],
+                                 expected)
+        with self.assertRaises(Exception):
+            select_jsoup(root, "section:eq(-1)")
+        with self.assertRaises(Exception):
+            select_jsoup(root, "[data-v~=[]")
+
+    def test_jsoup_document_root_participates_in_selection(self):
+        root = parse_markup('<main data-v="ABC"><p>A</p></main>')
+        selected = select_jsoup(root, "[data-v!=ABC]")
+        self.assertIs(selected[0], root)
+        self.assertEqual([node.name for node in selected[1:]],
+                         ["html", "head", "body", "p"])
+
+    def test_jsoup_js_dom_invalid_selector_propagates(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        with self.assertRaises(Exception):
+            runtime.evaluate(
+                "@js:org.jsoup.Jsoup.parse('<p>A</p>').select('p:eq(-1)')",
+                JsContext(source=source))
+
+    def test_xpath_jsoupxpath_extended_operators_and_axes(self):
+        root = parse_markup(
+            '<ul><li code="alpha-1">A</li><li code="beta-2">B</li>'
+            '<li code="alpha-3">C</li></ul>')
+        self.assertEqual(evaluate(
+            root, "//li[@code^='alpha']/text()", "html"), ["A", "C"])
+        self.assertEqual(evaluate(
+            root, "//li[@code$='2']/text()", "html"), ["B"])
+        self.assertEqual(evaluate(
+            root, "//li[@code*='ha-']/text()", "html"), ["A", "C"])
+        self.assertEqual(evaluate(
+            root, "//li[@code~='^beta.*']/text()", "html"), ["B"])
+        self.assertEqual(evaluate(
+            root, "//li[@code!~='^beta.*']/text()", "html"), ["A", "C"])
+        self.assertEqual(evaluate(
+            root, "//li[2]/following-sibling-one::li/text()", "html"), ["C"])
+        self.assertEqual(evaluate(
+            root, "//li[3]/preceding-sibling-one::li/text()", "html"), ["B"])
+
+    def test_xpath_jsoupxpath_extended_string_functions(self):
+        root = parse_markup("<p>a/b/c.txt</p>")
+        self.assertEqual(evaluate(
+            root, "@XPath:substring-ex(//p/text(),2,-4)", "html"), ["b/c"])
+        self.assertEqual(evaluate(
+            root, "@XPath:substring-after-last(//p/text(),'/')", "html"), ["c.txt"])
+        self.assertEqual(evaluate(
+            root, "@XPath:substring-before-last(//p/text(),'/')", "html"), ["a/b"])
+        self.assertEqual(evaluate(
+            root, "@XPath:substring-before-last(//p/text(),'|')", "html"), [""])
+        date_value = evaluate(
+            root,
+            "@XPath:format-date('2019-01-21 19:05:42','yyyy-MM-dd HH:mm:ss')",
+            "html")[0]
+        self.assertIsInstance(date_value, JavaDateValue)
+        self.assertIn("Jan 21 19:05:42", str(date_value))
+
+    def test_xpath_num_uses_all_text_and_accepts_leading_decimal(self):
+        root = parse_markup("<div>label <b>.69</b></div>")
+        self.assertEqual(evaluate(root, "//div/num()", "html"), [0.69])
+        nested = parse_markup(
+            "<ul><li><span>900</span></li><li><span>1200</span></li></ul>")
+        self.assertEqual(evaluate(
+            nested, "//li[./span/num()>1000]/span/text()", "html"), ["1200"])
+
+    def test_jsoupxpath_253_official_douban_matrix(self):
+        html = Path(
+            "base_history/JsoupXpath-2.5.3/src/test/resources/d_test.html"
+        ).read_text(encoding="utf-8")
+        root = parse_markup(html)
+        cases = (
+            ("//ul[@class='subject-list']/li[position()<3][last()]"
+             "/div/h2/allText()",
+             "黑客与画家 : 硅谷创业之父Paul Graham文集"
+             "T2-黑客与画家 : 硅谷创业之父Paul Graham文集"),
+            ("//ul[@class='subject-list']/li[2]/div/h2//text()",
+             "黑客与画家: 硅谷创业之父Paul Graham文集"
+             "T2-黑客与画家: 硅谷创业之父Paul Graham文集"),
+            ("//ul[@class='subject-list']/li[first()]/div/h2/allText()",
+             "失控 : 全人类的最终命运和结局"
+             "T2-失控 : 全人类的最终命运和结局"),
+            ("//ul[@class='subject-list']/li[./div/div/span[@class='pl']"
+             "/num()>(1000+90*(2*50))][last()][1]/div/h2/allText()",
+             "长尾理论长尾理论"),
+            ("//ul[@class='subject-list']/li[contains(./div/div/"
+             "span[@class='pl']//text(),'14582')]/div/h2//text()",
+             "黑客与画家: 硅谷创业之父Paul Graham文集"
+             "T2-黑客与画家: 硅谷创业之父Paul Graham文集"),
+            ("//*[@id='subject_list']/ul[1]/li[8]/div[2]/div[2]/"
+             "span[3]/num()", "3734"),
+            ("//a[@id]/@href | //*[@id='subject_list']/ul[1]/li[8]/"
+             "div[2]/div[2]/span[3]/num()",
+             "https://www.douban.com/doumail/3734"),
+        )
+        for xpath, expected in cases:
+            with self.subTest(xpath=xpath):
+                self.assertEqual("".join(map(str, evaluate(root, xpath, "html"))),
+                                 expected)
+        self.assertEqual(len(evaluate(root, "//ul[@class]", "html")), 3)
+
+    def test_jsoupxpath_253_official_text_node_matrix(self):
+        root = parse_markup(
+            '<p><span class="text-muted">分类：</span>动漫'
+            '<span class="split-line"></span>'
+            '<span class="text-muted hidden-xs">地区：</span>日本'
+            '<span class="split-line"></span>'
+            '<span class="text-muted hidden-xs">年份：</span>2010</p>')
+        self.assertEqual(evaluate(root, "//text()[3]", "html"), ["2010"])
+        self.assertEqual("".join(evaluate(root, "//text()", "html")),
+                         "分类：动漫地区：日本年份：2010")
+        child_order = parse_markup("<p> one <span> two</span> three </p>")
+        self.assertEqual(evaluate(child_order, "//text()[2]", "html"),
+                         ["three"])
+        ancestry = parse_markup(
+            "<div class='a'> a <div>need</div> "
+            "<div class='e'> not need</div> c </div>")
+        selected = set(evaluate(
+            ancestry,
+            "//div[@class='a']//text()[not(ancestor::div[@class='e'])]",
+            "html"))
+        self.assertEqual(selected, {"", "a", "need", "c"})
+
+    def test_jsoupxpath_253_official_axis_matrix(self):
+        root = parse_markup(
+            "<div class='a'>1</div><div>2</div><div class='a'>3</div>"
+            "<div>4</div><div>5</div>11<tag>6</tag>12"
+            "<div>7<span>8</span></div>")
+        cases = (
+            ("//div[text()='5']/following-sibling::div/text()", "7"),
+            ("//div[text()='5']/following-sibling::tag/text()", "6"),
+            ("//div[text()='5']/following::text()", "11 6 12 7 8"),
+            ("//div[text()='4']/following::div/text()", "5 7"),
+            ("//div[text()='3']/preceding::text()", "2 1"),
+        )
+        for xpath, expected in cases:
+            with self.subTest(xpath=xpath):
+                self.assertEqual(" ".join(evaluate(root, xpath, "html")), expected)
+        self.assertEqual(evaluate(
+            root, "//div[text()='7']/preceding-sibling::div/text()", "html")[0],
+            "5")
+        self.assertEqual(evaluate(
+            root, "//div[text()='5']/following-sibling::text()", "html")[0],
+            "11")
+        self.assertEqual(evaluate(
+            root, "//div[text()='7']/preceding-sibling::text()", "html")[0],
+            "12")
+
+    def test_jsoupxpath_253_official_sum_and_num_matrix(self):
+        root = parse_markup(Path(
+            "base_history/JsoupXpath-2.5.3/src/test/resources/issue66.html"
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(evaluate(
+            root, "@XPath:count(//bookstore/book)", "html"), [4])
+        self.assertEqual(evaluate(
+            root, "@XPath:sum(//bookstore/book/year[num()<2005])", "html"),
+            [4006])
+        self.assertEqual(evaluate(
+            root, "@XPath:sum(//bookstore/book/title)", "html"), [""])
+
+    def test_jxnode_number_boolean_and_element_bridge_identity(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var numbers=java.getElements('@XPath:count(//p)');
+            var flags=java.getElements('@XPath:boolean(//p)');
+            var nodes=java.getElements('@XPath://p');
+            [numbers.size(),numbers[0].isNumber(),numbers[0].asDouble(),
+             numbers[0].value(),numbers[0].asString(),
+             flags[0].isBoolean(),flags[0].asBoolean(),flags[0].value(),
+             nodes[0].isElement(),nodes[0].asString(),
+             nodes[0].asElement().tagName()];''',
+            JsContext(source=source, result="<main><p>A</p></main>"))
+        self.assertEqual(value, [1, True, 1, 1, "1", True, True, True,
+                                 True, "<p>A</p>", "p"])
+
+    def test_jsoup_get_elements_preserves_shared_dom_identity_and_mutation(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var nodes=java.getElements('div');
+            var same=nodes.contains(nodes[0]);
+            nodes[0].remove();
+            [same,nodes[1].text(),java.getString('div@text')];''',
+            JsContext(source=source, result="<main><div>A</div><div>B</div></main>"))
+        self.assertEqual(value, [True, "B", "B"])
+
+    def test_jsoupxpath_253_official_detail_tail_text(self):
+        root = parse_markup(Path(
+            "base_history/JsoupXpath-2.5.3/src/test/resources/d_detail_page.html"
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(evaluate(
+            root,
+            "//*[@id='info']/span[contains(text(),'页数')]"
+            "/following-sibling::text()",
+            "html")[0], "956")
+        self.assertEqual(evaluate(
+            root,
+            "//*[@id='info']/span[contains(text(),'定价')]"
+            "/following-sibling::text()",
+            "html")[0], "139.00元")
+
+    def test_jsoupxpath_253_official_mixed_direct_text_index(self):
+        root = parse_markup(
+            "<div class='total'><p><span> 4497</span>总字数</p>"
+            "<p><span> 0</span>总推荐</p></div>")
+        self.assertEqual(evaluate(
+            root, "//*[text()='总字数']//text()", "html"),
+            ["4497", "总字数"])
+        self.assertEqual(evaluate(
+            root, "//*[text()='总字数']//text()[1]", "html"),
+            ["4497", "总字数"])
+        self.assertEqual(evaluate(
+            root, "//*[text()='总字数']//text()[0]", "html"), [])
+        self.assertEqual(evaluate(
+            root, "//*[text()='总字数']//text()[2]", "html"), [])
+
+    def test_xpath_xml_declaration_preserves_element_case(self):
+        root = parse_markup(
+            '<?xml version="1.0"?><Root><Item ID="A">One</Item>'
+            '<item>two</item></Root>')
+        self.assertEqual(evaluate(root, "//Item/text()", "html"), ["One"])
+        self.assertEqual(evaluate(root, "//item/text()", "html"), ["two"])
+        nodes, kind = select_nodes(
+            '<Root><Item>One</Item><item>two</item></Root>',
+            "application/xml", "//Item")
+        self.assertEqual(kind, "html")
+        self.assertEqual(len(nodes), 1)
+
+    def test_xpath_xml_namespace_and_cdata_are_preserved(self):
+        root = parse_markup(
+            '<?xml version="1.0"?><feed xmlns:x="urn:test">'
+            '<x:Item><![CDATA[A < B]]></x:Item></feed>')
+        self.assertEqual(evaluate(root, "//x:Item/text()", "html"), ["A < B"])
+        special = parse_markup(
+            '<?xml version="1.0"?><root><!--note--><?next page?></root>')
+        self.assertEqual(len(evaluate(special, "//comment()", "html")), 1)
+        self.assertEqual(len(evaluate(
+            special, "//processing-instruction('next')", "html")), 1)
+
+    def test_javascript_get_elements_returns_jxnode_element_wrapper(self):
+        runtime = LegadoJsRuntime()
+        try:
+            value = runtime.evaluate(
+                '@js:var node=java.getElements("@XPath://p")[0];'
+                '[node.isElement(),node.asString(),node.asElement().html()]',
+                JsContext(source=SimpleNamespace(to_dict=lambda: {}),
+                          result="<root><p><b>text</b></p></root>",
+                          base_url="https://x"))
+        finally:
+            runtime.close()
+        self.assertEqual(value, [True, "<p><b>text</b></p>", "<b>text</b>"])
+
+    def test_jayway_jsonpath_tail_functions(self):
+        data = {"numbers": [1, 2, 3, 4], "object": {"a": 1, "b": 2}}
+        self.assertEqual(evaluate(data, "$.numbers.length()", "json"), [4])
+        self.assertEqual(evaluate(data, "$.numbers.min()", "json"), [1.0])
+        self.assertEqual(evaluate(data, "$.numbers.max()", "json"), [4.0])
+        self.assertEqual(evaluate(data, "$.numbers.sum()", "json"), [10.0])
+        self.assertEqual(evaluate(data, "$.numbers.avg()", "json"), [2.5])
+        self.assertAlmostEqual(evaluate(data, "$.numbers.stddev()", "json")[0],
+                               math.sqrt(1.25))
+        self.assertEqual(evaluate(data, "$.object.keys()", "json"), [["a", "b"]])
+        self.assertEqual(extract_value(data, "$.object.keys()", "json"), "[a, b]")
+        self.assertEqual(evaluate(data, "$.numbers.first()", "json"), [1])
+        self.assertEqual(evaluate(data, "$.numbers.last()", "json"), [4])
+        self.assertEqual(evaluate(data, "$.numbers.index(-2)", "json"), [3])
+        self.assertEqual(evaluate(data, "$.numbers.index(20)", "json"), [])
+        self.assertEqual(evaluate(data, "$.numbers.append(5)", "json"),
+                         [1, 2, 3, 4, 5])
+        self.assertEqual(evaluate(data, "$.numbers.concat([5, 6])", "json"),
+                         [1, 2, 3, 4, 5, 6])
+
     def test_forced_css_and_inline_rule(self):
         root = BeautifulSoup('<a href="/next">next</a>', "html.parser")
         self.assertEqual(evaluate(root, "@css:a:contains(next)@href", "html"), ["/next"])
@@ -1179,6 +2838,326 @@ class RuleParserTests(unittest.TestCase):
 
 
 class VariableTests(unittest.IsolatedAsyncioTestCase):
+
+    async def test_fixed_http_interceptor_headers_and_null_ua(self):
+        self.assertEqual(
+            ReaderEngine().headers["User-Agent"],
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/119.0.0.0 Safari/537.36")
+
+        class Response:
+            status, charset, content_type = 200, "utf-8", "text/plain"
+            headers, url = {}, "https://host/page"
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return False
+            async def read(self): return b"ok"
+
+        captured = []
+
+        class Session:
+            def __init__(self, *_args, **kwargs): captured.append(kwargs["headers"])
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return False
+            def request(self, *_args, **_kwargs): return Response()
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://source", concurrentRate="",
+            enabledCookieJar=False,
+            header={"User-Agent": "null", "Cache-Control": "source-value"})
+        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.rule_engine.aiohttp.TCPConnector",
+                      lambda **_kwargs: object()):
+            await ReaderEngine()._request({"url": "https://host/page"}, source)
+        headers = captured[0]
+        self.assertNotIn("User-Agent", headers)
+        self.assertEqual(headers.getall("Keep-Alive"), ["300"])
+        self.assertEqual(headers.getall("Connection"), ["Keep-Alive"])
+        self.assertEqual(headers.getall("Cache-Control"),
+                         ["source-value", "no-cache"])
+
+    async def test_okhttp_transparent_gzip_conditions_and_headers(self):
+        payload = b"fixed gzip body"
+        compressed = gzip.compress(payload)
+
+        class Response:
+            status, charset, content_type = 200, "utf-8", "text/plain"
+            headers = {"Content-Encoding": "gzip",
+                       "Content-Length": str(len(compressed)),
+                       "Content-Type": "text/plain"}
+            url = "https://host/page"
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return False
+            async def read(self): return compressed
+
+        sessions, requests = [], []
+
+        class Session:
+            def __init__(self, *_args, **kwargs): sessions.append(kwargs)
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return False
+            def request(self, *_args, **kwargs):
+                requests.append(kwargs)
+                return Response()
+
+        engine = ReaderEngine()
+        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.rule_engine.aiohttp.TCPConnector",
+                      lambda **_kwargs: object()):
+            decoded = await engine._request(
+                {"url": "https://host/default", "type": "hex"})
+            decoded_headers = dict(engine.last_response["headers"])
+            encoded = await engine._request({
+                "url": "https://host/explicit", "type": "hex",
+                "headers": {"Accept-Encoding": "gzip"}})
+        self.assertEqual(decoded[0], payload.hex())
+        self.assertNotIn("content-encoding", decoded_headers)
+        self.assertNotIn("content-length", decoded_headers)
+        self.assertEqual(encoded[0], compressed.hex())
+        self.assertEqual(engine.last_response["headers"]["content-encoding"],
+                         "gzip")
+        self.assertFalse(sessions[0]["auto_decompress"])
+        self.assertEqual(sessions[0]["headers"]["Accept-Encoding"], "gzip")
+        self.assertEqual(sessions[1]["headers"].getall("Accept-Encoding"),
+                         ["gzip"])
+
+    async def test_redirect_method_body_and_cross_origin_authorization(self):
+        observed = {}
+
+        async def final_302(request):
+            observed["302"] = (request.method, await request.read())
+            return web.Response(text="ok302")
+
+        async def final_307(request):
+            observed["307"] = (request.method, await request.read())
+            return web.Response(text="ok307")
+
+        async def cross_target(request):
+            observed["authorization"] = request.headers.get("Authorization")
+            return web.Response(text="cross")
+
+        async def redirect_302(_request):
+            return web.Response(status=302, headers={"Location": "/final302"})
+
+        async def redirect_307(_request):
+            return web.Response(status=307, headers={"Location": "/final307"})
+
+        second_app = web.Application()
+        second_app.router.add_route("*", "/target", cross_target)
+        second_runner = web.AppRunner(second_app)
+        await second_runner.setup()
+        second_site = web.TCPSite(second_runner, "127.0.0.1", 0)
+        await second_site.start()
+        second_port = second_site._server.sockets[0].getsockname()[1]
+
+        first_app = web.Application()
+        first_app.router.add_route("*", "/final302", final_302)
+        first_app.router.add_route("*", "/final307", final_307)
+        async def redirect_cross(_request):
+            return web.Response(status=302, headers={
+                "Location": f"http://127.0.0.1:{second_port}/target"})
+
+        first_app.router.add_post("/start302", redirect_302)
+        first_app.router.add_post("/start307", redirect_307)
+        first_app.router.add_get("/cross", redirect_cross)
+        first_runner = web.AppRunner(first_app)
+        await first_runner.setup()
+        first_site = web.TCPSite(first_runner, "127.0.0.1", 0)
+        await first_site.start()
+        first_port = first_site._server.sockets[0].getsockname()[1]
+        base = f"http://127.0.0.1:{first_port}"
+        engine = ReaderEngine()
+        try:
+            await engine._request({
+                "url": base + "/start302", "method": "POST", "body": "q=x"})
+            await engine._request({
+                "url": base + "/start307", "method": "POST", "body": "q=x"})
+            await engine._request({
+                "url": base + "/cross",
+                "headers": {"Authorization": "Bearer secret"}})
+        finally:
+            await first_runner.cleanup()
+            await second_runner.cleanup()
+        self.assertEqual(observed["302"], ("GET", b""))
+        self.assertEqual(observed["307"], ("POST", b"q=x"))
+        self.assertIsNone(observed["authorization"])
+
+    async def test_request_retry_defaults_and_explicit_count_match_legado(self):
+        engine = ReaderEngine()
+        self.assertEqual(engine._request_retry_count({}), 0)
+        self.assertEqual(engine._request_retry_count({"retry": 3}), 3)
+        self.assertEqual(engine._request_retry_count({"retry": -1}), 0)
+        self.assertEqual(engine._request_retry_count({"retry": "invalid"}), 0)
+
+    def test_custom_url_python_port_preserves_attributes_and_serialization(self):
+        value = CustomUrl('https://host/path , {"type":"zip","retry":2}')
+        self.assertEqual(value.get_url(), "https://host/path")
+        self.assertEqual(value.get_attr(), {"type": "zip", "retry": 2})
+        value.put_attribute("retry", None).put_attribute("serverID", 9)
+        self.assertEqual(str(value),
+                         'https://host/path,{"type":"zip","serverID":9}')
+        self.assertEqual(str(CustomUrl("https://host/path,{invalid}")),
+                         "https://host/path")
+
+    def test_js_request_retry_only_repeats_unsuccessful_http_responses(self):
+        runtime = LegadoJsRuntime()
+
+        class Opener:
+            def __init__(self, failures):
+                self.failures = list(failures)
+                self.calls = 0
+
+            def open(self, *_args, **_kwargs):
+                self.calls += 1
+                value = self.failures.pop(0)
+                if isinstance(value, Exception):
+                    raise value
+                return value
+
+        def http_error(code=503):
+            return HTTPError("https://host", code, "failed", Message(), BytesIO(b"x"))
+
+        success = object()
+        http_opener = Opener([http_error(), success])
+        self.assertIs(runtime._open_with_retry(object(), 2, http_opener), success)
+        self.assertEqual(http_opener.calls, 2)
+
+        final_opener = Opener([http_error(500), http_error(502)])
+        final = runtime._open_with_retry(object(), 1, final_opener)
+        self.assertIsInstance(final, HTTPError)
+        self.assertEqual(final.code, 502)
+        final.close()
+
+        connection_opener = Opener([URLError("offline"), success])
+        with self.assertRaises(URLError):
+            runtime._open_with_retry(object(), 3, connection_opener)
+        self.assertEqual(connection_opener.calls, 1)
+
+    async def test_reader_request_retries_http_status_but_not_connection_failure(self):
+        class Response:
+            def __init__(self, status, body):
+                self.status, self._body = status, body
+                self.headers, self.charset = {}, "utf-8"
+                self.content_type, self.url = "text/plain", "https://host/page"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def read(self):
+                return self._body
+
+        calls = []
+        responses = [Response(503, b"retry"), Response(200, b"ok")]
+
+        class Session:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def request(self, *_args, **_kwargs):
+                calls.append(1)
+                return responses.pop(0)
+
+        engine = ReaderEngine()
+        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.rule_engine.aiohttp.TCPConnector", lambda **_kwargs: object()):
+            result = await engine._request({"url": "https://host/page", "retry": 3})
+        self.assertEqual(result[0], "ok")
+        self.assertEqual(len(calls), 2)
+
+        class Failure:
+            async def __aenter__(self):
+                raise asyncio.TimeoutError("offline")
+
+            async def __aexit__(self, *_args):
+                return False
+
+        calls.clear()
+
+        class FailedSession(Session):
+            def request(self, *_args, **_kwargs):
+                calls.append(1)
+                return Failure()
+
+        with patch("app.services.rule_engine.aiohttp.ClientSession", FailedSession), \
+                patch("app.services.rule_engine.aiohttp.TCPConnector", lambda **_kwargs: object()):
+            with self.assertRaises(RuntimeError):
+                await engine._request({"url": "https://host/page", "retry": 3})
+        self.assertEqual(len(calls), 1)
+
+    def test_url_option_charset_does_not_override_response_decoding(self):
+        utf8 = "返回正文".encode("utf-8")
+        gbk = '<meta charset="gbk">中文'.encode("gb18030")
+        self.assertEqual(ReaderEngine._decode_response_body(utf8, "utf-8"),
+                         "返回正文")
+        self.assertEqual(ReaderEngine._decode_response_body(
+            b"\xef\xbb\xbf" + utf8, None),
+                         "返回正文")
+        self.assertEqual(ReaderEngine._decode_response_body(gbk, None),
+                         '<meta charset="gbk">中文')
+
+    def test_html_encoding_meta_scan_matches_fixed_encoding_detect(self):
+        declared = (b'<meta http-equiv="content-type" '
+                    b'content="text/html;charset=gbk">')
+        self.assertEqual(ReaderEngine._html_declared_encoding(declared), "gbk")
+        ignored = b'<div data-charset="gbk"></div>'
+        self.assertIsNone(ReaderEngine._html_declared_encoding(ignored))
+        odd_spacing = (b'<meta http-equiv="content-type" '
+                       b'content="text/html;charset = gbk">')
+        self.assertEqual(ReaderEngine._html_declared_encoding(odd_spacing), "= gbk")
+        with self.assertRaises(LookupError):
+            ReaderEngine._decode_response_body(odd_spacing + b"text", None)
+
+    def test_icu_detector_matches_fixed_east_asian_oracle_fixtures(self):
+        chinese = ("中文章节内容测试" * 10).encode("gb18030")
+        unusual_big5 = ("日本語の本文です" * 10).encode("big5")
+        self.assertEqual(detect_charset(chinese), "GB18030")
+        # The fixed bundled ICU4J detector deliberately supplies this oracle;
+        # UnicodeDammit instead reports Big5 for the same ambiguous bytes.
+        self.assertEqual(detect_charset(unusual_big5), "KOI8-R")
+
+    def test_fixed_icu_disabled_models_unicode_scores_and_greek_ngrams(self):
+        self.assertEqual(
+            detect_charset(("한국어 본문입니다" * 5).encode("gb18030")),
+            "GB18030")
+        self.assertEqual(
+            detect_charset(("Ελληνικό κείμενο" * 5).encode("gb18030")),
+            "windows-1253")
+        self.assertEqual(
+            detect_charset(("café déjà vu français" * 2).encode("iso-8859-1")),
+            "UTF-16LE")
+        self.assertEqual(
+            detect_charset("中文章节内容测试".encode("utf-16le")),
+            "windows-1252")
+
+    def test_xml_post_uses_same_default_json_media_type_as_legado(self):
+        self.assertEqual(ReaderEngine._default_post_content_type(
+            "<request><key>value</key></request>"),
+            "application/json; charset=UTF-8")
+
+    def test_zip_response_first_entry_and_xml_declaration_match_legado(self):
+        payload = BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("folder/", b"")
+            archive.writestr("content.txt", "压缩正文".encode("utf-8"))
+            archive.writestr("ignored.txt", b"ignored")
+        raw = ReaderEngine._uncompress_response_body(
+            payload.getvalue(), "application/zip; charset=utf-8")
+        self.assertEqual(raw.decode("utf-8"), "压缩正文")
+        self.assertEqual(ReaderEngine._normalize_response_text(
+            "<book>正文</book>", "application/xml; charset=utf-8"),
+            '<?xml version="1.0"?><book>正文</book>')
+        declared = '<?xml version="1.0"?><book />'
+        self.assertEqual(ReaderEngine._normalize_response_text(
+            declared, "text/xml"), declared)
     async def test_template_selector_then_postfix_js_keeps_pipeline(self):
         engine = ReaderEngine()
         source = SimpleNamespace(to_dict=lambda: {},
@@ -1229,6 +3208,13 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second_page,
                          "https://example.com/list?offset=20")
 
+    async def test_url_templates_are_not_truncated_at_thirty_two_stages(self):
+        engine = ReaderEngine()
+        source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://x")
+        template = "https://x/" + "/".join("{{page}}" for _ in range(40))
+        value = await engine._resolve_rule_url(template, source, page=7)
+        self.assertEqual(value, "https://x/" + "/".join(["7"] * 40))
+
     async def test_bad_optional_field_does_not_abort_other_list_records(self):
         engine = ReaderEngine()
         source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://x")
@@ -1244,7 +3230,20 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
             nodes, "html", rules, "https://x", source)
         usable = [book for book in books if book.name and book.url]
         self.assertEqual([(book.name, book.url) for book in usable],
-                         [("Book", "https://x/book/42")])
+                         [("header", "https://x"),
+                          ("Book", "https://x/book/42")])
+
+    async def test_bad_mandatory_search_field_propagates(self):
+        engine = ReaderEngine()
+        source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://x")
+        node = BeautifulSoup('<li><a href="/42">Book</a></li>',
+                             "html.parser").li
+        with self.assertRaises(JsBridgeError):
+            engine._books_from_nodes(
+                [node], "html", {
+                    "name": '<js>String(result).match(/missing=(\\d+)/)[1]</js>',
+                    "bookUrl": "a@href",
+                }, "https://x", source)
 
     async def test_source_concurrent_rate_supports_interval_and_window_forms(self):
         engine = ReaderEngine()
@@ -1267,8 +3266,182 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
             await engine._respect_concurrent_rate(window_source)
             starts.append(time.monotonic())
 
-        await asyncio.gather(*(window_call() for _ in range(3)))
+        # AnalyzeUrl 3.23.110211 checks frequency > N (not >= N), so 2/T
+        # permits three starts in the first window and delays the fourth.
+        await asyncio.gather(*(window_call() for _ in range(4)))
         self.assertGreaterEqual(starts[-1] - starts[0], 0.035)
+        self.assertLess(starts[2] - starts[0], 0.02)
+
+    def test_proxy_parser_matches_fixed_legado_grammar(self):
+        self.assertEqual(
+            ReaderEngine._normalize_proxy("http://proxy.example:8080"),
+            "http://proxy.example:8080",
+        )
+        self.assertEqual(
+            ReaderEngine._normalize_proxy(
+                "http://proxy.example:8080@user name@p@ss"),
+            "http://user%20name:p@proxy.example:8080",
+        )
+        self.assertEqual(
+            ReaderEngine._normalize_proxy("socks5://127.0.0.1:1080"),
+            "socks5://127.0.0.1:1080",
+        )
+        with self.assertRaises(ValueError):
+            ReaderEngine._normalize_proxy("proxy.example:8080")
+
+    async def test_socks_proxy_is_installed_as_session_connector(self):
+        class Response:
+            status, charset, content_type = 200, "utf-8", "text/plain"
+            headers, url = {}, "https://host/page"
+
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return False
+            async def read(self): return b"ok"
+
+        sessions, requests = [], []
+
+        class Session:
+            def __init__(self, *_args, **kwargs): sessions.append(kwargs)
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return False
+            def request(self, *_args, **kwargs):
+                requests.append(kwargs)
+                return Response()
+
+        socks_connector = object()
+        with patch("app.services.rule_engine.ProxyConnector.from_url",
+                   return_value=socks_connector) as make_socks, \
+                patch("app.services.rule_engine.aiohttp.ClientSession", Session):
+            result = await ReaderEngine()._request({
+                "url": "https://host/page",
+                "proxy": "socks5://127.0.0.1:1080@user@pass",
+            })
+        self.assertEqual(result[0], "ok")
+        make_socks.assert_called_once_with(
+            "socks5://user:pass@127.0.0.1:1080", ssl=False)
+        self.assertIs(sessions[0]["connector"], socks_connector)
+        self.assertNotIn("proxy", requests[0])
+
+    async def test_concurrent_rate_is_shared_between_engine_instances(self):
+        source = SimpleNamespace(
+            bookSourceUrl=f"https://shared-{time.monotonic_ns()}",
+            concurrentRate="30")
+        starts = []
+
+        async def call(engine):
+            await engine._respect_concurrent_rate(source)
+            starts.append(time.monotonic())
+
+        await asyncio.gather(call(ReaderEngine()), call(ReaderEngine()))
+        self.assertGreaterEqual(starts[-1] - starts[0], 0.025)
+
+    async def test_bare_concurrent_rate_holds_record_until_request_finishes(self):
+        release_first = asyncio.Event()
+        starts = []
+
+        class Response:
+            status, charset, content_type = 200, "utf-8", "text/plain"
+            headers, url = {}, "https://host/page"
+
+            def __init__(self, index): self.index = index
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return False
+            async def read(self):
+                if self.index == 0:
+                    await release_first.wait()
+                return b"ok"
+
+        class Session:
+            def __init__(self, *_args, **_kwargs): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return False
+            def request(self, *_args, **_kwargs):
+                starts.append(time.monotonic())
+                return Response(len(starts) - 1)
+
+        source = SimpleNamespace(
+            bookSourceUrl=f"https://occupied-{time.monotonic_ns()}",
+            concurrentRate="10", header="", enabledCookieJar=False)
+        engine = ReaderEngine()
+        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.rule_engine.aiohttp.TCPConnector",
+                      lambda **_kwargs: object()):
+            first = asyncio.create_task(engine._request(
+                {"url": "https://host/first"}, source))
+            while not starts:
+                await asyncio.sleep(0)
+            second = asyncio.create_task(engine._request(
+                {"url": "https://host/second"}, source))
+            await asyncio.sleep(0.03)
+            self.assertEqual(len(starts), 1)
+            release_first.set()
+            await asyncio.gather(first, second)
+        self.assertEqual(len(starts), 2)
+
+    async def test_cookie_jars_respect_source_enable_and_isolation(self):
+        engine = ReaderEngine()
+        first = SimpleNamespace(bookSourceUrl="https://first",
+                                enabledCookieJar=True)
+        second = SimpleNamespace(bookSourceUrl="https://second",
+                                 enabledCookieJar=True)
+        disabled = SimpleNamespace(bookSourceUrl="https://disabled",
+                                   enabledCookieJar=False)
+        first_jar = engine._cookie_jar_for_source(first)
+        self.assertIs(first_jar, engine._cookie_jar_for_source(first))
+        self.assertIsNot(first_jar, engine._cookie_jar_for_source(second))
+        self.assertIsInstance(engine._cookie_jar_for_source(disabled),
+                              aiohttp.DummyCookieJar)
+
+    async def test_source_cookie_jar_persists_between_engine_instances(self):
+        source = SimpleNamespace(
+            bookSourceUrl="https://source.example", enabledCookieJar=True)
+        with TemporaryDirectory() as directory:
+            first = ReaderEngine(state_dir=directory)
+            jar = first._cookie_jar_for_source(source)
+            jar.update_cookies({"sid": "abc"},
+                               response_url=URL("https://source.example/book"))
+            first._persist_source_cookie_jar(source)
+            second = ReaderEngine(state_dir=directory)
+            restored = second._cookie_jar_for_source(source).filter_cookies(
+                URL("https://source.example/next"))
+            self.assertEqual(restored["sid"].value, "abc")
+
+    async def test_reader_and_js_requests_share_cookie_manager_state(self):
+        captured = {}
+
+        class Headers(dict):
+            def getall(self, name, default):
+                value = self.get(name)
+                return [value] if value else default
+
+        class Response:
+            status, charset, content_type = 200, "utf-8", "text/plain"
+            url = "https://source.example/page"
+            headers = Headers({"Set-Cookie": "server=2; Path=/"})
+
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return False
+            async def read(self): return b"ok"
+
+        class Session:
+            def __init__(self, *args, **kwargs):
+                captured["headers"] = kwargs.get("headers", {})
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return False
+            def request(self, *_args, **_kwargs): return Response()
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://source.example", enabledCookieJar=True,
+            header="", to_dict=lambda: {"bookSourceUrl": "https://source.example"})
+        engine = ReaderEngine()
+        engine.js.set_cookie("https://source.example/", "client=1; Path=/")
+        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.rule_engine.aiohttp.TCPConnector",
+                      lambda **_kwargs: object()):
+            await engine._request({"url": "https://source.example/page"}, source)
+        self.assertEqual(captured["headers"]["Cookie"], "client=1")
+        self.assertIn("server=2", engine.js.export_cookie_header(
+            "https://source.example/next"))
 
     def test_legado_page_alternative_template(self):
         first = parse_search_url("/list/<,2,3>?q={{key}}", "https://source.example", "书", 1)
@@ -1330,6 +3503,19 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(book.name, book.author) for book in books],
                          [("One", "Alice"), ("Two", "Bob")])
 
+    async def test_book_list_is_not_truncated_after_one_hundred_results(self):
+        engine = ReaderEngine()
+        source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://source")
+        soup = BeautifulSoup("".join(
+            f'<li><a href="/{index}">Book {index}</a></li>'
+            for index in range(125)), "html.parser")
+        books = engine._books_from_nodes(
+            list(soup.select("li")), "html",
+            {"name": "a@text", "bookUrl": "a@href"},
+            source.bookSourceUrl, source)
+        self.assertEqual(len(books), 125)
+        self.assertEqual(books[-1].name, "Book 124")
+
     async def test_request_rule_runs_leading_js_before_plain_url(self):
         engine = ReaderEngine()
         source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://example.com")
@@ -1339,6 +3525,17 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(value, "/search?key=book&page=3")
         self.assertEqual(engine.js_variables["token"], "ok")
+
+    async def test_request_rule_js_stages_share_analyze_url_result(self):
+        engine = ReaderEngine()
+        source = SimpleNamespace(to_dict=lambda: {},
+                                 bookSourceUrl="https://example.com")
+        value = await engine._resolve_rule_url(
+            'first<js>String(result).startsWith("first") ? "one" : "bad"'
+            '</js>/@result/<js>String(result)+"/three"</js>',
+            source,
+        )
+        self.assertEqual(value, "/one//three")
 
     async def test_request_rule_runs_trailing_js_with_plain_prefix_as_result(self):
         engine = ReaderEngine()
@@ -1367,6 +3564,153 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
             "https://x/toc?id=42",
         )
 
+    async def test_put_block_keeps_following_js_and_runs_before_it(self):
+        engine = ReaderEngine()
+        source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://source")
+        value = engine._field_value(
+            {"name": "书名", "id": 42},
+            "$.name@put:{saved:$.id}@js:String(java.get('saved'))+'-'+result",
+            "json", source, source.bookSourceUrl)
+        self.assertEqual(value, "42-书名")
+        self.assertEqual(engine.js_variables["saved"], "42")
+
+    def test_list_put_parser_preserves_suffix_pipeline(self):
+        selector, put_rule = ReaderEngine._list_rule_parts(
+            "$.items[*]@put:{page:$.page}@js:result")
+        self.assertEqual(selector, "$.items[*]@js:result")
+        self.assertEqual(put_rule, "{page:$.page}")
+
+    def test_python_source_rule_compiler_preserves_stage_order_and_puts(self):
+        program = compile_rule_program(
+            "$.name@put:{id:$.id}<js>result+'!'</js>##!##?@js:result")
+        self.assertEqual([stage.mode for stage in program.stages],
+                         ["json", "js", "default", "js"])
+        self.assertEqual(program.stages[0].rule, "$.name")
+        self.assertEqual(program.stages[0].put_rule, "{id:$.id}")
+        self.assertEqual(program.stages[1].rule, "result+'!'")
+
+    def test_python_source_rule_compiler_matches_historical_mode_promotion(self):
+        cases = {
+            "@XPath://a": ("xpath", "//a"),
+            "@Json:$.items": ("json", "$.items"),
+            "@@div@text": ("default", "div@text"),
+            "prefix@get:{key}": ("regex", "prefix@get:{key}"),
+            "$1-title": ("regex", "$1-title"),
+            "div@text##x##{{result}}": ("default", "div@text##x##{{result}}"),
+        }
+        for raw, expected in cases.items():
+            stage = compile_rule_program(raw).stages[0]
+            self.assertEqual((stage.mode, stage.rule), expected)
+        stage = compile_rule_program(":ID:(\\d+)", all_in_one=True).stages[0]
+        self.assertEqual((stage.mode, stage.rule), ("regex", "ID:(\\d+)"))
+
+    def test_python_source_rule_compiler_honors_analyzer_context_mode(self):
+        json_stage = compile_rule_program("name", is_json=True).stages[0]
+        self.assertEqual((json_stage.mode, json_stage.rule), ("json", "name"))
+        explicit_xpath = compile_rule_program(
+            "@XPath://item", is_json=True).stages[0]
+        self.assertEqual(
+            (explicit_xpath.mode, explicit_xpath.rule), ("xpath", "//item"))
+        regex_program = compile_rule_program(
+            "$.name<js>result</js>@XPath://item", is_regex=True)
+        self.assertEqual(
+            [(stage.mode, stage.rule) for stage in regex_program.stages],
+            [("regex", "$.name"), ("js", "result"),
+             ("regex", "@XPath://item")],
+        )
+
+    def test_source_rule_program_cache_is_complete_and_context_keyed(self):
+        plain = compile_rule_program("name<js>result</js>")
+        self.assertIs(plain, compile_rule_program("name<js>result</js>"))
+        json_program = compile_rule_program(
+            "name<js>result</js>", is_json=True)
+        regex_program = compile_rule_program(
+            "name<js>result</js>", is_regex=True)
+        self.assertEqual(plain.stages[0].mode, "default")
+        self.assertEqual(json_program.stages[0].mode, "json")
+        self.assertEqual(regex_program.stages[0].mode, "regex")
+        self.assertIsNot(plain, json_program)
+        self.assertIsNot(json_program, regex_program)
+
+    def test_regex_make_up_rule_keeps_group_zero_literal(self):
+        self.assertEqual(
+            extract_value(["whole", "first"], "$0-$1-$2", "json"),
+            "$0-first-",
+        )
+        self.assertEqual(
+            extract_value(("whole", "first"), "$1", "json"), "$1")
+
+    async def test_get_prefix_is_passed_to_following_javascript_stage(self):
+        engine = ReaderEngine()
+        engine.js_variables["images"] = "a.jpg\nb.jpg"
+        source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://source")
+        value = engine._field_value(
+            {}, "@get:{images}@js:result.split('\\n').join('|')",
+            "json", source, source.bookSourceUrl)
+        self.assertEqual(value, "a.jpg|b.jpg")
+
+    async def test_post_js_stage_keeps_compiled_mode_instead_of_sniffing_output(self):
+        engine = ReaderEngine()
+        source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://source")
+        root = BeautifulSoup("<div>initial</div>", "html.parser")
+        self.assertEqual(
+            engine._field_value(
+                root, "<js>({foo:'bar'})</js>foo", "html", source,
+                source.bookSourceUrl),
+            "",
+        )
+        self.assertEqual(
+            engine._field_value(
+                root, "<js>({foo:'bar'})</js>@Json:$.foo", "html", source,
+                source.bookSourceUrl),
+            "bar",
+        )
+        self.assertEqual(
+            engine._field_value(
+                root, "<js>({foo:'bar'})</js><js>result.foo</js>", "html",
+                source, source.bookSourceUrl),
+            "bar",
+        )
+        self.assertEqual(
+            engine._field_value(
+                root, "div@text<js>({foo:'bar'})</js>foo", "html", source,
+                source.bookSourceUrl),
+            "",
+        )
+
+    async def test_java_get_string_native_object_uses_only_first_source_rule(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://x")
+        try:
+            value = runtime.evaluate(
+                "@js:var o={foo:'bar'};java.put('key','foo');["
+                "java.getString(\"foo<js>result+'!'</js>\",o),"
+                "java.getString('@Json:$.foo',o),"
+                "java.getStringList(\"foo<js>result+'!'</js>\",o).join('|'),"
+                "java.getString('@get:{key}',o),"
+                "java.getString('prefix@get:{key}',o),"
+                "java.getString('prefix@get:{key}##prefix##X',o),"
+                "java.getString('{{result.foo}}',o),"
+                "java.getString('key-{{result.foo}}',o),"
+                "java.getString('n={{1+1}}',o)]",
+                JsContext(source=source, result="", base_url="https://x"))
+        finally:
+            runtime.close()
+        self.assertEqual(
+            value,
+            ["bar", "", "bar", "bar", "prefixfoo", "Xfoo", "",
+             "key-bar", "n=2"],
+        )
+
+    async def test_get_inside_javascript_is_interpolated_before_execution(self):
+        engine = ReaderEngine()
+        engine.js_variables["id"] = "42"
+        source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://source")
+        value = engine._field_value(
+            {}, "@js:'book-'+'@get:{id}'", "json", source,
+            source.bookSourceUrl)
+        self.assertEqual(value, "book-42")
+
     async def test_inline_javascript_and_nested_rule_templates(self):
         engine = ReaderEngine()
         source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://x")
@@ -1385,7 +3729,7 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             engine._field_value(node, '@js:java.timeFormat({{$.id}},"ss")', "json",
                                 source, ""),
-            "07",
+            datetime.fromtimestamp(0.007).strftime("%Y/%m/%d %H:%M"),
         )
         self.assertEqual(
             engine._field_value(
@@ -1393,12 +3737,10 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
                 "json", source, ""),
             "A",
         )
-        self.assertEqual(
+        with self.assertRaises(json.JSONDecodeError):
             engine._field_value(
                 {}, '<js>"<div><a href=\\"/x\\">X</a></div>"</js> a@href',
-                "json", source, "https://example.com/base"),
-            "https://example.com/x",
-        )
+                "json", source, "https://example.com/base")
         html = BeautifulSoup('<div class="btn"><a href="/download">D</a></div>',
                              "html.parser")
         self.assertEqual(
@@ -1456,6 +3798,25 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
             '$.[*]', source, "https://x", "B", 1)
         self.assertEqual(kind, "json")
         self.assertEqual(nodes, [{"name": "B"}])
+
+    async def test_search_list_pipeline_keeps_precompiled_mode_after_js(self):
+        engine = ReaderEngine()
+        source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://x")
+        nodes, kind = await engine._list_rule_pipeline(
+            "<p>initial</p>", "text/html",
+            "<js>({items:[{name:'A'}]})</js>items", source, "https://x")
+        self.assertEqual((nodes, kind), ([], "html"))
+
+        nodes, kind = await engine._list_rule_pipeline(
+            "<p>initial</p>", "text/html",
+            "<js>({items:[{name:'A'}]})</js>@Json:$.items[*]",
+            source, "https://x")
+        self.assertEqual((nodes, kind), ([{"name": "A"}], "json"))
+
+        with self.assertRaises(json.JSONDecodeError):
+            await engine._list_rule_pipeline(
+                '{"seed":1}', "application/json",
+                '<js>"<a href=\\"/x\\">X</a>"</js>a', source, "https://x")
 
     async def test_empty_declared_json_list_is_empty_not_jsoup_error(self):
         engine = ReaderEngine()
@@ -1716,7 +4077,7 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
             ["https://source.example/p2", "https://source.example/p3"],
         )
 
-    async def test_regex_only_chapter_url_falls_back_to_anchor_and_keeps_options(self):
+    async def test_regex_only_chapter_url_does_not_fall_back_to_anchor(self):
         class Engine(LegadoReadingEngine):
             async def _request_value(self, value, source, base_url="", page=1,
                                      request_defaults=None):
@@ -1739,10 +4100,7 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         chapters = await Engine().chapters(
             source, BookItem("Book", url="https://source.example/book/1"))
         self.assertEqual(len(chapters), 1)
-        self.assertEqual(
-            chapters[0].url,
-            'https://source.example/chapter-42,{"webView": true}',
-        )
+        self.assertEqual(chapters[0].url, "https://source.example/book/1")
 
     async def test_fragment_chapter_url_resolves_against_detail_page(self):
         class Engine(LegadoReadingEngine):
@@ -1755,7 +4113,8 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         source = SimpleNamespace(
             bookSourceUrl="https://source.example",
             ruleBookInfo={},
-            ruleToc={"chapterList": ".album", "chapterName": "a@text"},
+            ruleToc={"chapterList": ".album", "chapterName": "a@text",
+                     "chapterUrl": "a@href"},
             to_dict=lambda: {"bookSourceUrl": "https://source.example"},
         )
         chapters = await Engine().chapters(
@@ -1873,6 +4232,33 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(chapters), 2)
         self.assertEqual(book.total_chapter_num, 2)
 
+    async def test_toc_format_js_runs_after_indexing_with_shared_g_int(self):
+        class Engine(LegadoReadingEngine):
+            async def _request_value(self, value, source, base_url="", page=1,
+                                     request_defaults=None):
+                return (
+                    '<ul><li><a href="/1">One</a></li>'
+                    '<li><a href="/2">Two</a></li></ul>',
+                    "text/html", "https://source.example/toc",
+                )
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://source.example",
+            ruleBookInfo={},
+            ruleToc={
+                "chapterList": "li",
+                "chapterName": "a@text",
+                "chapterUrl": "a@href",
+                "formatJs": 'gInt++;title+"-"+index+"-"+gInt',
+            },
+            to_dict=lambda: {"bookSourceUrl": "https://source.example"},
+        )
+        chapters = await Engine().chapters(
+            source, BookItem(name="Book", url="https://source.example/book"))
+
+        self.assertEqual([chapter.name for chapter in chapters],
+                         ["One-1-1", "Two-2-2"])
+
     async def test_detail_init_runs_complete_stage_pipeline(self):
         engine = LegadoReadingEngine()
         source = SimpleNamespace(
@@ -1884,8 +4270,117 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         root, kind, raw = await engine._initialize_detail(
             source, BookItem("book"), "ignored", "text/html", "https://x/book")
         self.assertEqual(kind, "json")
-        self.assertEqual(root, {"name": "B!"})
+        self.assertEqual(json.loads(root), {"name": "B!"})
         self.assertEqual(json.loads(raw), {"name": "B!"})
+
+    async def test_detail_init_preserves_elements_collection_and_null_failure(self):
+        engine = LegadoReadingEngine()
+        source = SimpleNamespace(
+            bookSourceUrl="https://x", ruleBookInfo={"init": "section"},
+            to_dict=lambda: {"bookSourceUrl": "https://x"})
+        root, kind, raw = await engine._initialize_detail(
+            source, BookItem("book"),
+            "<section><b>A</b></section><section><b>B</b></section>",
+            "text/html", "https://x/book")
+        self.assertEqual(kind, "html")
+        self.assertEqual(len(root), 2)
+        self.assertEqual(engine._strict_value(
+            root, "b@text", kind, source, "https://x/book",
+            raw_result=raw, collect_all=True), "A\nB")
+
+        source.ruleBookInfo["init"] = "<js>null</js>"
+        with self.assertRaisesRegex(AssertionError, "Content cannot be null"):
+            await engine._initialize_detail(
+                source, BookItem("book"), "body", "text/plain", "https://x/book")
+
+    async def test_book_info_and_toc_reuse_search_cached_html(self):
+        class NoNetworkEngine(LegadoReadingEngine):
+            async def _request_value(self, *args, **kwargs):
+                raise AssertionError("cached HTML must avoid network")
+
+        engine = NoNetworkEngine()
+        source = SimpleNamespace(
+            bookSourceUrl="https://x", bookSourceType=0,
+            ruleBookInfo={"name": "h1@text", "tocUrl": ""},
+            ruleToc={"chapterList": "li", "chapterName": "a@text",
+                     "chapterUrl": "a@href"},
+            to_dict=lambda: {"bookSourceUrl": "https://x"})
+        body = '<h1>Cached</h1><li><a href="/one">One</a></li>'
+        book = BookItem("", url="https://x/book", info_html=body)
+        await engine.book_info(source, book)
+        self.assertEqual((book.name, book.type, book.toc_url, book.toc_html),
+                         ("Cached", 8, "https://x/book", body))
+        chapters = await engine.chapters(source, book)
+        self.assertEqual([(item.name, item.url) for item in chapters],
+                         [("One", "https://x/one")])
+
+    async def test_content_need_save_title_catalog_and_no_notice_heuristic(self):
+        class Engine(LegadoReadingEngine):
+            async def _request_value(self, *args, **kwargs):
+                return ("<h1>Updated</h1><p>本章未完，请点击下一页继续阅读</p>",
+                        "text/html", "https://x/chapter")
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://x",
+            ruleContent={"title": "h1@text", "content": "p@text"},
+            to_dict=lambda: {"bookSourceUrl": "https://x"})
+        with TemporaryDirectory() as directory:
+            engine = Engine(state_dir=directory)
+            book = BookItem("Book", url="https://x/book")
+            chapter = ChapterItem("Old", "https://x/chapter", index=0,
+                                  book_url=book.url)
+            engine.current_book = book
+            engine.current_chapters = [chapter]
+            document = await engine.content_document(
+                source, chapter, need_save=False)
+            cache = ReadingCache(directory)
+            self.assertIn("本章未完", document.plain_text)
+            self.assertIsNone(cache.load_content(
+                source.bookSourceUrl, book.url, chapter.url))
+            self.assertEqual(cache.load_catalog(
+                source.bookSourceUrl, book.url)[0].name, "Updated")
+
+            await engine.content_document(source, chapter, need_save=True)
+            self.assertIsNotNone(cache.load_content(
+                source.bookSourceUrl, book.url, chapter.url))
+
+    async def test_empty_content_rule_and_synthetic_volume_bypass_request(self):
+        class NoNetworkEngine(LegadoReadingEngine):
+            async def _request_value(self, *args, **kwargs):
+                raise AssertionError("WebBook bypass must not request")
+
+        source = SimpleNamespace(ruleContent={}, to_dict=lambda: {})
+        chapter = ChapterItem("Chapter", "https://x/chapter")
+        self.assertEqual((await NoNetworkEngine().content_document(
+            source, chapter)).plain_text, "https://x/chapter")
+
+        source.ruleContent = {"content": "body@text"}
+        volume = ChapterItem("Volume", "Volume0", is_volume=True,
+                             tag="volume introduction")
+        self.assertEqual((await NoNetworkEngine().content_document(
+            source, volume)).plain_text, "volume introduction")
+
+    async def test_plain_content_api_keeps_fixed_img_markup(self):
+        class Engine(LegadoReadingEngine):
+            async def _request_value(self, *args, **kwargs):
+                return ('<p>Text</p><img src="/cover.jpg">', "text/html",
+                        "https://x/chapter")
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://x", ruleContent={"content": "body@html"},
+            to_dict=lambda: {"bookSourceUrl": "https://x"})
+        value = await Engine().content(
+            source, ChapterItem("Chapter", "https://x/chapter"))
+        self.assertIn('<img src="https://x/cover.jpg">', value)
+
+    async def test_web_file_detail_requires_download_url_list(self):
+        engine = LegadoReadingEngine()
+        source = SimpleNamespace(ruleBookInfo={"downloadUrls": "a@href"})
+        root = BeautifulSoup("<p>none</p>", "html.parser")
+        with self.assertRaisesRegex(RuntimeError, "下载链接为空"):
+            engine._apply_book_info(
+                source, BookItem("File", type=136), root, "html", str(root),
+                "https://x/file", "https://x/file")
 
     async def test_list_rule_runs_js_selector_js_pipeline(self):
         engine = LegadoReadingEngine()
@@ -1896,6 +4391,33 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
             '$.[*]', source, "https://x")
         self.assertEqual(kind, "json")
         self.assertEqual(nodes, [{"name": "A!"}, {"name": "B!"}])
+
+    async def test_reading_list_pipeline_keeps_precompiled_mode_after_js(self):
+        engine = LegadoReadingEngine()
+        source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://x")
+        nodes, kind = await engine._list_nodes(
+            "<p>initial</p>", "text/html",
+            "<js>({items:[{name:'A'}]})</js>items", source, "https://x")
+        self.assertEqual((nodes, kind), ([], "html"))
+        nodes, kind = await engine._list_nodes(
+            "<p>initial</p>", "text/html",
+            "<js>({items:[{name:'A'}]})</js>@Json:$.items[*]",
+            source, "https://x")
+        self.assertEqual((nodes, kind), ([{"name": "A"}], "json"))
+        with self.assertRaises(json.JSONDecodeError):
+            await engine._list_nodes(
+                '{"seed":1}', "application/json",
+                '<js>"<a href=\\"/x\\">X</a>"</js>a', source, "https://x")
+
+    async def test_reading_rule_outer_layers_do_not_swallow_selector_errors(self):
+        engine = LegadoReadingEngine()
+        source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://x")
+        root = BeautifulSoup("<div>x</div>", "html.parser")
+        with self.assertRaises(Exception):
+            engine._strict_value(root, "[invalid", "html", source, "https://x")
+        with self.assertRaises(Exception):
+            await engine._list_nodes(
+                "<div>x</div>", "text/html", "[invalid", source, "https://x")
 
     async def test_list_post_selector_js_keeps_original_src(self):
         engine = LegadoReadingEngine()
@@ -1949,7 +4471,7 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(book.author, "Writer")
         self.assertEqual(book.intro, "Full introduction")
 
-    async def test_search_filters_javascript_action_book_urls(self):
+    async def test_search_keeps_javascript_action_book_urls_like_fixed_booklist(self):
         class Engine(LegadoReadingEngine):
             async def _request(self, request, source=None):
                 return (
@@ -1965,7 +4487,65 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         )
         books = await Engine().search(source, "Book")
         self.assertEqual([(book.name, book.url) for book in books], [
+            ("Ad", "javascript:;"),
             ("Book", "https://source.example/book/1.html")])
+
+    async def test_search_book_fields_use_fixed_bookhelp_formatting(self):
+        class Engine(LegadoReadingEngine):
+            async def _request(self, request, source=None):
+                return (
+                    '<article><a href="/b">Novel　 作者 Someone</a>'
+                    '<i>作 者： Alice 著</i><div class="intro"><p>A&nbsp; B</p><b>C</b></div>'
+                    '<span class="kind">Fantasy</span><span class="words">12500</span>'
+                    '<span class="last">Chapter 8</span></article>',
+                    "text/html", "https://source.example/search")
+
+        source = BookSource(
+            bookSourceUrl="https://source.example", bookSourceName="Origin",
+            searchUrl="/search", ruleSearch={
+                "bookList": "article", "name": "a@text", "author": "i@text",
+                "intro": ".intro@html", "bookUrl": "a@href",
+                "kind": ".kind@text", "wordCount": ".words@text",
+                "lastChapter": ".last@text"})
+        book = (await Engine().search(source, "Novel"))[0]
+        self.assertEqual(
+            (book.name, book.author, book.intro, book.kind, book.word_count,
+             book.latest_chapter_title, book.origin, book.origin_name),
+            ("Novel　", "Alice", "　　A\xa0 B\n　　C", "Fantasy", "1.2万字",
+             "Chapter 8", "https://source.example", "Origin"))
+
+    async def test_search_empty_list_falls_back_to_detail_rules(self):
+        class Engine(LegadoReadingEngine):
+            async def _request(self, request, source=None):
+                return ('<h1>Detail</h1><a class="toc" href="/toc">Toc</a>',
+                        "text/html", "https://source.example/book/1")
+
+        source = BookSource(
+            bookSourceUrl="https://source.example", searchUrl="/book/1",
+            ruleSearch={"bookList": ".missing", "name": ".name@text",
+                        "bookUrl": "a@href"},
+            ruleBookInfo={"name": "h1@text", "tocUrl": "a.toc@href"})
+        books = await Engine().search(source, "Detail")
+        self.assertEqual(len(books), 1)
+        self.assertEqual((books[0].name, books[0].url, books[0].toc_url,
+                          books[0].info_html.startswith("<h1>")),
+                         ("Detail", "https://source.example/book/1",
+                          "https://source.example/toc", True))
+
+    async def test_search_matching_book_url_pattern_parses_detail_directly(self):
+        class Engine(LegadoReadingEngine):
+            async def _request(self, request, source=None):
+                return ('<h1>Direct</h1><ul><li>wrong list</li></ul>',
+                        "text/html", "https://source.example/book/9")
+
+        source = BookSource(
+            bookSourceUrl="https://source.example", searchUrl="/book/9",
+            bookUrlPattern=r"https://source\.example/book/\d+",
+            ruleSearch={"bookList": "li", "name": "li@text", "bookUrl": ""},
+            ruleBookInfo={"name": "h1@text"})
+        books = await Engine().search(source, "Direct")
+        self.assertEqual([(book.name, book.url) for book in books],
+                         [("Direct", "https://source.example/book/9")])
 
     async def test_content_title_and_image_style_are_preserved(self):
         class Engine(LegadoReadingEngine):
@@ -2023,14 +4603,29 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
             '<img src="/cover.jpg"><i class="kind">Fantasy</i>'
             '<em class="last">Chapter 9</em><span class="words">10K</span>'
             '<a class="download" href="/book.txt">TXT</a>', "html.parser")
-        book = BookItem("Old name", url="https://source/book")
+        book = BookItem("Old name", url="https://source/book", type=136)
         engine._apply_book_info(source, book, root, "html", str(root),
                                 "https://source/book")
         self.assertEqual(
             (book.name, book.author, book.intro, book.cover_url, book.kind,
              book.last_chapter, book.word_count, book.download_urls),
             ("New name", "Alice", "Intro", "https://source/cover.jpg", "Fantasy",
-             "Chapter 9", "10K", "https://source/book.txt"))
+             "Chapter 9", "10K", ["https://source/book.txt"]))
+
+    async def test_book_info_nonblank_can_rename_and_formats_fields(self):
+        engine = LegadoReadingEngine()
+        source = SimpleNamespace(ruleBookInfo={
+            "name": "h1@text", "canReName": "false", "author": ".author@text",
+            "intro": ".intro@html", "wordCount": ".words@text"})
+        root = BeautifulSoup(
+            '<h1>Title 作者 ignored</h1><b class="author">作者: Bob 著</b>'
+            '<div class="intro"><p>A&nbsp;B</p><i>C</i></div>'
+            '<span class="words">20000</span>', "html.parser")
+        book = BookItem("Old", author="Old author")
+        engine._apply_book_info(source, book, root, "html", str(root),
+                                "https://source/book")
+        self.assertEqual((book.name, book.author, book.intro, book.word_count),
+                         ("Title", "Bob", "　　A\xa0B\n　　C", "2万字"))
 
     async def test_existing_book_name_still_executes_name_rule_put_side_effect(self):
         engine = LegadoReadingEngine()
@@ -2070,14 +4665,14 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
             bookSourceUrl="https://source",
             loginUi='[{name:"Account",type:"text"},'
                     '{name:"Sign in",type:"button",action:"Login()"}]',
-            loginUrl='function Login(){source.putLoginInfo(infoMap.Account);'
-                     'return "ok:"+infoMap.Account}',
+            loginUrl='function Login(){source.putLoginInfo(result.Account);'
+                     'return "ok:"+result.Account}',
             to_dict=lambda: {
                 "bookSourceUrl": "https://source",
                 "loginUi": '[{name:"Account",type:"text"},'
                            '{name:"Sign in",type:"button",action:"Login()"}]',
-                "loginUrl": 'function Login(){source.putLoginInfo(infoMap.Account);'
-                            'return "ok:"+infoMap.Account}',
+                "loginUrl": 'function Login(){source.putLoginInfo(result.Account);'
+                            'return "ok:"+result.Account}',
             },
         )
         schema = await engine.login_schema(source)
@@ -2090,6 +4685,29 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
             JsContext(source=source, variables=engine.js_variables),
         )
         self.assertEqual(saved, "alice")
+
+    async def test_login_submit_persists_fields_before_invoking_login(self):
+        engine = LegadoReadingEngine()
+        source = SimpleNamespace(
+            bookSourceUrl="https://source", loginUi='[{name:"Account",type:"text"}]',
+            loginUrl=(
+                'function login(){source.putLoginHeader('
+                'JSON.stringify({Account:source.getLoginInfoMap().Account}))}'
+            ),
+            to_dict=lambda: {
+                "bookSourceUrl": "https://source",
+                "loginUi": '[{name:"Account",type:"text"}]',
+                "loginUrl": (
+                    'function login(){source.putLoginHeader('
+                    'JSON.stringify({Account:source.getLoginInfoMap().Account}))}')},
+        )
+        await engine.submit_login(source, {"Account": "alice"})
+        schema = await engine.login_schema(source)
+        header = engine.js.evaluate(
+            "@js:source.getLoginHeader()",
+            JsContext(source=source, variables=engine.js_variables))
+        self.assertEqual(schema[0]["value"], "alice")
+        self.assertEqual(json.loads(header), {"Account": "alice"})
 
     async def test_login_target_accepts_relative_and_json_url_but_not_notes(self):
         relative = SimpleNamespace(bookSourceUrl="https://source/base", loginUrl="/login")
@@ -2176,6 +4794,19 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
             root, r'##.*作者：([^<]+).*##$1', "html", source, "https://x",
             raw_result='<p>作者：李四</p>'), "李四")
 
+    async def test_all_field_and_content_regex_paths_use_java_syntax(self):
+        engine = LegadoReadingEngine()
+        source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://x")
+        root = BeautifulSoup("<p>unused</p>", "html.parser")
+        self.assertEqual(engine._strict_value(
+            root, r"##(?<first>book)\Rend\z##${first}",
+            "html", source, "https://x", raw_result="book\r\nend"), "book")
+        self.assertEqual(
+            await engine._replace_content_stages(
+                "book\r\nend", r"(?<first>book)\Rend\z##${first}",
+                source, ChapterItem("chapter", "https://x/1")),
+            "book")
+
     async def test_content_rule_collects_all_matching_paragraphs(self):
         engine = LegadoReadingEngine()
         source = SimpleNamespace(ruleContent={})
@@ -2193,6 +4824,17 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("book title", value)
         self.assertIn("first paragraph", value)
         self.assertIn("second paragraph", value)
+
+    async def test_strict_json_fields_keep_jayway_java_string_forms(self):
+        engine = LegadoReadingEngine()
+        source = SimpleNamespace(ruleContent={})
+        data = {"enabled": True, "item": {"id": 1}, "missing": None}
+        self.assertEqual(engine._strict_value(
+            data, "$.enabled", "json", source, ""), "true")
+        self.assertEqual(engine._strict_value(
+            data, "$.item", "json", source, ""), "{id=1}")
+        self.assertEqual(engine._strict_value(
+            data, "$.missing", "json", source, ""), "")
 
     async def test_content_pages_keep_order_and_stop_at_next_chapter(self):
         class Engine(LegadoReadingEngine):
@@ -2222,6 +4864,201 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.calls, ["https://x/c1", "https://x/c1_2", "https://x/c1_3"])
         self.assertEqual(document.plain_text, "A\nB\nC")
 
+    async def test_content_pagination_is_not_truncated_after_twenty_pages(self):
+        class Engine(LegadoReadingEngine):
+            async def _request_value(self, value, source, base_url="", page=1,
+                                     request_defaults=None):
+                number = int(str(value).rsplit("/", 1)[-1])
+                next_url = (f"https://source.example/page/{number + 1}"
+                            if number < 22 else "")
+                return (json.dumps({"content": f"Page {number}",
+                                    "next": next_url}),
+                        "application/json", str(value))
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://source.example",
+            ruleContent={"content": "$.content", "nextContentUrl": "$.next"},
+            to_dict=lambda: {"bookSourceUrl": "https://source.example"},
+        )
+        document = await Engine().content_document(
+            source, ChapterItem(name="Chapter",
+                                url="https://source.example/page/1"))
+
+        self.assertIn("Page 1", document.plain_text)
+        self.assertIn("Page 22", document.plain_text)
+
+    async def test_multiple_content_pages_are_concurrent_ordered_and_not_recursive(self):
+        class Engine(LegadoReadingEngine):
+            def __init__(self):
+                super().__init__()
+                self.active = 0
+                self.max_active = 0
+                self.calls = []
+
+            async def _request_value(self, value, source, base_url="", page=1,
+                                     request_defaults=None):
+                number = int(str(value).rsplit("/", 1)[-1])
+                self.calls.append(number)
+                if number > 1:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                    await asyncio.sleep(0.02)
+                    self.active -= 1
+                next_value = ["https://x/2", "https://x/3"] if number == 1 else (
+                    ["https://x/4"] if number == 2 else [])
+                return (json.dumps({"content": f"P{number}", "next": next_value}),
+                        "application/json", str(value))
+
+        source = SimpleNamespace(
+            ruleContent={"content": "$.content", "nextContentUrl": "$.next"},
+            to_dict=lambda: {},
+        )
+        engine = Engine()
+        document = await engine.content_document(
+            source, ChapterItem("chapter", "https://x/1"))
+        self.assertEqual(document.plain_text, "P1\nP2\nP3")
+        self.assertEqual(engine.calls, [1, 2, 3])
+        self.assertEqual(engine.max_active, 2)
+
+    async def test_multiple_toc_pages_are_concurrent_ordered_and_not_recursive(self):
+        class Engine(LegadoReadingEngine):
+            def __init__(self):
+                super().__init__()
+                self.active = 0
+                self.max_active = 0
+                self.calls = []
+
+            async def _request_value(self, value, source, base_url="", page=1,
+                                     request_defaults=None):
+                self.calls.append(str(value))
+                if str(value).endswith("detail"):
+                    body = {"toc": "https://x/1"}
+                else:
+                    number = int(str(value).rsplit("/", 1)[-1])
+                    if number > 1:
+                        self.active += 1
+                        self.max_active = max(self.max_active, self.active)
+                        await asyncio.sleep(0.02)
+                        self.active -= 1
+                    next_value = ["https://x/2", "https://x/3"] if number == 1 else (
+                        ["https://x/4"] if number == 2 else [])
+                    body = {"chapters": [{"name": f"C{number}",
+                                           "url": f"https://x/c{number}"}],
+                            "next": next_value}
+                return json.dumps(body), "application/json", str(value)
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://x", ruleBookInfo={"tocUrl": "$.toc"},
+            ruleToc={"chapterList": "$.chapters[*]", "chapterName": "$.name",
+                     "chapterUrl": "$.url", "nextTocUrl": "$.next"},
+            to_dict=lambda: {},
+        )
+        engine = Engine()
+        chapters = await engine.chapters(
+            source, BookItem("book", url="https://x/detail"))
+        self.assertEqual([item.name for item in chapters], ["C1", "C2", "C3"])
+        self.assertNotIn("https://x/4", engine.calls)
+        self.assertEqual(engine.max_active, 2)
+
+    async def test_toc_reverse_dedup_and_book_state_match_historical_order(self):
+        class Engine(LegadoReadingEngine):
+            async def _request_value(self, value, source, base_url="", page=1,
+                                     request_defaults=None):
+                body = {"items": [
+                    {"name": "A-first", "url": "/same"},
+                    {"name": "B", "url": "/b"},
+                    {"name": "A-last", "url": "/same"},
+                ]}
+                return json.dumps(body), "application/json", "https://x/toc"
+
+        async def names(prefix, reverse_toc):
+            source = SimpleNamespace(
+                bookSourceUrl="https://x",
+                ruleBookInfo={},
+                ruleToc={"chapterList": prefix + "$.items[*]",
+                         "chapterName": "$.name", "chapterUrl": "$.url"},
+                to_dict=lambda: {},
+            )
+            book = BookItem("book", url="https://x/toc",
+                            read_config={"reverseToc": reverse_toc})
+            chapters = await Engine().chapters(source, book)
+            self.assertEqual(book.latest_chapter_title, chapters[-1].name)
+            self.assertEqual(book.dur_chapter_title, chapters[0].name)
+            self.assertEqual(book.last_check_count, 2)
+            self.assertGreater(book.last_check_time, 0)
+            return [item.name for item in chapters]
+
+        self.assertEqual(await names("", False), ["B", "A-last"])
+        self.assertEqual(await names("-", False), ["B", "A-first"])
+        self.assertEqual(await names("", True), ["A-last", "B"])
+        self.assertEqual(await names("-", True), ["A-first", "B"])
+
+    async def test_volume_without_url_uses_title_and_page_index(self):
+        class Engine(LegadoReadingEngine):
+            async def _request_value(self, value, source, base_url="", page=1,
+                                     request_defaults=None):
+                body = {"items": [{"name": "Volume", "volume": True}]}
+                return json.dumps(body), "application/json", "https://x/toc"
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://x", ruleBookInfo={},
+            ruleToc={"chapterList": "$.items[*]", "chapterName": "$.name",
+                     "chapterUrl": "$.url", "isVolume": "$.volume"},
+            to_dict=lambda: {},
+        )
+        chapters = await Engine().chapters(
+            source, BookItem("book", url="https://x/toc"))
+        self.assertEqual(chapters[0].url, "Volume0")
+        self.assertEqual(chapters[0].base_url, "https://x/toc")
+
+    async def test_empty_toc_and_non_volume_content_raise_historical_errors(self):
+        class Engine(LegadoReadingEngine):
+            async def _request_value(self, value, source, base_url="", page=1,
+                                     request_defaults=None):
+                return "{}", "application/json", str(value)
+
+        toc_source = SimpleNamespace(
+            bookSourceUrl="https://x", ruleBookInfo={},
+            ruleToc={"chapterList": "$.items[*]"}, to_dict=lambda: {})
+        with self.assertRaises(TocEmptyError):
+            await Engine().chapters(
+                toc_source, BookItem("book", url="https://x/toc"))
+
+        content_source = SimpleNamespace(
+            ruleContent={"content": "$.content"}, to_dict=lambda: {})
+        with self.assertRaises(ContentEmptyError):
+            await Engine().content_document(
+                content_source, ChapterItem("chapter", "https://x/1"))
+        volume = await Engine().content_document(
+            content_source, ChapterItem("volume", "https://x/1", is_volume=True))
+        self.assertEqual(volume.plain_text, "")
+
+    async def test_image_decode_failure_returns_empty_like_image_utils_null(self):
+        class Response:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return False
+            def raise_for_status(self): return None
+            async def read(self): return b"encrypted"
+
+        class Session:
+            def __init__(self, *_args, **_kwargs): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return False
+            def get(self, *_args, **_kwargs): return Response()
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://x", header="",
+            ruleContent={"imageDecode": "throw new Error('bad')"},
+            to_dict=lambda: {"bookSourceUrl": "https://x"})
+        document = parse_content_blocks(
+            '<img src="https://x/encrypted.jpg">', "https://x/")
+        engine = LegadoReadingEngine()
+        with patch("app.services.reading_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.reading_engine.aiohttp.TCPConnector",
+                      lambda **_kwargs: object()):
+            await engine._load_protected_images(document, source)
+        self.assertEqual(document.blocks[0].value, b"")
+
     async def test_replace_regex_runs_after_content_pages_are_combined(self):
         class Engine(LegadoReadingEngine):
             async def _request_value(self, value, source, base_url="", page=1,
@@ -2240,6 +5077,45 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         document = await Engine().content_document(
             source, ChapterItem("chapter", "https://x/1"))
         self.assertEqual(document.plain_text, "combined")
+
+    def test_invalid_replace_regex_falls_back_to_literal_replacement(self):
+        self.assertEqual(_apply_replace_regex(r"a\b\c", "##\\"), "abc")
+
+    async def test_content_delays_html_unescape_until_after_structure_detection(self):
+        class Engine(LegadoReadingEngine):
+            async def _request_value(self, value, source, base_url="", page=1,
+                                     request_defaults=None):
+                return (json.dumps({"content":
+                                    "正文 &lt;b&gt;不是标签&lt;/b&gt; &amp; 结束"}),
+                        "application/json", str(value))
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://source.example",
+            ruleContent={"content": "$.content"},
+            to_dict=lambda: {"bookSourceUrl": "https://source.example"})
+        document = await Engine().content_document(
+            source, ChapterItem("chapter", "https://source.example/1"))
+        self.assertEqual(document.plain_text, "正文 <b>不是标签</b> & 结束")
+
+    async def test_content_does_not_guess_pagination_without_next_rule(self):
+        class Engine(LegadoReadingEngine):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+
+            async def _request_value(self, value, source, base_url="", page=1,
+                                     request_defaults=None):
+                self.calls.append(str(value))
+                return ('<main>正文</main><a href="/2">下一页</a>',
+                        "text/html", str(value))
+
+        source = SimpleNamespace(
+            ruleContent={"content": "main@text"}, to_dict=lambda: {})
+        engine = Engine()
+        document = await engine.content_document(
+            source, ChapterItem("chapter", "https://source.example/1"))
+        self.assertEqual(document.plain_text, "正文")
+        self.assertEqual(engine.calls, ["https://source.example/1"])
 
     async def test_replace_regex_runs_every_regex_and_js_stage(self):
         engine = LegadoReadingEngine()

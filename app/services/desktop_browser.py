@@ -21,6 +21,7 @@ class EdgeCdpSession:
         self.process = None
         self.port = 0
         self.target_ws = ""
+        self.initial_url = ""
 
     @staticmethod
     def find_edge() -> Path | None:
@@ -43,6 +44,7 @@ class EdgeCdpSession:
         return "; ".join(values)
 
     async def start(self, url: str) -> None:
+        self.initial_url = str(url)
         edge = self.find_edge()
         if edge is None:
             raise DesktopBrowserError("未找到 Microsoft Edge，无法打开网页验证")
@@ -98,11 +100,21 @@ class EdgeCdpSession:
                     raise DesktopBrowserError(str(payload["error"]))
                 return payload.get("result") or {}
 
-    async def capture(self, script: str = "", delay_ms: int = 0) -> dict:
+    async def capture(self, script: str = "", delay_ms: int = 0,
+                      html: str = "", source_regex: str = "",
+                      override_regex: str = "") -> dict:
         await self._select_target()
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(self.target_ws, max_msg_size=64 * 1024 * 1024) as ws:
                 command_id = 1
+                if html:
+                    await self._command(ws, command_id, "Runtime.evaluate", {
+                        "expression": (
+                            "document.open();document.write(" +
+                            json.dumps(str(html), ensure_ascii=False) +
+                            ");document.close()"),
+                        "awaitPromise": True, "returnByValue": True})
+                    command_id += 1
                 if script:
                     await self._command(ws, command_id, "Runtime.evaluate", {
                         "expression": str(script), "awaitPromise": True,
@@ -111,17 +123,30 @@ class EdgeCdpSession:
                     if delay_ms:
                         await asyncio.sleep(max(0, delay_ms) / 1000)
                 value = await self._command(ws, command_id, "Runtime.evaluate", {
-                    "expression": "({html:document.documentElement.outerHTML,url:location.href})",
+                    "expression": ("({html:document.documentElement.outerHTML,url:location.href,"
+                                   "resources:performance.getEntriesByType('resource').map(e=>e.name)})"),
                     "returnByValue": True,
                 })
                 cookies = await self._command(ws, command_id + 1, "Network.getAllCookies")
         page = ((value.get("result") or {}).get("value") or {})
         final_url = str(page.get("url") or "")
-        return {
+        result = {
             "body": str(page.get("html") or ""), "headers": {"content-type": "text/html"},
             "status": 200, "url": final_url,
             "cookie": self.cookie_header(cookies.get("cookies") or [], final_url),
         }
+        from app.services.java_regex import compile_pattern
+        if source_regex:
+            pattern = compile_pattern(source_regex)
+            matched = next((str(item) for item in page.get("resources") or []
+                            if pattern.fullmatch(str(item))), "")
+            if matched:
+                result.update(body=matched, source=matched,
+                              url=self.initial_url or final_url)
+        if override_regex and compile_pattern(override_regex).fullmatch(final_url):
+            result.update(body=final_url, overrideUrl=final_url,
+                          url=self.initial_url or final_url)
+        return result
 
     async def close(self) -> None:
         process, self.process = self.process, None

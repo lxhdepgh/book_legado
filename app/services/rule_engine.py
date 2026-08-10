@@ -4,26 +4,101 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import gzip
+import html
+import hashlib
+import io
 import json
 import re
+import struct
+import threading
 import time
+import xml.etree.ElementTree as ET
+import zipfile
 from collections import deque
 from dataclasses import dataclass, field
-from urllib.parse import unquote_to_bytes, urljoin
+from decimal import Decimal
+from pathlib import Path
+from urllib.parse import quote, unquote_to_bytes, urljoin
 
 import aiohttp
-from bs4 import BeautifulSoup
+from aiohttp_socks import ProxyConnector
+from bs4 import BeautifulSoup, UnicodeDammit
+from multidict import CIMultiDict
 
 from test_book_sources_async import (encode_url, jsonpath_get, parse_search_url,
                                      simplify_legado_selector, usable_non_js_rule)
 from app.services.legado_js import (JsBridgeError, JsContext, LegadoJsRuntime,
                                     split_js_rule)
-from app.services.legado_rule_parser import RuleParseError, evaluate, split_balanced
-from app.services.request_compat import escape_form, escape_url_query
+from app.services.legado_rule_parser import (JavaArrayNull, JavaKeySet,
+                                             RuleParseError, evaluate,
+                                             parse_json_smart, parse_markup,
+                                             split_balanced)
+from app.services.java_regex import (search as java_regex_search,
+                                     sub as java_regex_sub,
+                                     translate_replacement)
+from app.services.icu_charset import detect_charset
+from app.services.request_compat import (encode_form_fields,
+                                         encode_url_query_fields, escape_form,
+                                         escape_url_query)
+from app.services.source_rule import compile_rule_program, strip_put_rules
 
 
 class UnsupportedRule(RuntimeError):
     pass
+
+
+def _trim_ascii_space(value: str) -> str:
+    return re.sub(r"^[\x00-\x20]+|[\x00-\x20]+$", "", str(value or ""))
+
+
+def _format_book_name(value: str) -> str:
+    space = r"[ \t\n\x0B\f\r]"
+    return _trim_ascii_space(re.sub(
+        rf"{space}+作{space}*者.*|{space}+\S+{space}+著", "", str(value or "")))
+
+
+def _format_book_author(value: str) -> str:
+    space = r"[ \t\n\x0B\f\r]"
+    return _trim_ascii_space(re.sub(
+        rf"^{space}*作{space}*者[:： \t\n\x0B\f\r]+|{space}+著", "", str(value or "")))
+
+
+def _format_word_count(value: str) -> str:
+    text = str(value or "")
+    if not re.fullmatch(r"-?[0-9]+", text):
+        return text
+    number = int(text)
+    if not -(2 ** 31) <= number < 2 ** 31:
+        raise ValueError("word count exceeds Java Int")
+    if number <= 0:
+        return ""
+    if number <= 10000:
+        return f"{number}字"
+    # Kotlin evaluates this historical expression through Float before
+    # DecimalFormat, so halfway values can sit just below their decimal form.
+    quotient = struct.unpack("!f", struct.pack("!f", number / 10000))[0]
+    rendered = f"{quotient:.1f}".rstrip("0").rstrip(".")
+    return f"{rendered}万字"
+
+
+def _format_book_intro(value: str) -> str:
+    text = str(value or "")
+    text = re.sub(r"(?:&nbsp;)+", " ", text)
+    text = re.sub(r"&ensp;|&emsp;", " ", text)
+    text = re.sub(r"&thinsp;|&zwnj;|&zwj;", "", text)
+    text = re.sub(r"</?(?:div|p|br|hr|h\d|article|dd|dl)[^>]*>", "\n", text)
+    text = re.sub(r"<!--[^>]*-->", "", text)
+    text = re.sub(r"</?[a-zA-Z]+(?=[ >])[^<>]*>", "", text)
+    text = re.sub(r"\s*\n+\s*", "\n　　", text)
+    text = re.sub(r"^[\n\s]+", "　　", text)
+    return re.sub(r"[\n\s]+$", "", text)
+
+
+def _book_type(source) -> int:
+    """Map legacy BookSourceType to fixed bitwise BookType."""
+    return {0: 8, 1: 32, 2: 64, 3: 8 | 128}.get(
+        int(getattr(source, "bookSourceType", 0) or 0), 8)
 
 
 @dataclass
@@ -36,8 +111,9 @@ class BookItem:
     toc_url: str = ""
     kind: str = ""
     last_chapter: str = ""
+    latest_chapter_title: str = ""
     word_count: str = ""
-    download_urls: str = ""
+    download_urls: list[str] | None = None
     origin: str = ""
     origin_name: str = ""
     type: int = 0
@@ -61,6 +137,49 @@ class BookItem:
     info_html: str = ""
     toc_html: str = ""
     variables: dict = field(default_factory=dict)
+    origins: list[str] = field(default_factory=list)
+
+    def add_origin(self, origin: str) -> None:
+        value = str(origin or "")
+        if value and value not in self.origins:
+            self.origins.append(value)
+
+    def origin_set(self) -> list[str]:
+        values = list(self.origins)
+        if self.origin and self.origin not in values:
+            values.insert(0, self.origin)
+        return values
+
+
+def merge_search_items(existing: list[BookItem], new_items: list[BookItem],
+                       search_key: str, precision: bool = False) -> list[BookItem]:
+    """Port SearchModel.mergeItems, including origin aggregation and ordering."""
+    equal, contains, other = [], [], []
+
+    def category(book: BookItem):
+        if book.name == search_key or book.author == search_key:
+            return equal
+        if search_key in book.name or search_key in book.author:
+            return contains
+        return other
+
+    for book in existing:
+        book.origins = book.origin_set()
+        category(book).append(book)
+    for book in new_items:
+        target = category(book)
+        if target is other and precision:
+            continue
+        duplicate = next((item for item in target
+                          if item.name == book.name and item.author == book.author), None)
+        if duplicate is not None:
+            duplicate.add_origin(book.origin)
+        else:
+            book.origins = book.origin_set()
+            target.append(book)
+    equal.sort(key=lambda item: len(item.origin_set()), reverse=True)
+    contains.sort(key=lambda item: len(item.origin_set()), reverse=True)
+    return equal + contains + ([] if precision else other)
 
 
 @dataclass
@@ -77,6 +196,8 @@ class ChapterItem:
     resource_url: str = ""
     start: int | None = None
     end: int | None = None
+    start_fragment_id: str | None = None
+    end_fragment_id: str | None = None
     variables: dict = field(default_factory=dict)
 
 
@@ -238,10 +359,12 @@ def _xpath_to_css(rule: str) -> tuple[str, str]:
 
 
 def _json_values(data, rule: str) -> list:
-    selector, _ = _split_rule(rule)
+    selector = str(rule or "").strip()
+    if selector.lower().startswith("@json:"):
+        selector = selector.split(":", 1)[1].strip()
     if not selector:
         return data if isinstance(data, list) else [data]
-    values = jsonpath_get(data, selector)
+    values = evaluate(data, selector, "json")
     if len(values) == 1 and isinstance(values[0], list):
         return values[0]
     return values
@@ -258,37 +381,16 @@ def select_nodes(text: str, content_type: str, rule: str) -> tuple[list, str]:
         raise UnsupportedRule("列表规则需要 JavaScript 引擎")
     if "json" in (content_type or "").lower() or text.lstrip().startswith(("{", "[")):
         try:
-            data = json.loads(text)
+            data = parse_json_smart(text)
             values = evaluate(data, rule, "json") if rule else (data if isinstance(data, list) else [data])
             if values:
                 return values, "json"
         except (json.JSONDecodeError, TypeError):
             pass
-    soup = BeautifulSoup(text, "html.parser")
-    try:
-        nodes = evaluate(soup, rule, "html")
-        if nodes:
-            return nodes, "html"
-    except RuleParseError:
-        pass
-    # 无规则或规则失效时，按常见书籍卡片结构智能推断。
-    for selector in (".bookbox", ".book-item", ".booklist li", ".listbg", ".novel-item",
-                     ".search-result li", "article", "main li"):
-        nodes = soup.select(selector)
-        if len(nodes) >= 2:
-            return nodes, "html"
-    # Outdated sources are common. Infer a repeated record container, but only
-    # after the source's own rule has produced no nodes.
-    groups = {}
-    for item in soup.select("li:has(a[href])"):
-        if item.find_parent(("nav", "header", "footer")):
-            continue
-        parent = item.parent
-        groups.setdefault(id(parent), (parent, []))[1].append(item)
-    if groups:
-        inferred = max(groups.values(), key=lambda pair: len(pair[1]))[1]
-        if len(inferred) >= 3:
-            return inferred, "html"
+    soup = parse_markup(text, content_type)
+    nodes = evaluate(soup, rule, "html")
+    if nodes:
+        return nodes, "html"
     # A valid selector with no matching records is an ordinary empty search,
     # not an engine failure. Syntax is checked independently by corpus audit.
     return [], "html"
@@ -312,26 +414,120 @@ def _is_pagination_item(name: str, url: str) -> bool:
     ))
 
 
-def _is_action_url(url: str) -> bool:
-    return str(url or "").strip().lower().startswith(("javascript:", "void("))
-
-
 def _java_replacement(value: str) -> str:
     """Translate Java/Rhino ``$1`` capture references for Python ``re``."""
-    return re.sub(r"\$(\d+)", r"\\g<\1>", str(value or ""))
+    return translate_replacement(value)
+
+
+def _legado_value_string(value) -> str:
+    """Render JSONPath values like Jayway/json-smart and Java toString()."""
+    if value is None:
+        return ""
+    if isinstance(value, JavaArrayNull):
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, ET.Element):
+        return ET.tostring(value, encoding="unicode")
+    if isinstance(value, JavaKeySet):
+        return "[" + ", ".join(str(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(
+            f"{key}={_java_map_child_string(item)}"
+            for key, item in value.items()) + "}"
+    if isinstance(value, list):
+        return _json_smart_array_string(value)
+    if isinstance(value, Decimal):
+        return str(value)
+    return str(value)
+
+
+def _json_smart_array_string(value) -> str:
+    def render(item):
+        if item is None: return "null"
+        if isinstance(item, bool): return "true" if item else "false"
+        if isinstance(item, str):
+            return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+        if isinstance(item, dict):
+            return "{" + ",".join(
+                json.dumps(str(key), ensure_ascii=False) + ":" + render(child)
+                for key, child in item.items()) + "}"
+        if isinstance(item, (list, tuple)):
+            return "[" + ",".join(render(child) for child in item) + "]"
+        return str(item)
+    return "[" + ",".join(render(item) for item in value) + "]"
+
+
+def _java_map_child_string(value) -> str:
+    if value is None: return "null"
+    if isinstance(value, bool): return "true" if value else "false"
+    if isinstance(value, dict): return _legado_value_string(value)
+    if isinstance(value, list): return _json_smart_array_string(value)
+    return str(value)
+
+
+def _replace_jsonpath_embeds(template: str, node) -> str:
+    """Replace balanced ``{$...}`` expressions as Legado RuleAnalyzer does."""
+    result, cursor = [], 0
+    while True:
+        start = template.find("{$.", cursor)
+        while start > 0 and template[start - 1] == "{":
+            start = template.find("{$.", start + 2)
+        if start < 0:
+            result.append(template[cursor:])
+            break
+        result.append(template[cursor:start])
+        quote, escaped, depth, end = "", False, 1, -1
+        for index in range(start + 1, len(template)):
+            char = template[index]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = ""
+            elif char in "'\"":
+                quote = char
+            elif char in "[({":
+                depth += 1
+            elif char in "]) }".replace(" ", ""):
+                depth -= 1
+                if char == "}" and depth == 0:
+                    end = index
+                    break
+        if end < 0:
+            result.append(template[start:])
+            break
+        values = _json_values(node, template[start + 1:end].strip())
+        result.append("" if not values else _legado_value_string(values[0]))
+        cursor = end + 1
+    return "".join(result)
+
+
+def _split_put_rules(rule: str) -> tuple[str, str]:
+    return strip_put_rules(rule)
 
 
 def _capture_value(node, rule: str) -> str | None:
     """Render Regex-mode records in fields such as ``$3`` or ``url/$1``."""
-    if not isinstance(node, (list, tuple)) or not re.search(r"\$\d+", str(rule)):
+    rule_text = str(rule)
+    capture_part, separator, suffix = rule_text.partition("##")
+    if not re.search(r"\$\d{1,2}", capture_part):
         return None
+    if not isinstance(node, list):
+        # SourceRule.makeUpRule only casts to List<String?>; on another result
+        # type capture tokens remain literal instead of being consumed.
+        return rule_text
     values = ["" if value is None else str(value) for value in node]
-    return re.sub(
-        r"\$(\d+)",
-        lambda match: (values[int(match.group(1))]
+    rendered = re.sub(
+        r"\$(\d{1,2})",
+        lambda match: (match.group(0) if int(match.group(1)) == 0 else
+                       values[int(match.group(1))]
                        if int(match.group(1)) < len(values) else ""),
-        str(rule),
+        capture_part,
     )
+    return rendered + (separator + suffix if separator else "")
 
 
 def extract_values(node, rule: str, kind: str, base_url: str = "") -> list[str]:
@@ -347,17 +543,15 @@ def extract_values(node, rule: str, kind: str, base_url: str = "") -> list[str]:
     for candidate in _rule_candidates(rule):
         pieces = candidate.split("##")
         selector_rule = pieces[0]
-        try:
-            targets = evaluate(node, selector_rule, kind)
-        except RuleParseError:
-            continue
+        targets = evaluate(node, selector_rule, kind)
         values = []
         for target in targets:
-            value = (target.get_text(" ", strip=True) if hasattr(target, "get_text") else str(target))
+            value = (target.get_text(" ", strip=True) if hasattr(target, "get_text")
+                     else _legado_value_string(target))
             if len(pieces) >= 2 and pieces[1]:
                 try:
-                    value = re.sub(pieces[1], _java_replacement(
-                        pieces[2] if len(pieces) > 2 else ""), value)
+                    value = java_regex_sub(
+                        pieces[1], pieces[2] if len(pieces) > 2 else "", value)
                 except re.error:
                     pass
             value = value.strip()
@@ -374,22 +568,35 @@ def _apply_regex_suffix(value: str, suffix: str) -> str:
     pieces = str(suffix or "").split("##")
     if len(pieces) < 2 or not pieces[1]:
         return str(value)
+    pattern = pieces[1]
+    replacement = pieces[2] if len(pieces) > 2 else ""
+    rendered_replacement = _java_replacement(replacement)
+    if len(pieces) > 3:
+        try:
+            match = java_regex_search(pattern, str(value))
+            if match is None:
+                return ""
+            return java_regex_sub(pattern, replacement, match.group(0), count=1)
+        except re.error:
+            # AnalyzeRule returns the replacement when a replace-first pattern
+            # itself is invalid.
+            return replacement
     try:
-        return re.sub(pieces[1], _java_replacement(
-            pieces[2] if len(pieces) > 2 else ""), str(value),
-                      count=1 if len(pieces) > 3 else 0)
+        return java_regex_sub(pattern, replacement, str(value))
     except re.error:
-        return str(value)
+        return str(value).replace(pattern, replacement)
 
 
-def extract_value(node, rule: str, kind: str, base_url: str = "") -> str:
+def extract_value(node, rule: str, kind: str, base_url: str = "",
+                  unescape_html: bool = True) -> str:
+    decode = html.unescape if unescape_html else (lambda value: value)
     if not rule:
         return ""
     if "{baseUrl}" in rule:
-        return rule.replace("{baseUrl}", base_url).strip()
+        return decode(rule.replace("{baseUrl}", base_url)).strip()
     captured = _capture_value(node, rule)
     if captured is not None:
-        captured = captured.strip()
+        captured = decode(captured).strip()
         if base_url and captured.startswith(("/", "./", "../", "//", "#")):
             captured = urljoin(base_url, captured)
         return captured
@@ -402,15 +609,17 @@ def extract_value(node, rule: str, kind: str, base_url: str = "") -> str:
             values = extract_values(node, nested, kind, base_url)
             return "" if not values else str(values[0])
         value = re.sub(r"\{\{@@(.*?)\}\}", replace_nested, rule)
-        value = value.strip()
+        value = decode(value).strip()
         return urljoin(base_url, value) if base_url else value
 
     if kind == "json" and ("{{" in rule or "{$" in rule):
+        rule = _replace_jsonpath_embeds(rule, node)
         def replace_field(match):
-            expression = (match.group(1) or match.group(2) or "").strip()
+            expression = (match.group(1) or "").strip()
             values = _json_values(node, expression)
-            return "" if not values else str(values[0])
-        value = re.sub(r"\{\{([^{}]+)\}\}|\{(\$[^{}]+)\}", replace_field, rule)
+            return "" if not values else _legado_value_string(values[0])
+        value = re.sub(r"\{\{([^{}]+)\}\}", replace_field, rule)
+        value = decode(value)
         return urljoin(base_url, value) if base_url else value
 
     candidates = _rule_candidates(rule) or [rule]
@@ -420,20 +629,7 @@ def extract_value(node, rule: str, kind: str, base_url: str = "") -> str:
                                       first_only=bool(base_url))
         if value:
             break
-    # 智能字段回退。
-    if not value and kind == "html":
-        selector = "a"
-        if any(key in rule.lower() for key in ("cover", "src", "img")):
-            selector = "img"
-        target = node.select_one(selector) if hasattr(node, "select_one") else None
-        if target:
-            if any(key in rule.lower() for key in ("url", "href")):
-                value = target.get("href", "")
-            elif any(key in rule.lower() for key in ("cover", "src", "img")):
-                value = target.get("data-src") or target.get("data-original") or target.get("src", "")
-            else:
-                value = target.get("title") or target.get_text(" ", strip=True)
-    value = value.strip()
+    value = decode(value).strip()
     url_hint = any(key in rule.lower() for key in ("url", "href", "src"))
     relative_hint = value.startswith(("/", "./", "../", "//", "#"))
     if base_url and value and (url_hint or relative_hint) and not value.startswith(("data:", "javascript:")):
@@ -450,36 +646,85 @@ def _extract_single_value(node, rule: str, kind: str,
     if (kind == "html" and hasattr(node, "get") and
             re.fullmatch(r"[A-Za-z_:][-A-Za-z0-9_:.]*", selector_rule.strip())):
         value = str(node.get(selector_rule.strip()) or "")
-    try:
-        values = [] if value else evaluate(node, selector_rule, kind)
-    except RuleParseError:
-        values = []
+    values = [] if value else evaluate(node, selector_rule, kind)
     if values:
         rendered = [item.get_text(" ", strip=True) if hasattr(item, "get_text")
-                    else str(item) for item in values]
+                    else _legado_value_string(item) for item in values]
         value = rendered[0] if first_only else "\n".join(rendered)
     # 常见 ##正则替换：正文前是提取规则，此处至少完成删除匹配项。
     if "##" in rule:
         pieces = rule.split("##")
         if len(pieces) >= 2 and pieces[1]:
-            try:
-                value = re.sub(pieces[1], _java_replacement(
-                    pieces[2] if len(pieces) > 2 else ""), value)
-            except re.error:
-                pass
+            value = _apply_regex_suffix(value, "##" + "##".join(pieces[1:]))
     return value.strip()
 
 
 class ReaderEngine:
+    _global_rate_states = {}
+    _global_rate_lock = threading.Lock()
+
     def __init__(self, timeout: int = 15, state_dir=None):
         self.timeout = timeout
         self.state_dir = state_dir
         self.js = LegadoJsRuntime(timeout, state_dir=state_dir)
         self.js_variables = {}
-        self.headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"}
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/119.0.0.0 Safari/537.36")}
         self.cookie_jar = aiohttp.CookieJar(unsafe=True)
+        self._source_cookie_jars = {}
         self.last_response = None
-        self._rate_states = {}
+
+    def create_search_model(self, *, thread_count: int = 16,
+                            precision: bool = False, on_update=None,
+                            on_start=None, on_finish=None, on_cancel=None):
+        """Create the stateful multi-source search path used by the UI/API."""
+        from app.services.search_model import SearchBookStore, SearchModel
+
+        store = None
+        if self.state_dir is not None:
+            store = SearchBookStore(Path(self.state_dir) / "search-books.sqlite3")
+        return SearchModel(
+            self.search, thread_count=thread_count, precision=precision,
+            store=store, on_update=on_update, on_start=on_start,
+            on_finish=on_finish, on_cancel=on_cancel)
+
+    def _cookie_jar_for_source(self, source=None):
+        if source is None:
+            return self.cookie_jar
+        if not bool(getattr(source, "enabledCookieJar", True)):
+            return aiohttp.DummyCookieJar()
+        key = str(getattr(source, "bookSourceUrl", "") or id(source))
+        jar = self._source_cookie_jars.get(key)
+        if jar is None:
+            jar = aiohttp.CookieJar(unsafe=True)
+            path = self._source_cookie_path(key)
+            if path is not None:
+                try:
+                    jar.load(path)
+                except (FileNotFoundError, OSError, ValueError):
+                    pass
+            self._source_cookie_jars[key] = jar
+        return jar
+
+    def _source_cookie_path(self, source_key: str) -> Path | None:
+        if not self.state_dir:
+            return None
+        return (Path(self.state_dir) / "cookies" /
+                (hashlib.sha256(source_key.encode()).hexdigest() + ".jar"))
+
+    def _persist_source_cookie_jar(self, source) -> None:
+        if source is None or not bool(getattr(source, "enabledCookieJar", True)):
+            return
+        key = str(getattr(source, "bookSourceUrl", "") or id(source))
+        path = self._source_cookie_path(key)
+        jar = self._source_cookie_jars.get(key)
+        if path is None or jar is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        jar.save(path)
 
     async def _respect_concurrent_rate(self, source) -> None:
         """Apply Legado ``concurrentRate`` before starting a network call.
@@ -491,43 +736,83 @@ class ReaderEngine:
         if not raw:
             return
         source_key = str(getattr(source, "bookSourceUrl", "") or id(source))
-        state = self._rate_states.get(source_key)
-        if state is None:
-            state = {"lock": asyncio.Lock(), "starts": deque(), "last": 0.0}
-            self._rate_states[source_key] = state
         try:
             if "/" in raw:
                 count_text, window_text = raw.split("/", 1)
-                count = max(1, int(count_text))
+                # Fixed AnalyzeUrl 3.23.110211 initializes frequency to 1,
+                # then rejects only when `frequency > count`. Consequently
+                # N/T observably permits the initial start plus N more starts.
+                count = max(1, int(count_text)) + 1
                 window = max(0, int(window_text)) / 1000.0
             else:
                 count, window = 1, max(0, int(raw)) / 1000.0
         except ValueError:
             return
-        async with state["lock"]:
+        with self._global_rate_lock:
+            state = self._global_rate_states.setdefault(
+                source_key, {"starts": deque(), "last": 0.0})
             now = time.monotonic()
             if "/" not in raw:
                 target = state["last"] + window
-                # Windows timers can wake asyncio.sleep early. Re-check the
-                # monotonic deadline so concurrentRate is a real lower bound.
-                while now < target:
-                    await asyncio.sleep(target - now)
-                    now = time.monotonic()
-                state["last"] = time.monotonic()
-                return
-            starts = state["starts"]
-            while starts and now - starts[0] >= window:
-                starts.popleft()
-            while len(starts) >= count:
-                # Leave a small Windows scheduler margin so the caller's
-                # observable request start cannot slip below the configured
-                # window when earlier waiters resume late.
-                await asyncio.sleep(max(
-                    0.001, window + 0.005 - (now - starts[0])))
-                now = time.monotonic()
+                reserved = max(now, target)
+                state["last"] = reserved
+            else:
+                starts = state["starts"]
                 while starts and now - starts[0] >= window:
                     starts.popleft()
-            starts.append(time.monotonic())
+                reserved = (starts[-count] + window
+                            if len(starts) >= count else now)
+                starts.append(reserved)
+        while True:
+            remaining = reserved - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(remaining)
+
+    async def _acquire_concurrent_rate(self, source):
+        """Acquire the fixed AnalyzeUrl fetch record for a real request."""
+        if source is None:
+            return None
+        raw = str(getattr(source, "concurrentRate", "") or "").strip()
+        if not raw or raw == "0":
+            return None
+        if "/" in raw:
+            await self._respect_concurrent_rate(source)
+            return None
+        try:
+            interval = max(0, int(raw)) / 1000.0
+        except ValueError:
+            return None
+        source_key = str(getattr(source, "bookSourceUrl", "") or id(source))
+        while True:
+            with self._global_rate_lock:
+                state = self._global_rate_states.get(source_key)
+                if state is None:
+                    self._global_rate_states[source_key] = {
+                        "active": 1, "time": time.monotonic()}
+                    return source_key
+                state.setdefault("active", 0)
+                state.setdefault("time", state.get("last", time.monotonic()))
+                now = time.monotonic()
+                if state["active"] > 0:
+                    # Fixed fetchStart waits the complete configured interval
+                    # whenever another request still owns the record.
+                    wait_time = interval
+                else:
+                    wait_time = max(0.0, state["time"] + interval - now)
+                    if wait_time <= 0:
+                        state["time"] = now
+                        state["active"] = 1
+                        return source_key
+            await asyncio.sleep(wait_time if wait_time > 0 else 0)
+
+    def _release_concurrent_rate(self, token) -> None:
+        if token is None:
+            return
+        with self._global_rate_lock:
+            state = self._global_rate_states.get(token)
+            if state is not None:
+                state["active"] = max(0, int(state.get("active", 0)) - 1)
 
     @staticmethod
     def _source_headers(source) -> dict:
@@ -539,6 +824,29 @@ class ReaderEngine:
             return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
         except (json.JSONDecodeError, AttributeError):
             return {}
+
+    @staticmethod
+    def _normalize_proxy(proxy: object) -> str:
+        """Parse the fixed getProxyClient proxy grammar.
+
+        Historical authenticated values use ``scheme://host:port@user@pass``
+        rather than the conventional user-info position. aiohttp expects the
+        latter, so only the transport representation is rearranged.
+        """
+        value = str(proxy or "").strip()
+        match = re.search(
+            r"(http|socks4|socks5)://(.*):(\d{2,5})(@.*@.*)?", value)
+        if not match:
+            raise ValueError(f"invalid Legado proxy: {value}")
+        scheme, host, port, credentials = match.groups()
+        auth = ""
+        if credentials:
+            fields = credentials.split("@")
+            username, password = fields[1], fields[2]
+            auth = (quote(username, safe="") + ":" +
+                    quote(password, safe="") + "@")
+        transport_scheme = "http" if scheme == "http" else scheme
+        return f"{transport_scheme}://{auth}{host}:{port}"
 
     async def _resolved_source_headers(self, source, base_url="") -> dict:
         raw = getattr(source, "header", "") or ""
@@ -559,6 +867,13 @@ class ReaderEngine:
 
     async def _request(self, request: dict, source=None) -> tuple[str, str, str]:
         request = await self._apply_request_option_js(request, source)
+        rate_token = await self._acquire_concurrent_rate(source)
+        try:
+            return await self._request_transport(request, source)
+        finally:
+            self._release_concurrent_rate(rate_token)
+
+    async def _request_transport(self, request: dict, source=None) -> tuple[str, str, str]:
         request_url = str(request.get("url") or "")
         if request_url.startswith("data:"):
             header, _, payload = request_url.partition(",")
@@ -579,13 +894,8 @@ class ReaderEngine:
                 "status": 200, "url": request_url}
             return text, content_type, request_url
         timeout = aiohttp.ClientTimeout(total=self.timeout)
-        if source is not None:
-            await self._respect_concurrent_rate(source)
-        last_error = None
-        retry_value = request.get("retry")
-        retry_count = max(0, min(10, int(2 if retry_value is None else retry_value)))
+        retry_count = self._request_retry_count(request)
         for attempt in range(retry_count + 1):
-            connector = aiohttp.TCPConnector(ssl=False)
             try:
                 headers = dict(self.headers)
                 proxy = request.get("proxy")
@@ -596,27 +906,56 @@ class ReaderEngine:
                         if name.lower() == "proxy":
                             proxy = proxy or source_headers.pop(name)
                     headers.update(source_headers)
+                normalized_proxy = self._normalize_proxy(proxy) if proxy else ""
+                socks_proxy = normalized_proxy.startswith(("socks4://", "socks5://"))
+                connector = (ProxyConnector.from_url(normalized_proxy, ssl=False)
+                             if socks_proxy else aiohttp.TCPConnector(ssl=False))
                 request_headers = request.get("headers") or {}
                 if isinstance(request_headers, str):
                     try: request_headers = json.loads(request_headers)
                     except json.JSONDecodeError: request_headers = {}
                 headers.update(request_headers if isinstance(request_headers, dict) else {})
+                # Fixed HttpHelper's application interceptor removes the UA
+                # sentinel and then appends these three headers on every call.
+                for name in list(headers):
+                    if name.lower() == "user-agent" and headers[name] == "null":
+                        headers.pop(name)
+                wire_headers = CIMultiDict(headers)
+                wire_headers.add("Keep-Alive", "300")
+                wire_headers.add("Connection", "Keep-Alive")
+                wire_headers.add("Cache-Control", "no-cache")
+                transparent_gzip = ("Accept-Encoding" not in wire_headers and
+                                    "Range" not in wire_headers)
+                if transparent_gzip:
+                    wire_headers.add("Accept-Encoding", "gzip")
                 request_url = request["url"]
+                cookie_enabled = (source is None or bool(
+                    getattr(source, "enabledCookieJar", True)))
+                if cookie_enabled and not any(
+                        str(name).lower() == "cookie" for name in headers):
+                    shared_cookie = self.js.export_cookie_header(request_url)
+                    if shared_cookie:
+                        wire_headers["Cookie"] = shared_cookie
                 method = str(request.get("method", "GET")).upper()
                 if str(request.get("charset") or "").lower() == "escape":
                     request_url = escape_url_query(request_url)
+                else:
+                    request_url = encode_url_query_fields(
+                        request_url, str(request.get("charset") or "utf-8"))
                 if method == "POST":
                     body = str(request.get("body") or "").lstrip()
-                    content_type = ("application/json; charset=UTF-8"
-                                    if body.startswith(("{", "[")) else
-                                    "application/x-www-form-urlencoded; charset=UTF-8")
-                    headers.setdefault("Content-Type", content_type)
-                async with aiohttp.ClientSession(headers=headers, connector=connector,
-                                                 cookie_jar=self.cookie_jar) as session:
+                    headers.setdefault("Content-Type",
+                                       self._default_post_content_type(body))
+                async with aiohttp.ClientSession(
+                        headers=wire_headers, connector=connector,
+                        cookie_jar=self._cookie_jar_for_source(source),
+                        auto_decompress=False) as session:
                     kwargs = {"timeout": timeout, "ssl": False, "allow_redirects": True}
-                    if proxy:
-                        proxy = str(proxy).strip()
-                        kwargs["proxy"] = (proxy if "://" in proxy else "http://" + proxy)
+                    # aiohttp natively handles HTTP proxying, including CONNECT
+                    # tunnels for HTTPS. SOCKS must be installed as the session
+                    # connector and must not also be passed as request.proxy.
+                    if normalized_proxy and not socks_proxy:
+                        kwargs["proxy"] = normalized_proxy
                     if method == "POST":
                         body = request.get("body") or ""
                         charset_name = str(request.get("charset") or "utf-8")
@@ -626,37 +965,127 @@ class ReaderEngine:
                                 charset_name = "ascii"
                             else:
                                 charset_name = "utf-8"
+                        elif not str(body).lstrip().startswith(("{", "[", "<")):
+                            body = encode_form_fields(str(body), charset_name)
+                            charset_name = "ascii"
                         if charset_name.lower() in ("gbk", "gb2312", "gb_2312-80"):
                             charset_name = "gb18030"
                         kwargs["data"] = (body.encode(charset_name, errors="replace")
                                           if isinstance(body, str) else body)
                     async with session.request(method, encode_url(request_url), **kwargs) as resp:
-                        if not (source is not None and getattr(source, "loginCheckJs", "")):
-                            resp.raise_for_status()
-                        charset = request.get("charset") or resp.charset
                         raw = await resp.read()
-                        meta = re.search(
-                            br"charset\s*=\s*['\"]?([A-Za-z0-9._-]+)", raw[:4096], re.I)
-                        if meta and not request.get("charset"):
-                            charset = meta.group(1).decode("ascii", errors="ignore")
-                        if (charset or "").lower() in ("gbk", "gb2312", "gb_2312-80"):
-                            charset = "gb18030"
-                        text = (raw.hex() if request.get("type") not in (None, "") else
-                                raw.decode(charset or "utf-8", errors="replace"))
+                        response_headers = {
+                            str(k).lower(): str(v) for k, v in resp.headers.items()}
+                        if (transparent_gzip and
+                                response_headers.get("content-encoding", "").lower() == "gzip"):
+                            raw = gzip.decompress(raw)
+                            response_headers.pop("content-encoding", None)
+                            response_headers.pop("content-length", None)
+                        if cookie_enabled:
+                            cookie_values = (resp.headers.getall("Set-Cookie", [])
+                                             if hasattr(resp.headers, "getall") else
+                                             ([resp.headers.get("Set-Cookie")]
+                                              if resp.headers.get("Set-Cookie") else []))
+                            for cookie_value in cookie_values:
+                                self.js.set_cookie(str(resp.url), cookie_value)
+                        self._persist_source_cookie_jar(source)
+                        if request.get("type") not in (None, ""):
+                            text = raw.hex()
+                        else:
+                            decoded_raw = self._uncompress_response_body(
+                                raw, resp.headers.get("Content-Type", ""))
+                            text = self._decode_response_body(decoded_raw, resp.charset)
+                            text = self._normalize_response_text(
+                                text, resp.headers.get("Content-Type", ""))
                         self.last_response = {
                             "body": text,
                             "bodyBytes": list(raw),
-                            "headers": {str(k).lower(): str(v) for k, v in resp.headers.items()},
+                            "headers": response_headers,
                             "status": int(resp.status),
                             "url": str(resp.url),
                         }
-                        return text, resp.content_type or "", str(resp.url)
+                        if 200 <= int(resp.status) < 300 or attempt >= retry_count:
+                            return text, resp.content_type or "", str(resp.url)
             except (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError,
                     asyncio.TimeoutError) as exc:
-                last_error = exc
-                if attempt < retry_count:
-                    await asyncio.sleep(0.4 * (attempt + 1))
-        raise RuntimeError(f"连接失败（已尝试 {retry_count + 1} 次）：{last_error}")
+                raise RuntimeError(f"连接失败：{exc}") from exc
+        raise RuntimeError("request loop ended without a response")
+
+    @staticmethod
+    def _request_retry_count(request: dict) -> int:
+        """Match AnalyzeUrl.UrlOption: absent retry means no extra attempt."""
+        try:
+            return max(0, int(request.get("retry") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _decode_response_body(raw: bytes, response_charset: str | None = None) -> str:
+        """Decode like OkHttp ResponseBody.text(); URL-option charset is unrelated."""
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        charset = response_charset
+        if not charset:
+            charset = ReaderEngine._html_declared_encoding(raw)
+        if not charset:
+            charset = (detect_charset(raw) or
+                       UnicodeDammit(raw, is_html=True).original_encoding or "utf-8")
+        if charset.lower() in ("gbk", "gb2312", "gb_2312-80"):
+            charset = "gb18030"
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+._:-]*", str(charset)):
+            raise LookupError(f"illegal charset name: {charset}")
+        return raw.decode(charset, errors="replace")
+
+    @staticmethod
+    def _html_declared_encoding(raw: bytes) -> str | None:
+        """Port EncodingDetect.getHtmlEncode's Jsoup meta-tag pass."""
+        try:
+            document = BeautifulSoup(raw.decode("utf-8", errors="replace"), "html.parser")
+            for meta in document.find_all("meta"):
+                charset = str(meta.get("charset") or "")
+                if charset:
+                    return charset
+                content = str(meta.get("content") or "")
+                http_equiv = str(meta.get("http-equiv") or "")
+                if http_equiv.lower() != "content-type":
+                    continue
+                lowered = content.lower()
+                if "charset" in lowered:
+                    # Keep the historical index arithmetic, including its odd
+                    # result for whitespace between `charset` and `=`.
+                    charset = content[lowered.index("charset") + len("charset="):]
+                else:
+                    charset = content[lowered.find(";") + 1:]
+                if charset:
+                    return charset
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _default_post_content_type(body: str) -> str:
+        if str(body or "").lstrip().startswith(("{", "[", "<")):
+            return "application/json; charset=UTF-8"
+        return "application/x-www-form-urlencoded; charset=UTF-8"
+
+    @staticmethod
+    def _uncompress_response_body(raw: bytes, content_type: str) -> bytes:
+        if str(content_type or "").split(";", 1)[0].strip().lower() != "application/zip":
+            return raw
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                first = next((item for item in archive.infolist() if not item.is_dir()), None)
+                return archive.read(first) if first is not None else b""
+        except (OSError, ValueError, zipfile.BadZipFile):
+            return raw
+
+    @staticmethod
+    def _normalize_response_text(text: str, content_type: str) -> str:
+        media_type = str(content_type or "").split(";", 1)[0].strip().lower()
+        if (media_type in {"application/xml", "text/xml", "application/xhtml+xml"}
+                and not text.lstrip().lower().startswith("<?xml")):
+            return '<?xml version="1.0"?>' + text
+        return text
 
     async def _apply_request_option_js(self, request: dict, source=None) -> dict:
         script = str(request.get("js") or "").strip()
@@ -678,45 +1107,67 @@ class ReaderEngine:
         return prepared
 
     @staticmethod
-    def _field_parts(rule: str) -> tuple[str, str]:
+    def _field_parts(rule: str, kind: str = "") -> tuple[str, str]:
         value = rule or ""
-        if value.strip().startswith(("@js:", "<js>")):
-            return "", value.strip()
-        marker = value.find("@js:")
-        if marker > 0:
-            return value[:marker].strip(), value[marker:].strip()
-        marker = value.find("<js>")
-        if marker > 0 and "</js>" in value[marker:]:
-            # Keep the complete suffix. Legado rules may contain several JS,
-            # regex and selector stages and each stage consumes the previous result.
-            return value[:marker].strip(), value[marker:].strip()
-        return value, ""
+        return compile_rule_program(
+            value, is_json=kind == "json").selector_and_suffix()
+
+    @staticmethod
+    def _rhino_result_string(value) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return str(value).lower()
+        if isinstance(value, dict):
+            return "[object Object]"
+        if isinstance(value, (list, tuple)):
+            return ",".join(ReaderEngine._rhino_result_string(item)
+                            if isinstance(item, (dict, list, tuple)) else
+                            "" if item is None else str(item)
+                            for item in value)
+        return str(value)
+
+    @classmethod
+    def _payload_for_compiled_stage(cls, transformed, remaining: str,
+                                    analyzer_kind: str):
+        program = compile_rule_program(
+            remaining, is_json=analyzer_kind == "json")
+        mode = program.stages[0].mode if program.stages else "default"
+        if mode == "js":
+            return transformed, analyzer_kind, transformed
+        if mode == "json":
+            if isinstance(transformed, (dict, list)):
+                return transformed, "json", transformed
+            text = cls._rhino_result_string(transformed)
+            return parse_json_smart(text), "json", transformed
+        text = cls._rhino_result_string(transformed)
+        return parse_markup(text), "html", text
 
     def _field_value(self, node, rule: str, kind: str, source, base_url: str,
                      key: str = "", page: int = 1, book=None, chapter=None,
                      raw_result=None, title: str = "",
-                     next_chapter_url: str = "") -> str:
-        rule = rule or ""
-        put_rule = ""
-        put_marker = rule.find("@put:")
-        if put_marker >= 0:
-            put_rule = rule[put_marker + 5:].strip()
-            rule = rule[:put_marker].strip()
+                     next_chapter_url: str = "",
+                     unescape_html: bool = True) -> str:
+        rule, put_rule = _split_put_rules(rule or "")
+        if put_rule:
+            self._put_rule_values(node, put_rule, kind, source, base_url,
+                                  key, page, book, chapter, raw_result)
         if "{{" in rule and "{{@@" not in rule:
             def render_expression(match):
                 expression = match.group(1).strip()
                 lowered_expression = expression.lower()
                 if expression.startswith("@@"):
                     return extract_value(
-                        node, expression[2:], kind, base_url)
+                        node, expression[2:], kind, base_url, unescape_html)
                 if (expression.startswith("@") and not
                         lowered_expression.startswith((
                             "@js:", "@json:", "@xpath:", "@css:"))):
                     return extract_value(
-                        node, expression[1:], kind, base_url)
+                        node, expression[1:], kind, base_url, unescape_html)
                 if (expression.startswith(("$", "//")) or
                         lowered_expression.startswith(("@json:", "@xpath:", "@css:"))):
-                    return extract_value(node, expression, kind, base_url)
+                    return extract_value(node, expression, kind, base_url,
+                                         unescape_html)
                 context = JsContext(
                     source=source, key=key, page=page,
                     result=raw_result if raw_result is not None else (
@@ -724,7 +1175,8 @@ class ReaderEngine:
                     base_url=base_url, variables=self.js_variables,
                     get_string=lambda nested: extract_value(node, nested, kind, base_url),
                     get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
-                    get_elements=lambda nested: [str(item) for item in evaluate(node, nested, kind)],
+                    get_elements=lambda nested: [_legado_value_string(item)
+                                                  for item in evaluate(node, nested, kind)],
                     book=book, chapter=chapter, title=title,
                     next_chapter_url=next_chapter_url,
                     result_html_nodes=(raw_result is None and kind == "html" and
@@ -746,23 +1198,17 @@ class ReaderEngine:
                     literal, stages = rendered[:js_marker], rendered[js_marker:]
                     value = self._field_value(
                         node, stages, kind, source, base_url, key, page,
-                        book, chapter, literal)
-                    if put_rule:
-                        self._put_rule_values(node, put_rule, kind, source, base_url,
-                                              key, page, book, chapter, raw_result)
+                        book, chapter, literal, unescape_html=unescape_html)
                     return value.strip()
                 pieces = rendered.split("##")
                 value = pieces[0]
                 if len(pieces) > 1 and pieces[1]:
                     try:
-                        value = re.sub(pieces[1], _java_replacement(
-                            pieces[2] if len(pieces) > 2 else ""), value,
-                                       count=1 if len(pieces) > 3 else 0)
+                        value = java_regex_sub(
+                            pieces[1], pieces[2] if len(pieces) > 2 else "", value,
+                            count=1 if len(pieces) > 3 else 0)
                     except re.error:
                         pass
-                if put_rule:
-                    self._put_rule_values(node, put_rule, kind, source, base_url,
-                                          key, page, book, chapter, raw_result)
                 return value.strip()
         stripped_rule = rule.strip()
         if stripped_rule.startswith("<js>") and "</js>" in stripped_rule:
@@ -780,19 +1226,20 @@ class ReaderEngine:
                     transformed_root = json.loads(transformed_text)
                     transformed_kind = "json"
                 except (json.JSONDecodeError, TypeError):
-                    transformed_root = BeautifulSoup(transformed_text, "html.parser")
+                    transformed_root = parse_markup(transformed_text)
                     transformed_kind = "html"
                 return self._field_value(
                     transformed_root, remaining, transformed_kind, source, base_url,
                     key, page, book, chapter, transformed_text, title,
-                    next_chapter_url)
+                    next_chapter_url, unescape_html)
             context = JsContext(
                 source=source, key=key, page=page,
                 result=initial_result,
                 base_url=base_url, variables=self.js_variables,
                 get_string=lambda nested: extract_value(node, nested, kind, base_url),
                 get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
-                get_elements=lambda nested: [str(item) for item in evaluate(node, nested, kind)],
+                get_elements=lambda nested: [_legado_value_string(item)
+                                              for item in evaluate(node, nested, kind)],
                 book=book, chapter=chapter, title=title,
                 next_chapter_url=next_chapter_url,
                 result_html_nodes=(raw_result is None and kind == "html" and
@@ -804,46 +1251,51 @@ class ReaderEngine:
             if remaining.startswith("##"):
                 return _apply_regex_suffix("" if transformed is None else str(transformed),
                                            remaining).strip()
-            transformed_text = (json.dumps(transformed, ensure_ascii=False)
-                                if not isinstance(transformed, str) else transformed)
-            try:
-                transformed_root = json.loads(transformed_text)
-                transformed_kind = "json"
-            except (json.JSONDecodeError, TypeError):
-                transformed_root = BeautifulSoup(transformed_text, "html.parser")
-                transformed_kind = "html"
+            transformed_root, transformed_kind, stage_result = (
+                self._payload_for_compiled_stage(transformed, remaining, kind))
             return self._field_value(
                 transformed_root, remaining, transformed_kind, source, base_url,
-                key, page, book, chapter, transformed_text, title,
-                next_chapter_url,
+                key, page, book, chapter, stage_result, title,
+                next_chapter_url, unescape_html,
             )
         get_matches = list(re.finditer(r"@get:\{([^{}]+)\}", rule))
         if get_matches:
             value = re.sub(
                 r"@get:\{([^{}]+)\}",
                 lambda match: str(self.js_variables.get(match.group(1), "")), rule)
-            if value.strip().startswith("@js:"):
+            stripped_value = value.strip()
+            js_positions = [position for position in
+                            (stripped_value.find("@js:"), stripped_value.find("<js>"))
+                            if position >= 0]
+            js_position = min(js_positions) if js_positions else -1
+            if js_position == 0:
                 # @get is preprocessing inside a JavaScript stage, not the
                 # terminal value of the field rule. Continue into the normal
                 # JS pipeline after interpolation.
-                rule = value
+                rule = stripped_value
+            elif js_position > 0:
+                # splitSourceRule passes the completed literal/get stage as
+                # ``result`` to the following JavaScript SourceRule.
+                return self._field_value(
+                    node, stripped_value[js_position:], kind, source, base_url,
+                    key, page, book, chapter,
+                    stripped_value[:js_position].strip(), title,
+                    next_chapter_url, unescape_html)
             else:
-                pieces = value.split("##")
+                pieces = stripped_value.split("##")
                 value = pieces[0]
                 if len(pieces) >= 2 and pieces[1]:
                     try:
-                        value = re.sub(pieces[1], _java_replacement(
-                            pieces[2] if len(pieces) > 2 else ""), value)
+                        value = java_regex_sub(
+                            pieces[1], pieces[2] if len(pieces) > 2 else "", value)
                     except re.error:
                         pass
-                if put_rule:
-                    self._put_rule_values(node, put_rule, kind, source, base_url,
-                                          key, page, book, chapter, raw_result)
                 return value.strip()
 
-        selector, post_js = self._field_parts(rule)
+        selector, post_js = self._field_parts(rule, kind)
         value = ((raw_result if raw_result is not None else node)
-                 if not selector and post_js else extract_value(node, selector, kind, base_url))
+                 if not selector and post_js else extract_value(
+                     node, selector, kind, base_url, unescape_html))
         remaining = post_js.strip()
         while remaining:
             if remaining.startswith("<js>") and "</js>" in remaining:
@@ -859,7 +1311,8 @@ class ReaderEngine:
                     base_url=base_url, variables=self.js_variables,
                     get_string=lambda nested: extract_value(node, nested, kind, base_url),
                     get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
-                    get_elements=lambda nested: [str(item) for item in evaluate(node, nested, kind)],
+                    get_elements=lambda nested: [_legado_value_string(item)
+                                                  for item in evaluate(node, nested, kind)],
                     book=book, chapter=chapter, title=title,
                     next_chapter_url=next_chapter_url,
                     result_html_nodes=(not selector and raw_result is None and kind == "html" and
@@ -878,7 +1331,8 @@ class ReaderEngine:
                     base_url=base_url, variables=self.js_variables,
                     get_string=lambda nested: extract_value(node, nested, kind, base_url),
                     get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
-                    get_elements=lambda nested: [str(item) for item in evaluate(node, nested, kind)],
+                    get_elements=lambda nested: [_legado_value_string(item)
+                                                  for item in evaluate(node, nested, kind)],
                     book=book, chapter=chapter, title=title,
                     next_chapter_url=next_chapter_url,
                     result_html_nodes=(not selector and raw_result is None and kind == "html" and
@@ -891,24 +1345,15 @@ class ReaderEngine:
                 remaining = ""
                 continue
             # A selector after JavaScript analyzes the transformed payload.
-            transformed_text = (value if isinstance(value, str) else
-                                json.dumps(value, ensure_ascii=False))
-            try:
-                transformed_root = json.loads(transformed_text)
-                transformed_kind = "json"
-            except (json.JSONDecodeError, TypeError):
-                transformed_root = BeautifulSoup(str(transformed_text), "html.parser")
-                transformed_kind = "html"
+            transformed_root, transformed_kind, stage_result = (
+                self._payload_for_compiled_stage(value, remaining, kind))
             value = self._field_value(
                 transformed_root, remaining, transformed_kind, source, base_url,
-                key, page, book, chapter, transformed_text, title,
-                next_chapter_url)
+                key, page, book, chapter, stage_result, title,
+                next_chapter_url, unescape_html)
             remaining = ""
         if base_url and isinstance(value, str) and value.startswith(("/", "./", "../", "//")):
             value = urljoin(base_url, value)
-        if put_rule:
-            self._put_rule_values(node, put_rule, kind, source, base_url,
-                                  key, page, book, chapter, raw_result)
         if value is None:
             return ""
         return value if isinstance(value, str) else str(value)
@@ -933,28 +1378,41 @@ class ReaderEngine:
 
     def _book_from_node(self, node, kind: str, rules: dict, base_url: str,
                         source=None, key: str = "", page: int = 1) -> BookItem:
-        def field(primary, fallback, with_base=False):
-            try:
-                value = self._field_value(node, primary or fallback, kind, source,
-                                          base_url if with_base else "", key, page)
-                if value or not primary:
-                    return value
-            except (UnsupportedRule, RuleParseError, JsBridgeError):
-                pass
-            return self._field_value(node, fallback, kind, source,
-                                     base_url if with_base else "", key, page)
+        def field(primary, fallback, with_base=False, tolerate=False):
+            if not primary:
+                return ""
+            if tolerate:
+                try:
+                    return self._field_value(
+                        node, primary, kind, source,
+                        base_url if with_base else "", key, page)
+                except (UnsupportedRule, RuleParseError, JsBridgeError):
+                    return ""
+            return self._field_value(
+                node, primary, kind, source,
+                base_url if with_base else "", key, page)
 
+        name = _format_book_name(field(rules.get("name"), ""))
+        author = _format_book_author(field(rules.get("author"), ""))
+        intro = _format_book_intro(field(rules.get("intro"), "", tolerate=True))
+        url = field(rules.get("bookUrl"), "", True) or base_url
+        cover_url = field(rules.get("coverUrl"), "", True, tolerate=True)
+        kind_value = field(rules.get("kind"), "", tolerate=True)
+        last_chapter = field(rules.get("lastChapter"), "", tolerate=True)
+        try:
+            word_count = _format_word_count(field(
+                rules.get("wordCount"), "", tolerate=True))
+        except (ValueError, OverflowError):
+            word_count = ""
         book = BookItem(
-            name=field(rules.get("name"), "name||title||bookName" if kind == "json" else
-                       ".book-name@text||.title@text||h3@text||h2@text||a@title||a@text"),
-            author=field(rules.get("author"), "author||authorName" if kind == "json" else
-                         ".author@text||.book-author@text"),
-            intro=field(rules.get("intro"), "intro||description||desc" if kind == "json" else
-                        ".intro@text||.description@text||p@text"),
-            url=field(rules.get("bookUrl"), "bookUrl||url||href" if kind == "json" else
-                      "a@href", True),
-            cover_url=field(rules.get("coverUrl"), "coverUrl||cover||image" if kind == "json" else
-                            "img@data-src||img@data-original||img@src", True),
+            name=name, author=author, intro=intro, url=url,
+            cover_url=cover_url, kind=kind_value,
+            last_chapter=last_chapter,
+            latest_chapter_title=last_chapter, word_count=word_count,
+            origin=str(getattr(source, "bookSourceUrl", "") or ""),
+            origin_name=str(getattr(source, "bookSourceName", "") or ""),
+            type=_book_type(source),
+            origin_order=int(getattr(source, "customOrder", 0) or 0),
         )
         book.variables = dict(self.js_variables)
         return book
@@ -971,7 +1429,7 @@ class ReaderEngine:
                 intros = extract_values(nodes[0], rules.get("intro", ""), kind)
                 covers = extract_values(nodes[0], rules.get("coverUrl", ""), kind, base_url)
                 books = []
-                for index in range(min(len(names), len(urls), 100)):
+                for index in range(min(len(names), len(urls))):
                     books.append(BookItem(
                         name=names[index], url=urls[index],
                         author=authors[index] if index < len(authors) else "",
@@ -980,7 +1438,7 @@ class ReaderEngine:
                     ))
                 return books
         books = []
-        for node in nodes[:100]:
+        for node in nodes:
             if list_put:
                 self._put_rule_values(node, list_put, kind, source, base_url,
                                       key, page, raw_result=str(node))
@@ -990,22 +1448,32 @@ class ReaderEngine:
 
     @staticmethod
     def _list_rule_parts(rule: str) -> tuple[str, str]:
-        marker = str(rule or "").find("@put:")
-        if marker < 0:
-            return str(rule or ""), ""
-        return str(rule or "")[:marker].strip(), str(rule or "")[marker + 5:].strip()
+        return _split_put_rules(rule)
 
     async def _list_rule_pipeline(self, text: str, content_type: str, rule: str,
                                   source, base_url: str, key: str = "",
                                   page: int = 1) -> tuple[list, str]:
         """Run every selector/JS stage in a Legado list rule in order."""
         value = str(rule or "").strip()
+        original_text = text
+        original_content_type = content_type
+        if "json" in (content_type or "").lower() and not text.strip():
+            analyzer_kind = "json"
+        else:
+            try:
+                parse_json_smart(text)
+                analyzer_kind = "json"
+            except (json.JSONDecodeError, TypeError):
+                analyzer_kind = "html"
+        current_result = text
+        pending_root = None
         def js_context_result(rule_text):
             try:
-                root = (json.loads(text) if "json" in (content_type or "").lower()
-                        else BeautifulSoup(text, "html.parser"))
+                root = (parse_json_smart(original_text)
+                        if "json" in (original_content_type or "").lower()
+                        else parse_markup(original_text, original_content_type))
                 root_kind = "json" if isinstance(root, (dict, list)) else "html"
-                return [str(item) for item in evaluate(
+                return [_legado_value_string(item) for item in evaluate(
                     root, str(rule_text), root_kind)]
             except (json.JSONDecodeError, RuleParseError, TypeError, ValueError):
                 return []
@@ -1023,15 +1491,21 @@ class ReaderEngine:
             if js_rule:
                 transformed = await asyncio.to_thread(
                     self.js.evaluate, js_rule,
-                    JsContext(source=source, key=key, page=page, result=text,
+                    JsContext(source=source, key=key, page=page,
+                              result=current_result,
                               base_url=base_url, variables=self.js_variables,
                               get_elements=js_context_result))
+                current_result = transformed
                 text = (transformed if isinstance(transformed, str) else
                         json.dumps(transformed, ensure_ascii=False))
-                content_type = ("application/json" if isinstance(transformed, (dict, list))
-                                or text.lstrip().startswith(("{", "[")) else "text/html")
                 value = remaining
                 if value:
+                    program = compile_rule_program(
+                        value, is_json=analyzer_kind == "json")
+                    if program.stages and program.stages[0].mode != "js":
+                        root, kind, _ = self._payload_for_compiled_stage(
+                            transformed, value, analyzer_kind)
+                        pending_root = (root, kind)
                     continue
                 if (isinstance(transformed, list) and transformed and
                         all(isinstance(item, dict) and "__markup" in item
@@ -1040,24 +1514,34 @@ class ReaderEngine:
                 if (isinstance(transformed, list) and transformed and
                         all(isinstance(item, str) and item.lstrip().startswith("<")
                             for item in transformed)):
-                    nodes = [BeautifulSoup(item, "html.parser").find()
+                    nodes = [parse_markup(item).find()
                              for item in transformed]
                     nodes = [item for item in nodes if item is not None]
                     kind = "html"
                     break
-                root, kind = ((json.loads(text), "json") if "json" in content_type else
-                              (BeautifulSoup(text, "html.parser"), "html"))
+                if isinstance(transformed, dict) or (
+                        isinstance(transformed, list) and
+                        all(isinstance(item, dict) for item in transformed)):
+                    nodes = (transformed if isinstance(transformed, list)
+                             else [transformed])
+                    kind = "json"
+                    break
+                root, kind = ((parse_json_smart(text), "json") if "json" in content_type else
+                              (parse_markup(text, content_type), "html"))
                 nodes = root if isinstance(root, list) else [root]
                 break
 
-            if "json" in (content_type or "").lower() or text.lstrip().startswith(("{", "[")):
+            if pending_root is not None:
+                root, kind = pending_root
+                pending_root = None
+            elif "json" in (content_type or "").lower() or text.lstrip().startswith(("{", "[")):
                 try:
-                    root, kind = json.loads(text), "json"
+                    root, kind = parse_json_smart(text), "json"
                 except json.JSONDecodeError:
-                    root, kind = BeautifulSoup(text, "html.parser"), "html"
+                    root, kind = parse_markup(text, content_type), "html"
             else:
-                root, kind = BeautifulSoup(text, "html.parser"), "html"
-            selector, suffix = self._field_parts(value)
+                root, kind = parse_markup(text, content_type), "html"
+            selector, suffix = self._field_parts(value, kind)
             nodes = evaluate(root, selector, kind) if selector else (
                 root if isinstance(root, list) else [root])
             if not suffix:
@@ -1073,11 +1557,16 @@ class ReaderEngine:
                 JsContext(source=source, key=key, page=page, result=stage_result,
                           base_url=base_url, variables=self.js_variables,
                           result_html_nodes=kind == "html"))
+            current_result = transformed
             text = (transformed if isinstance(transformed, str) else
                     json.dumps(transformed, ensure_ascii=False))
-            content_type = ("application/json" if isinstance(transformed, (dict, list))
-                            or text.lstrip().startswith(("{", "[")) else "text/html")
             if value:
+                program = compile_rule_program(
+                    value, is_json=analyzer_kind == "json")
+                if program.stages and program.stages[0].mode != "js":
+                    root, kind, _ = self._payload_for_compiled_stage(
+                        transformed, value, analyzer_kind)
+                    pending_root = (root, kind)
                 continue
             if (isinstance(transformed, list) and transformed and
                     all(isinstance(item, dict) and "__markup" in item
@@ -1086,13 +1575,20 @@ class ReaderEngine:
             if (isinstance(transformed, list) and transformed and
                     all(isinstance(item, str) and item.lstrip().startswith("<")
                         for item in transformed)):
-                nodes = [BeautifulSoup(item, "html.parser").find()
+                nodes = [parse_markup(item).find()
                          for item in transformed]
                 nodes = [item for item in nodes if item is not None]
                 kind = "html"
                 break
-            root, kind = ((json.loads(text), "json") if "json" in content_type else
-                          (BeautifulSoup(text, "html.parser"), "html"))
+            if isinstance(transformed, dict) or (
+                    isinstance(transformed, list) and
+                    all(isinstance(item, dict) for item in transformed)):
+                nodes = (transformed if isinstance(transformed, list)
+                         else [transformed])
+                kind = "json"
+                break
+            root, kind = ((parse_json_smart(text), "json") if "json" in content_type else
+                          (parse_markup(text, content_type), "html"))
             nodes = root if isinstance(root, list) else [root]
             break
         if reverse:
@@ -1106,15 +1602,54 @@ class ReaderEngine:
             if not req:
                 raise RuntimeError("搜索地址格式暂时无法解析")
         text, ctype, final_url = await self._request(req, source)
+        pattern = str(getattr(source, "bookUrlPattern", "") or "")
+        if pattern and re.fullmatch(pattern, final_url):
+            book = await self._detail_book_from_response(
+                source, text, ctype, final_url, str(req.get("url") or final_url))
+            return [book] if book.name else []
         rules = source.ruleSearch or {}
         list_rule = rules.get("bookList", "")
         list_rule, list_put = self._list_rule_parts(list_rule)
         nodes, kind = await self._list_rule_pipeline(
             text, ctype, list_rule, source, final_url, keyword, page)
+        if not nodes and not pattern:
+            book = await self._detail_book_from_response(
+                source, text, ctype, final_url, str(req.get("url") or final_url))
+            return [book] if book.name else []
         books = self._books_from_nodes(
             nodes, kind, rules, final_url, source, keyword, page, list_put)
-        return [b for b in books if b.name and b.url and not _is_action_url(b.url)
-                and not _is_pagination_item(b.name, b.url)]
+        distinct = []
+        seen_urls = set()
+        for book in books:
+            if book.name and book.url not in seen_urls:
+                distinct.append(book)
+                seen_urls.add(book.url)
+        return distinct
+
+    async def _detail_book_from_response(self, source, text: str,
+                                         content_type: str, final_url: str,
+                                         book_url: str) -> BookItem:
+        book = BookItem(
+            "", url=book_url, origin=str(getattr(source, "bookSourceUrl", "") or ""),
+            origin_name=str(getattr(source, "bookSourceName", "") or ""),
+            type=_book_type(source),
+            origin_order=int(getattr(source, "customOrder", 0) or 0),
+            info_html=text,
+        )
+        if hasattr(self, "_initialize_detail") and hasattr(self, "_apply_book_info"):
+            root, kind, raw_text = await self._initialize_detail(
+                source, book, text, content_type, final_url)
+            self._apply_book_info(
+                source, book, root, kind, raw_text, book_url, final_url, text,
+                can_rename=False)
+            return book
+        root = (parse_json_smart(text) if "json" in content_type.lower()
+                else parse_markup(text, content_type))
+        kind = "json" if isinstance(root, (dict, list)) else "html"
+        parsed = self._book_from_node(
+            root, kind, getattr(source, "ruleBookInfo", {}) or {}, final_url, source)
+        parsed.url, parsed.info_html = book_url, text
+        return parsed
 
     async def explore(self, source, category: ExploreCategory, page: int = 1) -> list[BookItem]:
         # Legado conditional paging, e.g. /list/<,index_{{page}}.html>, must be
@@ -1160,17 +1695,27 @@ class ReaderEngine:
         list_rule, list_put = self._list_rule_parts(list_rule)
         nodes, kind = await self._list_rule_pipeline(
             text, ctype, list_rule, source, final_url, "", page)
+        if not nodes and not str(getattr(source, "bookUrlPattern", "") or ""):
+            book = await self._detail_book_from_response(
+                source, text, ctype, final_url, final_url)
+            return [book] if book.name else []
         books = self._books_from_nodes(
             nodes, kind, rules, final_url, source, "", page, list_put)
-        return [book for book in books
-                if book.name and book.url and not _is_action_url(book.url)
-                and not _is_pagination_item(book.name, book.url)]
+        distinct = []
+        seen_urls = set()
+        for book in books:
+            if book.name and book.url not in seen_urls:
+                distinct.append(book)
+                seen_urls.add(book.url)
+        return distinct
 
     async def _render_templates(self, value: str, source, key: str = "",
                                 page: int = 1) -> str:
         """Evaluate Legado's inline ``{{ JavaScript }}`` URL expressions."""
         rendered = str(value or "")
-        for _ in range(32):
+        seen = set()
+        while rendered not in seen:
+            seen.add(rendered)
             match = re.search(r"\{\{([\s\S]*?)\}\}", rendered)
             if not match:
                 break
@@ -1203,66 +1748,29 @@ class ReaderEngine:
 
     async def _resolve_rule_url(self, value: str, source, key: str = "",
                                 page: int = 1) -> str:
-        """Execute leading JS stages, then return the following request rule."""
-        rendered = await self._render_templates(value, source, key, page)
-        for _ in range(16):
-            text = rendered.strip()
-            if text.startswith("<js>") and "</js>" in text:
-                end = text.find("</js>") + 5
-                script, remaining = text[:end], text[end:].strip()
-                result = await asyncio.to_thread(
-                    self.js.evaluate, script,
-                    JsContext(source=source, key=key, page=page,
-                              base_url=source.bookSourceUrl,
-                              variables=self.js_variables),
-                )
-                rendered = (remaining.replace("@result", str(result or ""))
-                            if remaining else str(result or ""))
-                if not remaining:
-                    break
+        """Run fixed-version ``AnalyzeUrl.analyzeJs`` stage semantics."""
+        program = compile_rule_program(value)
+        if not any(stage.mode == "js" for stage in program.stages):
+            return await self._render_templates(value, source, key, page)
+
+        # AnalyzeUrl starts with the complete rule as result.  Every non-JS
+        # fragment replaces @result, while every JS fragment receives the
+        # preceding value as its `result` binding.
+        result = str(value or "")
+        for stage in program.stages:
+            if stage.mode != "js":
+                fragment = stage.raw.strip()
+                if fragment:
+                    result = fragment.replace("@result", result)
                 continue
-            if text.startswith("@js:"):
-                result = await asyncio.to_thread(
-                    self.js.evaluate, text,
-                    JsContext(source=source, key=key, page=page,
-                              base_url=source.bookSourceUrl,
-                              variables=self.js_variables),
-                )
-                return await self._render_templates(
-                    str(result or ""), source, key, page)
-            break
-        # AnalyzeUrl executes JS stages embedded after a normal request rule.
-        # The preceding text is exposed as `result`; this is commonly used to
-        # perform a POST with java.connect() and return its redirect URL.
-        marker = re.search(r"(?:^|\n)\s*@js:\s*", rendered, flags=re.I)
-        if marker and marker.start() > 0:
-            prefix = rendered[:marker.start()].strip()
-            script = "@js:" + rendered[marker.end():]
-            result = await asyncio.to_thread(
-                self.js.evaluate, script,
-                JsContext(source=source, key=key, page=page, result=prefix,
+            evaluated = await asyncio.to_thread(
+                self.js.evaluate, stage.raw,
+                JsContext(source=source, key=key, page=page, result=result,
                           base_url=source.bookSourceUrl,
                           variables=self.js_variables),
             )
-            return await self._render_templates(
-                str(result or ""), source, key, page)
-        marker_pos = rendered.find("<js>")
-        if marker_pos > 0:
-            end = rendered.find("</js>", marker_pos)
-            if end >= 0:
-                prefix = rendered[:marker_pos].strip()
-                script = rendered[marker_pos:end + 5]
-                suffix = rendered[end + 5:].strip()
-                result = await asyncio.to_thread(
-                    self.js.evaluate, script,
-                    JsContext(source=source, key=key, page=page, result=prefix,
-                              base_url=source.bookSourceUrl,
-                              variables=self.js_variables),
-                )
-                value = (suffix.replace("@result", str(result or ""))
-                         if suffix else str(result or ""))
-                return await self._render_templates(value, source, key, page)
-        return await self._render_templates(rendered, source, key, page)
+            result = str(evaluated)
+        return await self._render_templates(result, source, key, page)
 
     async def chapters(self, source, book: BookItem) -> list[ChapterItem]:
         init = (source.ruleBookInfo or {}).get("init", "")
@@ -1274,21 +1782,19 @@ class ReaderEngine:
         toc_url_rule = (source.ruleBookInfo or {}).get("tocUrl", "")
         detail_root = (json.loads(detail_text) if "json" in detail_type and
                        detail_text.lstrip().startswith(("{", "[")) else
-                       BeautifulSoup(detail_text, "html.parser"))
+                       parse_markup(detail_text, detail_type))
         detail_kind = "json" if isinstance(detail_root, (dict, list)) else "html"
         toc_url = self._field_value(detail_root, toc_url_rule, detail_kind,
                                     source, detail_url) if toc_url_rule else detail_url
         if not toc_url:
             toc_url = detail_url
         text, ctype, final_url = await self._request({"url": toc_url, "method": "GET"}, source)
-        chapter_list_rule = toc_rule.get("chapterList") or ".chapter-list li||#list li||.listmain dd||main li"
+        chapter_list_rule = str(toc_rule.get("chapterList") or "")
         nodes, kind = select_nodes(text, ctype, chapter_list_rule)
         chapters = [ChapterItem(
-            self._field_value(n, toc_rule.get("chapterName") or
-                              ("name||title" if kind == "json" else "a@text||.title@text"),
+            self._field_value(n, str(toc_rule.get("chapterName") or ""),
                               kind, source, final_url),
-            self._field_value(n, toc_rule.get("chapterUrl") or
-                              ("url||href||chapterUrl" if kind == "json" else "a@href"),
+            self._field_value(n, str(toc_rule.get("chapterUrl") or ""),
                               kind, source, final_url),
         ) for n in nodes]
         return [c for c in chapters
@@ -1296,8 +1802,10 @@ class ReaderEngine:
 
     async def content(self, source, chapter: ChapterItem) -> str:
         text, ctype, final_url = await self._request({"url": chapter.url, "method": "GET"}, source)
-        rule = (source.ruleContent or {}).get("content") or ".content@html||#content@html||article@html||main@html"
-        root = json.loads(text) if "json" in ctype and text.lstrip().startswith(("{", "[")) else BeautifulSoup(text, "html.parser")
+        rule = str((source.ruleContent or {}).get("content") or "")
+        root = (parse_json_smart(text) if "json" in ctype and
+                text.lstrip().startswith(("{", "[")) else
+                parse_markup(text, ctype))
         value = self._field_value(root, rule,
                                   "json" if isinstance(root, (dict, list)) else "html",
                                   source, final_url)
