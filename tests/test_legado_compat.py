@@ -3847,10 +3847,10 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ExploreCategoryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_alice_rank_current_list_markup_is_parsed(self):
+    async def test_alice_rank_both_observed_list_layouts_are_parsed(self):
         source = BookSource.from_json(Path("resource/bookSource.json"))[1]
         engine = LegadoReadingEngine()
-        html = '''
+        compact_html = '''
         <ul class="rank-list">
           <li><span class="s2"><a href="/novel/1.html">
             <span class="fenleibt">[系统]</span> 第一部
@@ -3860,18 +3860,33 @@ class ExploreCategoryTests(unittest.IsolatedAsyncioTestCase):
           </a></span><span class="five">8万</span></li>
         </ul>'''
 
+        table_html = '''
+        <div class="clearfix rec_rullist"><ul>
+          <li class="sev"><span><a>系统小说</a></span></li>
+          <li class="two"><a href="/novel/3.html">第三部</a></li>
+          <li class="three"><a href="/book/3.html">第十章</a></li>
+          <li class="four">作者甲</li><li class="five">22万</li>
+        </ul></div>'''
+
+        responses = iter((compact_html, table_html))
+
         async def request(_request, _source):
-            return html, "text/html", source.bookSourceUrl + "rank.html"
+            return next(responses), "text/html", source.bookSourceUrl + "rank.html"
 
         engine._request = request
         try:
             categories = await resolve_explore_categories(source, engine.js)
-            books = await engine.explore(source, categories[0], 1)
+            compact_books = await engine.explore(source, categories[0], 1)
+            table_books = await engine.explore(source, categories[0], 1)
         finally:
             engine.js.close()
 
-        self.assertEqual([book.name for book in books], ["第一部", "第二部"])
-        self.assertEqual(books[0].url, source.bookSourceUrl + "novel/1.html")
+        self.assertEqual([book.name for book in compact_books], ["第一部", "第二部"])
+        self.assertEqual(compact_books[0].url, source.bookSourceUrl + "novel/1.html")
+        self.assertEqual([book.name for book in table_books], ["第三部"])
+        self.assertEqual(table_books[0].author, "作者甲")
+        self.assertEqual(table_books[0].last_chapter, "第十章")
+        self.assertEqual(table_books[0].url, source.bookSourceUrl + "novel/3.html")
 
     def test_static_formats_and_group_headers(self):
         source = SimpleNamespace(

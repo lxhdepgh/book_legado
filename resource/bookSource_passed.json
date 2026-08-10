@@ -76,12 +76,12 @@
       "chapterUrl": "//a/@href"
     },
     "ruleExplore": {
-      "author": "",
-      "bookList": "li:has(span.s2 > a)",
-      "bookUrl": ".s2 a@href",
-      "kind": ".fenleibt@text",
-      "lastChapter": "",
-      "name": ".s2 a@text##^\\[[^]]+\\]\\s*",
+      "author": ".four@text",
+      "bookList": "div.rec_rullist > ul, li:has(span.s2 > a)",
+      "bookUrl": ".two a@href||.s2 a@href",
+      "kind": ".sev a@text||.fenleibt@text",
+      "lastChapter": ".three a@text",
+      "name": ".two a@text||.s2 a@text##^\\[[^]]+\\]\\s*",
       "wordCount": ".five@text"
     },
     "bookSourceType": 0
