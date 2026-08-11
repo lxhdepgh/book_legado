@@ -1,5 +1,8 @@
 $ErrorActionPreference = "Stop"
 
+# Use build_windows.cmd as the public entry point. It applies a process-only
+# execution-policy bypass, so no machine or user PowerShell setting is changed.
+
 $python = "D:\env_manger\minicaoda\envs\legodo_booksource_check\python.exe"
 if (-not (Test-Path -LiteralPath $python)) {
     $python = "python"
