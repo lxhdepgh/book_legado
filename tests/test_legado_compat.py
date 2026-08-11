@@ -2493,6 +2493,26 @@ class RuleParserTests(unittest.TestCase):
                                      first_id, "selected",
                                      first_id, first_id, first_id])
 
+    def test_expired_cache_can_be_cleaned_during_fresh_runtime_startup(self):
+        with TemporaryDirectory() as directory:
+            state_path = Path(directory) / "rule_engine_state.json"
+            state_path.write_text(json.dumps({
+                "cache": {
+                    "expired": {"value": "old", "expires": 100.0},
+                },
+            }), encoding="utf-8")
+
+            with patch("app.services.legado_js.time.time", return_value=101.0):
+                runtime = LegadoJsRuntime(state_dir=directory)
+
+            try:
+                stored = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertTrue(runtime.device_id)
+                self.assertEqual(stored["deviceId"], runtime.device_id)
+                self.assertNotIn("expired", stored.get("cache", {}))
+            finally:
+                runtime.close()
+
     def test_cache_expiry_removes_database_and_file_entries(self):
         with TemporaryDirectory() as directory:
             runtime = LegadoJsRuntime(state_dir=directory)

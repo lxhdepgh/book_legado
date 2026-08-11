@@ -120,12 +120,16 @@ class LegadoJsRuntime:
                           Path(self._temporary_files.name))
         self._archive_temp_initialized = False
         self.persistent_state = self._load_persistent_state()
-        self._hydrate_cookie_state()
-        self._hydrate_cache_state()
-        self.device_id = str(self.persistent_state.get("deviceId") or uuid.uuid4().hex)
+        # Cache hydration can remove expired entries and persist the cleaned
+        # state.  The persistence path includes deviceId, so it must exist
+        # before any hydration routine is allowed to write.
+        self.device_id = str(
+            self.persistent_state.get("deviceId") or uuid.uuid4().hex)
         if self.persistent_state.get("deviceId") != self.device_id:
             self.persistent_state["deviceId"] = self.device_id
             self._save_persistent_state()
+        self._hydrate_cookie_state()
+        self._hydrate_cache_state()
         self.font_store = {}
         self.bitmap_store = {}
         self.dom_store = {}

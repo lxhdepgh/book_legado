@@ -20,6 +20,7 @@ from app.services.reading_engine import LegadoReadingEngine
 from app.services.reading_cache import ReadingCache
 from app.services.desktop_browser import EdgeCdpSession
 from app.services.book_cache_service import WholeBookCacheService
+from app.services.reading_progress import ReadingProgressStore, ReadingSession
 
 
 class ReadingView(ft.Column):
@@ -36,6 +37,8 @@ class ReadingView(ft.Column):
         self.reading_cache = ReadingCache(getattr(service, "cache_dir", service.data_dir))
         self.whole_book_cache = WholeBookCacheService(
             getattr(service, "cache_dir", service.data_dir), service.data_dir)
+        self.progress_store = ReadingProgressStore(service)
+        self.reading_session = ReadingSession()
         self._whole_book_tasks = {}
         self.discovery_only = discovery_only
         self.engine = LegadoReadingEngine(
@@ -61,15 +64,19 @@ class ReadingView(ft.Column):
         self._current_book = None
         self._pending_scroll_offset = 0.0
         self._pending_scroll_ratio = 0.0
+        self._pending_document_offset = 0.0
+        self._pending_scroll_maximum = 0.0
         self._scroll_save_generation = 0
         self._reader_preferences_path = service.data_dir / "reader-layout.json"
         self._reader_preferences = self._load_reader_preferences()
         self._font_size = int(self._reader_preferences["font_size"])
         self._reader_dialog = None
         self._reading_loading = False
+        self._restoring_scroll = False
         self._prefetch_task = None
         self._chapter_cache = {}
         self._continuous_loaded = set()
+        self._pending_append_starts = {}
         self._auto_scroll_armed = True
         self.books = []
         self.chapters = []
@@ -1774,6 +1781,7 @@ class ReadingView(ft.Column):
     def _reset_book_session(self, book_name=""):
         self._cancel_prefetch(clear_cache=True)
         self._reading_loading = False
+        self._restoring_scroll = False
         self.engine.current_book = None
         self.engine.js_variables.clear()
         self._current_book = None
@@ -1781,8 +1789,12 @@ class ReadingView(ft.Column):
         self.chapters = []
         self._visible_chapters = []
         self._continuous_loaded.clear()
+        self._pending_append_starts.clear()
         self._pending_scroll_offset = 0.0
         self._pending_scroll_ratio = 0.0
+        self._pending_document_offset = 0.0
+        self._pending_scroll_maximum = 0.0
+        self.reading_session.reset()
         self._chapters.controls.clear()
         # Internal state and visible state must change together. A book without
         # cache may wait on the network, but it must never expose the previous
@@ -1830,6 +1842,11 @@ class ReadingView(ft.Column):
 
     def _show_section(self, section):
         self._section = section
+        if section == "reader" and self._is_desktop_reader():
+            # Keep desktop controls in a stable layout. Showing/hiding this
+            # row changes the viewport height and can make Flet restore the
+            # offset captured when the book was first opened.
+            self._reader_toolbar.visible = True
         self._shelf_page.visible = section == "shelf"
         self._detail_page.visible = section == "detail"
         self._reader_page.visible = section == "reader"
@@ -1853,6 +1870,9 @@ class ReadingView(ft.Column):
         self.update()
 
     def _continue_from_detail(self, _):
+        # The detail page can stay mounted for the whole reading session. Do
+        # not reuse the snapshot captured when the book was first opened.
+        self._refresh_detail_resume()
         chapter = self._resume_chapter(self._detail_resume)
         if chapter is None:
             chapter = next((item for item in self.chapters
@@ -1984,6 +2004,10 @@ class ReadingView(ft.Column):
         self.chapters = chapters
         self._current_chapter = None
         self._continuous_loaded.clear()
+        self._pending_append_starts.clear()
+        self.reading_session.bind(
+            self.current_source.bookSourceUrl, book.url, chapters,
+            self._detail_resume)
         self._chapters.controls.clear()
         self._chapter_visible_count = 0
         self._apply_directory_filter()
@@ -2101,7 +2125,13 @@ class ReadingView(ft.Column):
         self.update()
 
     def _load_content(self, chapter):
-        self.page.run_task(self._run_content, chapter, False)
+        self._refresh_detail_resume()
+        saved_chapter = self._resume_chapter(self._detail_resume)
+        restore_offset = (
+            float((self._detail_resume or {}).get("scroll_offset", 0) or 0)
+            if saved_chapter is chapter else 0.0)
+        self.page.run_task(
+            self._run_content, chapter, False, restore_offset)
 
     async def _run_content(self, chapter, append=False, restore_offset=0.0,
                            open_generation=None):
@@ -2116,6 +2146,7 @@ class ReadingView(ft.Column):
             self._pending_scroll_ratio = 0.0
         self._cancel_prefetch()
         self._reading_loading = True
+        self._restoring_scroll = not append
         self._set_busy(f"正在加载 {chapter.name}…")
         try:
             next_chapter_url = ""
@@ -2140,10 +2171,21 @@ class ReadingView(ft.Column):
                         self._current_book.url, chapter.url, content)
             if (open_generation is not None and
                     open_generation != self._book_open_generation):
+                self._restoring_scroll = False
                 self._reading_loading = False
                 return
             rendered = self._render_content(content)
+            chapter_text_length = sum(
+                len(str(control.value or ""))
+                for control in rendered
+                if getattr(control, "data", None) in
+                {"reader-text", "reader-heading"})
             if append:
+                chapter_start = float(
+                    self._pending_append_starts.pop(
+                        chapter.url, self._pending_document_offset))
+                self.reading_session.mount(
+                    chapter, chapter_start, chapter_text_length)
                 self._content_host.controls.extend([
                     ft.Divider(height=32),
                     ft.Text(chapter.name, size=22, weight=ft.FontWeight.BOLD),
@@ -2153,18 +2195,35 @@ class ReadingView(ft.Column):
                 self._title.value = content.title or chapter.name
                 self._content_host.controls = rendered
                 self._continuous_loaded = {chapter.url}
+                self.reading_session.reset(
+                    self.current_source.bookSourceUrl,
+                    self._current_book.url, self.chapters,
+                    self.reading_session.position)
+                self.reading_session.mount(
+                    chapter, 0.0, chapter_text_length)
                 self._auto_scroll_armed = True
             if not self._content_host.controls:
                 self._content_host.controls = [ft.Text("正文解析结果为空")]
             self._continuous_loaded.add(chapter.url)
             self._current_chapter = chapter
+            saved_position = (
+                self._detail_resume
+                if self._resume_chapter(self._detail_resume) is chapter else {})
+            self.reading_session.enter(
+                chapter, self._font_size,
+                offset=(0.0 if append else float(restore_offset or 0)),
+                ratio=(0.0 if append else float(
+                    (saved_position or {}).get("scroll_ratio", 0) or 0)),
+                character_offset=(0 if append else int(
+                    (saved_position or {}).get("chapter_pos", 0) or 0)))
             current_book = getattr(self.engine, "current_book", None)
             if current_book is not None:
                 current_book.variables = dict(self.engine.js_variables)
                 self.service.update_bookshelf_state(
                     self.current_source.bookSourceUrl, current_book.url,
-                    variables=current_book.variables, chapter=chapter,
-                    book=current_book)
+                    variables=current_book.variables, book=current_book)
+            self.progress_store.save(
+                self.reading_session.position, chapter, len(self.chapters))
             self._update_chapter_navigation()
             self._status.value = (f"{chapter.name} · 已从缓存打开"
                                   if content_from_cache else chapter.name)
@@ -2179,9 +2238,24 @@ class ReadingView(ft.Column):
             if not append:
                 target_offset = max(0.0, float(restore_offset or 0))
                 self._pending_scroll_offset = target_offset
+                self._pending_document_offset = target_offset
+                # A frozen desktop build may acknowledge the control update
+                # before Flutter has measured the newly mounted paragraphs.
+                # Yield one frame so a non-zero target is not clamped to the
+                # temporary zero scroll extent.
+                if target_offset:
+                    await asyncio.sleep(0.05)
                 await self._reader.scroll_to(
-                    offset=target_offset, duration=150)
+                    offset=target_offset, duration=0)
+                if target_offset:
+                    # Paragraph/image measurement can continue after the first
+                    # frame in a frozen desktop build. Confirm once more after
+                    # layout settles so the target cannot be clamped to zero.
+                    await asyncio.sleep(0.15)
+                    await self._reader.scroll_to(
+                        offset=target_offset, duration=0)
         finally:
+            self._restoring_scroll = False
             self._reading_loading = False
             self.update()
         if self._current_chapter is chapter:
@@ -2283,12 +2357,40 @@ class ReadingView(ft.Column):
 
     def _toggle_reader_chrome(self, _=None):
         self._reader_toolbar.visible = not self._reader_toolbar.visible
-        self.update()
+        # Updating the complete reading view can cause Flet to reconcile the
+        # scrollable document and restore an older offset.  The tap only
+        # changes this overlay, so keep the update local to the toolbar.
+        try:
+            self._reader_toolbar.update()
+        except RuntimeError:
+            # Unit tests and the short interval before the first mount do not
+            # yet have a page-bound toolbar.
+            pass
+
+    def _is_desktop_reader(self):
+        try:
+            platform = self.page.platform
+        except (AssertionError, AttributeError, RuntimeError):
+            return False
+        return platform in {
+            ft.PagePlatform.WINDOWS,
+            ft.PagePlatform.MACOS,
+            ft.PagePlatform.LINUX,
+        }
 
     def _on_reader_tap(self, event):
+        # A desktop primary-button click is commonly used to select text or
+        # reveal controls.  Treating the left/right part of the document as a
+        # chapter button makes an ordinary click unexpectedly replace the
+        # continuously appended document with the previous chapter.
+        if self._is_desktop_reader():
+            # Do not mutate any desktop reader layout from a primary click.
+            # The toolbar is permanently available on desktop.
+            return
         position = getattr(event, "local_position", None)
         x = float(getattr(position, "x", 0) or 0)
-        width = float(self.page.width or 430)
+        # local_position is relative to the reading document, not the page.
+        width = float(self._reader_document.width or self.page.width or 430)
         if x and x < width * 0.22:
             self._previous_chapter(None)
         elif x and x > width * 0.78:
@@ -2460,25 +2562,57 @@ class ReadingView(ft.Column):
             self.page.run_task(self._run_content, chapter, False)
 
     def _show_directory(self, _):
+        # Treat leaving the reader as a progress commit boundary, including
+        # sessions whose final movement did not emit another scroll callback.
+        self._persist_scroll_position()
+        self._refresh_detail_resume()
         self._show_section("detail")
         self.update()
+
+    def _refresh_detail_resume(self):
+        if self._current_book is None or self.current_source is None:
+            return self._detail_resume
+        position = self.progress_store.load(
+            self.current_source.bookSourceUrl, self._current_book.url)
+        if position is not None:
+            self._detail_resume = position.as_reading()
+        return self._detail_resume
 
     def _on_reader_scroll(self, event):
         pixels = getattr(event, "pixels", 0) or 0
         maximum = getattr(event, "max_scroll_extent", 0) or 0
-        if self._reading_loading:
+        # Mounting a replacement document emits a transient zero-offset event
+        # before the saved offset is restored. It is layout noise, not user
+        # progress, and must not overwrite the saved chapter position.
+        if self._restoring_scroll:
             return
         if self._current_chapter is None:
             return
-        self._pending_scroll_offset = max(0.0, float(pixels))
-        self._pending_scroll_ratio = (
-            min(1.0, self._pending_scroll_offset / float(maximum))
-            if maximum else 0.0)
+        self._pending_document_offset = max(0.0, float(pixels))
+        self._pending_scroll_maximum = max(0.0, float(maximum))
+        position, visible_chapter = self.reading_session.track(
+            self._pending_document_offset, self._pending_scroll_maximum,
+            self._font_size)
+        if visible_chapter is not None and visible_chapter is not self._current_chapter:
+            self._current_chapter = visible_chapter
+            self._update_chapter_navigation()
+        self._pending_scroll_offset = position.chapter_offset
+        self._pending_scroll_ratio = position.chapter_ratio
+        # Scroll callbacks are already throttled by ``scroll_interval``.  Save
+        # the latest callback synchronously so closing the window or tapping
+        # the reading surface cannot leave the debounced, older record on
+        # disk.  The delayed save remains as a final settled-position write.
+        self._persist_scroll_position()
         self._scroll_save_generation += 1
         self.page.run_task(
             self._save_scroll_position_after_delay,
             self._scroll_save_generation)
         if not maximum:
+            return
+        # Loading only blocks another chapter request. It must never block
+        # position tracking: the mounted document remains scrollable while a
+        # following chapter is fetched.
+        if self._reading_loading:
             return
         distance = float(maximum) - float(pixels)
         if distance > 500:
@@ -2488,6 +2622,7 @@ class ReadingView(ft.Column):
             chapter = self._adjacent_chapter(1)
             if chapter and chapter.url not in self._continuous_loaded:
                 self._auto_scroll_armed = False
+                self._pending_append_starts[chapter.url] = float(maximum)
                 self.page.run_task(self._run_content, chapter, True)
 
     async def _save_scroll_position_after_delay(self, generation):
@@ -2499,24 +2634,15 @@ class ReadingView(ft.Column):
         if (self._current_chapter is None or self._current_book is None or
                 self.current_source is None):
             return
-        text_length = sum(
-            len(str(control.value or ""))
-            for control in self._content_host.controls
-            if getattr(control, "data", None) in
-            {"reader-text", "reader-heading"})
-        # Legado persists the first visible character position. Flet exposes
-        # pixels, so use the scroll ratio to retain the same layout-independent
-        # semantic position, while also keeping the exact desktop pixel offset.
-        chapter_pos = int(text_length * self._pending_scroll_ratio)
-        self.service.update_bookshelf_state(
-            self.current_source.bookSourceUrl,
-            self._current_book.url,
-            chapter=self._current_chapter,
-            scroll_offset=self._pending_scroll_offset,
-            scroll_ratio=self._pending_scroll_ratio,
-            font_size=self._font_size,
-            chapter_pos=chapter_pos,
-            total_chapters=len(self.chapters))
+        position = self.reading_session.position
+        if position.chapter_url != self._current_chapter.url:
+            position = self.reading_session.enter(
+                self._current_chapter, self._font_size,
+                self._pending_scroll_offset, self._pending_scroll_ratio)
+        updated = self.progress_store.save(
+            position, self._current_chapter, len(self.chapters))
+        if updated:
+            self._refresh_detail_resume()
 
     def _render_content(self, document):
         controls = []

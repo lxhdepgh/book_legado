@@ -95,7 +95,7 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
             reopened.engine.js.close()
 
     async def test_reader_tap_zones_keep_middle_for_chrome(self):
-        page = SimpleNamespace(width=1000)
+        page = SimpleNamespace(width=1000, platform=ft.PagePlatform.ANDROID)
         with patch.object(type(self.view), "page", new_callable=PropertyMock,
                           return_value=page):
             self.view._previous_chapter = unittest.mock.Mock()
@@ -110,6 +110,146 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.view._previous_chapter.assert_called_once()
         self.view._next_chapter.assert_called_once()
         self.assertTrue(self.view._reader_toolbar.visible)
+
+    async def test_desktop_primary_click_never_changes_chapter(self):
+        page = SimpleNamespace(
+            width=1000, platform=ft.PagePlatform.WINDOWS)
+        with patch.object(type(self.view), "page", new_callable=PropertyMock,
+                          return_value=page):
+            self.view._previous_chapter = unittest.mock.Mock()
+            self.view._next_chapter = unittest.mock.Mock()
+            self.view._toggle_reader_chrome = unittest.mock.Mock()
+            event = SimpleNamespace(
+                local_position=SimpleNamespace(x=10))
+
+            self.view._on_reader_tap(event)
+
+        self.view._toggle_reader_chrome.assert_not_called()
+        self.view._previous_chapter.assert_not_called()
+        self.view._next_chapter.assert_not_called()
+
+    async def test_desktop_reader_toolbar_stays_visible_without_layout_toggle(self):
+        page = SimpleNamespace(
+            width=1000, platform=ft.PagePlatform.WINDOWS)
+        self.view._reader_toolbar.visible = False
+        with patch.object(type(self.view), "page", new_callable=PropertyMock,
+                          return_value=page):
+            self.view._show_section("reader")
+
+        self.assertTrue(self.view._reader_toolbar.visible)
+
+    async def test_reader_chrome_toggle_does_not_update_scroll_document(self):
+        self.view.update = unittest.mock.Mock()
+        self.view._reader_toolbar.update = unittest.mock.Mock()
+
+        self.view._toggle_reader_chrome()
+
+        self.view._reader_toolbar.update.assert_called_once_with()
+        self.view.update.assert_not_called()
+
+    async def test_reader_scroll_persists_before_debounced_save(self):
+        chapter = ChapterItem("one", "https://source/1", index=0)
+        self.view._current_chapter = chapter
+        self.view._current_book = BookItem("book", url="https://book")
+        self.view.current_source = BookSource(
+            bookSourceName="source", bookSourceUrl="https://source")
+        self.view._content_host.controls = [
+            ft.Text("x" * 100, data="reader-text")]
+        self.view.reading_session.bind(
+            self.view.current_source.bookSourceUrl,
+            self.view._current_book.url, [chapter])
+        self.view.reading_session.mount(chapter, 0.0, 100)
+        self.view.service.update_bookshelf_state = unittest.mock.Mock()
+        scheduled = []
+        page = SimpleNamespace(
+            run_task=lambda function, *args: scheduled.append((function, args)))
+
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=page):
+            self.view._on_reader_scroll(SimpleNamespace(
+                pixels=400, max_scroll_extent=1000))
+
+        self.view.service.update_bookshelf_state.assert_called_once()
+        kwargs = self.view.service.update_bookshelf_state.call_args.kwargs
+        self.assertEqual(kwargs["scroll_offset"], 400.0)
+        self.assertEqual(kwargs["scroll_ratio"], 0.4)
+        self.assertEqual(kwargs["chapter_pos"], 40)
+
+    async def test_continuous_scroll_persists_visible_chapter_local_position(self):
+        first = ChapterItem("six", "https://source/6", index=5)
+        second = ChapterItem("hundred", "https://source/100", index=99)
+        self.view.chapters = [first, second]
+        self.view._current_chapter = second
+        self.view._current_book = BookItem("book", url="https://book")
+        self.view.current_source = BookSource(
+            bookSourceName="source", bookSourceUrl="https://source")
+        self.view.reading_session.bind(
+            self.view.current_source.bookSourceUrl,
+            self.view._current_book.url, self.view.chapters)
+        self.view.reading_session.mount(first, 0.0, 100)
+        self.view.reading_session.mount(second, 1000.0, 200)
+        self.view.service.update_bookshelf_state = unittest.mock.Mock()
+        page = SimpleNamespace(run_task=lambda *_args: None)
+
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=page):
+            self.view._on_reader_scroll(SimpleNamespace(
+                pixels=1500, max_scroll_extent=2000))
+
+        kwargs = self.view.service.update_bookshelf_state.call_args.kwargs
+        self.assertIs(kwargs["chapter"], second)
+        self.assertEqual(kwargs["scroll_offset"], 500.0)
+        self.assertEqual(kwargs["scroll_ratio"], 0.5)
+        self.assertEqual(kwargs["chapter_pos"], 100)
+
+    async def test_scroll_during_next_chapter_load_still_persists_position(self):
+        chapter = ChapterItem("one", "https://source/1", index=0)
+        self.view.chapters = [chapter]
+        self.view._current_chapter = chapter
+        self.view._current_book = BookItem("book", url="https://book")
+        self.view.current_source = BookSource(
+            bookSourceName="source", bookSourceUrl="https://source")
+        self.view.reading_session.bind(
+            self.view.current_source.bookSourceUrl,
+            self.view._current_book.url, [chapter])
+        self.view.reading_session.mount(chapter, 0.0, 1000)
+        self.view.service.update_bookshelf_state = unittest.mock.Mock(
+            return_value=True)
+        self.view._reading_loading = True
+        page = SimpleNamespace(run_task=lambda *_args: None)
+
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=page):
+            self.view._on_reader_scroll(SimpleNamespace(
+                pixels=500, max_scroll_extent=1000))
+
+        kwargs = self.view.service.update_bookshelf_state.call_args.kwargs
+        self.assertEqual(kwargs["scroll_offset"], 500.0)
+        self.assertEqual(kwargs["scroll_ratio"], 0.5)
+        self.assertEqual(kwargs["chapter_pos"], 500)
+
+    async def test_layout_zero_event_during_restore_cannot_overwrite_progress(self):
+        chapter = ChapterItem("one", "https://source/1", index=0)
+        self.view._current_chapter = chapter
+        self.view._current_book = BookItem("book", url="https://book")
+        self.view.current_source = BookSource(
+            bookSourceName="source", bookSourceUrl="https://source")
+        self.view.reading_session.bind(
+            self.view.current_source.bookSourceUrl,
+            self.view._current_book.url, [chapter], {
+                "chapter_url": chapter.url, "chapter_index": 0,
+                "scroll_offset": 840.0, "scroll_ratio": 0.4,
+                "chapter_pos": 400,
+            })
+        self.view.service.update_bookshelf_state = unittest.mock.Mock()
+        self.view._restoring_scroll = True
+
+        self.view._on_reader_scroll(SimpleNamespace(
+            pixels=0, max_scroll_extent=2000))
+
+        self.view.service.update_bookshelf_state.assert_not_called()
+        self.assertEqual(
+            self.view.reading_session.position.chapter_offset, 840.0)
 
     async def test_reader_shortcuts_can_be_rebound_and_swap_conflicts(self):
         self.view._set_reader_shortcut("previous", "right")
@@ -314,6 +454,37 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.view._detail_page.visible)
         self.assertFalse(self.view._reader_page.visible)
 
+    async def test_return_to_directory_commits_and_refreshes_resume_state(self):
+        chapter = ChapterItem("hundred", "https://source/100", index=99)
+        book = BookItem("book", url="https://book")
+        source = BookSource(
+            bookSourceName="source", bookSourceUrl="https://source")
+        item = {
+            "source_url": source.bookSourceUrl,
+            "url": book.url,
+            "reading": {"chapter_url": chapter.url,
+                        "chapter_index": chapter.index,
+                        "scroll_offset": 321.0},
+        }
+        self.view._current_book = book
+        self.view._current_chapter = chapter
+        self.view.current_source = source
+        self.view.chapters = [chapter]
+        self.view.service.bookshelf = [item]
+        self.view.service.update_bookshelf_state = unittest.mock.Mock(
+            return_value=True)
+        self.view.service.reading_state = lambda selected: dict(
+            selected["reading"])
+        self.view._detail_resume = {
+            "chapter_url": "https://source/6", "chapter_index": 5}
+        self.view.update = lambda: None
+
+        self.view._show_directory(None)
+
+        self.view.service.update_bookshelf_state.assert_called_once()
+        self.assertEqual(self.view._detail_resume["chapter_url"], chapter.url)
+        self.assertEqual(self.view._detail_resume["scroll_offset"], 321.0)
+
     async def test_resume_prefers_saved_url_then_falls_back_to_index(self):
         first = ChapterItem("one", "https://source/1", index=0)
         second = ChapterItem("two", "https://source/2", index=1)
@@ -324,6 +495,54 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
             second)
         self.assertIs(
             self.view._resume_chapter({"chapter_index": 0}), first)
+
+    async def test_directory_click_on_saved_chapter_restores_chapter_offset(self):
+        first = ChapterItem("one", "https://source/1", index=0)
+        second = ChapterItem("two", "https://source/2", index=1)
+        self.view.chapters = [first, second]
+        self.view._current_book = BookItem("book", url="https://book")
+        self.view.current_source = BookSource(
+            bookSourceName="source", bookSourceUrl="https://source")
+        self.view.service.bookshelf = [{
+            "source_url": "https://source", "url": "https://book",
+            "reading": {"chapter_url": second.url,
+                        "chapter_index": 1, "scroll_offset": 840.0},
+        }]
+        self.view.service.reading_state = lambda item: dict(item["reading"])
+        scheduled = []
+        page = SimpleNamespace(
+            run_task=lambda function, *args: scheduled.append((function, args)))
+
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=page):
+            self.view._load_content(second)
+
+        self.assertEqual(scheduled, [
+            (self.view._run_content, (second, False, 840.0))])
+
+    async def test_directory_click_on_other_chapter_starts_at_top(self):
+        first = ChapterItem("one", "https://source/1", index=0)
+        second = ChapterItem("two", "https://source/2", index=1)
+        self.view.chapters = [first, second]
+        self.view._current_book = BookItem("book", url="https://book")
+        self.view.current_source = BookSource(
+            bookSourceName="source", bookSourceUrl="https://source")
+        self.view.service.bookshelf = [{
+            "source_url": "https://source", "url": "https://book",
+            "reading": {"chapter_url": second.url,
+                        "chapter_index": 1, "scroll_offset": 840.0},
+        }]
+        self.view.service.reading_state = lambda item: dict(item["reading"])
+        scheduled = []
+        page = SimpleNamespace(
+            run_task=lambda function, *args: scheduled.append((function, args)))
+
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=page):
+            self.view._load_content(first)
+
+        self.assertEqual(scheduled, [
+            (self.view._run_content, (first, False, 0.0))])
 
     async def test_font_size_is_bounded(self):
         self.view.update = lambda: None
