@@ -35,6 +35,26 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.view._reader.controls[2], self.view._content_host)
         self.assertFalse(hasattr(self.view, "_reader_nav"))
 
+    async def test_bookshelf_refresh_uses_stable_unique_control_keys(self):
+        first = {"name": "One", "source_url": "https://source-a",
+                 "url": "https://book/1"}
+        second = {"name": "Two", "source_url": "https://source-a",
+                  "url": "https://book/2"}
+        self.view.service.bookshelf = [first, second]
+        self.view.service.reading_state = lambda _item: None
+
+        self.view._render_bookshelf()
+        list_keys = [control.key for control in self.view._bookshelf.controls]
+        grid_keys = [control.key for control in self.view._bookshelf_grid.controls]
+        self.view._render_bookshelf()
+
+        self.assertEqual(2, len(set(list_keys)))
+        self.assertEqual(2, len(set(grid_keys)))
+        self.assertEqual(list_keys,
+                         [control.key for control in self.view._bookshelf.controls])
+        self.assertEqual(grid_keys,
+                         [control.key for control in self.view._bookshelf_grid.controls])
+
     async def test_image_style_maps_default_full_and_text_layout(self):
         self.assertEqual(ReadingView._image_render_options("DEFAULT", 18),
                          {"fit": ft.BoxFit.SCALE_DOWN})

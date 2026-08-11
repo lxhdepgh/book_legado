@@ -9,6 +9,7 @@ import flet as ft
 
 from app.services.source_service import SourceService
 from app.services.theme_service import ThemeService
+from app.ui_feedback import show_snack_bar
 from app.views.appearance_view import AppearanceView
 from app.views.book_source_view import BookSourceView
 from app.views.reading_view import ReadingView
@@ -49,7 +50,7 @@ class BookSourceApp:
             # 首次运行没有书源文件，创建空列表
             self.service.sources = []
         except Exception as e:
-            page.show_snack_bar(
+            show_snack_bar(page,
                 ft.SnackBar(content=ft.Text(f"加载书源失败: {e}"),
                             bgcolor=ft.Colors.RED_100))
 
@@ -159,12 +160,12 @@ class BookSourceApp:
 
     def _appearance_message(self, message: str):
         self.theme_service.apply(self._page)
-        self._page.show_snack_bar(ft.SnackBar(content=ft.Text(message)))
+        show_snack_bar(self._page, ft.SnackBar(content=ft.Text(message)))
         self._page.update()
 
     def _on_imported(self, result: dict):
         """导入完成后的回调 - 显示提示（Tab 切换由 BookSourceView 内部处理）"""
-        self._page.show_snack_bar(
+        show_snack_bar(self._page,
             ft.SnackBar(
                 content=ft.Text(
                     f"导入完成: 新增 {result['imported']} 条"

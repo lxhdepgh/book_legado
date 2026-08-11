@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import re
 import uuid
@@ -927,6 +928,7 @@ class ReadingView(ft.Column):
         if item.get("updateError"):
             details.append("更新失败")
         return ft.ListTile(
+            key=self._shelf_control_key(item, "list"),
             leading=(ft.Image(src=item.get("cover_url"), width=42, height=56,
                               fit=ft.BoxFit.COVER)
                      if item.get("cover_url") else ft.Icon(ft.Icons.BOOK)),
@@ -953,7 +955,7 @@ class ReadingView(ft.Column):
                  if item.get("cover_url") else
                  ft.Container(height=150, alignment=ft.Alignment.CENTER,
                               content=ft.Icon(ft.Icons.BOOK, size=54)))
-        return ft.Card(content=ft.Container(
+        return ft.Card(key=self._shelf_control_key(item, "grid"), content=ft.Container(
             padding=8, on_click=lambda e, selected=item: self._open_shelf_item(selected),
             content=ft.Column([
                 ft.Stack([cover, ft.Container(
@@ -971,6 +973,16 @@ class ReadingView(ft.Column):
                                       on_click=lambda e, selected=item:
                                       self._show_shelf_manage(selected))], spacing=0),
             ], spacing=4)))
+
+    @staticmethod
+    def _shelf_control_key(item, layout):
+        """Return a stable Flet reconciliation key for one persisted book."""
+        identity = "\n".join((
+            str(item.get("source_url") or item.get("origin") or ""),
+            str(item.get("url") or item.get("bookUrl") or ""),
+        ))
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        return f"bookshelf-{layout}-{digest}"
 
     def _remove_shelf_item(self, item):
         self.service.remove_from_bookshelf(item.get("source_url", ""), item.get("url", ""))

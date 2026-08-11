@@ -5653,6 +5653,54 @@ class BookshelfPersistenceTests(unittest.TestCase):
 
 
 class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
+
+    async def test_bare_href_reads_current_chapter_node_attribute(self):
+        class Engine(LegadoReadingEngine):
+            async def _request_value(self, value, source, base_url="", page=1,
+                                     request_defaults=None):
+                return (
+                    '<ul><li><a href="/chapter/1">One</a></li>'
+                    '<li><a href="/chapter/2">Two</a></li></ul>',
+                    "text/html", "https://source.example/book")
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://source.example", ruleBookInfo={},
+            ruleToc={"chapterList": "li@tag.a", "chapterName": "text",
+                     "chapterUrl": "href"},
+            to_dict=lambda: {"bookSourceUrl": "https://source.example"})
+        chapters = await Engine().chapters(
+            source, BookItem("Book", url="https://source.example/book"))
+        self.assertEqual(
+            [(item.name, item.url) for item in chapters],
+            [("One", "https://source.example/chapter/1"),
+             ("Two", "https://source.example/chapter/2")])
+
+    async def test_empty_saved_toc_url_retries_detail_page_once(self):
+        requested = []
+
+        class Engine(LegadoReadingEngine):
+            async def _request_value(self, value, source, base_url="", page=1,
+                                     request_defaults=None):
+                requested.append(value)
+                if value.endswith("/1.html"):
+                    return ("<main>Chapter content</main>", "text/html", value)
+                return (
+                    '<ul class="clearfix"><li><a href="/book/1.html">'
+                    'Chapter 1</a></li><li><a href="/book/2.html">'
+                    'Chapter 2</a></li></ul>', "text/html", value)
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://source.example", ruleBookInfo={},
+            ruleToc={"chapterList": ".clearfix@li@tag.a",
+                     "chapterName": "text", "chapterUrl": "href"},
+            to_dict=lambda: {"bookSourceUrl": "https://source.example"})
+        book = BookItem("Book", url="https://source.example/book/index.html",
+                        toc_url="https://source.example/book/1.html")
+        chapters = await Engine().chapters(source, book)
+        self.assertEqual(requested, ["https://source.example/book/1.html",
+                                     "https://source.example/book/index.html"])
+        self.assertEqual([item.name for item in chapters],
+                         ["Chapter 1", "Chapter 2"])
     async def test_virtual_data_url_decodes_without_network_request(self):
         engine = LegadoReadingEngine()
         source = SimpleNamespace(bookSourceUrl="https://example.com")

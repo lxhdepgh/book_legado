@@ -6,6 +6,8 @@ from __future__ import annotations
 import asyncio
 import flet as ft
 
+from app.ui_feedback import show_snack_bar
+
 from app.models.book_source import BookSource
 from app.services.source_service import SourceService
 
@@ -300,7 +302,7 @@ class ManageView(ft.Column):
             except RuntimeError:
                 page = None
             if page:
-                page.show_snack_bar(ft.SnackBar(
+                show_snack_bar(page, ft.SnackBar(
                     content=ft.Text(f"状态保存失败，已恢复原值：{exc}")))
         self._render_page()
 
@@ -403,6 +405,6 @@ class ManageView(ft.Column):
                         source.enabled = previous_enabled[id(source)]
             self._apply_filters(update_groups=True)
             if self.page:
-                self.page.show_snack_bar(ft.SnackBar(content=ft.Text(
+                show_snack_bar(self.page, ft.SnackBar(content=ft.Text(
                     f"操作未保存，已恢复原状态：{exc}")))
         self._render_page()

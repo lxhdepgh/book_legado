@@ -803,6 +803,21 @@ class LegadoReadingEngine(ReaderEngine):
             initial = raw_result if raw_result is not None else (
                 json.dumps(node, ensure_ascii=False) if kind == "json" else str(node))
             return _apply_regex_suffix(str(initial), regex_suffix).strip()
+        # Older Legado sources commonly use a bare attribute name when the
+        # chapterList node is already the target element (for example
+        # chapterUrl="href"). Jsoup reads that as node.attr("href"); treating
+        # it as a descendant selector loses the URL.
+        if (kind == "html" and hasattr(node, "get") and selector and
+                re.fullmatch(r"[A-Za-z_:][\w:.-]*", selector)):
+            direct = node.get(selector)
+            if direct is not None:
+                value = _legado_value_string(direct)
+                if regex_suffix:
+                    value = _apply_regex_suffix(value, regex_suffix)
+                if is_url:
+                    value = _resolve_rule_url(value, base_url)
+                value = value.strip()
+                return html.unescape(value) if unescape_html else value
         values = evaluate(node, selector, kind)
         if not values:
             return ""
@@ -1240,6 +1255,17 @@ class LegadoReadingEngine(ReaderEngine):
                 pending_pages.extend(
                     (item, response, False)
                     for item, response in zip(accepted, responses))
+
+            # Some legacy sources incorrectly resolve ruleBookInfo.tocUrl to
+            # the first chapter even though the chapter list lives on the book
+            # detail page. Legado users can encounter this after a site layout
+            # change or with an old saved tocUrl. Retry the detail page once,
+            # only when the declared TOC produced no usable entries.
+            if not chapters and not pending_pages:
+                fallback_url = book.url
+                fallback_key = _media_request(fallback_url, detail_url)[0]
+                if fallback_key and fallback_key not in visited_pages:
+                    pending_pages.append((fallback_url, None, True))
 
         if not chapters:
             raise TocEmptyError("chapter list is empty")

@@ -5,9 +5,17 @@ from unittest.mock import patch
 from app.models.book_source import BookSource
 from app.services import check_service
 from app.views.manage_view import ManageView
+from app.ui_feedback import show_snack_bar
 
 
 class UiSafetyTests(unittest.TestCase):
+    def test_snack_bar_uses_flet_dialog_api(self):
+        shown = []
+        page = SimpleNamespace(show_dialog=shown.append)
+        snack = object()
+        show_snack_bar(page, snack)
+        self.assertEqual([snack], shown)
+
     def test_single_source_toggle_rolls_back_when_save_fails(self):
         source = BookSource(bookSourceName="A", bookSourceUrl="https://a")
         service = SimpleNamespace(sources=[source], save=lambda: None)
