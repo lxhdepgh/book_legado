@@ -991,6 +991,7 @@ class ReadingView(ft.Column):
             title=ft.Text(item.get("name") or "未命名"),
             subtitle=ft.Text(" · ".join(details)),
             trailing=ft.Row([
+                self._cache_status_control(item),
                 ft.Container(
                     visible=unread > 0, padding=ft.Padding(7, 2, 7, 2),
                     border_radius=12, bgcolor=ft.Colors.BLUE_100,
@@ -1023,12 +1024,43 @@ class ReadingView(ft.Column):
                         weight=ft.FontWeight.BOLD),
                 ft.Text(reading.get("chapter_name") or item.get("author") or "",
                         size=11, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                self._cache_status_control(item, compact=True),
                 ft.Row([ft.Text(item.get("source_name") or "", size=10, expand=True,
                                 max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
                         ft.IconButton(ft.Icons.MORE_VERT, icon_size=18,
                                       on_click=lambda e, selected=item:
                                       self._show_shelf_manage(selected))], spacing=0),
             ], spacing=4)))
+
+    def _cache_status_control(self, item, compact=False):
+        key = self._book_task_key(item)
+        cached = max(0, int(item.get("cachedChapterCount", 0) or 0))
+        total = max(0, int(item.get("cacheTotalChapterCount", 0) or
+                           item.get("totalChapterNum", 0) or 0))
+        if key in self._whole_book_tasks:
+            label, icon = "缓存中", ft.Icons.DOWNLOADING
+            background, foreground = (ft.Colors.PRIMARY_CONTAINER,
+                                      ft.Colors.ON_PRIMARY_CONTAINER)
+        elif total > 0 and cached >= total:
+            label, icon = "已离线", ft.Icons.DOWNLOAD_DONE
+            background, foreground = (ft.Colors.PRIMARY_CONTAINER,
+                                      ft.Colors.ON_PRIMARY_CONTAINER)
+        elif cached > 0:
+            label, icon = f"{cached}/{total or '?'}", ft.Icons.CLOUD_DOWNLOAD_OUTLINED
+            background, foreground = (ft.Colors.SURFACE_CONTAINER,
+                                      ft.Colors.PRIMARY)
+        else:
+            label, icon = "未缓存", ft.Icons.CLOUD_OUTLINED
+            background, foreground = (ft.Colors.SURFACE_CONTAINER,
+                                      ft.Colors.ON_SURFACE_VARIANT)
+        return ft.Container(
+            tooltip=(label if compact else f"离线状态：{label}"),
+            padding=ft.Padding(6, 2, 6, 2), border_radius=10,
+            bgcolor=background,
+            content=ft.Row(tight=True, spacing=3, controls=[
+                ft.Icon(icon, size=13, color=foreground),
+                ft.Text(label, size=10, color=foreground),
+            ]))
 
     @staticmethod
     def _shelf_control_key(item, layout):
@@ -1954,6 +1986,8 @@ class ReadingView(ft.Column):
         for control in self._content_host.controls:
             if getattr(control, "data", None) == "reader-text":
                 control.size = new_size
+            elif getattr(control, "data", None) == "reader-heading":
+                control.size = new_size + 2
         self.update()
 
     def _previous_chapter(self, _):
@@ -2007,7 +2041,8 @@ class ReadingView(ft.Column):
         text_length = sum(
             len(str(control.value or ""))
             for control in self._content_host.controls
-            if getattr(control, "data", None) == "reader-text")
+            if getattr(control, "data", None) in
+            {"reader-text", "reader-heading"})
         # Legado persists the first visible character position. Flet exposes
         # pixels, so use the scroll ratio to retain the same layout-independent
         # semantic position, while also keeping the exact desktop pixel offset.
@@ -2032,10 +2067,15 @@ class ReadingView(ft.Column):
             image_style = configured_style
         for block in document.blocks:
             if block.kind == "text":
-                text = ft.Text(
-                    str(block.value), selectable=True, size=self._font_size)
-                text.data = "reader-text"
-                controls.append(text)
+                for value, is_heading in self._novel_paragraphs(block.value):
+                    controls.append(ft.Text(
+                        value,
+                        selectable=True,
+                        size=self._font_size + (2 if is_heading else 0),
+                        weight=(ft.FontWeight.W_600 if is_heading else None),
+                        style=ft.TextStyle(height=1.45 if is_heading else 1.7),
+                        data="reader-heading" if is_heading else "reader-text",
+                    ))
             elif block.kind == "image":
                 options = self._image_render_options(image_style, self._font_size)
                 controls.append(ft.Image(src=block.value,
@@ -2059,6 +2099,26 @@ class ReadingView(ft.Column):
                     aspect_ratio=16 / 9, controls=ftv.AdaptiveVideoControls(),
                 ))
         return controls
+
+    @staticmethod
+    def _novel_paragraphs(value):
+        """Turn source text into readable novel paragraphs without changing data."""
+        normalized = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+        normalized = normalized.replace("\xa0", " ")
+        paragraphs = []
+        heading_pattern = re.compile(
+            r"^(?:第[0-9０-９零〇一二三四五六七八九十百千万两]+"
+            r"[章节卷回部篇集]|卷[0-9０-９零〇一二三四五六七八九十百千万两]+|"
+            r"序章|序言|前言|楔子|引子|后记|尾声|番外)(?:\s|$|[：:、.-])")
+        for raw_line in normalized.split("\n"):
+            line = re.sub(r"[ \t\f\v]+", " ", raw_line).strip()
+            if not line:
+                continue
+            is_heading = len(line) <= 48 and bool(heading_pattern.match(line))
+            if not is_heading and not line.startswith(("　　", "•", "·", "- ", "— ")):
+                line = f"　　{line.lstrip('　')}"
+            paragraphs.append((line, is_heading))
+        return paragraphs
 
     @staticmethod
     def _image_render_options(image_style, font_size):

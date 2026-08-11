@@ -15,6 +15,7 @@ from app.services.rule_engine import BookItem, ChapterItem
 from app.services.source_service import SourceService
 from app.views.reading_view import ReadingView
 from app.app import BookSourceApp
+from app.views.settings_view import SettingsView
 
 
 class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
@@ -32,6 +33,32 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
     async def test_reader_toolbar_keeps_navigation_and_font_controls_visible(self):
         self.assertEqual(len(self.view._reader_toolbar.content.controls), 7)
         self.assertEqual(self.view._font_size, 16)
+
+    async def test_text_novel_content_uses_paragraph_reading_layout(self):
+        document = ChapterContent([ContentBlock(
+            "text",
+            "第一章 初见\r\n\r\n 第一段正文。\n第二段正文。\n\n")])
+
+        controls = self.view._render_content(document)
+
+        self.assertEqual([control.value for control in controls], [
+            "第一章 初见", "　　第一段正文。", "　　第二段正文。"])
+        self.assertEqual(controls[0].data, "reader-heading")
+        self.assertEqual(controls[0].size, self.view._font_size + 2)
+        self.assertEqual(controls[0].style.height, 1.45)
+        self.assertEqual(controls[1].data, "reader-text")
+        self.assertEqual(controls[1].style.height, 1.7)
+        self.assertTrue(all(control.selectable for control in controls))
+
+    async def test_font_size_preserves_text_heading_hierarchy(self):
+        self.view._content_host.controls = self.view._render_content(
+            ChapterContent([ContentBlock("text", "序章\n正文")]))
+        self.view.update = lambda: None
+
+        self.view._change_font_size(2)
+
+        self.assertEqual(self.view._content_host.controls[0].size, 20)
+        self.assertEqual(self.view._content_host.controls[1].size, 18)
         self.assertEqual(len(self.view._reader.controls), 3)
         self.assertIs(self.view._reader.controls[0], self.view._title)
         self.assertIs(self.view._reader.controls[2], self.view._content_host)
@@ -85,6 +112,28 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("该书源仅支持关键词搜索，请输入书名或作者",
                          self.view._status.value)
         self.assertEqual([], self.view._category_host.controls)
+
+    async def test_cache_badges_distinguish_states_with_semantic_theme_colors(self):
+        item = {"source_url": "https://source", "url": "https://book",
+                "totalChapterNum": 10}
+        uncached = self.view._cache_status_control(item)
+        self.assertEqual("未缓存", uncached.content.controls[1].value)
+        self.assertEqual(ft.Colors.SURFACE_CONTAINER, uncached.bgcolor)
+
+        item.update(cachedChapterCount=4, cacheTotalChapterCount=10)
+        partial = self.view._cache_status_control(item)
+        self.assertEqual("4/10", partial.content.controls[1].value)
+        self.assertEqual(ft.Colors.PRIMARY,
+                         partial.content.controls[0].color)
+
+        item["cachedChapterCount"] = 10
+        complete = self.view._cache_status_control(item)
+        self.assertEqual("已离线", complete.content.controls[1].value)
+        self.assertEqual(ft.Colors.PRIMARY_CONTAINER, complete.bgcolor)
+
+        self.view._whole_book_tasks[self.view._book_task_key(item)] = object()
+        running = self.view._cache_status_control(item)
+        self.assertEqual("缓存中", running.content.controls[1].value)
 
     async def test_image_style_maps_default_full_and_text_layout(self):
         self.assertEqual(ReadingView._image_render_options("DEFAULT", 18),
@@ -273,6 +322,16 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PersistentReadingTests(unittest.TestCase):
+    def test_settings_places_appearance_under_extensible_configuration_tabs(self):
+        with TemporaryDirectory() as directory:
+            from app.services.theme_service import ThemeService
+            service = ThemeService(directory)
+            service.load()
+            view = SettingsView(service, lambda _value: None, lambda _value: None)
+            self.assertEqual(1, view.tabs.length)
+            self.assertIs(view.tabs.content.controls[1].controls[0],
+                          view.appearance_view)
+
     def test_platform_paths_never_depend_on_executable_directory(self):
         home = Path("/users/tester")
         windows = default_app_paths(

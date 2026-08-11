@@ -10,9 +10,9 @@ import flet as ft
 from app.services.source_service import SourceService
 from app.services.theme_service import ThemeService
 from app.ui_feedback import show_snack_bar
-from app.views.appearance_view import AppearanceView
 from app.views.book_source_view import BookSourceView
 from app.views.reading_view import ReadingView
+from app.views.settings_view import SettingsView
 
 
 class BookSourceApp:
@@ -62,7 +62,7 @@ class BookSourceApp:
             on_imported=self._on_imported,
             discover_view=self._discover_view,
         )
-        self._appearance_view = AppearanceView(
+        self._settings_view = SettingsView(
             self.theme_service,
             on_preview=self._preview_appearance,
             on_saved=self._appearance_message,
@@ -91,9 +91,9 @@ class BookSourceApp:
                     label="阅读",
                 ),
                 ft.NavigationBarDestination(
-                    icon=ft.Icons.PALETTE_OUTLINED,
-                    selected_icon=ft.Icons.PALETTE,
-                    label="外观",
+                    icon=ft.Icons.SETTINGS_OUTLINED,
+                    selected_icon=ft.Icons.SETTINGS,
+                    label="配置",
                 ),
             ],
         )
@@ -138,7 +138,7 @@ class BookSourceApp:
 
         # Leaving the settings page must not retain an unsaved live preview.
         if previous_index == 2:
-            self._appearance_view.cancel_preview()
+            self._settings_view.cancel_preview()
 
         if index == 0:
             self._content_container.content = self._book_source_view
@@ -148,8 +148,8 @@ class BookSourceApp:
             self._reading_view.refresh_bookshelf(update=False)
             self._content_container.content = self._reading_view
         elif index == 2:
-            self._appearance_view.sync_from_saved()
-            self._content_container.content = self._appearance_view
+            self._settings_view.sync_from_saved()
+            self._content_container.content = self._settings_view
 
         self._page.update()
 

@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -51,7 +52,7 @@ class WholeBookCacheTests(unittest.IsolatedAsyncioTestCase):
             engine = _Engine()
             service = WholeBookCacheService(
                 Path(directory) / "cache", Path(directory) / "data",
-                engine_factory=lambda: engine, retries=3)
+                engine_factory=lambda: engine, retries=3, concurrency=1)
             source = SimpleNamespace(bookSourceUrl="https://source")
             book = BookItem("Book", url="https://book")
             progress = []
@@ -77,6 +78,43 @@ class WholeBookCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(2, resumed.cached)
             self.assertEqual(calls_before, len(engine.calls))
             self.assertEqual((2, 0), progress[-1])
+
+    async def test_cache_uses_bounded_parallel_workers(self):
+        active = 0
+        peak = 0
+        engines = []
+
+        class ParallelEngine(_Engine):
+            async def chapters(self, _source, _book):
+                return [ChapterItem(str(index), f"https://book/{index}", index=index)
+                        for index in range(8)]
+
+            async def content_document(self, _source, chapter, _next_url=""):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                try:
+                    await asyncio.sleep(0.02)
+                    return ChapterContent([ContentBlock("text", chapter.name)])
+                finally:
+                    active -= 1
+
+        def factory():
+            engine = ParallelEngine()
+            engines.append(engine)
+            return engine
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = WholeBookCacheService(
+                Path(directory) / "cache", Path(directory) / "data",
+                engine_factory=factory, concurrency=3)
+            result = await service.cache_book(
+                SimpleNamespace(bookSourceUrl="https://source"),
+                BookItem("Book", url="https://book"))
+
+        self.assertEqual(8, result.cached)
+        self.assertEqual(3, peak)
+        self.assertEqual(3, len(engines))
 
 
 if __name__ == "__main__":
