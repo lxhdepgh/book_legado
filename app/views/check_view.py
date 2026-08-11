@@ -6,6 +6,24 @@ import flet as ft
 from app.services.check_service import CHECK_CONCURRENCY, TAG_PAGE_CONCURRENCY, check_sources
 
 
+CHECK_STATE_LABELS = {
+    "fully_usable": "完整可用",
+    "list_usable": "列表可用",
+    "search_only": "仅搜索可用",
+    "explore_only": "仅发现可用",
+    "content_unavailable": "阅读链路失败",
+    "unknown": "待确认",
+    "unusable": "不可用",
+}
+
+READING_STAGE_LABELS = {
+    "detail": "详情",
+    "catalog": "目录",
+    "content": "正文",
+    "complete": "正文",
+}
+
+
 class CheckView(ft.Column):
     RESULT_UPDATE_BATCH_SIZE = 10
 
@@ -28,7 +46,7 @@ class CheckView(ft.Column):
                 ft.Text("书源检测", size=28, weight=ft.FontWeight.BOLD),
                 ft.Text(
                     f"使用 {CHECK_CONCURRENCY} 个书源协程、最多 {TAG_PAGE_CONCURRENCY} 个标签页协程，"
-                    "检测服务器、搜索规则、每个分类标签及第二页加载。默认仅生成检测结果，不会修改书源状态。",
+                    "使用当前规则引擎检测服务器、搜索、分类，并抽检详情、目录和正文。默认只生成结果，不修改书源状态。",
                     color=ft.Colors.GREY_600,
                 ),
                 self._enabled_only,
@@ -97,6 +115,8 @@ class CheckView(ft.Column):
             server = result["status"].upper()
             search = (result.get("search_status") or "-").upper()
             detail = f"连通 {server} · 搜索 {search}"
+            state = result.get("check_state", "unknown")
+            detail += f" · {CHECK_STATE_LABELS.get(state, state)}"
             count = result.get("book_count")
             if count is not None and count >= 0:
                 detail += f" · 搜索结果 {count} 本"
@@ -112,15 +132,17 @@ class CheckView(ft.Column):
                     detail += f" · 翻页失败 {broken_pages}"
             if result.get("tag_check_timeout"):
                 detail += " · 标签检测超过 60 秒（保留启用）"
-            if result.get("tag_check_js_skipped"):
-                detail += " · JS 分类需在阅读页单独验证"
+            reading_stage = result.get("reading_stage")
+            if result.get("reading_status") == "ok":
+                detail += f" · 阅读抽检通过（{result.get('chapter_count', 0)} 章）"
+            elif reading_stage not in {None, "none"}:
+                stage_label = READING_STAGE_LABELS.get(reading_stage, reading_stage)
+                detail += f" · {stage_label}失败：{result.get('reading_error') or '未知错误'}"
             if result.get("auto_disabled"):
                 detail += f" · 已自动停用（{result.get('disable_reason', '不可用')}）"
             elif result.get("check_state") == "unknown":
                 detail += " · 待确认（限流、超时或 JS 规则，不停用）"
-            healthy = (result["status"] == "ok" and
-                       result.get("search_status") == "ok" and
-                       result.get("tag_invalid", 0) == 0)
+            healthy = result.get("check_state") == "fully_usable"
             color = ft.Colors.GREEN if healthy else ft.Colors.ORANGE
             pending_rows.append(ft.ListTile(
                 leading=ft.Icon(ft.Icons.CHECK_CIRCLE if healthy else ft.Icons.INFO_OUTLINE,
@@ -145,8 +167,9 @@ class CheckView(ft.Column):
             if disabled_count:
                 self.service.save()
             available = sum(1 for result in self._results
-                            if result["status"] == "ok" and
-                            result.get("search_status") == "ok")
+                            if result.get("search_status") == "ok")
+            readable = sum(1 for result in self._results
+                           if result.get("check_state") == "fully_usable")
             reachable = sum(1 for result in self._results if result["status"] == "ok")
             tag_total = sum(result.get("tag_total", 0) for result in self._results)
             tag_valid = sum(result.get("tag_valid", 0) for result in self._results)
@@ -154,7 +177,8 @@ class CheckView(ft.Column):
                             if result.get("check_state") == "unknown")
             self._summary.value = (
                 f"检测完成：服务器可达 {reachable}/{len(sources)}，"
-                f"搜索可用 {available}/{len(sources)}，标签可用 {tag_valid}/{tag_total}，"
+                f"完整可读 {readable}/{len(sources)}，搜索可用 {available}/{len(sources)}，"
+                f"标签可用 {tag_valid}/{tag_total}，"
                 f"{'自动停用 ' + str(disabled_count) + ' 个，' if self._auto_disable.value else ''}"
                 f"待确认 {uncertain} 个"
             )

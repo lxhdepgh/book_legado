@@ -7,8 +7,7 @@ from unittest.mock import AsyncMock, patch
 from app.services import check_service
 from app.models.book_source import BookSource
 from app.services.legado_js import LegadoJsRuntime
-from app.services.rule_engine import ExploreCategory
-from app.services.rule_engine import ReaderEngine
+from app.services.rule_engine import ExploreCategory, ReaderEngine
 
 
 def _source(**overrides):
@@ -16,64 +15,98 @@ def _source(**overrides):
         "bookSourceName": "speed-test",
         "bookSourceUrl": "https://example.com",
         "searchUrl": "/search?key={{key}}",
-        "ruleSearch": {},
-        "ruleExplore": {},
-        "header": "",
-        "enabled": True,
-        "enabledExplore": True,
-        "exploreUrl": "分类::/list",
+        "ruleSearch": {}, "ruleExplore": {}, "ruleBookInfo": {},
+        "ruleToc": {}, "ruleContent": {}, "header": "", "enabled": True,
+        "enabledExplore": True, "exploreUrl": "分类::/list",
     }
     values.update(overrides)
-    source = SimpleNamespace(**values)
-    source.to_dict = lambda: dict(values)
-    return source
+    return SimpleNamespace(**values)
 
 
 class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_search_and_category_network_waits_overlap(self):
-        async def fake_test_one(source, index, session, sem, timeout):
-            await asyncio.sleep(0.08)
-            return {
-                "idx": index, "name": source["bookSourceName"],
-                "raw_url": source["bookSourceUrl"], "status": "ok",
-                "search_status": "ok", "book_count": 1, "error": None,
-            }
+    async def test_sources_use_independent_engines_concurrently(self):
+        active = 0
+        peak = 0
 
-        async def fake_categories(source, session, sem, timeout=10):
+        async def fake_search(source, engine, timeout):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
             await asyncio.sleep(0.08)
-            return []
+            active -= 1
+            return ({"search_status": "no_results", "book_count": 0,
+                     "search_keyword": "test", "search_method": "rule-engine",
+                     "search_error": None}, [])
+
+        async def fake_probe(*args, **kwargs):
+            return {"status": "ok", "status_code": 200,
+                    "response_time_ms": 1, "error": None}
+
+        class FakeEngine:
+            def __init__(self, **kwargs):
+                self.js = SimpleNamespace(close=lambda: None)
 
         started = time.perf_counter()
-        with patch.object(check_service, "test_one", fake_test_one), patch.object(
-                check_service, "check_categories", fake_categories):
-            results = await check_service.check_sources(
-                [_source()], concurrency=1, timeout=1)
+        with patch.object(check_service, "_engine_search_check", fake_search), \
+                patch.object(check_service, "_probe_source", fake_probe), \
+                patch.object(check_service, "LegadoReadingEngine", FakeEngine):
+            await check_service.check_sources(
+                [_source(enabledExplore=False, exploreUrl="") for _ in range(2)],
+                concurrency=2, timeout=1)
         elapsed = time.perf_counter() - started
 
-        self.assertEqual(results[0]["check_state"], "usable")
+        self.assertEqual(peak, 2)
         self.assertLess(elapsed, 0.14)
 
-    async def test_static_categories_do_not_eagerly_create_reading_engine(self):
-        async def fast_page(source, category, page, session, global_sem,
-                            source_sem, timeout, get_engine=None,
-                            prepared_rules=None, prepared_headers=None):
-            return {
-                "page": page, "valid": True, "status_code": 200,
-                "item_count": 1, "content_type": "text/html", "error": None,
-                "attempts": 1, "persistent_rate_limit": False,
-            }
-
-        with patch.object(check_service, "resolve_explore_categories",
-                          AsyncMock(return_value=[ExploreCategory("分类", "/list")])), \
-                patch.object(check_service, "_fetch_tag_page", fast_page), \
-                patch.object(check_service, "LegadoReadingEngine") as engine_type:
+    async def test_categories_use_full_rule_engine(self):
+        engine = SimpleNamespace(
+            explore=AsyncMock(return_value=[SimpleNamespace(name="book")]),
+            js=SimpleNamespace(close=lambda: None))
+        category_resolver = AsyncMock(
+            return_value=[ExploreCategory("分类", "/list")])
+        with patch.object(
+                check_service, "resolve_explore_categories",
+                category_resolver):
             results = await check_service.check_categories(
-                _source(), session=object(), sem=asyncio.Semaphore(1), timeout=1)
+                _source(), timeout=1, engine=engine)
 
         self.assertTrue(results[0]["valid"])
-        engine_type.assert_not_called()
+        engine.explore.assert_awaited_once()
+        category_resolver.assert_awaited_once_with(
+            unittest.mock.ANY, runtime=engine.js)
 
-    async def test_explore_fallback_can_reuse_downloaded_document(self):
+    async def test_reading_chain_checks_detail_catalog_and_content(self):
+        book = SimpleNamespace(name="book", url="https://example/book")
+        chapter = SimpleNamespace(
+            name="chapter", url="https://example/chapter", is_volume=False)
+        document = SimpleNamespace(
+            blocks=[SimpleNamespace(kind="text", value="body")], raw_content="body")
+        engine = SimpleNamespace(
+            book_info=AsyncMock(return_value=book),
+            chapters=AsyncMock(return_value=[chapter]),
+            content_document=AsyncMock(return_value=document))
+
+        result = await check_service._reading_chain_check(
+            _source(), engine, [book], timeout=1)
+
+        self.assertEqual(result["reading_status"], "ok")
+        self.assertEqual(result["reading_stage"], "complete")
+        self.assertEqual(result["chapter_count"], 1)
+        engine.book_info.assert_awaited_once()
+        engine.chapters.assert_awaited_once()
+        engine.content_document.assert_awaited_once()
+
+    def test_result_classification_distinguishes_reading_failures(self):
+        self.assertEqual(check_service._classify_result({
+            "search_status": "ok", "tag_valid": 0,
+            "reading_status": "rule_error", "status": "ok",
+        }), "content_unavailable")
+        self.assertEqual(check_service._classify_result({
+            "search_status": "ok", "tag_valid": 0,
+            "reading_status": "ok", "status": "ok",
+        }), "fully_usable")
+
+    async def test_explore_document_reuses_downloaded_response(self):
         engine = ReaderEngine()
         engine._request = AsyncMock(return_value=(
             '<a href="/book/1">Book</a>', "text/html",

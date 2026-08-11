@@ -29,6 +29,25 @@ class UiSafetyTests(unittest.TestCase):
 
 
 class CheckSafetyTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _patch_unusable():
+        async def probe(*args, **kwargs):
+            return {"status": "ok", "status_code": 200,
+                    "response_time_ms": 1, "error": None}
+
+        async def search(*args, **kwargs):
+            return ({"search_status": "rule_error", "book_count": None,
+                     "search_keyword": "test", "search_method": "rule-engine",
+                     "search_error": "broken"}, [])
+
+        class Engine:
+            def __init__(self, **kwargs):
+                self.js = SimpleNamespace(close=lambda: None)
+
+        return (patch.object(check_service, "_probe_source", probe),
+                patch.object(check_service, "_engine_search_check", search),
+                patch.object(check_service, "LegadoReadingEngine", Engine))
+
     async def test_check_does_not_disable_by_default(self):
         source = SimpleNamespace(
             bookSourceName="bad", bookSourceUrl="https://bad",
@@ -37,12 +56,8 @@ class CheckSafetyTests(unittest.IsolatedAsyncioTestCase):
             to_dict=lambda: {"bookSourceName": "bad",
                              "bookSourceUrl": "https://bad"})
 
-        async def unusable(*args, **kwargs):
-            return {"idx": 1, "name": "bad", "raw_url": "https://bad",
-                    "status": "err", "search_status": "error",
-                    "error": "offline"}
-
-        with patch.object(check_service, "test_one", unusable):
+        first, second, third = self._patch_unusable()
+        with first, second, third:
             result = await check_service.check_sources([source], timeout=0.1)
 
         self.assertFalse(result[0]["auto_disabled"])
@@ -56,12 +71,8 @@ class CheckSafetyTests(unittest.IsolatedAsyncioTestCase):
             to_dict=lambda: {"bookSourceName": "bad",
                              "bookSourceUrl": "https://bad"})
 
-        async def unusable(*args, **kwargs):
-            return {"idx": 1, "name": "bad", "raw_url": "https://bad",
-                    "status": "err", "search_status": "error",
-                    "error": "offline"}
-
-        with patch.object(check_service, "test_one", unusable):
+        first, second, third = self._patch_unusable()
+        with first, second, third:
             result = await check_service.check_sources(
                 [source], timeout=0.1, auto_disable=True)
 
