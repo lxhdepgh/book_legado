@@ -171,15 +171,14 @@ class ReadingView(ft.Column):
         self._reader_toolbar = ft.Container(
             padding=ft.Padding(6, 2, 6, 2),
             content=ft.Row([
-                ft.IconButton(ft.Icons.HOME_OUTLINED, tooltip="回到书架",
-                              on_click=self._back_to_shelf),
                 self._top_prev_btn,
-                ft.IconButton(ft.Icons.ARROW_BACK, tooltip="书籍详情与章节",
+                ft.IconButton(ft.Icons.ARROW_BACK, tooltip="返回书籍详情与目录",
                               on_click=self._show_directory),
                 self._reader_progress,
                 ft.IconButton(ft.Icons.TEXT_DECREASE, tooltip="减小字号",
                               on_click=lambda e: self._change_font_size(-1)),
-                self._font_size_label,
+                ft.Row([ft.Text("字号", size=11), self._font_size_label],
+                       spacing=3, tight=True),
                 ft.IconButton(ft.Icons.TEXT_INCREASE, tooltip="增大字号",
                               on_click=lambda e: self._change_font_size(1)),
                 self._top_next_btn,
@@ -979,7 +978,9 @@ class ReadingView(ft.Column):
         dialog = ft.AlertDialog(
             modal=True,
             title=ft.Text("移出书架"),
-            content=ft.Text(f"确定将《{item.get('name') or '未命名'}》移出书架吗？"),
+            content=ft.Text(
+                f"确定将《{item.get('name') or '未命名'}》移出书架吗？\n"
+                "该书的阅读缓存也会一并清除。"),
             actions=[
                 ft.TextButton("取消", on_click=lambda e: self.page.pop_dialog()),
                 ft.Button(
@@ -1043,7 +1044,7 @@ class ReadingView(ft.Column):
 
     def _remove_from_manage(self, item):
         self.page.pop_dialog()
-        self._remove_shelf_item(item)
+        self._confirm_remove_shelf_item(item)
 
     def _refresh_one_from_dialog(self, item):
         self.page.pop_dialog()

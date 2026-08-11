@@ -25,6 +25,7 @@ class ImportView(ft.Column):
         self._mode_ref = ft.Ref[ft.RadioGroup]()
         self._progress_ref = ft.Ref[ft.ProgressBar]()
         self._result_ref = ft.Ref[ft.Text]()
+        self._importing = False
 
         # 文件选择器
         self.file_picker = ft.FilePicker()
@@ -156,7 +157,33 @@ class ImportView(ft.Column):
 
     def _do_import(self, e):
         mode = self._mode_ref.current.value or "append"
+        if mode == "replace":
+            existing = len(self.service.sources)
+            incoming = self._total_ref.current.text or "0"
+            dialog = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("替换全部现有书源？"),
+                content=ft.Text(
+                    f"现有 {existing} 条书源将被所选文件中的 {incoming} 条书源完全替换。此操作不可撤销。"),
+                actions=[
+                    ft.TextButton("取消", on_click=lambda event: self.page.pop_dialog()),
+                    ft.Button("确认替换", color=ft.Colors.RED,
+                              on_click=self._confirm_replace),
+                ])
+            self.page.show_dialog(dialog)
+            return
+        self._perform_import(mode)
+
+    def _confirm_replace(self, _):
+        self.page.pop_dialog()
+        self._perform_import("replace")
+
+    def _perform_import(self, mode):
+        if self._importing:
+            return
+        self._importing = True
         file_path = self._path_ref.current.text
+        previous_sources = list(self.service.sources)
 
         self._result_card.visible = True
         self._progress_ref.current.visible = True
@@ -183,7 +210,11 @@ class ImportView(ft.Column):
                 self.service.save()
                 self._result_ref.current.value += "\n已保存到文件。"
             except Exception as save_err:
-                self._result_ref.current.value += f"\n保存失败: {save_err}"
+                self.service.sources = previous_sources
+                self._result_ref.current.value = (
+                    f"导入未完成：保存失败，已恢复原有书源。\n{save_err}")
+                self.update()
+                return
 
             self.update()
 
@@ -194,6 +225,8 @@ class ImportView(ft.Column):
             self._progress_ref.current.visible = False
             self._result_ref.current.value = f"导入失败: {err}"
             self.update()
+        finally:
+            self._importing = False
 
     def _show_error(self, msg: str):
         self._preview_card.visible = False

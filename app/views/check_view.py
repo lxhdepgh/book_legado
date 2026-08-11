@@ -18,6 +18,9 @@ class CheckView(ft.Column):
         self._progress = ft.ProgressBar(value=0)
         self._rows = ft.ListView(expand=True, spacing=4)
         self._enabled_only = ft.Checkbox(label="仅检测已启用书源", value=True)
+        self._auto_disable = ft.Checkbox(
+            label="检测后自动停用确认不可用的书源", value=False,
+            on_change=self._on_auto_disable_change)
         self._start = ft.Button("开始检测", icon=ft.Icons.PLAY_ARROW,
                                 on_click=self._start_check)
         self.controls = [
@@ -25,10 +28,12 @@ class CheckView(ft.Column):
                 ft.Text("书源检测", size=28, weight=ft.FontWeight.BOLD),
                 ft.Text(
                     f"使用 {CHECK_CONCURRENCY} 个书源协程、最多 {TAG_PAGE_CONCURRENCY} 个标签页协程，"
-                    "检测服务器、搜索规则、每个分类标签及第二页加载；无可用搜索且无有效标签的书源会自动停用。",
+                    "检测服务器、搜索规则、每个分类标签及第二页加载。默认仅生成检测结果，不会修改书源状态。",
                     color=ft.Colors.GREY_600,
                 ),
-                ft.Row([self._enabled_only, self._start], wrap=True, run_spacing=8),
+                self._enabled_only,
+                self._auto_disable,
+                ft.Row([self._start], wrap=True, run_spacing=8),
                 self._progress,
                 self._summary,
             ])),
@@ -38,8 +43,31 @@ class CheckView(ft.Column):
         ]
 
     def _start_check(self, _):
-        if not self._running:
-            self.page.run_task(self._run_check)
+        if self._running:
+            return
+        if self._auto_disable.value:
+            dialog = ft.AlertDialog(
+                modal=True,
+                title=ft.Text("检测并自动停用书源？"),
+                content=ft.Text(
+                    "检测过程中，明确判定为不可用的书源会被停用。限流、超时和需要 JS 验证的书源不会被停用。"),
+                actions=[
+                    ft.TextButton("取消", on_click=lambda e: self.page.pop_dialog()),
+                    ft.Button("开始检测并自动停用", color=ft.Colors.RED,
+                              on_click=self._confirm_start_check),
+                ])
+            self.page.show_dialog(dialog)
+            return
+        self.page.run_task(self._run_check)
+
+    def _on_auto_disable_change(self, _):
+        self._start.text = ("检测并自动停用" if self._auto_disable.value
+                            else "开始检测")
+        self.update()
+
+    def _confirm_start_check(self, _):
+        self.page.pop_dialog()
+        self.page.run_task(self._run_check)
 
     async def _run_check(self):
         self._running = True
@@ -103,7 +131,9 @@ class CheckView(ft.Column):
             flush_results()
 
         try:
-            self._results = await check_sources(sources, on_result=receive)
+            self._results = await check_sources(
+                sources, on_result=receive,
+                auto_disable=bool(self._auto_disable.value))
             flush_results(force=True)
             by_url = {source.bookSourceUrl: source for source in sources}
             for result in self._results:
@@ -125,7 +155,8 @@ class CheckView(ft.Column):
             self._summary.value = (
                 f"检测完成：服务器可达 {reachable}/{len(sources)}，"
                 f"搜索可用 {available}/{len(sources)}，标签可用 {tag_valid}/{tag_total}，"
-                f"自动停用 {disabled_count} 个，待确认 {uncertain} 个"
+                f"{'自动停用 ' + str(disabled_count) + ' 个，' if self._auto_disable.value else ''}"
+                f"待确认 {uncertain} 个"
             )
         except Exception as exc:
             flush_results(force=True)

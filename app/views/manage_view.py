@@ -73,25 +73,9 @@ class ManageView(ft.Column):
             ],
         )
 
-        # ── 数据表格 ──
+        # ── 选择状态与移动端卡片列表 ──
         self._select_all_checkbox = ft.Checkbox(on_change=self._on_select_all)
-        self._table = ft.DataTable(
-            show_checkbox_column=False,
-            heading_row_height=50,
-            data_row_min_height=44,
-            data_row_max_height=52,
-            column_spacing=20,
-            width=760,
-            columns=[
-                ft.DataColumn(self._select_all_checkbox),
-                ft.DataColumn(ft.Text("#", size=12), numeric=True),
-                ft.DataColumn(ft.Text("书源名称", size=13), numeric=False),
-                ft.DataColumn(ft.Text("域名", size=13), numeric=False),
-                ft.DataColumn(ft.Text("分组", size=13), numeric=False),
-                ft.DataColumn(ft.Text("启用", size=13), numeric=False),
-            ],
-            rows=[],
-        )
+        self._source_cards = ft.Column(spacing=6)
 
         # ── 状态栏 ──
         self._status_bar = ft.Container(
@@ -109,7 +93,7 @@ class ManageView(ft.Column):
                         ft.Text("书源管理", size=28, weight=ft.FontWeight.BOLD),
                         ft.Container(expand=True),
                         ft.OutlinedButton(
-                            "全选书源",
+                            "全选筛选结果",
                             icon=ft.Icons.SELECT_ALL,
                             tooltip="选中当前筛选结果中的全部书源",
                             on_click=self._select_all_sources,
@@ -129,20 +113,11 @@ class ManageView(ft.Column):
                 padding=ft.Padding(16,0,16,4),
                 content=self._batch_bar,
             ),
-            # 表格区域
+            # 卡片列表更适合应用默认的手机宽度，避免横向滚动隐藏关键操作。
             ft.Container(
                 expand=True,
                 padding=ft.Padding(16,0,16,0),
-                content=ft.Column([
-                    ft.Container(
-                        expand=True,
-                        content=ft.Row(
-                            controls=[self._table],
-                            scroll=ft.ScrollMode.AUTO,
-                            vertical_alignment=ft.CrossAxisAlignment.START,
-                        ),
-                    ),
-                ]),
+                content=self._source_cards,
             ),
             # 状态栏
             self._status_bar,
@@ -248,38 +223,43 @@ class ManageView(ft.Column):
         all_indices = set(range(total))
         self._select_all_checkbox.value = bool(all_indices) and all_indices.issubset(self._selected)
 
-        # 更新表格行
-        self._table.rows = [self._build_row(i, source)
-                            for i, source in enumerate(page_data)]
+        self._source_cards.controls = [
+            self._build_card(i, source) for i, source in enumerate(page_data)]
 
         self._update_status_bar()
 
         self.update()
 
-    def _build_row(self, idx_in_filtered: int, source: BookSource):
-        """构建一行；索引始终指向完整过滤结果，供全选和批处理使用。"""
+    def _build_card(self, idx_in_filtered: int, source: BookSource):
         is_selected = idx_in_filtered in self._selected
-        return ft.DataRow(
-            selected=is_selected,
-            cells=[
-                ft.DataCell(ft.Checkbox(
+        return ft.Card(content=ft.Container(
+            padding=ft.Padding(10, 6, 10, 6),
+            bgcolor=ft.Colors.BLUE_50 if is_selected else None,
+            content=ft.Row([
+                ft.Checkbox(
                     value=is_selected,
-                    on_change=lambda e, idx=idx_in_filtered: self._on_row_check(idx, e),
-                )),
-                ft.DataCell(ft.Text(str(idx_in_filtered + 1), size=11)),
-                ft.DataCell(ft.Text(
-                    source.display_name, size=13,
-                    weight=ft.FontWeight.W_500 if source.enabled else ft.FontWeight.W_400,
-                    color=ft.Colors.GREY_400 if not source.enabled else None,
-                )),
-                ft.DataCell(ft.Text(source.short_url, size=12, color=ft.Colors.GREY_600)),
-                ft.DataCell(ft.Text(source.display_group, size=12)),
-                ft.DataCell(ft.Switch(
+                    tooltip=f"选择 {source.display_name}",
+                    on_change=lambda e, idx=idx_in_filtered:
+                    self._on_row_check(idx, e)),
+                ft.Column([
+                    ft.Text(source.display_name, max_lines=1,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                            weight=ft.FontWeight.W_500,
+                            color=(ft.Colors.GREY_400
+                                   if not source.enabled else None)),
+                    ft.Text(
+                        " · ".join(value for value in
+                                   [source.short_url, source.display_group]
+                                   if value),
+                        size=11, color=ft.Colors.GREY_600, max_lines=1,
+                        overflow=ft.TextOverflow.ELLIPSIS),
+                ], spacing=2, expand=True),
+                ft.Switch(
                     value=source.enabled,
-                    on_change=lambda e, selected=source: self._toggle_enabled(selected),
-                )),
-            ],
-        )
+                    tooltip="启用或停用书源",
+                    on_change=lambda e, selected=source:
+                    self._toggle_enabled(selected, e.control.value)),
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER)))
 
     def _on_scroll(self, e):
         """接近底部时追加下一批，不重建已经显示的行。"""
@@ -290,8 +270,8 @@ class ManageView(ft.Column):
             return
         old_count = self._visible_count
         self._visible_count = min(old_count + self.LOAD_BATCH_SIZE, len(self._filtered))
-        self._table.rows.extend(
-            self._build_row(i, self._filtered[i])
+        self._source_cards.controls.extend(
+            self._build_card(i, self._filtered[i])
             for i in range(old_count, self._visible_count)
         )
         self._update_status_bar()
@@ -307,15 +287,22 @@ class ManageView(ft.Column):
             size=12, color=ft.Colors.GREY_600,
         )
 
-    def _toggle_enabled(self, source: BookSource):
-        """切换单个书源的启用状态"""
-        source.enabled = not source.enabled
-        self._render_page()
-        # 保存
+    def _toggle_enabled(self, source: BookSource, desired=None):
+        """保存单个书源状态；失败时回滚，避免界面与文件不一致。"""
+        previous = source.enabled
+        source.enabled = (not previous if desired is None else bool(desired))
         try:
             self.service.save()
-        except Exception:
-            pass
+        except Exception as exc:
+            source.enabled = previous
+            try:
+                page = self.page
+            except RuntimeError:
+                page = None
+            if page:
+                page.show_snack_bar(ft.SnackBar(
+                    content=ft.Text(f"状态保存失败，已恢复原值：{exc}")))
+        self._render_page()
 
     # ── 选择逻辑 ──
 
@@ -363,22 +350,42 @@ class ManageView(ft.Column):
 
     def _batch_enable(self, e):
         sources = [self._filtered[i] for i in self._selected if i < len(self._filtered)]
+        previous = {id(source): source.enabled for source in sources}
         self.service.batch_enable(sources)
-        self._finish_batch_action()
+        self._finish_batch_action(previous_enabled=previous)
 
     def _batch_disable(self, e):
         sources = [self._filtered[i] for i in self._selected if i < len(self._filtered)]
+        previous = {id(source): source.enabled for source in sources}
         self.service.batch_disable(sources)
-        self._finish_batch_action()
+        self._finish_batch_action(previous_enabled=previous)
 
     def _batch_delete(self, e):
         if not self._selected:
             return
         sources = [self._filtered[i] for i in self._selected if i < len(self._filtered)]
-        self.service.batch_delete(sources)
-        self._finish_batch_action()
+        names = "、".join(source.display_name for source in sources[:3])
+        if len(sources) > 3:
+            names += f" 等 {len(sources)} 条"
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"删除 {len(sources)} 条书源？"),
+            content=ft.Text(f"将删除：{names}\n此操作不可撤销。"),
+            actions=[
+                ft.TextButton("取消", on_click=lambda event: self.page.pop_dialog()),
+                ft.Button("确认删除", color=ft.Colors.RED,
+                          on_click=lambda event, selected=sources:
+                          self._confirm_batch_delete(selected)),
+            ])
+        self.page.show_dialog(dialog)
 
-    def _finish_batch_action(self):
+    def _confirm_batch_delete(self, sources):
+        self.page.pop_dialog()
+        previous_sources = list(self.service.sources)
+        self.service.batch_delete(sources)
+        self._finish_batch_action(previous_sources=previous_sources)
+
+    def _finish_batch_action(self, previous_sources=None, previous_enabled=None):
         """批量修改后重建过滤列表、分页并持久化。"""
         self._selected.clear()
         self._batch_bar.visible = False
@@ -388,6 +395,14 @@ class ManageView(ft.Column):
         try:
             self.service.save()
         except Exception as exc:
+            if previous_sources is not None:
+                self.service.sources = previous_sources
+            if previous_enabled is not None:
+                for source in self.service.sources:
+                    if id(source) in previous_enabled:
+                        source.enabled = previous_enabled[id(source)]
+            self._apply_filters(update_groups=True)
             if self.page:
-                self.page.show_snack_bar(ft.SnackBar(content=ft.Text(f"保存失败：{exc}")))
+                self.page.show_snack_bar(ft.SnackBar(content=ft.Text(
+                    f"操作未保存，已恢复原状态：{exc}")))
         self._render_page()

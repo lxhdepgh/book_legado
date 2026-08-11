@@ -237,7 +237,8 @@ async def check_categories(source, session, sem, timeout=10):
             engine.js.close()
 
 
-async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12, on_result=None):
+async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
+                        on_result=None, auto_disable=False):
     source_sem = asyncio.Semaphore(concurrency)
     tag_sem = asyncio.Semaphore(max(concurrency, TAG_PAGE_CONCURRENCY))
     js_sem = asyncio.Semaphore(JS_CHECK_CONCURRENCY)
@@ -333,7 +334,8 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12, on_r
             else:
                 result["check_state"] = "unusable"
             result["auto_disabled"] = False
-            if result["check_state"] == "unusable" and source.enabled:
+            if (auto_disable and result["check_state"] == "unusable" and
+                    source.enabled):
                 source.enabled = False
                 result["auto_disabled"] = True
                 if result["status"] != "ok":

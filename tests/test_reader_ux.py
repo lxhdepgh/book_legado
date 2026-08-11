@@ -27,7 +27,7 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.directory.cleanup()
 
     async def test_reader_toolbar_keeps_navigation_and_font_controls_visible(self):
-        self.assertEqual(len(self.view._reader_toolbar.content.controls), 8)
+        self.assertEqual(len(self.view._reader_toolbar.content.controls), 7)
         self.assertEqual(self.view._font_size, 16)
         self.assertEqual(len(self.view._reader.controls), 3)
         self.assertIs(self.view._reader.controls[0], self.view._title)
