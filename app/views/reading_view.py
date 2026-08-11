@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import re
+import time
 import uuid
 
 import flet as ft
@@ -18,6 +19,7 @@ from app.services.rule_engine import (UnsupportedRule, parse_explore_categories,
 from app.services.reading_engine import LegadoReadingEngine
 from app.services.reading_cache import ReadingCache
 from app.services.desktop_browser import EdgeCdpSession
+from app.services.book_cache_service import WholeBookCacheService
 
 
 class ReadingView(ft.Column):
@@ -28,7 +30,10 @@ class ReadingView(ft.Column):
     def __init__(self, service, discovery_only=False):
         super().__init__(spacing=0, expand=True)
         self.service = service
-        self.reading_cache = ReadingCache(service.data_dir)
+        self.reading_cache = ReadingCache(getattr(service, "cache_dir", service.data_dir))
+        self.whole_book_cache = WholeBookCacheService(
+            getattr(service, "cache_dir", service.data_dir), service.data_dir)
+        self._whole_book_tasks = {}
         self.discovery_only = discovery_only
         self.engine = LegadoReadingEngine(
             webview_fetcher=self._fetch_with_webview,
@@ -131,6 +136,7 @@ class ReadingView(ft.Column):
         self._bookshelf_grid = ft.GridView(
             expand=True, max_extent=190, child_aspect_ratio=0.72,
             spacing=8, run_spacing=8)
+        self._bookshelf_render_generation = 0
         self._bookshelf_host = ft.Column(
             expand=True, spacing=0, controls=[
                 ft.Container(padding=ft.Padding(8, 4, 8, 4), content=ft.ResponsiveRow([
@@ -269,6 +275,9 @@ class ReadingView(ft.Column):
         if self._verification_future and not self._verification_future.done():
             self._verification_future.cancel()
         self._cancel_prefetch(clear_cache=True)
+        for task in self._whole_book_tasks.values():
+            if task and not task.done():
+                task.cancel()
         if self._book_open_task and not self._book_open_task.done():
             self._book_open_task.cancel()
         self._persist_scroll_position()
@@ -342,7 +351,8 @@ class ReadingView(ft.Column):
         self._webview_initial_url = str(url)
         if self.page.platform == ft.PagePlatform.WINDOWS:
             self._desktop_webview = EdgeCdpSession(
-                self.service.data_dir / "edge-webview-profile")
+                getattr(self.service, "cache_dir", self.service.data_dir) /
+                "edge-webview-profile")
             await self._desktop_webview.start(url)
             dialog_content = ft.Container(
                 width=400, height=150,
@@ -499,7 +509,9 @@ class ReadingView(ft.Column):
 
     def refresh_sources(self, update=True):
         enabled = [s for s in self.service.sources if s.enabled and (s.searchUrl or s.exploreUrl)]
-        self._source.options = [ft.dropdown.Option(str(i), s.display_name) for i, s in enumerate(enabled)]
+        self._source.options = [
+            ft.dropdown.Option(str(i), self._source_option_label(source))
+            for i, source in enumerate(enabled)]
         self._source_map = enabled
         if enabled and (self._source.value is None or int(self._source.value) >= len(enabled)):
             self._source.value = "0"
@@ -520,10 +532,22 @@ class ReadingView(ft.Column):
             self._reset_results()
             self._category_load_id += 1
             self._rebuild_category_tabs([])
-            self._status.value = "正在解析分类标签…"
+            if not str(self.current_source.exploreUrl or "").strip():
+                self._status.value = "该书源仅支持关键词搜索，请输入书名或作者"
+                self.update()
+                return
+            self._status.value = "正在解析发现分类…"
             self.update()
             self.page.run_task(self._load_categories, self.current_source, True,
                                self._category_load_id)
+
+    @staticmethod
+    def _source_option_label(source):
+        label = source.display_name
+        if (str(source.searchUrl or "").strip() and
+                not str(source.exploreUrl or "").strip()):
+            return f"{label} · 仅搜索"
+        return label
 
     def _update_login_button(self):
         source = self.current_source
@@ -594,6 +618,13 @@ class ReadingView(ft.Column):
     async def _load_categories(self, source, run_first=False, load_id=None):
         if source is None:
             return
+        if not str(source.exploreUrl or "").strip():
+            if (source is self.current_source and
+                    (load_id is None or load_id == self._category_load_id)):
+                self._rebuild_category_tabs([])
+                self._status.value = "该书源仅支持关键词搜索，请输入书名或作者"
+                self.update()
+            return
         try:
             categories = await resolve_explore_categories(source, self.engine.js)
         except Exception as exc:
@@ -608,7 +639,7 @@ class ReadingView(ft.Column):
         if self.categories and run_first:
             await self._run_explore(0, True)
         elif not self.categories:
-            self._status.value = "该书源没有可解析的分类标签，可使用关键词搜索"
+            self._status.value = "该书源的发现分类未生成可用入口，可使用关键词搜索"
         self.update()
 
     def _rebuild_category_tabs(self, categories=None):
@@ -882,22 +913,40 @@ class ReadingView(ft.Column):
         else:
             items.sort(key=lambda item: int((self.service.reading_state(item) or {}).get(
                 "last_read_at") or 0), reverse=True)
-        self._bookshelf.controls = [self._shelf_control(item) for item in items]
-        self._bookshelf_grid.controls = [self._shelf_grid_control(item) for item in items]
+        list_controls = [self._shelf_control(item) for item in items]
+        grid_controls = [self._shelf_grid_control(item) for item in items]
         if not self.service.bookshelf:
-            empty = ft.Container(
-                padding=32,
-                content=ft.Column([
-                    ft.Icon(ft.Icons.MENU_BOOK, size=52, color=ft.Colors.GREY_400),
-                    ft.Text("书架还是空的", size=18),
-                    ft.Text("请到“书源 → 找书”中选择书籍并加入书架",
-                            color=ft.Colors.GREY_600),
-                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-            )
-            self._bookshelf.controls = [empty]
-            self._bookshelf_grid.controls = [empty]
+            list_controls = [self._empty_bookshelf_control()]
+            grid_controls = [self._empty_bookshelf_control()]
+        # Replacing the keyed collection root prevents Flet 0.86 from retaining
+        # the old tail item when two navigation/render updates arrive close
+        # together. Child keys alone are insufficient for this client diff case.
+        self._bookshelf_render_generation += 1
+        generation = self._bookshelf_render_generation
+        self._bookshelf = ft.ListView(
+            key=f"bookshelf-list-root-{generation}", expand=True, spacing=4,
+            controls=list_controls)
+        self._bookshelf_grid = ft.GridView(
+            key=f"bookshelf-grid-root-{generation}", expand=True,
+            max_extent=190, child_aspect_ratio=0.72, spacing=8, run_spacing=8,
+            controls=grid_controls)
+        self._bookshelf_host.controls[-1] = (
+            self._bookshelf_grid if self._bookshelf_layout == "grid"
+            else self._bookshelf)
         self._status.value = (f"书架中有 {len(self.service.bookshelf)} 本书"
                               + (f"，当前显示 {len(items)} 本" if query else ""))
+
+    @staticmethod
+    def _empty_bookshelf_control():
+        return ft.Container(
+            padding=32,
+            content=ft.Column([
+                ft.Icon(ft.Icons.MENU_BOOK, size=52, color=ft.Colors.GREY_400),
+                ft.Text("书架还是空的", size=18),
+                ft.Text("请到“书源 → 找书”中选择书籍并加入书架",
+                        color=ft.Colors.GREY_600),
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+        )
 
     def _filter_bookshelf(self, _):
         self._render_bookshelf()
@@ -927,6 +976,13 @@ class ReadingView(ft.Column):
             details.append(f"未读 {unread} 章")
         if item.get("updateError"):
             details.append("更新失败")
+        cache_key = self._book_task_key(item)
+        if cache_key in self._whole_book_tasks:
+            details.append("正在缓存全本")
+        elif item.get("cacheTotalChapterCount"):
+            details.append(
+                f"已缓存 {item.get('cachedChapterCount', 0)}/"
+                f"{item.get('cacheTotalChapterCount', 0)} 章")
         return ft.ListTile(
             key=self._shelf_control_key(item, "list"),
             leading=(ft.Image(src=item.get("cover_url"), width=42, height=56,
@@ -985,6 +1041,7 @@ class ReadingView(ft.Column):
         return f"bookshelf-{layout}-{digest}"
 
     def _remove_shelf_item(self, item):
+        self._cancel_whole_book_cache(item)
         self.service.remove_from_bookshelf(item.get("source_url", ""), item.get("url", ""))
         self.reading_cache.remove_book(
             item.get("source_url", ""), item.get("url", ""))
@@ -1026,6 +1083,9 @@ class ReadingView(ft.Column):
                 ft.Text(f"书源：{item.get('source_name') or '未知'}"),
                 ft.Text(f"阅读进度：{reading.get('chapter_name') or '尚未阅读'}"),
                 ft.Text(f"目录：{item.get('totalChapterNum', 0)} 章 · 未读 {unread} 章"),
+                ft.Text(
+                    f"离线缓存：{item.get('cachedChapterCount', 0)}/"
+                    f"{item.get('cacheTotalChapterCount', 0) or item.get('totalChapterNum', 0)} 章"),
                 group_input,
                 ft.Text(item.get("updateError") or "", color=ft.Colors.RED_600,
                         visible=bool(item.get("updateError"))),
@@ -1037,6 +1097,13 @@ class ReadingView(ft.Column):
                               self._show_source_switch(selected)),
                 ft.TextButton("清除缓存", on_click=lambda e, selected=item:
                               self._clear_shelf_cache(selected)),
+                ft.TextButton(
+                    "停止缓存" if self._book_task_key(item) in self._whole_book_tasks
+                    else "缓存全本",
+                    icon=(ft.Icons.STOP if self._book_task_key(item) in self._whole_book_tasks
+                          else ft.Icons.DOWNLOAD),
+                    on_click=lambda e, selected=item:
+                    self._toggle_whole_book_cache(selected)),
                 ft.TextButton("保存分组", on_click=lambda e, selected=item,
                               field=group_input: self._save_shelf_group(selected, field)),
                 ft.TextButton("刷新目录", on_click=lambda e, selected=item:
@@ -1182,6 +1249,7 @@ class ReadingView(ft.Column):
     def _apply_source_switch(self, item, source, book):
         old_source = item.get("source_url", "")
         old_url = item.get("url", "")
+        self._cancel_whole_book_cache(item)
         try:
             changed = self.service.switch_bookshelf_source(item, source, book)
             if not changed:
@@ -1204,11 +1272,88 @@ class ReadingView(ft.Column):
         self.update()
 
     def _clear_shelf_cache(self, item):
+        task = self._whole_book_tasks.get(self._book_task_key(item))
+        if task and not task.done():
+            task.cancel()
         self.reading_cache.remove_book(
             item.get("source_url", ""), item.get("url", ""))
         self.page.pop_dialog()
+        self.service.update_bookshelf_options(
+            item.get("source_url", ""), item.get("url", ""),
+            cachedChapterCount=0, cacheTotalChapterCount=0,
+            cacheErrorCount=0, cacheUpdatedAt=0)
         self._status.value = f"《{item.get('name') or ''}》缓存已清除"
+        self._render_bookshelf()
         self.update()
+
+    @staticmethod
+    def _book_task_key(item):
+        return (str(item.get("source_url") or ""), str(item.get("url") or ""))
+
+    def _cancel_whole_book_cache(self, item):
+        task = self._whole_book_tasks.get(self._book_task_key(item))
+        if task and not task.done():
+            task.cancel()
+
+    def _toggle_whole_book_cache(self, item):
+        self.page.pop_dialog()
+        key = self._book_task_key(item)
+        task = self._whole_book_tasks.get(key)
+        if task and not task.done():
+            task.cancel()
+            self._status.value = f"正在停止《{item.get('name') or ''}》缓存…"
+        else:
+            self._whole_book_tasks[key] = self.page.run_task(
+                self._run_whole_book_cache, item)
+        self._render_bookshelf()
+        self.update()
+
+    async def _run_whole_book_cache(self, item):
+        key = self._book_task_key(item)
+        source = next((value for value in self.service.sources
+                       if value.bookSourceUrl == item.get("source_url")), None)
+        if source is None:
+            self._status.value = "缓存失败：原书源不存在"
+            self._whole_book_tasks.pop(key, None)
+            self.update()
+            return
+        book = self._book_from_shelf(item)
+        last_display = [-1]
+
+        def progress_changed(progress):
+            if (progress.cached + progress.failed == progress.total or
+                    progress.cached + progress.failed - last_display[0] >= 10):
+                last_display[0] = progress.cached + progress.failed
+                self._status.value = (
+                    f"正在缓存《{book.name}》：{progress.cached}/"
+                    f"{progress.total}，失败 {progress.failed}"
+                    + (f" · {progress.current}" if progress.current else ""))
+                self.update()
+
+        self._status.value = f"正在准备《{book.name}》目录与离线缓存…"
+        self.update()
+        try:
+            result = await self.whole_book_cache.cache_book(
+                source, book, progress_changed)
+            self.service.update_bookshelf_options(
+                *key, cachedChapterCount=result.cached,
+                cacheTotalChapterCount=result.total,
+                cacheErrorCount=result.failed, cacheUpdatedAt=int(time.time()))
+            self._status.value = (
+                f"《{book.name}》缓存完成：{result.cached}/{result.total} 章"
+                + (f"，失败 {result.failed} 章，可再次缓存重试" if result.failed else ""))
+        except asyncio.CancelledError:
+            cached, total = self.reading_cache.cache_counts(*key)
+            self.service.update_bookshelf_options(
+                *key, cachedChapterCount=cached,
+                cacheTotalChapterCount=total)
+            self._status.value = f"《{book.name}》缓存已停止：{cached}/{total} 章"
+        except Exception as exc:
+            self._status.value = f"《{book.name}》缓存失败：{exc}"
+        finally:
+            self._whole_book_tasks.pop(key, None)
+            self._render_bookshelf()
+            self.update()
 
     def _remove_from_manage(self, item):
         self.page.pop_dialog()

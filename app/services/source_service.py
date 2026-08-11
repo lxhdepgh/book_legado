@@ -3,21 +3,30 @@
 """
 from __future__ import annotations
 import json
-import os
 import shutil
 import time
 from pathlib import Path
 from typing import Callable
 
 from app.models.book_source import BookSource
+from app.services.app_paths import default_app_paths
 
 
 class SourceService:
     """书源业务逻辑服务"""
 
-    def __init__(self, resource_dir: str | Path, data_dir: str | Path | None = None):
+    def __init__(self, resource_dir: str | Path, data_dir: str | Path | None = None,
+                 cache_dir: str | Path | None = None):
         self.resource_dir = Path(resource_dir)
-        self.data_dir = Path(data_dir) if data_dir else self._default_data_dir()
+        defaults = default_app_paths()
+        self.data_dir = Path(data_dir) if data_dir else defaults.data
+        self.cache_dir = Path(cache_dir) if cache_dir else (
+            Path(data_dir) / "cache" if data_dir is not None else defaults.cache)
+        if data_dir is None:
+            self._migrate_legacy_data_dir()
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_cache_dirs()
         self._sources: list[BookSource] = []
         self._current_path: str | None = None
         # 书源 URL -> 分类检测结果。仅作为本次运行缓存，不改写原始 exploreUrl。
@@ -27,22 +36,45 @@ class SourceService:
     @staticmethod
     def _default_data_dir() -> Path:
         """返回与程序安装目录分离的持久化用户数据目录。"""
-        override = os.environ.get("LEGADO_BOOKSOURCE_DATA_DIR")
-        if override:
-            return Path(override)
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            return Path(local_app_data) / "LegadoBookSourceCheck"
-        return Path.home() / ".legado_booksource_check"
+        return default_app_paths().data
+
+    @property
+    def sources_path(self) -> Path:
+        return self.data_dir / "bookSource.json"
+
+    def _migrate_legacy_cache_dirs(self) -> None:
+        """Copy caches created by older versions under data_dir."""
+        for name in ("reader-cache", "edge-webview-profile"):
+            old = self.data_dir / name
+            new = self.cache_dir / name
+            if old.exists() and not new.exists():
+                try:
+                    shutil.copytree(old, new)
+                except OSError:
+                    pass
+
+    def _migrate_legacy_data_dir(self) -> None:
+        legacy = Path.home() / ".legado_booksource_check"
+        if self.data_dir.exists() or not legacy.exists() or legacy == self.data_dir:
+            return
+        try:
+            shutil.copytree(legacy, self.data_dir)
+        except OSError:
+            pass
 
     # ── 加载/保存 ──
 
     def load(self, path: str | Path | None = None) -> list[BookSource]:
         """从 JSON 文件加载书源，默认加载 bookSource.json"""
         if path is None:
-            path = self.resource_dir / "bookSource.json"
-        self._current_path = str(path)
+            path = (self.sources_path if self.sources_path.exists() else
+                    self.resource_dir / "bookSource.json")
         self._sources = BookSource.from_json(path)
+        # Runtime mutations always target the writable user copy. Explicit
+        # save_as remains available for exports to a user-selected path.
+        self._current_path = str(self.sources_path)
+        if Path(path) != self.sources_path and not self.sources_path.exists():
+            self.save()
         self.load_bookshelf()
         return self._sources
 
@@ -90,6 +122,9 @@ class SourceService:
             "group": 0,
             "groupName": "",
             "latestChapterTime": 0,
+            "cachedChapterCount": 0,
+            "cacheTotalChapterCount": 0,
+            "cacheErrorCount": 0,
         }
         reading = item.get("reading") or {}
         if not reading and (item.get("durChapterTitle") or item.get("durChapterTime")):
@@ -166,6 +201,8 @@ class SourceService:
             "durChapterTime": 0, "canUpdate": True, "order": 0,
             "group": 0,
             "groupName": "", "latestChapterTime": 0,
+            "cachedChapterCount": 0, "cacheTotalChapterCount": 0,
+            "cacheErrorCount": 0,
         })
         self.save_bookshelf()
         return True
@@ -252,7 +289,9 @@ class SourceService:
         return False
 
     def update_bookshelf_options(self, source_url: str, book_url: str, **options) -> bool:
-        allowed = {"canUpdate", "group", "groupName", "order"}
+        allowed = {"canUpdate", "group", "groupName", "order",
+                   "cachedChapterCount", "cacheTotalChapterCount",
+                   "cacheErrorCount", "cacheUpdatedAt"}
         for item in self.bookshelf:
             if (item.get("source_url"), item.get("url")) != (source_url, book_url):
                 continue
@@ -333,14 +372,17 @@ class SourceService:
     def save(self, path: str | Path | None = None) -> bool:
         """保存书源列表到 JSON 文件"""
         if path is None:
-            if self._current_path:
-                path = self._current_path
-            else:
-                path = self.resource_dir / "bookSource.json"
+            path = self.sources_path
         try:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
             data = [s.to_dict() for s in self._sources]
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(path)
+            if path == self.sources_path:
+                self._current_path = str(path)
             return True
         except Exception as e:
             raise RuntimeError(f"保存失败: {e}")

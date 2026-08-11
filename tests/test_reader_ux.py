@@ -1,3 +1,4 @@
+import json
 import unittest
 import flet as ft
 from pathlib import Path
@@ -7,6 +8,7 @@ from unittest.mock import AsyncMock, patch, PropertyMock
 
 from app.models.book_source import BookSource
 from app.services.reading_cache import ReadingCache
+from app.services.app_paths import default_app_paths
 from app.services.reading_engine import (ChapterContent, ContentBlock,
                                          parse_content_blocks)
 from app.services.rule_engine import BookItem, ChapterItem
@@ -46,6 +48,7 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.view._render_bookshelf()
         list_keys = [control.key for control in self.view._bookshelf.controls]
         grid_keys = [control.key for control in self.view._bookshelf_grid.controls]
+        first_list_root = self.view._bookshelf.key
         self.view._render_bookshelf()
 
         self.assertEqual(2, len(set(list_keys)))
@@ -54,6 +57,34 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
                          [control.key for control in self.view._bookshelf.controls])
         self.assertEqual(grid_keys,
                          [control.key for control in self.view._bookshelf_grid.controls])
+        self.assertNotEqual(first_list_root, self.view._bookshelf.key)
+        self.assertIs(self.view._bookshelf_host.controls[-1], self.view._bookshelf)
+
+    async def test_bookshelf_render_count_always_matches_persisted_items(self):
+        self.view.service.reading_state = lambda _item: None
+        for count in range(1, 6):
+            self.view.service.bookshelf.append({
+                "name": f"Book {count}", "source_url": "https://source",
+                "url": f"https://book/{count}"})
+            self.view._render_bookshelf()
+            self.assertEqual(count, len(self.view._bookshelf.controls))
+            self.assertEqual(count, len(self.view._bookshelf_grid.controls))
+
+    async def test_search_only_source_is_labeled_without_category_parse_error(self):
+        source = SimpleNamespace(
+            enabled=True, searchUrl="/search?key={{key}}", exploreUrl="",
+            display_name="二三小说", bookSourceUrl="https://source")
+        self.view.service.sources = [source]
+        self.view.current_source = source
+        self.view.update = lambda: None
+
+        self.view.refresh_sources(update=False)
+        await self.view._load_categories(source)
+
+        self.assertEqual("二三小说 · 仅搜索", self.view._source.options[0].text)
+        self.assertEqual("该书源仅支持关键词搜索，请输入书名或作者",
+                         self.view._status.value)
+        self.assertEqual([], self.view._category_host.controls)
 
     async def test_image_style_maps_default_full_and_text_layout(self):
         self.assertEqual(ReadingView._image_render_options("DEFAULT", 18),
@@ -242,6 +273,59 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PersistentReadingTests(unittest.TestCase):
+    def test_platform_paths_never_depend_on_executable_directory(self):
+        home = Path("/users/tester")
+        windows = default_app_paths(
+            platform="win32", environ={"LOCALAPPDATA": "C:/Local"}, home=home)
+        macos = default_app_paths(platform="darwin", environ={}, home=home)
+        linux = default_app_paths(
+            platform="linux", environ={"XDG_DATA_HOME": "/data",
+                                        "XDG_CACHE_HOME": "/cache"}, home=home)
+
+        self.assertEqual(Path("C:/Local/LegadoBookSourceCheck"), windows.data)
+        self.assertEqual(windows.data / "cache", windows.cache)
+        self.assertEqual(home / "Library/Application Support/LegadoBookSourceCheck",
+                         macos.data)
+        self.assertEqual(home / "Library/Caches/LegadoBookSourceCheck", macos.cache)
+        self.assertEqual(Path("/data/LegadoBookSourceCheck"), linux.data)
+        self.assertEqual(Path("/cache/LegadoBookSourceCheck"), linux.cache)
+
+    def test_packaged_seed_is_copied_and_changes_save_to_user_data(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            resource = root / "readonly-resource"
+            data = root / "user-data"
+            cache = root / "user-cache"
+            resource.mkdir()
+            seed_path = resource / "bookSource.json"
+            seed = [{"bookSourceName": "seed", "bookSourceUrl": "https://seed"}]
+            seed_path.write_text(json.dumps(seed), encoding="utf-8")
+
+            service = SourceService(resource, data_dir=data, cache_dir=cache)
+            service.load()
+            service.sources.append(BookSource(
+                bookSourceName="imported", bookSourceUrl="https://imported"))
+            service.save()
+
+            self.assertEqual(seed, json.loads(seed_path.read_text(encoding="utf-8")))
+            self.assertEqual(service.sources_path, Path(service.current_path))
+            reopened = SourceService(resource, data_dir=data, cache_dir=cache)
+            reopened.load()
+            self.assertEqual(["https://seed", "https://imported"],
+                             [source.bookSourceUrl for source in reopened.sources])
+
+    def test_old_reader_cache_is_copied_to_new_cache_root(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_file = root / "data" / "reader-cache" / "book" / "catalog.json"
+            old_file.parent.mkdir(parents=True)
+            old_file.write_text("{}", encoding="utf-8")
+            service = SourceService(
+                root / "resource", data_dir=root / "data",
+                cache_dir=root / "cache")
+            self.assertTrue((service.cache_dir / "reader-cache" /
+                             "book" / "catalog.json").exists())
+
     def test_desktop_window_uses_wide_layout_and_mobile_keeps_native_size(self):
         desktop = SimpleNamespace(
             platform=ft.PagePlatform.WINDOWS, window=SimpleNamespace(
@@ -262,7 +346,11 @@ class PersistentReadingTests(unittest.TestCase):
 
     def test_app_defaults_to_reading_navigation(self):
         with TemporaryDirectory() as directory:
-            app = BookSourceApp(Path(directory))
+            root = Path(directory)
+            with patch.dict("os.environ", {
+                    "LEGADO_BOOKSOURCE_DATA_DIR": str(root / "data"),
+                    "LEGADO_BOOKSOURCE_CACHE_DIR": str(root / "cache")}, clear=False):
+                app = BookSourceApp(root)
             self.assertEqual(app._current_index, 1)
 
     def test_bookshelf_refresh_and_group_state_survive_reopen(self):

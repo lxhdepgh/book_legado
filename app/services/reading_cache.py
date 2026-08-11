@@ -110,11 +110,27 @@ class ReadingCache:
         })
         self._prune()
 
+    def has_content(self, source_url: str, book_url: str, chapter_url: str) -> bool:
+        return self._content_path(source_url, book_url, chapter_url).is_file()
+
+    def cache_counts(self, source_url: str, book_url: str) -> tuple[int, int]:
+        chapters = self.load_catalog(source_url, book_url) or []
+        readable = [item for item in chapters if not item.is_volume and item.url]
+        cached = sum(self.has_content(source_url, book_url, item.url)
+                     for item in readable)
+        return cached, len(readable)
+
+    def pin_book(self, source_url: str, book_url: str) -> None:
+        """Protect a user-requested offline book from automatic cache pruning."""
+        marker = self._book_dir(source_url, book_url) / ".offline"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch(exist_ok=True)
+
     def _prune(self) -> None:
         """Keep the persistent reader cache bounded, evicting oldest content."""
         try:
             files = [path for path in self.root.glob("*/content/*.json")
-                     if path.is_file()]
+                     if path.is_file() and not (path.parent.parent / ".offline").exists()]
             sized = [(path.stat().st_mtime, path.stat().st_size, path)
                      for path in files]
         except OSError:
