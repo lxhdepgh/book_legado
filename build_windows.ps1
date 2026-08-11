@@ -19,18 +19,21 @@ foreach ($dll in $runtimeDlls) {
     $binaryArgs += @("--add-binary", "$path;.")
 }
 
-$arguments = @(
-    "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile",
-    "--windowed", "--name", "LegadoReader",
-    "--workpath", "build/windows-packaging", "--distpath", "dist",
-    "--add-data", "resource;resource",
-    "--add-data", "app/resources;app/resources"
-) + $binaryArgs + @("main.py")
+$flet = Join-Path (Split-Path -Parent $python) "Scripts\flet.exe"
+if (-not (Test-Path -LiteralPath $flet)) {
+    throw "Flet CLI is missing: $flet"
+}
 
-& $python @arguments
+$arguments = @(
+    "pack", "main.py", "--yes", "--name", "LegadoReader",
+    "--distpath", "dist",
+    "--add-data", "resource;resource", "app/resources;app/resources"
+) + $binaryArgs
+
+& $flet @arguments
 
 if ($LASTEXITCODE -ne 0) {
-    throw "PyInstaller build failed with exit code $LASTEXITCODE"
+    throw "Flet pack failed with exit code $LASTEXITCODE"
 }
 
 & ".\dist\LegadoReader.exe" --smoke-test
