@@ -693,8 +693,8 @@ class ReaderEngine:
 
     def _cookie_jar_for_source(self, source=None):
         if source is None:
-            return self.cookie_jar
-        if not bool(getattr(source, "enabledCookieJar", True)):
+            return aiohttp.DummyCookieJar()
+        if getattr(source, "enabledCookieJar", True) is not True:
             return aiohttp.DummyCookieJar()
         key = str(getattr(source, "bookSourceUrl", "") or id(source))
         jar = self._source_cookie_jars.get(key)
@@ -709,6 +709,21 @@ class ReaderEngine:
             self._source_cookie_jars[key] = jar
         return jar
 
+    @staticmethod
+    def _merge_cookie_header(stored: str, request_cookie: str | None) -> str:
+        values: dict[str, str] = {}
+        for declaration in (stored, request_cookie):
+            if declaration is None:
+                continue
+            for pair in str(declaration).split(";"):
+                key, separator, value = pair.partition("=")
+                if not separator:
+                    continue
+                key, value = key.strip(), value.strip()
+                if key and value:
+                    values[key] = value
+        return "; ".join(f"{key}={value}" for key, value in values.items())
+
     def _source_cookie_path(self, source_key: str) -> Path | None:
         if not self.state_dir:
             return None
@@ -716,7 +731,8 @@ class ReaderEngine:
                 (hashlib.sha256(source_key.encode()).hexdigest() + ".jar"))
 
     def _persist_source_cookie_jar(self, source) -> None:
-        if source is None or not bool(getattr(source, "enabledCookieJar", True)):
+        if (source is None or
+                getattr(source, "enabledCookieJar", True) is not True):
             return
         key = str(getattr(source, "bookSourceUrl", "") or id(source))
         path = self._source_cookie_path(key)
@@ -849,21 +865,17 @@ class ReaderEngine:
         return f"{transport_scheme}://{auth}{host}:{port}"
 
     async def _resolved_source_headers(self, source, base_url="") -> dict:
-        raw = getattr(source, "header", "") or ""
-        if isinstance(raw, str) and raw.strip().startswith(("@js:", "<js>")):
-            value = await asyncio.to_thread(
-                self.js.evaluate, raw.strip(),
-                JsContext(source=source, base_url=base_url or source.bookSourceUrl,
-                          variables=self.js_variables))
-            if isinstance(value, dict):
-                return {str(key): str(item) for key, item in value.items()}
-            try:
-                value = json.loads(str(value or ""))
-                return ({str(key): str(item) for key, item in value.items()}
-                        if isinstance(value, dict) else {})
-            except json.JSONDecodeError:
-                return {}
-        return self._source_headers(source)
+        # AnalyzeUrl initializes with source.getHeaderMap(true), not a direct
+        # parse of source.header.  This also evaluates dynamic declarations,
+        # supplies the default UA and overlays cached login headers.
+        value = await asyncio.to_thread(
+            self.js.evaluate, "@js:source.getHeaderMap(true)",
+            JsContext(source=source, base_url=str(
+                getattr(source, "bookSourceUrl", "") or base_url or ""),
+                      variables=self.js_variables))
+        if isinstance(value, dict):
+            return {str(key): str(item) for key, item in value.items()}
+        return {}
 
     async def _request(self, request: dict, source=None) -> tuple[str, str, str]:
         request = await self._apply_request_option_js(request, source)
@@ -883,27 +895,27 @@ class ReaderEngine:
             except (ValueError, binascii.Error):
                 raw = b""
             charset = str(request.get("charset") or "utf-8")
-            if charset.lower() in ("gbk", "gb2312", "gb_2312-80"):
-                charset = "gb18030"
-            text = (raw.hex() if request.get("type") not in (None, "") else
+            text = (raw.hex() if request.get("type") is not None else
                     raw.decode(charset, errors="replace"))
             content_type = header[5:].split(";", 1)[0] or "text/plain"
             self.last_response = {
                 "body": text, "bodyBytes": list(raw),
                 "headers": {"content-type": content_type},
-                "status": 200, "url": request_url}
+                "headersMulti": {"content-type": [content_type]},
+                "status": 200, "message": "OK", "protocol": "http/1.1",
+                "responseKind": "str", "url": request_url}
             return text, content_type, request_url
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         retry_count = self._request_retry_count(request)
         for attempt in range(retry_count + 1):
             try:
                 headers = dict(self.headers)
-                proxy = request.get("proxy")
+                proxy = None
                 if source is not None:
                     source_headers = await self._resolved_source_headers(
                         source, str(request.get("url") or ""))
                     for name in list(source_headers):
-                        if name.lower() == "proxy":
+                        if name == "proxy":
                             proxy = proxy or source_headers.pop(name)
                     headers.update(source_headers)
                 normalized_proxy = self._normalize_proxy(proxy) if proxy else ""
@@ -915,11 +927,22 @@ class ReaderEngine:
                     try: request_headers = json.loads(request_headers)
                     except json.JSONDecodeError: request_headers = {}
                 headers.update(request_headers if isinstance(request_headers, dict) else {})
+                method = str(request.get("method", "GET")).upper()
+                if method == "POST" and not any(
+                        str(name).lower() == "content-type" for name in headers):
+                    body = str(request.get("body") or "").lstrip()
+                    headers["Content-Type"] = self._default_post_content_type(body)
                 # Fixed HttpHelper's application interceptor removes the UA
                 # sentinel and then appends these three headers on every call.
                 for name in list(headers):
                     if name.lower() == "user-agent" and headers[name] == "null":
                         headers.pop(name)
+                request_url = request["url"]
+                shared_cookie = self.js.export_cookie_header(request_url)
+                merged_cookie = self._merge_cookie_header(
+                    shared_cookie, headers.get("Cookie"))
+                if merged_cookie:
+                    headers["Cookie"] = merged_cookie
                 wire_headers = CIMultiDict(headers)
                 wire_headers.add("Keep-Alive", "300")
                 wire_headers.add("Connection", "Keep-Alive")
@@ -928,24 +951,13 @@ class ReaderEngine:
                                     "Range" not in wire_headers)
                 if transparent_gzip:
                     wire_headers.add("Accept-Encoding", "gzip")
-                request_url = request["url"]
-                cookie_enabled = (source is None or bool(
-                    getattr(source, "enabledCookieJar", True)))
-                if cookie_enabled and not any(
-                        str(name).lower() == "cookie" for name in headers):
-                    shared_cookie = self.js.export_cookie_header(request_url)
-                    if shared_cookie:
-                        wire_headers["Cookie"] = shared_cookie
-                method = str(request.get("method", "GET")).upper()
+                cookie_enabled = (source is not None and
+                                  getattr(source, "enabledCookieJar", True) is True)
                 if str(request.get("charset") or "").lower() == "escape":
                     request_url = escape_url_query(request_url)
                 else:
                     request_url = encode_url_query_fields(
                         request_url, str(request.get("charset") or "utf-8"))
-                if method == "POST":
-                    body = str(request.get("body") or "").lstrip()
-                    headers.setdefault("Content-Type",
-                                       self._default_post_content_type(body))
                 async with aiohttp.ClientSession(
                         headers=wire_headers, connector=connector,
                         cookie_jar=self._cookie_jar_for_source(source),
@@ -958,38 +970,31 @@ class ReaderEngine:
                         kwargs["proxy"] = normalized_proxy
                     if method == "POST":
                         body = request.get("body") or ""
-                        charset_name = str(request.get("charset") or "utf-8")
-                        if charset_name.lower() == "escape":
-                            if not str(body).lstrip().startswith(("{", "[", "<")):
-                                body = escape_form(str(body))
-                                charset_name = "ascii"
-                            else:
-                                charset_name = "utf-8"
-                        elif not str(body).lstrip().startswith(("{", "[", "<")):
-                            body = encode_form_fields(str(body), charset_name)
-                            charset_name = "ascii"
-                        if charset_name.lower() in ("gbk", "gb2312", "gb_2312-80"):
-                            charset_name = "gb18030"
-                        kwargs["data"] = (body.encode(charset_name, errors="replace")
-                                          if isinstance(body, str) else body)
+                        kwargs["data"] = self._encode_request_body(
+                            body, request.get("charset") or "utf-8",
+                            headers.get("Content-Type", ""))
                     async with session.request(method, encode_url(request_url), **kwargs) as resp:
                         raw = await resp.read()
                         response_headers = {
                             str(k).lower(): str(v) for k, v in resp.headers.items()}
+                        response_headers_multi = {
+                            str(name).lower(): [str(item) for item in (
+                                resp.headers.getall(name, [])
+                                if hasattr(resp.headers, "getall") else
+                                [resp.headers[name]])]
+                            for name in dict(resp.headers.items())
+                        }
                         if (transparent_gzip and
                                 response_headers.get("content-encoding", "").lower() == "gzip"):
                             raw = gzip.decompress(raw)
                             response_headers.pop("content-encoding", None)
                             response_headers.pop("content-length", None)
+                            response_headers_multi.pop("content-encoding", None)
+                            response_headers_multi.pop("content-length", None)
                         if cookie_enabled:
-                            cookie_values = (resp.headers.getall("Set-Cookie", [])
-                                             if hasattr(resp.headers, "getall") else
-                                             ([resp.headers.get("Set-Cookie")]
-                                              if resp.headers.get("Set-Cookie") else []))
-                            for cookie_value in cookie_values:
-                                self.js.set_cookie(str(resp.url), cookie_value)
+                            self.js.save_response_cookies(str(resp.url), resp.headers)
                         self._persist_source_cookie_jar(source)
-                        if request.get("type") not in (None, ""):
+                        if request.get("type") is not None:
                             text = raw.hex()
                         else:
                             decoded_raw = self._uncompress_response_body(
@@ -1001,7 +1006,12 @@ class ReaderEngine:
                             "body": text,
                             "bodyBytes": list(raw),
                             "headers": response_headers,
+                            "headersMulti": response_headers_multi,
                             "status": int(resp.status),
+                            "message": str(getattr(resp, "reason", "") or ""),
+                            "protocol": (f"http/{resp.version.major}.{resp.version.minor}"
+                                         if getattr(resp, "version", None) else "http/1.1"),
+                            "responseKind": "str",
                             "url": str(resp.url),
                         }
                         if 200 <= int(resp.status) < 300 or attempt >= retry_count:
@@ -1015,7 +1025,7 @@ class ReaderEngine:
     def _request_retry_count(request: dict) -> int:
         """Match AnalyzeUrl.UrlOption: absent retry means no extra attempt."""
         try:
-            return max(0, int(request.get("retry") or 0))
+            return int(request.get("retry") or 0)
         except (TypeError, ValueError):
             return 0
 
@@ -1030,8 +1040,6 @@ class ReaderEngine:
         if not charset:
             charset = (detect_charset(raw) or
                        UnicodeDammit(raw, is_html=True).original_encoding or "utf-8")
-        if charset.lower() in ("gbk", "gb2312", "gb_2312-80"):
-            charset = "gb18030"
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+._:-]*", str(charset)):
             raise LookupError(f"illegal charset name: {charset}")
         return raw.decode(charset, errors="replace")
@@ -1067,6 +1075,20 @@ class ReaderEngine:
         if str(body or "").lstrip().startswith(("{", "[", "<")):
             return "application/json; charset=UTF-8"
         return "application/x-www-form-urlencoded; charset=UTF-8"
+
+    @staticmethod
+    def _encode_request_body(body, charset="utf-8", content_type="") -> bytes:
+        text = str(body or "")
+        if not text.lstrip().startswith(("{", "[", "<")):
+            if str(charset or "").lower() == "escape":
+                return escape_form(text).encode("ascii", errors="replace")
+            return encode_form_fields(
+                text, str(charset or "utf-8")).encode("ascii")
+        match = re.search(
+            r"charset\s*=\s*[\"']?([^;\s\"']+)",
+            str(content_type or ""), re.I)
+        body_charset = match.group(1) if match else "utf-8"
+        return text.encode(body_charset, errors="replace")
 
     @staticmethod
     def _uncompress_response_body(raw: bytes, content_type: str) -> bytes:
@@ -1658,7 +1680,7 @@ class ReaderEngine:
         if category_url.strip().startswith(("@js:", "<js>")):
             js_value = await asyncio.to_thread(
                 self.js.evaluate, category_url,
-                JsContext(source=source, page=page,
+                JsContext(source=source, host_kind="url", page=page,
                           base_url=source.bookSourceUrl,
                           variables=self.js_variables),
             )
@@ -1722,7 +1744,7 @@ class ReaderEngine:
             expression = match.group(1).strip()
             result = await asyncio.to_thread(
                 self.js.evaluate, f"@js:{expression}",
-                JsContext(source=source, key=key, page=page,
+                JsContext(source=source, host_kind="url", key=key, page=page,
                           base_url=source.bookSourceUrl,
                           variables=self.js_variables),
             )
@@ -1765,7 +1787,7 @@ class ReaderEngine:
                 continue
             evaluated = await asyncio.to_thread(
                 self.js.evaluate, stage.raw,
-                JsContext(source=source, key=key, page=page, result=result,
+                JsContext(source=source, host_kind="url", key=key, page=page, result=result,
                           base_url=source.bookSourceUrl,
                           variables=self.js_variables),
             )

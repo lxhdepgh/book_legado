@@ -315,6 +315,46 @@ class LegadoReadingEngine(ReaderEngine):
         self.webview_fetcher = webview_fetcher
         self.verification_fetcher = verification_fetcher
         self.current_chapters: list[ChapterItem] = []
+        self.js.reget_book_handler = self._js_reget_book
+        self.js.refresh_book_handler = self._js_refresh_book
+
+    def _js_refresh_book(self, source, book) -> None:
+        if source is None or book is None:
+            return
+        asyncio.run(self.book_info(source, book))
+
+    def _js_reget_book(self, source, book) -> None:
+        if source is None or book is None:
+            return
+
+        async def refresh():
+            matches = await self.search(source, str(getattr(book, "name", "")), 1)
+            author = str(getattr(book, "author", "") or "")
+            match = next((item for item in matches
+                          if str(getattr(item, "name", "")) == str(
+                              getattr(book, "name", "")) and
+                          str(getattr(item, "author", "") or "") == author), None)
+            if match is None:
+                raise RuntimeError(
+                    f"未搜索到 {getattr(book, 'name', '')}({author}) 书籍")
+            book.url = match.url
+            variables = getattr(match, "variables", None)
+            if isinstance(variables, dict):
+                getattr(book, "variables", {}).update(variables)
+            await self.book_info(source, book)
+
+        asyncio.run(refresh())
+
+    @staticmethod
+    def _url_option_uses_webview(value) -> bool:
+        # AnalyzeUrl.UrlOption.useWebView uses a Kotlin `when`, not generic
+        # truthiness.  Numeric zero is therefore enabled, while only these
+        # four exact representations are disabled.
+        if value is None or value is False:
+            return False
+        if isinstance(value, str) and value in {"", "false"}:
+            return False
+        return True
 
     async def _replace_content_stages(self, value: str, rule: str, source,
                                       chapter, context=None) -> str:
@@ -398,28 +438,24 @@ class LegadoReadingEngine(ReaderEngine):
             return str(cover_url or "")
         await self._request({"url": str(cover_url), "method": "GET"}, source)
         raw = bytes((self.last_response or {}).get("bodyBytes") or [])
-        if not raw:
-            return str(cover_url)
         if not script.startswith(("@js:", "<js>")):
             script = "@js:" + script
-        decoded = await asyncio.to_thread(
-            self.js.evaluate, script,
-            JsContext(source=source, src=str(cover_url), result=list(raw),
-                      base_url=str(cover_url), variables=self.js_variables),
-        )
-        if isinstance(decoded, str):
-            if decoded.startswith(("data:", "http://", "https://")):
-                return decoded
-            try:
-                payload = base64.b64decode(decoded, validate=True)
-            except Exception:
-                payload = decoded.encode("latin-1", errors="ignore")
-        elif isinstance(decoded, (bytes, bytearray)):
-            payload = bytes(decoded)
-        elif isinstance(decoded, (list, tuple)):
-            payload = bytes(int(value) & 0xff for value in decoded)
-        else:
-            return str(cover_url)
+        try:
+            decoded = await asyncio.to_thread(
+                self.js.evaluate, script,
+                JsContext(source=source, src=str(cover_url), result=list(raw),
+                          base_url=str(cover_url), variables=self.js_variables),
+            )
+            if isinstance(decoded, (bytes, bytearray)):
+                payload = bytes(decoded)
+            elif isinstance(decoded, (list, tuple)):
+                payload = bytes(int(value) & 0xff for value in decoded)
+            else:
+                # ImageUtils.decode casts the script result to ByteArray in
+                # runCatching; strings and every other type become null.
+                return ""
+        except Exception:
+            return ""
         mime = "image/png" if payload.startswith(b"\x89PNG") else (
             "image/webp" if payload.startswith(b"RIFF") else "image/jpeg")
         return f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
@@ -441,11 +477,24 @@ class LegadoReadingEngine(ReaderEngine):
 
     async def _request(self, request: dict, source=None) -> tuple[str, str, str]:
         request = await self._apply_request_option_js(request, source)
-        use_webview = bool(request.get("webView") or request.get("webview"))
-        if use_webview and self.webview_fetcher:
-            return await self._fetch_browser_response(request["url"], source, request)
+        webview_value = (request["webView"] if "webView" in request else
+                         request.get("webview"))
+        use_webview = self._url_option_uses_webview(webview_value)
         try:
-            response = await super()._request(request, source)
+            if use_webview and self.webview_fetcher:
+                browser_options = dict(request)
+                if str(request.get("method") or "GET").upper() == "POST":
+                    preliminary = await super()._request(request, source)
+                    browser_options["html"] = preliminary[0]
+                    browser_options["initialHtml"] = preliminary[0]
+                    browser_options["initialUrl"] = preliminary[2]
+                    response = await self._fetch_browser_response(
+                        preliminary[2], source, browser_options)
+                else:
+                    response = await self._fetch_browser_response(
+                        request["url"], source, browser_options)
+            else:
+                response = await super()._request(request, source)
             login_check = str(getattr(source, "loginCheckJs", "") or "").strip()
             if not login_check or not self.last_response:
                 return response
@@ -498,17 +547,31 @@ class LegadoReadingEngine(ReaderEngine):
             headers = value.get("headers") if isinstance(value.get("headers"), dict) else {}
             content_type = str(headers.get("content-type") or "text/html").split(";", 1)[0]
             cookie = str(value.get("cookie") or "")
-            if cookie:
+            cookie_tag = str(getattr(source, "bookSourceUrl", "") or url)
+            if "cookie" in value:
+                jar = self._cookie_jar_for_source(source)
+                cookie_host = URL(cookie_tag).host
+                if cookie_host:
+                    jar.clear_domain(cookie_host)
                 parsed = SimpleCookie()
                 parsed.load(cookie)
-                self._cookie_jar_for_source(source).update_cookies(
-                    {name: morsel.value for name, morsel in parsed.items()},
-                    response_url=URL(final_url))
-                self.js.import_cookie_header(final_url, cookie)
+                self.js.store_set_cookie(cookie_tag, cookie)
+                if parsed:
+                    jar.update_cookies(
+                        {name: morsel.value for name, morsel in parsed.items()},
+                        response_url=URL(cookie_tag))
             self.last_response = {
                 "body": body, "bodyBytes": list(body.encode("utf-8")),
                 "headers": {str(k).lower(): str(v) for k, v in headers.items()},
-                "status": int(value.get("status") or 200), "url": final_url,
+                "headersMulti": {
+                    str(k).lower(): ([str(item) for item in v]
+                                     if isinstance(v, (list, tuple)) else [str(v)])
+                    for k, v in headers.items()
+                },
+                "status": int(value.get("status") or 200),
+                "message": str(value.get("message") or "OK"),
+                "protocol": str(value.get("protocol") or "http/1.1"),
+                "responseKind": "str", "url": final_url,
             }
             return body, content_type, final_url
         if isinstance(value, (list, tuple)):
@@ -684,7 +747,7 @@ class LegadoReadingEngine(ReaderEngine):
                                payload.encode("utf-8"))
                     options = (parse_request_config(raw[option_at + 1:])
                                if option_at > raw.find(",") else {}) or {}
-                    body = (decoded.hex() if options.get("type") not in (None, "")
+                    body = (decoded.hex() if options.get("type") is not None
                             else decoded.decode("utf-8"))
                 except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
                     body = ""
@@ -1202,8 +1265,8 @@ class LegadoReadingEngine(ReaderEngine):
             if not format_js.startswith(("@js:", "<js>")):
                 format_js = "@js:" + format_js
             format_context = JsContext(
-                source=source, base_url=toc_url,
-                variables=self.js_variables, book=book,
+                source=source, host_kind="format", base_url=toc_url,
+                rule_data_present=False,
             )
             for index, chapter in enumerate(unique, 1):
                 format_context.index = index

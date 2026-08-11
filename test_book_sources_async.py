@@ -144,11 +144,10 @@ def parse_search_url(search_url: str, base_url: str, keyword: str,
             if not resolved_url:
                 return None
             # 解析 config
-            config = parse_request_config(config_str)
-            if config is None:
-                return None
-            method = (config.get("method") or "GET").upper()
-            body = config.get("body", "")
+            from app.services.request_compat import normalize_url_option
+            config = normalize_url_option(parse_request_config(config_str))
+            method = config.get("method", "GET")
+            body = config.get("body")
             if isinstance(body, (dict, list)):
                 body = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
             elif body is not None and not isinstance(body, str):
@@ -188,10 +187,44 @@ def parse_request_config(config_str: str) -> dict | None:
         return value if isinstance(value, dict) else None
     except json.JSONDecodeError:
         pass
-    # 兼容 headers:、method: 等未加引号的键，以及单引号字符串。
+    # Gson's JsonReader is lenient: accept unquoted keys and single-quoted
+    # strings without corrupting apostrophes inside ordinary double strings.
     try:
         relaxed = re.sub(r"([{,]\s*)([A-Za-z_][\w-]*)(\s*:)", r'\1"\2"\3', config_str)
-        relaxed = relaxed.replace("'", '"')
+        output, index = [], 0
+        while index < len(relaxed):
+            char = relaxed[index]
+            if char == '"':
+                start = index
+                index += 1
+                while index < len(relaxed):
+                    if relaxed[index] == "\\":
+                        index += 2
+                    elif relaxed[index] == '"':
+                        index += 1
+                        break
+                    else:
+                        index += 1
+                output.append(relaxed[start:index])
+                continue
+            if char == "'":
+                index += 1
+                value = []
+                while index < len(relaxed):
+                    if relaxed[index] == "\\" and index + 1 < len(relaxed):
+                        value.append(relaxed[index + 1])
+                        index += 2
+                    elif relaxed[index] == "'":
+                        index += 1
+                        break
+                    else:
+                        value.append(relaxed[index])
+                        index += 1
+                output.append(json.dumps("".join(value), ensure_ascii=False))
+                continue
+            output.append(char)
+            index += 1
+        relaxed = re.sub(r",\s*([}\]])", r"\1", "".join(output))
         value = json.loads(relaxed)
         return value if isinstance(value, dict) else None
     except (json.JSONDecodeError, TypeError):

@@ -33,13 +33,15 @@ from app.services.legado_rule_parser import (JavaDateValue, _jsoup_html_markup,
                                               evaluate, parse_markup,
                                               select_jsoup,
                                               split_rule_expression)
-from app.services.compat_audit import audit_source_corpus
+from app.services.compat_audit import (SUPPORTED_JAVA_APIS, SUPPORTED_OBJECT_APIS,
+                                       audit_source_corpus)
 from app.services.desktop_browser import EdgeCdpSession
 from app.services.icu_charset import detect_charset
 from app.services.legado_js import JsBridgeError, JsContext, LegadoJsRuntime
 from app.services.request_compat import (encode_form_fields,
                                          encode_url_query_fields, escape_form,
-                                         escape_url_query, legado_escape)
+                                         escape_url_query, legado_escape,
+                                         normalize_url_option)
 from app.services.reading_engine import (ContentEmptyError, LegadoReadingEngine,
                                          TocEmptyError, _legado_truthy,
                                          _apply_replace_regex,
@@ -51,6 +53,7 @@ from app.services.source_service import SourceService
 from app.services.source_rule import compile_rule_program
 from app.services.custom_url import CustomUrl
 from app.services.java_regex import search as java_regex_search, sub as java_regex_sub
+from app.services.public_suffix import effective_tld_plus_one
 from app.services.rule_engine import (BookItem, ChapterItem, ReaderEngine,
                                       merge_search_items,
                                       parse_explore_categories,
@@ -58,7 +61,8 @@ from app.services.rule_engine import (BookItem, ChapterItem, ReaderEngine,
 from app.services.rule_engine import extract_value
 from app.services.search_model import SearchBookStore, SearchModel
 from app.services.reading_cache import ReadingCache
-from test_book_sources_async import classify_js_bridge_error, parse_search_url
+from test_book_sources_async import (classify_js_bridge_error,
+                                     parse_request_config, parse_search_url)
 
 
 class SearchModelTests(unittest.IsolatedAsyncioTestCase):
@@ -422,17 +426,33 @@ class RuleParserTests(unittest.TestCase):
         self.assertEqual(legado_escape("书😀 a"), "%u4E66%uD83D%uDE00%20a")
         self.assertEqual(escape_form("q=书 源&empty="),
                          "q=%u4E66%20%u6E90&empty=")
+        self.assertEqual(escape_form("书键=值&&flag"),
+                         "%E4%B9%A6%E9%94%AE=%u503C&flag=")
         self.assertEqual(
             escape_url_query("https://source/search?q=书 源&page=1"),
             "https://source/search?q=%u4E66%20%u6E90&page=1")
 
     def test_url_encoder_uses_declared_charset_and_preserves_encoded_values(self):
+        self.assertEqual(encode_form_fields("x=𠀀", "gbk"), "x=%3F")
         self.assertEqual(encode_form_fields("q=书 源&done=%CA%E9", "gbk"),
                          "q=%CA%E9+%D4%B4&done=%CA%E9")
+        self.assertEqual(encode_form_fields("flag&&empty=", "utf-8"),
+                         "flag=&empty=")
         self.assertEqual(
             encode_url_query_fields("https://source/search?q=书 源&page=1", "gbk"),
             "https://source/search?q=%CA%E9+%D4%B4&page=1",
         )
+
+    def test_post_body_charset_only_controls_analyzed_fields(self):
+        encode = ReaderEngine._encode_request_body
+        self.assertEqual(encode("q=书", "gbk"), b"q=%CA%E9")
+        self.assertEqual(encode('{"q":"书"}', "gbk"),
+                         '{"q":"书"}'.encode("utf-8"))
+        self.assertEqual(encode('{"q":"书"}', "utf-8",
+                                "application/json; charset=gbk"),
+                         '{"q":"书"}'.encode("gbk"))
+        self.assertEqual(encode("书键=值&&flag", "escape"),
+                         b"%E4%B9%A6%E9%94%AE=%u503C&flag=")
 
     def test_fallback_rule_short_circuits_after_first_nonempty_branch(self):
         soup = BeautifulSoup('<p class="ok">value</p>', "html.parser")
@@ -641,30 +661,97 @@ class RuleParserTests(unittest.TestCase):
         self.assertGreater(audit.regex_count, 400)
         self.assertEqual(audit.syntax_issues, [])
         self.assertEqual(audit.rule_syntax_issues, [])
+        self.assertEqual(audit.regex_syntax_issues, [])
         self.assertEqual(audit.unknown_rule_fields, [])
         self.assertEqual(audit.unsupported_java_apis, [])
         self.assertEqual(audit.unsupported_object_apis, [])
         self.assertEqual(audit.unsupported_jsoup_pseudos, [])
+        self.assertTrue(audit.successful)
+        self.assertNotIn("putVariable", SUPPORTED_OBJECT_APIS["source"])
 
-    def test_book_source_preserves_review_rules_for_forward_compatibility(self):
+    def test_every_fixed_js_extension_method_is_exposed_by_python_bridge(self):
+        root = Path("base_history/legado-3.23.110211/app/src/main/java/io/legado/app/help")
+        names = set()
+        for filename in ("JsExtensions.kt", "JsEncodeUtils.kt"):
+            text = (root / filename).read_text(encoding="utf-8")
+            names.update(re.findall(
+                r"^\s*fun\s+([A-Za-z_$][\w$]*)\s*\(", text, flags=re.M))
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.example"})
+        missing = [name for name in sorted(names) if runtime.evaluate(
+            f"@js:typeof java.{name}", JsContext(source=source)) != "function"]
+        self.assertEqual(len(names), 86)
+        self.assertEqual(missing, [])
+
+    def test_book_source_uses_fixed_review_rule_fields_and_ignores_unknowns(self):
         source = BookSource.from_dict({
             "bookSourceName": "source", "bookSourceUrl": "https://source",
-            "ruleReview": {"reviewList": ".review", "content": ".text@text"},
+            "ruleReview": {"reviewUrl": "/review", "contentRule": ".text@text",
+                           "reviewList": ".review"},
         })
-        self.assertEqual(source.ruleReview["reviewList"], ".review")
-        self.assertEqual(source.to_dict()["ruleReview"]["content"], ".text@text")
+        self.assertEqual(source.ruleReview["reviewUrl"], "/review")
+        self.assertEqual(source.to_dict()["ruleReview"]["contentRule"], ".text@text")
+        self.assertNotIn("reviewList", source.ruleReview)
+
+    def test_book_source_gson_coercion_matches_fixed_deserializers(self):
+        source = BookSource.from_dict({
+            "bookSourceUrl": 123, "bookSourceComment": {"a": 1},
+            "bookSourceType": "1", "customOrder": 3.9,
+            "enabled": "false", "lastUpdateTime": "42",
+            "ruleSearch": {"name": 7, "intro": False, "kind": {"x": 1},
+                           "unknown": "discard"},
+        })
+        self.assertEqual(source.bookSourceUrl, "123")
+        self.assertEqual(source.bookSourceComment, '{"a":1}')
+        self.assertEqual(source.bookSourceType, 0)
+        self.assertEqual(source.customOrder, 3)
+        self.assertFalse(source.enabled)
+        self.assertEqual(source.lastUpdateTime, 42)
+        self.assertEqual(source.ruleSearch,
+                         {"name": "7", "intro": "false", "kind": '{"x":1}'})
+
+    def test_book_source_gson_boolean_and_long_boundaries(self):
+        source = BookSource.from_dict({
+            "bookSourceUrl": "https://source", "enabled": None,
+            "enabledExplore": "TRUE", "enabledCookieJar": None,
+            "lastUpdateTime": "42.0", "respondTime": "180001",
+        })
+        self.assertTrue(source.enabled)
+        self.assertTrue(source.enabledExplore)
+        self.assertIsNone(source.enabledCookieJar)
+        self.assertEqual(source.lastUpdateTime, 42)
+        self.assertEqual(source.respondTime, 180001)
+        with self.assertRaisesRegex(ValueError, "boolean field"):
+            BookSource.from_dict({"bookSourceUrl": "x", "enabled": 1})
+        with self.assertRaisesRegex(ValueError, "invalid long"):
+            BookSource.from_dict({"bookSourceUrl": "x", "lastUpdateTime": 1.5})
+        with self.assertRaisesRegex(ValueError, "invalid long"):
+            BookSource.from_dict({"bookSourceUrl": "x", "respondTime": 1.5})
+        self.assertEqual(BookSource.from_dict({
+            "bookSourceUrl": "x", "lastUpdateTime": 2 ** 63,
+        }).lastUpdateTime, 2 ** 63 - 1)
+        self.assertEqual(BookSource.from_dict({
+            "bookSourceUrl": "x", "lastUpdateTime": -(2 ** 63) - 1,
+        }).lastUpdateTime, -(2 ** 63))
+        with self.assertRaisesRegex(ValueError, "invalid long"):
+            BookSource.from_dict({"bookSourceUrl": "x",
+                                  "lastUpdateTime": 10 ** 30})
 
     def test_book_source_accepts_legacy_string_encoded_rule_objects(self):
         source = BookSource.from_dict({
             "bookSourceName": "source",
             "bookSourceUrl": "https://source",
             "ruleSearch": '{"bookList":"$.data[*]","name":"$.name"}',
-            "ruleToc": "not-json",
         })
 
         self.assertEqual(source.ruleSearch["bookList"], "$.data[*]")
         self.assertEqual(source.ruleSearch["name"], "$.name")
-        self.assertEqual(source.ruleToc, {})
+        self.assertIsNone(source.ruleToc)
+
+        with self.assertRaisesRegex(ValueError, "invalid serialized ruleToc"):
+            BookSource.from_dict({"bookSourceUrl": "https://source",
+                                  "ruleToc": "not-json"})
 
     def test_book_source_missing_fields_use_legado_defaults(self):
         source = BookSource.from_dict({
@@ -674,6 +761,108 @@ class RuleParserTests(unittest.TestCase):
         self.assertEqual(source.bookSourceType, 0)
         self.assertTrue(source.enabledExplore)
         self.assertTrue(source.enabledCookieJar)
+        self.assertIsNone(source.ruleSearch)
+        self.assertIsNone(source.bookSourceGroup)
+        self.assertNotIn("ruleSearch", source.to_dict())
+        self.assertNotIn("bookSourceGroup", source.to_dict())
+
+    def test_book_source_file_accepts_single_json_object_like_import_view_model(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "source.json"
+            path.write_text(json.dumps({
+                "bookSourceName": "single",
+                "bookSourceUrl": "https://single.example",
+            }), encoding="utf-8")
+            sources = BookSource.from_json(path)
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].bookSourceName, "single")
+
+    def test_book_source_entity_identity_is_url_only_like_legado(self):
+        first = BookSource(bookSourceName="one", bookSourceUrl="https://same")
+        second = BookSource(bookSourceName="two", bookSourceUrl="https://same")
+        other = BookSource(bookSourceName="one", bookSourceUrl="https://other")
+
+        self.assertEqual(first, second)
+        self.assertEqual(hash(first), hash(second))
+        self.assertNotEqual(first, other)
+
+    def test_book_source_configuration_equal_normalizes_null_and_empty(self):
+        first = BookSource(bookSourceUrl="https://same", bookSourceGroup="")
+        second = BookSource(bookSourceUrl="https://same", bookSourceGroup=None)
+        self.assertTrue(first.equal(second))
+        second.ruleContent = {"content": "@text"}
+        self.assertFalse(first.equal(second))
+
+    def test_book_source_rule_getters_are_lazy_and_mutating(self):
+        source = BookSource(bookSourceUrl="https://source")
+        source.ruleSearch = None
+        rule = source.getSearchRule()
+        rule["bookList"] = ".book"
+        self.assertIs(rule, source.ruleSearch)
+        self.assertEqual(source.getSearchRule()["bookList"], ".book")
+
+    def test_book_source_groups_follow_legado_split_rules(self):
+        source = BookSource(bookSourceGroup="a；b")
+        self.assertTrue(source.hasGroup("b"))
+        self.assertIs(source.addGroup("b,c"), source)
+        self.assertEqual(set(source._groups(source.bookSourceGroup)), {"a", "b", "c"})
+        self.assertIs(source.removeGroup("a；c"), source)
+        self.assertEqual(source.bookSourceGroup, "b")
+
+    def test_book_source_invalid_groups_use_fixed_chinese_names(self):
+        source = BookSource(bookSourceGroup="正常，已失效；校验超时,失效站点")
+        self.assertEqual(set(source._groups(source.getInvalidGroupNames())),
+                         {"已失效", "校验超时", "失效站点"})
+        source.removeInvalidGroups()
+        self.assertEqual(source.bookSourceGroup, "正常")
+
+    def test_book_source_group_methods_preserve_fixed_null_branch(self):
+        source = BookSource(bookSourceGroup=None)
+        self.assertIs(source.removeGroup("a"), source)
+        self.assertIsNone(source.bookSourceGroup)
+        source.addGroup("a； b")
+        self.assertEqual(source.bookSourceGroup, "a； b")
+
+    def test_book_source_export_preserves_false_zero_and_empty_values(self):
+        source = BookSource(
+            bookSourceUrl="https://source", enabled=False,
+            enabledExplore=False, enabledCookieJar=False, customOrder=0,
+            ruleSearch={},
+        )
+        exported = source.to_dict()
+        self.assertIs(exported["enabled"], False)
+        self.assertIs(exported["enabledExplore"], False)
+        self.assertIs(exported["enabledCookieJar"], False)
+        self.assertEqual(exported["customOrder"], 0)
+        self.assertEqual(exported["ruleSearch"], {})
+
+    def test_old_book_source_is_migrated_with_historical_legado_rules(self):
+        source = BookSource.from_dict({
+            "bookSourceUrl": "https://old.example", "bookSourceName": "old",
+            "bookSourceType": "AUDIO", "enable": False, "serialNumber": 7,
+            "httpUserAgent": "OldUA", "ruleFindUrl": "",
+            "ruleSearchUrl": "https://old.example/s?key=searchKey&page=searchPage|charset=gbk",
+            "ruleSearchList": "div|li", "ruleSearchName": "h3@text",
+            "ruleBookContent": "$body@html", "ruleBookContentReplace": "a#b",
+        })
+        self.assertEqual(source.bookSourceType, 1)
+        self.assertFalse(source.enabled)
+        self.assertFalse(source.enabledExplore)
+        self.assertEqual(source.customOrder, 7)
+        self.assertEqual(source.header, '{"User-Agent":"OldUA"}')
+        self.assertIn("{{key}}", source.searchUrl)
+        self.assertIn('"charset":"gbk"', source.searchUrl)
+        self.assertEqual(source.ruleSearch["bookList"], "div||li")
+        self.assertEqual(source.ruleContent["content"], "body@html")
+        self.assertEqual(source.ruleContent["replaceRegex"], "a##b")
+        self.assertNotIn("author", source.to_dict()["ruleSearch"])
+
+    def test_old_url_migration_preserves_embedded_javascript_placeholders(self):
+        from app.models.legacy_book_source import to_new_url
+        migrated = to_new_url("https://x/{{searchKey+'x'}}?p=searchPage@q=searchKey")
+        self.assertIn("{{key+'x'}}", migrated)
+        self.assertIn('"method":"POST"', migrated)
+        self.assertIn('"body":"q={{key}}"', migrated)
 
     def test_base64_decode_accepts_urlsafe_value_without_padding(self):
         self.assertEqual(LegadoJsRuntime._base64_decode("eyJhIjoxfQ"), '{"a":1}')
@@ -696,6 +885,22 @@ class RuleParserTests(unittest.TestCase):
         })
         self.assertEqual(runtime.evaluate(
             "@js:typeof leakedFromMap", JsContext(source=source)), "undefined")
+
+    def test_js_lib_only_treats_json_objects_as_remote_mappings(self):
+        runtime = LegadoJsRuntime()
+        for library in ('"var leaked=1"', '["var leaked=1"]'):
+            source = SimpleNamespace(to_dict=lambda library=library: {
+                "bookSourceUrl": "https://source/" + library[0], "jsLib": library,
+            })
+            self.assertEqual(runtime.evaluate(
+                "@js:typeof leaked", JsContext(source=source)), "undefined")
+            self.assertFalse(runtime.evaluate(
+                "@js:source.getShareScope()===null", JsContext(source=source)))
+        blank = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source/blank", "jsLib": "  \n ",
+        })
+        self.assertTrue(runtime.evaluate(
+            "@js:source.getShareScope()===null", JsContext(source=blank)))
 
     def test_js_lib_state_is_shared_across_rule_evaluations(self):
         runtime = LegadoJsRuntime()
@@ -730,15 +935,14 @@ class RuleParserTests(unittest.TestCase):
             self.assertEqual(runtime.evaluate(
                 "@js:let local=helper+1;local", JsContext(source=source)), 2)
 
-    def test_empty_login_maps_keep_java_map_methods(self):
+    def test_empty_login_maps_are_null_like_fixed_base_source(self):
         runtime = LegadoJsRuntime()
         source = SimpleNamespace(
             to_dict=lambda: {"bookSourceUrl": "https://source"})
         value = runtime.evaluate(
-            '@js:[source.getLoginInfoMap().get("token"),'
-            'source.getLoginHeaderMap().containsKey("Authorization")]',
+            '@js:[source.getLoginInfoMap(),source.getLoginHeaderMap()]',
             JsContext(source=source))
-        self.assertEqual(value, [None, False])
+        self.assertEqual(value, [None, None])
 
     def test_injected_json_objects_use_java_map_string_form(self):
         runtime = LegadoJsRuntime()
@@ -801,15 +1005,126 @@ class RuleParserTests(unittest.TestCase):
         runtime = LegadoJsRuntime()
         runtime._request_json = lambda _request, *_: json.dumps({
             "body": "ok", "headers": {"etag": "v1"},
-            "status": 200, "url": "https://final.example/",
+            "headersMulti": {"etag": ["v1"]}, "message": "OK",
+            "status": 200, "url": "https://final.example/", "responseKind": "str",
         })
-        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source.example"})
         value = runtime.evaluate(
             '@js:var r=java.connect("/x");'
-            '[String(r),r.body(),r.header("etag"),r.code(),r.raw().request().url()]',
+            '[String(r),r.body(),r.headers().get("etag"),r.code(),r.message(),'
+            'r.errorBody(),typeof r.header,r.raw().request().url()]',
             JsContext(source=source),
         )
-        self.assertEqual(value, ["ok", "ok", "v1", 200, "https://final.example/"])
+        self.assertEqual(value, [
+            "Response{protocol=http/1.1, code=200, message=OK, "
+            "url=https://final.example/}", "ok", "v1", 200, "OK", None,
+            "undefined", "https://final.example/",
+        ])
+
+    def test_transport_preserves_reason_and_repeated_response_headers(self):
+        runtime = LegadoJsRuntime()
+
+        class Response:
+            status = 302
+            reason = "Found"
+            def __init__(self):
+                self.headers = Message()
+                self.headers["Location"] = "/first"
+                self.headers["Location"] = "/second"
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self): return b""
+            def geturl(self): return "https://example.com/start"
+
+        class Opener:
+            def open(self, _request, timeout=None): return Response()
+
+        with patch("app.services.legado_js.build_opener",
+                   lambda *_handlers: Opener()):
+            data = json.loads(runtime._request_json(
+                'https://example.com/start,{"__rawJsoupRequest":true,'
+                '"__followRedirects":false}', cookie_enabled=False))
+        self.assertEqual(data["message"], "Found")
+        self.assertEqual(data["headersMulti"]["location"], ["/first", "/second"])
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://example.com"})
+        value = json.loads(runtime.evaluate(
+            '@js:result=JSON.stringify([result.statusMessage(),'
+            'result.headers("Location"),result.header("Location"),'
+            'result.headers().Location,result.headers().location])',
+            JsContext(source=source, response_data=data))
+        )["body"]
+        self.assertEqual(json.loads(value),
+                         ["Found", ["/first", "/second"], "/second",
+                          "/second", "/second"])
+
+    def test_js_analyze_url_webview_get_and_post_follow_fixed_order(self):
+        runtime = LegadoJsRuntime()
+        calls = []
+        runtime.browser_fetcher = lambda url, _title, options: (
+            calls.append((url, dict(options))) or {
+                "body": "rendered", "url": url + "#done", "status": 200,
+                "headers": {"Content-Type": "text/html"}})
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://example.com", "enabledCookieJar": False})
+
+        get_value = runtime.evaluate(
+            '@js:java.ajax("https://example.com/get,{\\"webView\\":true}")',
+            JsContext(source=source))
+        self.assertEqual(get_value, "rendered")
+        self.assertEqual(calls[0][0], "https://example.com/get")
+        self.assertNotIn("initialHtml", calls[0][1])
+
+        class Response:
+            status = 200
+            reason = "OK"
+            def __init__(self):
+                self.headers = Message()
+                self.headers["Content-Type"] = "text/html; charset=utf-8"
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self): return b"preliminary"
+            def geturl(self): return "https://example.com/post-final"
+        class Opener:
+            def open(self, _request, timeout=None): return Response()
+
+        with patch("app.services.legado_js.build_opener",
+                   lambda *_handlers: Opener()):
+            post_value = runtime.evaluate(
+                '@js:java.ajax("https://example.com/post,{\\"method\\":\\"POST\\",'
+                '\\"body\\":\\"x=1\\",\\"webView\\":true}")',
+                JsContext(source=source))
+        self.assertEqual(post_value, "rendered")
+        self.assertEqual(calls[1][0], "https://example.com/post-final")
+        self.assertEqual(calls[1][1]["initialHtml"], "preliminary")
+
+    def test_js_analyze_url_unzips_text_and_adds_xml_declaration(self):
+        runtime = LegadoJsRuntime()
+        archive = BytesIO()
+        with zipfile.ZipFile(archive, "w") as output:
+            output.writestr("body.txt", "zip text")
+
+        class Response:
+            status = 200
+            reason = "OK"
+            def __init__(self, body, content_type):
+                self._body = body
+                self.headers = Message()
+                self.headers["Content-Type"] = content_type
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self): return self._body
+            def geturl(self): return "https://example.com/data"
+
+        responses = iter((
+            Response(archive.getvalue(), "application/zip"),
+            Response(b"<root/>", "application/xml; charset=utf-8"),
+        ))
+        runtime.opener = SimpleNamespace(open=lambda *_args, **_kwargs: next(responses))
+        zipped = json.loads(runtime._request_json("https://example.com/archive"))
+        xml = json.loads(runtime._request_json("https://example.com/xml"))
+        self.assertEqual(zipped["body"], "zip text")
+        self.assertEqual(zipped["bodyBytes"], list(archive.getvalue()))
+        self.assertEqual(xml["body"], '<?xml version="1.0"?><root/>')
 
     def test_java_get_disables_redirect_following_like_jsoup(self):
         runtime = LegadoJsRuntime()
@@ -817,7 +1132,8 @@ class RuleParserTests(unittest.TestCase):
         runtime._request_json = lambda request, *_args: (
             captured.append(request) or json.dumps({
                 "body": "", "headers": {"location": "/result?id=42"},
-                "status": 302, "url": "https://source/search"}))
+                "status": 302, "url": "https://source/search",
+                "responseKind": "jsoup"}))
         source = SimpleNamespace(
             to_dict=lambda: {"bookSourceUrl": "https://source"})
         value = runtime.evaluate(
@@ -825,7 +1141,7 @@ class RuleParserTests(unittest.TestCase):
             '.header("location")', JsContext(source=source))
         request = json.loads(captured[0].split(",", 1)[1])
         self.assertEqual(value, "/result?id=42")
-        self.assertIs(request["followRedirects"], False)
+        self.assertIs(request["__followRedirects"], False)
         self.assertEqual(request["headers"]["accept"], "text/html")
 
     def test_java_post_disables_redirect_following_like_legado_js_extensions(self):
@@ -834,7 +1150,8 @@ class RuleParserTests(unittest.TestCase):
         runtime._request_json = lambda request, *_args: (
             captured.append(request) or json.dumps({
                 "body": "", "headers": {"location": "/result?id=43"},
-                "status": 302, "url": "https://source/search"}))
+                "status": 302, "url": "https://source/search",
+                "responseKind": "jsoup"}))
         source = SimpleNamespace(
             to_dict=lambda: {"bookSourceUrl": "https://source"})
 
@@ -844,7 +1161,7 @@ class RuleParserTests(unittest.TestCase):
 
         request = json.loads(captured[0].split(",", 1)[1])
         self.assertEqual(value, "/result?id=43")
-        self.assertIs(request["followRedirects"], False)
+        self.assertIs(request["__followRedirects"], False)
         self.assertEqual(request["method"], "POST")
 
     def test_analyze_url_get_response_requests_current_rule_url(self):
@@ -858,10 +1175,202 @@ class RuleParserTests(unittest.TestCase):
 
         runtime._request_json = respond
         source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
-        value = runtime.evaluate('@js:java.getResponse().body()', JsContext(
-            source=source, base_url="https://source/current"))
+        value = runtime.evaluate('@js:java.getResponse().body().string()', JsContext(
+            source=source, host_kind="url", base_url="https://source/current"))
         self.assertEqual(value, "fetched")
         self.assertEqual(requested, ["https://source/current"])
+
+    def test_analyze_url_okhttp_response_and_sync_method_surface(self):
+        runtime = LegadoJsRuntime()
+        runtime._request_json = lambda value, *_args: json.dumps({
+            "body": "bytes", "bodyBytes": [98, 121, 116, 101, 115],
+            "headers": {"content-type": "text/plain"}, "status": 201,
+            "message": "Created", "url": value, "protocol": "http/1.1"})
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.test/"})
+        value = runtime.evaluate('''@js:
+            function type(call){try{call();return false}catch(e){return e instanceof TypeError}}
+            var response=java.getResponse(),body=response.body();
+            [response.code(),response.message(),body.string(),body.bytes(),
+             body.byteStream().read(),body.contentType(),String(response.close()),
+             typeof response.errorBody,typeof response.raw,
+             type(()=>java.getResponse(1)),type(()=>java.getByteArray(1)),
+             type(()=>java.getInputStream(1)),type(()=>java.getStrResponse(1,2,3,4))];''',
+            JsContext(source=source, host_kind="url",
+                      base_url="https://source.test/data"))
+        self.assertEqual(value[:3], [201, "Created", "bytes"])
+        self.assertEqual(bytes(item & 255 for item in value[3]), b"bytes")
+        self.assertEqual(value[4:], [
+            98, "text/plain", "undefined", "undefined", "undefined",
+            True, True, True, True,
+        ])
+
+    def test_analyze_url_sync_webview_arguments_and_data_uri_boundary(self):
+        runtime = LegadoJsRuntime()
+        calls = []
+        runtime._request_json = lambda *args: (
+            calls.append(args) or json.dumps({
+                "body": "ok", "bodyBytes": [111, 107], "headers": {},
+                "status": 200, "url": str(args[0])}))
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.test/"})
+        context = JsContext(source=source, host_kind="url",
+                            base_url="https://source.test/data")
+        self.assertEqual(runtime.evaluate(
+            '@js:java.getStrResponse("run()","ready",false).body()', context), "ok")
+        self.assertEqual(calls[0][5:], (False, "run()", "ready"))
+        runtime.evaluate('@js:java.getResponse()', context)
+        runtime.evaluate('@js:java.getByteArray()', context)
+        runtime.evaluate('@js:java.getInputStream()', context)
+        self.assertTrue(all(call[5] is False for call in calls[1:]))
+
+        data_context = JsContext(
+            source=source, host_kind="url",
+            base_url="data:text/plain;base64,aGVsbG8=?ignored")
+        value = runtime.evaluate(
+            '@js:[java.getByteArray(),java.getInputStream().read()]', data_context)
+        self.assertEqual(bytes(item & 255 for item in value[0]), b"hello")
+        self.assertEqual(value[1], ord("h"))
+        self.assertEqual(len(calls), 4)
+
+    def test_js_ajax_resolves_dynamic_and_login_source_headers_on_call(self):
+        runtime = LegadoJsRuntime()
+        captured = []
+        runtime._request_json = lambda value, headers=None, *_args: (
+            captured.append((value, headers)) or json.dumps({
+                "body": "ok", "bodyBytes": [], "headers": {}, "status": 200,
+                "url": value}))
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.example",
+            "header": '@js:JSON.stringify({"X-Dynamic":baseUrl})'})
+        runtime.evaluate(
+            '@js:source.putLoginHeader(\'{"Authorization":"Bearer token"}\');'
+            'java.ajax("/page")', JsContext(source=source))
+        self.assertEqual(captured[0][1]["X-Dynamic"],
+                         "https://source.example")
+        self.assertEqual(captured[0][1]["Authorization"], "Bearer token")
+
+    def test_java_host_surface_is_context_specific(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source"})
+        rule = runtime.evaluate(
+            "@js:[typeof java.getString,typeof java.getStrResponse]",
+            JsContext(source=source))
+        url = runtime.evaluate(
+            "@js:[typeof java.getString,typeof java.getStrResponse,typeof java.notOfficial]",
+            JsContext(source=source, host_kind="url"))
+        self.assertEqual(rule, ["function", "undefined"])
+        self.assertEqual(url, ["undefined", "function", "undefined"])
+
+    def test_java_host_bindings_are_context_specific(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source"})
+        chapter = ChapterItem(name="C", url="/1")
+        rule = runtime.evaluate(
+            "@js:[typeof key,typeof page,typeof speakText,typeof chapter,typeof src]",
+            JsContext(source=source, key="k", page=2, speak_text="s",
+                      chapter=chapter, src="body"))
+        url = runtime.evaluate(
+            "@js:[typeof key,typeof page,typeof speakText,typeof chapter,typeof src]",
+            JsContext(source=source, host_kind="url", key="k", page=2,
+                      speak_text="s", chapter=chapter, src="body"))
+        self.assertEqual(rule, ["undefined", "undefined", "undefined",
+                                "object", "string"])
+        self.assertEqual(url, ["string", "number", "string",
+                               "undefined", "undefined"])
+
+    def test_base_source_eval_js_uses_source_host_and_fresh_bindings(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            "@js:source.evalJS('[java===source,baseUrl,typeof result,typeof book]')",
+            JsContext(source=source, result="outer", book=SimpleNamespace(name="B")))
+        self.assertEqual(value, [True, "https://source", "undefined", "undefined"])
+
+    def test_analyze_rule_get_put_uses_fixed_variable_fallback_order(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source"})
+        book = BookItem(name="Book", variables={"shared": "book", "bookOnly": "b"})
+        chapter = ChapterItem(name="Chapter", url="/1",
+                              variables={"shared": "chapter"})
+        variables = {"shared": "rule", "ruleOnly": "r",
+                     "source:data:sourceOnly": "s"}
+        value = runtime.evaluate('''@js:
+            var before=[java.get('bookName'),java.get('title'),java.get('shared'),
+              java.get('bookOnly'),java.get('ruleOnly'),java.get('sourceOnly')];
+            java.put('written','value');
+            before.concat([chapter.getVariable('written'),book.getVariable('written')]);
+        ''', JsContext(source=source, variables=variables, book=book, chapter=chapter))
+        self.assertEqual(value, ["Book", "Chapter", "chapter", "b", "r", "s",
+                                 "value", ""])
+        self.assertEqual(chapter.variables["written"], "value")
+        self.assertNotIn("written", book.variables)
+        self.assertNotIn("written", variables)
+
+    def test_analyze_url_get_put_stops_after_rule_data(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source"})
+        runtime.evaluate("@js:source.put('sourceOnly','s')", JsContext(source=source))
+        no_rule_data = runtime.evaluate(
+            "@js:[java.put('x','v'),java.get('x'),java.get('sourceOnly')]",
+            JsContext(source=source, host_kind="url"))
+        book = BookItem(name="Book")
+        with_rule_data = runtime.evaluate(
+            "@js:[java.put('x','v'),java.get('x'),java.get('bookName')]",
+            JsContext(source=source, host_kind="url", book=book,
+                      rule_data_present=True, variables={}))
+        self.assertEqual(no_rule_data, ["v", "", ""])
+        self.assertEqual(with_rule_data, ["v", "v", "Book"])
+        self.assertEqual(book.variables["x"], "v")
+
+    def test_rule_data_object_methods_and_java_put_share_variable_map(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source"})
+        book = BookItem(name="Book", variables={"initial": "b"})
+        chapter = ChapterItem(name="Chapter", url="/1",
+                              variables={"initial": "c"})
+        value = runtime.evaluate('''@js:
+          var before=[book.getVariable('initial'),chapter.getVariable('initial')];
+          chapter.putVariable('direct','yes');java.put('throughJava','yes');
+          chapter.putVariable('initial',null);
+          before.concat([chapter.getVariable('direct'),chapter.getVariable('throughJava')]);
+        ''', JsContext(source=source, book=book, chapter=chapter))
+        self.assertEqual(value, ["b", "c", "yes", "yes"])
+        self.assertEqual(chapter.variables, {"direct": "yes", "throughJava": "yes"})
+        self.assertEqual(book.variables, {"initial": "b"})
+
+    def test_book_and_chapter_variable_methods_match_rule_data_interface(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {})
+        book, chapter = BookItem(name="B"), ChapterItem(name="C", url="/1")
+        value = runtime.evaluate('''@js:
+          var a=book.putVariable('x',7),b=chapter.putVariable('y',false);
+          var custom=book.putCustomVariable('z');book.putVariable('x',null);
+          function npe(call){try{call();return false}catch(e){return e.javaException
+            instanceof Packages.java.lang.NullPointerException}}
+          var reverse=book.setReverseToc(true);
+          [a,b,custom,book.getVariable('x'),chapter.getVariable('y'),
+           book.getCustomVariable(),npe(()=>book.getVariable(null)),reverse,
+           book.getReverseToc(),typeof book.getDisplayTag];
+        ''', JsContext(source=source, book=book, chapter=chapter))
+        self.assertEqual(value, [True, True, None, "", "false", "z", True,
+                                 None, True, "undefined"])
+        self.assertEqual(book.variables, {"custom": "z"})
+        self.assertEqual(chapter.variables, {"y": "false"})
+
+    def test_analyze_rule_source_fallback_persists_between_scopes(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source"})
+        runtime.evaluate("@js:java.put('token','saved')", JsContext(source=source))
+        self.assertEqual(runtime.evaluate(
+            "@js:java.get('token')", JsContext(source=source)), "saved")
 
     def test_js_requests_inherit_source_headers(self):
         runtime = LegadoJsRuntime()
@@ -875,17 +1384,18 @@ class RuleParserTests(unittest.TestCase):
             "bookSourceUrl": "https://source", "header": '{"X-Source":"enabled"}'})
         value = runtime.evaluate('@js:java.ajax("/path")', JsContext(source=source))
         self.assertEqual(value, "ok")
-        self.assertEqual(captured, {"X-Source": "enabled"})
+        self.assertEqual(captured["X-Source"], "enabled")
+        self.assertIn("Mozilla/5.0", captured["User-Agent"])
 
     def test_http_response_cookie_map_and_java_collection_views(self):
         runtime = LegadoJsRuntime()
         runtime._request_json = lambda _request, *_: json.dumps({
             "body": "", "headers": {"set-cookie": "sid=abc; Path=/"},
-            "status": 200, "url": "https://source/"})
+            "status": 200, "url": "https://source/", "responseKind": "jsoup"})
         source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
         value = runtime.evaluate(
             '''@js:
-            var cookies=java.head("https://source").cookies();
+            var cookies=java.head("https://source",{}).cookies();
             var values=[0,1,2,3];values.subList(1,3).clear();
             [cookies.get("sid"),cookies.entrySet().toArray().join("; "),
              String(cookies),values];''', JsContext(source=source))
@@ -898,7 +1408,7 @@ class RuleParserTests(unittest.TestCase):
         value = runtime.evaluate("""
             source.putLoginHeader('{"X-Test":"yes"}');
             source.putLoginInfo('{"name":"reader"}');
-            var parsed=java.toURL('../book?id=7');
+            var parsed=java.toURL('../book?id=7',baseUrl);
             var before=[source.getLoginHeaderMap().get('X-Test'),
               source.getLoginInfoMap().get('name'),parsed.host,parsed.pathname,
               parsed.searchParams.get('id'),result];
@@ -907,17 +1417,205 @@ class RuleParserTests(unittest.TestCase):
             before.concat([source.getLoginHeader(),source.getLoginInfo(),cache.getFromMemory('temporary')]);
         """, JsContext(source=source, result="payload", base_url=source.bookSourceUrl))
         self.assertEqual(value, ["yes", "reader", "example.com", "/book", "7",
-                                 "payload", "", "", None])
+                                 "payload", None, None, None])
+
+    def test_base_source_methods_match_fixed_legado_null_and_return_semantics(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source", "bookSourceName": "Name",
+            "loginUi": '[{"name":"Account","type":"text"}]',
+            "loginUrl": "@js:function login(){source.put('called','yes')}"
+        })
+        value = runtime.evaluate('''@js:
+            var absent=[source.getLoginHeader(),source.getLoginHeaderMap(),
+              source.getLoginInfo(),source.getLoginInfoMap()];
+            var setReturn=source.setVariable(null);
+            var infoReturn=source.putLoginInfo('{"id":"7"}');
+            source.login();
+            [source.getTag(),source.getKey(),source.getSource()===source,
+             source.loginUi()[0].name,source.getLoginJs().startsWith('function'),
+             source.get('called'),setReturn,infoReturn,source.evalJS('typeof login')].concat(absent);
+        ''', JsContext(source=source))
+        self.assertEqual(value, ["Name", "https://source", True, "Account", True,
+                                 "yes", None, True, "undefined",
+                                 None, None, None, None])
+
+    def test_book_source_methods_are_visible_in_javascript(self):
+        runtime = LegadoJsRuntime()
+        source = BookSource(bookSourceName="Name", bookSourceUrl="https://source",
+                            bookSourceGroup="group")
+        expected_hash = 0
+        for char in source.bookSourceUrl:
+            expected_hash = ((31 * expected_hash + ord(char) + 2**31) % 2**32) - 2**31
+        value = runtime.evaluate('''@js:
+            var search=source.getSearchRule();search.name='h1@text';
+            [source.tag,source.getDisPlayNameGroup(),source.hashCode(),
+             source.equals({bookSourceUrl:'https://source'}),
+             source.equals({bookSourceUrl:'https://other'}),source.ruleSearch.name,
+             source.equal(source)];
+        ''', JsContext(source=source))
+        self.assertEqual(value, ["Name", "Name (group)", expected_hash,
+                                 True, False, "h1@text", True])
+        self.assertEqual(source.ruleSearch["name"], "h1@text")
+
+    def test_every_audited_source_method_exists_on_runtime_bridge(self):
+        runtime = LegadoJsRuntime()
+        source = BookSource(bookSourceUrl="https://source")
+        method_names = sorted(SUPPORTED_OBJECT_APIS["source"])
+        missing = [name for name in method_names if runtime.evaluate(
+            f"@js:typeof source.{name}", JsContext(source=source)) != "function"]
+        self.assertEqual(missing, [])
+
+    def test_book_source_group_methods_are_visible_and_sync_to_python(self):
+        runtime = LegadoJsRuntime()
+        source = BookSource(
+            bookSourceName="Name", bookSourceUrl="https://source",
+            bookSourceGroup="正常；已失效", variableComment="变量说明",
+        )
+        value = runtime.evaluate('''@js:
+            var same=source.addGroup('新组，校验超时')===source;
+            var before=[source.hasGroup('新组'),source.getInvalidGroupNames()];
+            source.removeInvalidGroups();source.removeGroup('新组');
+            [same,before,source.bookSourceGroup,
+             source.getDisplayVariableComment('其他说明')];
+        ''', JsContext(source=source))
+        self.assertEqual(value, [True, [True, "已失效, 校验超时"], "正常",
+                                 "变量说明\n其他说明"])
+        self.assertEqual(source.bookSourceGroup, "正常")
+        empty = BookSource(bookSourceUrl="https://empty", bookSourceGroup=None)
+        null_branch = runtime.evaluate('''@js:
+            source.removeGroup('x');var before=source.bookSourceGroup;
+            source.addGroup('a； b');[before,source.bookSourceGroup];
+        ''', JsContext(source=empty))
+        self.assertEqual(null_branch, [None, "a； b"])
+        self.assertEqual(empty.bookSourceGroup, "a； b")
+
+    def test_source_login_ui_uses_fixed_row_ui_gson_shape(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source",
+            "loginUi": json.dumps([{
+                "name": 7, "type": False, "action": {"x": 1},
+                "unknown": "discard",
+            }]),
+        })
+        value = runtime.evaluate('''@js:
+            var row=source.loginUi()[0];
+            [row.name,row.type,row.action,row.unknown];
+        ''', JsContext(source=source))
+        self.assertEqual(value, ["7", "false", '{"x":1}', None])
+        invalid = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source", "loginUi": '["row"]',
+        })
+        self.assertIsNone(runtime.evaluate("@js:source.loginUi()",
+                                           JsContext(source=invalid)))
+
+    def test_source_non_null_string_parameters_and_public_surface(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source"})
+        value = runtime.evaluate('''@js:
+            function fails(call){try{call();return false}catch(e){
+              return e.javaException instanceof Packages.java.lang.NullPointerException}}
+            [typeof source.putVariable,
+             fails(()=>source.put(null,'v')),fails(()=>source.put('k',null)),
+             fails(()=>source.get(null)),fails(()=>source.putLoginHeader(null)),
+             fails(()=>source.putLoginInfo(null)),
+             source.setVariable(undefined),source.getVariable(),
+             source.put('undefined',undefined),source.get('undefined'),
+             (()=>{try{source.get();return false}catch(e){return e instanceof TypeError}})()];
+        ''', JsContext(source=source))
+        self.assertEqual(value, ["undefined", True, True, True, True, True,
+                                 None, "undefined", "undefined", "undefined", True])
+
+    def test_put_login_header_replaces_source_cookie_and_remove_clears_it(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source.example/path"})
+        value = runtime.evaluate('''@js:
+            source.putLoginHeader('{"Cookie":"sid=abc"}');
+            var before=cookie.getKey(source.getKey(),'sid');
+            source.removeLoginHeader();
+            [before,cookie.getKey(source.getKey(),'sid'),source.getLoginHeader()];
+        ''', JsContext(source=source))
+        self.assertEqual(value, ["abc", "", None])
+
+    def test_source_get_header_map_evaluates_dynamic_header_and_default_ua(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.example",
+            "header": '@js:JSON.stringify({"X-Key":source.getKey()})',
+        })
+        value = runtime.evaluate(
+            '@js:[source.getHeaderMap().get("X-Key"),'
+            'source.getHeaderMap().containsKey("User-Agent")]',
+            JsContext(source=source))
+        self.assertEqual(value, ["https://source.example", True])
+        self.assertEqual(runtime.evaluate(
+            '@js:source.getHeaderMap().get("User-Agent")', JsContext(source=source)),
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/119.0.0.0 Safari/537.36")
+
+    def test_source_dynamic_header_stringifies_before_gson_parse(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.example",
+            "header": '@js:({"X-Extra":"object"})',
+        })
+        value = runtime.evaluate(
+            '@js:[source.getHeaderMap().get("X-Extra"),'
+            'source.getHeaderMap().containsKey("User-Agent")]',
+            JsContext(source=source))
+        self.assertEqual(value, [None, True])
+
+    def test_source_dynamic_header_propagates_script_and_block_errors(self):
+        runtime = LegadoJsRuntime()
+        throwing = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.example",
+            "header": '@js:throw new Error("header failed")',
+        })
+        with self.assertRaisesRegex(JsBridgeError, "header failed"):
+            runtime.evaluate("@js:source.getHeaderMap()", JsContext(source=throwing))
+        malformed_header = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.example", "header": "<js>({})",
+        })
+        with self.assertRaisesRegex(JsBridgeError, "substring range"):
+            runtime.evaluate("@js:source.getHeaderMap()",
+                             JsContext(source=malformed_header))
+        malformed_login = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.example", "loginUrl": "<js>login()",
+        })
+        with self.assertRaisesRegex(JsBridgeError, "substring range"):
+            runtime.evaluate("@js:source.getLoginJs()", JsContext(source=malformed_login))
+
+    def test_source_get_header_map_optionally_merges_login_header(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.example", "header": '{"A":"source"}'})
+        value = runtime.evaluate('''@js:
+            source.putLoginHeader('{"A":"login","B":"extra"}');
+            [source.getHeaderMap().get('A'),source.getHeaderMap().get('B'),
+             source.getHeaderMap(true).get('A'),source.getHeaderMap(true).get('B')];
+        ''', JsContext(source=source))
+        self.assertEqual(value, ["source", None, "login", "extra"])
 
     def test_documented_chapter_and_tts_script_globals(self):
         source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
         chapter = SimpleNamespace(name="Chapter One")
-        value = LegadoJsRuntime().evaluate(
-            "[title,nextChapterUrl,speakText,speakSpeed]",
+        runtime = LegadoJsRuntime()
+        rule_value = runtime.evaluate(
+            "[title,nextChapterUrl,typeof speakText,typeof speakSpeed]",
             JsContext(source=source, chapter=chapter,
                       next_chapter_url="https://source/chapter-2",
                       speak_text="hello", speak_speed=12))
-        self.assertEqual(value, ["Chapter One", "https://source/chapter-2", "hello", 12])
+        url_value = runtime.evaluate(
+            "[typeof title,typeof nextChapterUrl,speakText,speakSpeed]",
+            JsContext(source=source, host_kind="url", chapter=chapter,
+                      next_chapter_url="https://source/chapter-2",
+                      speak_text="hello", speak_speed=12))
+        self.assertEqual(rule_value, ["Chapter One", "https://source/chapter-2",
+                                      "undefined", "undefined"])
+        self.assertEqual(url_value, ["undefined", "undefined", "hello", 12])
 
     def test_get_string_overloads_parse_supplied_content(self):
         source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
@@ -976,7 +1674,7 @@ class RuleParserTests(unittest.TestCase):
         value = runtime.evaluate(
             '@js:if(result.code()===403){result=java.getStrResponse()} result',
             JsContext(
-                source=source, base_url="https://source/start",
+                source=source, host_kind="url", base_url="https://source/start",
                 response_data={"body": "blocked", "headers": {},
                                "status": 403, "url": "https://source/start"},
             ),
@@ -1005,7 +1703,7 @@ class RuleParserTests(unittest.TestCase):
             '@js:book.kind="玄幻,冒险";book.wordCount="10万字";'
             'book.customTag="收藏";book.customCoverUrl="custom.jpg";'
             'book.durChapterIndex=3;book.totalChapterNum=8;'
-            '[book.getKindList(),book.getDisplayTag(),book.getDisplayCover(),'
+            '[book.getKindList(),book.customTag,book.getDisplayCover(),'
             'book.getUnreadChapterNum()]', JsContext(source=source, book=book))
         self.assertEqual(display,
                          [["10万字", "玄幻", "冒险"], "收藏", "custom.jpg", 4])
@@ -1036,12 +1734,13 @@ class RuleParserTests(unittest.TestCase):
         runtime = LegadoJsRuntime()
         source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://example.com"})
         value = runtime.evaluate(
-            '@js:cookie.setCookie(baseUrl,"sid=abc; Path=/");'
-            '[cookie.getCookie(baseUrl),cookie.getKey(baseUrl,"sid"),java.getCookie(baseUrl,"sid")]',
+            '@js:cookie.setCookie(baseUrl,"sid=abc");'
+            '[cookie.getCookie(baseUrl),cookie.getKey(baseUrl,"sid"),'
+            'java.getCookie(baseUrl,"sid"),java.getCookie(baseUrl,null)]',
             JsContext(source=source, base_url="https://example.com/book/1"),
         )
-        self.assertEqual(value, ["sid=abc", "abc", "abc"])
-        self.assertTrue(runtime.evaluate(
+        self.assertEqual(value, ["sid=abc", "abc", "abc", "sid=abc"])
+        self.assertIsNone(runtime.evaluate(
             '@js:cookie.removeCookie(baseUrl)',
             JsContext(source=source, base_url="https://example.com/book/1"),
         ))
@@ -1053,7 +1752,7 @@ class RuleParserTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             first = LegadoJsRuntime(state_dir=directory)
             first.evaluate(
-                '@js:cookie.setCookie(baseUrl,"sid=abc; Path=/");',
+                '@js:cookie.setCookie(baseUrl,"sid=abc");',
                 JsContext(source=source, base_url="https://example.com/book"))
             self.assertEqual(first.export_cookie_header(
                 "http://example.com/next"), "sid=abc")
@@ -1064,6 +1763,223 @@ class RuleParserTests(unittest.TestCase):
             third = LegadoJsRuntime(state_dir=directory)
             self.assertEqual(third.export_cookie_header(
                 "https://example.com/next"), "")
+
+    def test_cookie_store_set_replaces_and_replace_cookie_merges_persistent_map(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://example.com"})
+        value = runtime.evaluate('''@js:
+            var setResult=cookie.setCookie(baseUrl,
+              "a=1; blank=; literal=null; flag; Path=/");
+            var first=cookie.getCookie(baseUrl);
+            var replaceResult=cookie.replaceCookie(baseUrl,"a=2; b=3");
+            var second=cookie.getCookie(baseUrl);
+            cookie.setCookie(baseUrl,"only=1");
+            [typeof setResult,typeof replaceResult,first,second,
+             cookie.getCookie(baseUrl)];''',
+            JsContext(source=source, base_url="https://example.com/"))
+        self.assertEqual(value, [
+            "undefined", "undefined", "a=1; literal=null; Path=/",
+            "a=2; literal=null; Path=/; b=3", "only=1",
+        ])
+
+    def test_cookie_store_get_prunes_random_keys_to_fixed_4096_limit(self):
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            runtime.store_set_cookie("https://example.com/", "; ".join(
+                f"k{index}=" + str(index) * 600 for index in range(8)))
+            with patch("app.services.legado_js.random.choice",
+                       side_effect=lambda values: values[0]):
+                cookie = runtime.export_cookie_header("https://example.com/")
+            self.assertLessEqual(len(cookie), 4096)
+            self.assertNotIn("k0=", cookie)
+            restored = LegadoJsRuntime(state_dir=directory)
+            self.assertEqual(restored.export_cookie_header("https://example.com/"),
+                             cookie)
+
+    def test_cookie_store_interface_arity_null_and_map_methods(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://example.com"})
+        value = runtime.evaluate('''@js:
+            var parsed=cookie.cookieToMap("a=1; blank=; literal=null; flag");
+            function npe(call){try{call();return false}catch(e){return e.javaException
+              instanceof Packages.java.lang.NullPointerException}}
+            function type(call){try{call();return false}catch(e){return e instanceof TypeError}}
+            [parsed.get("a"),parsed.containsKey("blank"),parsed.get("literal"),
+             cookie.mapToCookie({a:1,b:"x"}),cookie.mapToCookie({}),
+             cookie.mapToCookie(null),npe(()=>cookie.getCookie(null)),
+             npe(()=>cookie.getKey(baseUrl,null)),npe(()=>cookie.setCookie(null,"a=1")),
+             npe(()=>cookie.replaceCookie(baseUrl,null)),npe(()=>cookie.removeCookie(null)),
+             npe(()=>cookie.cookieToMap(null)),type(()=>cookie.getCookie()),
+             type(()=>cookie.setCookie(baseUrl))];''',
+            JsContext(source=source, base_url="https://example.com/"))
+        self.assertEqual(value, [
+            "1", False, "null", "a=1; b=x", None, None,
+            True, True, True, True, True, True, True, True,
+        ])
+
+    def test_cookie_store_clear_deletes_persistent_table_but_keeps_session(self):
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            runtime.store_set_cookie("https://example.com/", "saved=disk")
+            runtime.set_cookie("https://example.com/", "sid=memory", session=True)
+            source = SimpleNamespace(to_dict=lambda: {
+                "bookSourceUrl": "https://example.com"})
+            value = runtime.evaluate('''@js:
+                var result=cookie.clear();
+                function type(call){try{call();return false}catch(e){return e instanceof TypeError}}
+                [String(result),cookie.getCookie(baseUrl),type(()=>cookie.clear(1))];''',
+                JsContext(source=source, base_url="https://example.com/"))
+            self.assertEqual(value, ["undefined", "sid=memory", True])
+            restored = LegadoJsRuntime(state_dir=directory)
+            self.assertEqual(restored.export_cookie_header("https://example.com/"), "")
+
+    def test_js_extensions_to_url_and_log_type_public_contract(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://example.com/base/page"})
+        value = runtime.evaluate('''@js:
+            function npe(call){try{call();return false}catch(e){return e.javaException
+              instanceof Packages.java.lang.NullPointerException}}
+            function type(call){try{call();return false}catch(e){return e instanceof TypeError}}
+            var one=java.toURL("https://one.test/child?q=1");
+            var two=java.toURL("child","https://host.test/root/");
+            [one.host,one.pathname,one.searchParams.get("q"),two.host,two.pathname,
+             String(java.logType(null)),npe(()=>java.toURL(null)),
+             type(()=>java.toURL()),type(()=>java.toURL("a","b","c")),
+             type(()=>java.logType())];''',
+            JsContext(source=source, base_url="https://example.com/base/page"))
+        self.assertEqual(value, [
+            "one.test", "/child", "1", "host.test", "/root/child", "undefined",
+            True, True, True, True,
+        ])
+
+    def test_response_cookie_session_and_persistent_layers_match_cookie_manager(self):
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            runtime.set_cookie("https://www.example.com/", "sid=persistent; Path=/")
+            headers = Message()
+            headers["Set-Cookie"] = "sid=session; Path=/private; Secure"
+            headers["Set-Cookie"] = "temporary=memory; Path=/private"
+            headers["Set-Cookie"] = "saved=disk; Max-Age=3600; Path=/private; Secure"
+            runtime.save_response_cookies("https://www.example.com/private", headers)
+
+            # CookieManager discards Path/Secure for its key/value stores and
+            # overlays the in-memory session map over the persistent DB map.
+            self.assertEqual(runtime.export_cookie_header(
+                "http://api.example.com/other"),
+                "sid=session; temporary=memory; saved=disk")
+            state = json.loads((Path(directory) / "rule_engine_state.json").read_text(
+                encoding="utf-8"))
+            persisted = {item["name"]: item["value"] for item in state["cookies"]}
+            self.assertEqual(persisted, {"sid": "persistent", "saved": "disk"})
+
+            restored = LegadoJsRuntime(state_dir=directory)
+            self.assertEqual(restored.export_cookie_header(
+                "http://api.example.com/other"), "sid=persistent; saved=disk")
+
+    def test_js_requests_disable_jar_but_still_send_cookie_store(self):
+        runtime = LegadoJsRuntime()
+        runtime.set_cookie("https://example.com/", "sid=old; Path=/")
+        captured = {}
+
+        class Response:
+            status = 200
+
+            def __init__(self):
+                self.headers = Message()
+                self.headers["Content-Type"] = "text/plain; charset=utf-8"
+                self.headers["Set-Cookie"] = "sid=new; Path=/"
+
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self): return b"ok"
+            def geturl(self): return "https://example.com/page"
+
+        class Opener:
+            def open(self, request, timeout=None):
+                captured["cookie"] = request.get_header("Cookie")
+                return Response()
+
+        def opener(*handlers):
+            captured["handlers"] = handlers
+            return Opener()
+
+        for enabled in (False, None):
+            captured.clear()
+            source = SimpleNamespace(to_dict=lambda enabled=enabled: {
+                "bookSourceUrl": "https://example.com",
+                "enabledCookieJar": enabled,
+            })
+            with patch("app.services.legado_js.build_opener", opener):
+                value = runtime.evaluate(
+                    '@js:java.ajax("https://example.com/page")',
+                    JsContext(source=source),
+                )
+            self.assertEqual(value, "ok")
+            self.assertEqual(captured["cookie"], "sid=old")
+            self.assertFalse(any(type(item).__name__ == "HTTPCookieProcessor"
+                                 for item in captured["handlers"]))
+            self.assertEqual(runtime.export_cookie_header(
+                "https://example.com/next"), "sid=old")
+
+    def test_direct_jsoup_request_with_disabled_jar_does_not_load_cookie_store(self):
+        runtime = LegadoJsRuntime()
+        runtime.set_cookie("https://example.com/", "sid=stored")
+        captured = {}
+
+        class Response:
+            status = 200
+            headers = Message()
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def read(self): return b"ok"
+            def geturl(self): return "https://example.com/"
+
+        class Opener:
+            def open(self, request, timeout=None):
+                captured["cookie"] = request.get_header("Cookie")
+                return Response()
+
+        with patch("app.services.legado_js.build_opener",
+                   lambda *_handlers: Opener()):
+            result = json.loads(runtime._request_json(
+                'https://example.com/,{"__rawJsoupRequest":true}',
+                cookie_enabled=False))
+        self.assertEqual(result["body"], "ok")
+        self.assertIsNone(captured["cookie"])
+
+    def test_legacy_cookie_state_is_normalized_to_cookie_store_domain(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory) / "rule_engine_state.json"
+            state.write_text(json.dumps({"cookies": [{
+                "name": "sid", "value": "old", "domain": "www.example.com",
+                "domainSpecified": False, "domainInitialDot": False,
+                "path": "/private", "pathSpecified": True, "secure": True,
+                "expires": None, "rest": {}}]}), encoding="utf-8")
+            runtime = LegadoJsRuntime(state_dir=directory)
+            self.assertEqual(runtime.export_cookie_header(
+                "http://api.example.com/other"), "sid=old")
+
+    def test_public_suffix_database_matches_okhttp_cookie_domains(self):
+        self.assertEqual(effective_tld_plus_one("www.example.com"), "example.com")
+        self.assertEqual(effective_tld_plus_one("www.biquge.com.cn"),
+                         "biquge.com.cn")
+        self.assertEqual(effective_tld_plus_one("a.blogspot.com"),
+                         "a.blogspot.com")
+        self.assertEqual(effective_tld_plus_one("x.city.kawasaki.jp"),
+                         "city.kawasaki.jp")
+        self.assertEqual(effective_tld_plus_one("a.b.ck"), "a.b.ck")
+        self.assertEqual(effective_tld_plus_one("x.www.ck"), "www.ck")
+        self.assertEqual(effective_tld_plus_one("127.0.0.1"), "127.0.0.1")
+
+    def test_cookie_store_shares_effective_domain_and_discards_path_secure(self):
+        runtime = LegadoJsRuntime()
+        runtime.set_cookie("https://www.example.com/private",
+                           "sid=value; Path=/private; Secure")
+        self.assertEqual(runtime.export_cookie_header(
+            "http://api.example.com/other"), "sid=value")
 
     def test_cookie_map_and_memory_cache_aliases(self):
         runtime = LegadoJsRuntime()
@@ -1363,14 +2279,15 @@ class RuleParserTests(unittest.TestCase):
         source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
         value = runtime.evaluate(
             '''@js:
-            var bytes=java.getByteArray("https://source/data");
-            var stream=java.getInputStream("https://source/data");
+            var bytes=java.getByteArray();
+            var stream=java.getInputStream();
             var first=stream.read(),remaining=stream.readAllBytes(),after=stream.available();
             stream.reset();var buffer=[0,0,0,0],count=stream.read(buffer,1,2);
             stream.mark(10);var marked=stream.read();stream.reset();var replay=stream.read();
             var eof=false;try{stream.skipNBytes(2)}catch(e){eof=e instanceof Packages.java.io.EOFException}
             [bytes,3,first,remaining,after,count,buffer,marked,replay,eof];
-            ''', JsContext(source=source))
+            ''', JsContext(source=source, host_kind="url",
+                           base_url="https://source/data"))
         self.assertEqual(value, [
             [65, 66, 67], 3, 65, [66, 67], 0, 2, [0, 65, 66, 0],
             67, 67, True])
@@ -1387,7 +2304,7 @@ class RuleParserTests(unittest.TestCase):
         value = runtime.evaluate(
             '''@js:
             source.setVariable("saved");
-            source.putLoginInfo({user:"u"});
+            source.putLoginInfo('{"user":"u"}');
             var response=java.startBrowserAwait("https://verify","验证");
             var values=["a","b"];
             [response.body(),response.url(),source.getVariable(),
@@ -1397,6 +2314,55 @@ class RuleParserTests(unittest.TestCase):
         )
         self.assertEqual(value, ["<p>验证</p>", "https://verify?done=1", "saved",
                                  "u", "1", 2, "b", "ab"])
+
+    def test_base_source_string_parameters_and_gson_string_map_values(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.example",
+            "header": '{"number":7,"flag":true,"nested":{"x":1}}',
+        })
+        value = runtime.evaluate('''@js:
+            source.putLoginInfo({user:'u'});
+            var invalid=source.getLoginInfoMap();
+            var objectText=""+source.getLoginInfo();
+            source.putLoginInfo('{"number":7,"flag":true,"nested":{"x":1}}');
+            var info=source.getLoginInfoMap(),header=source.getHeaderMap();
+            [objectText,invalid,info.number,info.flag,info.nested,
+             header.number,header.flag,header.nested];
+        ''', JsContext(source=source))
+        self.assertEqual(value, ["[object Object]", None,
+                                 "7", "true", '{"x":1}',
+                                 "7", "true", '{"x":1}'])
+
+    def test_login_info_is_aes_encrypted_at_rest_and_restored(self):
+        with TemporaryDirectory() as directory:
+            source = SimpleNamespace(to_dict=lambda: {
+                "bookSourceUrl": "https://source.example"})
+            runtime = LegadoJsRuntime(state_dir=directory)
+            runtime.evaluate(
+                '@js:source.putLoginInfo("{\\"account\\":\\"alice\\"}")',
+                JsContext(source=source))
+            raw_state = (Path(directory) / "rule_engine_state.json").read_text(
+                encoding="utf-8")
+            self.assertNotIn("alice", raw_state)
+            restored = LegadoJsRuntime(state_dir=directory).evaluate(
+                "@js:source.getLoginInfo()", JsContext(source=source))
+        self.assertEqual(restored, '{"account":"alice"}')
+
+    def test_login_info_invalid_ciphertext_returns_null_like_fixed_source(self):
+        with TemporaryDirectory() as directory:
+            source = SimpleNamespace(to_dict=lambda: {
+                "bookSourceUrl": "https://source.example"})
+            runtime = LegadoJsRuntime(state_dir=directory)
+            runtime.evaluate('@js:source.putLoginInfo("secret")',
+                             JsContext(source=source))
+            state_path = Path(directory) / "rule_engine_state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["sources"]["https://source.example"]["source:loginInfo"] = "plaintext"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            value = LegadoJsRuntime(state_dir=directory).evaluate(
+                "@js:source.getLoginInfo()", JsContext(source=source))
+        self.assertIsNone(value)
 
     def test_start_browser_is_non_blocking_for_media_content_rules(self):
         runtime = LegadoJsRuntime()
@@ -1440,12 +2406,15 @@ class RuleParserTests(unittest.TestCase):
             if options.get("overrideUrlRegex"):
                 return {"body": "https://host/final/42",
                         "overrideUrl": "https://host/final/42", "url": url}
-            return {"body": "rendered", "url": url}
+            return {"body": "rendered", "url": url,
+                    **({"cookie": "web=stored"} if len(calls) == 1 else {})}
 
         runtime.browser_fetcher = fetch
-        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.example",
+            "header": '{"X-Source":"yes"}'})
         value = runtime.evaluate(
-            '''@js:[
+            '''@js:source.putLoginHeader('{"X-Login":"token"}');[
               java.webView('<p>seed</p>','https://host/base','document.body.innerText'),
               java.webViewGetSource(null,'https://host/page',null,'src="([^"]+)"'),
               java.webViewGetOverrideUrl('', 'https://host/start', '', 'https://host/final/[0-9]+')
@@ -1455,6 +2424,12 @@ class RuleParserTests(unittest.TestCase):
         self.assertEqual(calls[0][2]["javaScript"], "document.body.innerText")
         self.assertEqual(calls[1][2]["sourceRegex"], 'src="([^"]+)"')
         self.assertEqual(calls[2][2]["overrideUrlRegex"], "https://host/final/[0-9]+")
+        self.assertEqual(calls[0][2]["cookieTag"], "https://source.example")
+        self.assertEqual(calls[0][2]["headerMap"]["X-Source"], "yes")
+        self.assertEqual(calls[0][2]["headerMap"]["X-Login"], "token")
+        self.assertIn("User-Agent", calls[0][2]["headerMap"])
+        self.assertEqual(runtime.export_cookie_header("https://source.example/"),
+                         "web=stored")
 
     def test_ajax_and_connect_return_error_stack_like_js_extensions(self):
         runtime = LegadoJsRuntime()
@@ -1477,6 +2452,9 @@ class RuleParserTests(unittest.TestCase):
         chapter = ChapterItem("locked", "https://source/1", is_vip=True)
         self.assertTrue(runtime.evaluate(
             "@js:chapter.isVip()", JsContext(source=source, chapter=chapter)))
+        paid = ChapterItem("paid", "https://source/2", is_pay=True)
+        self.assertFalse(runtime.evaluate(
+            "@js:chapter.isVip()", JsContext(source=source, chapter=paid)))
 
     def test_source_empty_dataclass_fields_are_visible_to_javascript(self):
         runtime = LegadoJsRuntime()
@@ -1485,7 +2463,7 @@ class RuleParserTests(unittest.TestCase):
             runtime.evaluate(
                 "@js:[source.bookSourceComment,source.bookSourceGroup]",
                 JsContext(source=source)),
-            ["", ""],
+            [None, None],
         )
 
     def test_source_state_device_id_and_file_cache_persist(self):
@@ -1610,7 +2588,9 @@ class RuleParserTests(unittest.TestCase):
         )
         self.assertEqual(value[:4], ["YQ==\n", "YQ", "a", None])
         self.assertEqual(value[4], datetime.fromtimestamp(0).strftime("%Y/%m/%d %H:%M"))
-        self.assertEqual(value[5], "汉".encode("gb18030").decode("utf-8", errors="replace"))
+        self.assertEqual(value[5], "汉".encode("gbk").decode("utf-8", errors="replace"))
+        self.assertEqual(runtime.evaluate(
+            "@js:java.utf8ToGbk('𠀀')", JsContext(source=source)), "?")
 
     def test_js_extensions_ajax_list_concurrency_and_connect_header_overload(self):
         runtime = LegadoJsRuntime()
@@ -1620,7 +2600,7 @@ class RuleParserTests(unittest.TestCase):
         maximum_active = 0
         lock = threading.Lock()
 
-        def request(value, _headers=None, _base=None):
+        def request(value, _headers=None, _base=None, *_context):
             nonlocal active, maximum_active
             calls.append(value)
             with lock:
@@ -1636,13 +2616,49 @@ class RuleParserTests(unittest.TestCase):
         value = runtime.evaluate(
             "@js:var all=java.ajaxAll(['u1','u2','u3']);"
             "var one=java.ajax(['first','ignored']);"
+            "var empty=java.ajax([]);"
             "var response=java.connect('target','{\\\"X-Test\\\":\\\"yes\\\"}');"
-            "[all.map(x=>x.body()),one,response.body()]",
+            "var objectHeader=java.connect('object',{X:'ignored'});"
+            "function npe(call){try{call();return false}catch(e){return "
+            "e.javaException instanceof Packages.java.lang.NullPointerException}}"
+            "[all.map(x=>x.body()),one,empty,response.body(),objectHeader.body(),"
+            "npe(()=>java.ajax(null)),npe(()=>java.ajaxAll(null)),"
+            "npe(()=>java.connect(null)),"
+            "(()=>{try{java.connect();return false}catch(e){return e instanceof TypeError}})()]",
             JsContext(source=source),
         )
-        self.assertEqual(value, [["u1", "u2", "u3"], "first", "target"])
+        self.assertEqual(value, [["u1", "u2", "u3"], "first", "null", "target",
+                                 "object", True, True, True, True])
         self.assertEqual(maximum_active, 3)
         self.assertTrue(any('"X-Test":"yes"' in call for call in calls))
+        self.assertFalse(any('"X":"ignored"' in call for call in calls))
+
+    def test_java_get_overload_uses_arity_without_absolute_url_heuristic(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        calls = []
+
+        def request(value, *_args):
+            calls.append(value)
+            return json.dumps({"body": "network", "headers": {}, "status": 200,
+                               "url": str(value).split(",", 1)[0]})
+
+        runtime._request_json = request
+        value = runtime.evaluate('''@js:
+            java.put('https://host/path','stored');
+            var local=java.get('https://host/path');
+            var remote=java.get('https://host/path',{}).body();
+            var objectText=java.put('object',{x:1});
+            function npe(call){try{call();return false}catch(e){return e.javaException
+              instanceof Packages.java.lang.NullPointerException}}
+            [local,remote,objectText,java.get('object'),
+             npe(()=>java.get('x',null)),npe(()=>java.post('x','b',null)),
+             npe(()=>java.head('x',null)),
+             (()=>{try{java.post('x','b');return false}catch(e){return e instanceof TypeError}})()];
+        ''', JsContext(source=source))
+        self.assertEqual(value, ["stored", "network", "[object Object]",
+                                 "[object Object]", True, True, True, True])
+        self.assertEqual(len(calls), 1)
 
     def test_inherited_js_encode_utils_digest_and_symmetric_helpers(self):
         runtime = LegadoJsRuntime()
@@ -2079,7 +3095,7 @@ class RuleParserTests(unittest.TestCase):
             "bookSourceUrl": "https://source"})
         value = runtime.evaluate(
             '@js:let page=java.get("stored")||page;page+1',
-            JsContext(source=source, page=4, variables={}))
+            JsContext(source=source, host_kind="url", page=4, variables={}))
         self.assertEqual(value, 5)
 
     def test_shadowed_source_global_is_not_written_back_as_model_state(self):
@@ -2218,6 +3234,407 @@ class RuleParserTests(unittest.TestCase):
         self.assertEqual(bytes(item & 255 for item in value[2]), "\u9605\u8bfb".encode("gb18030"))
         self.assertIsNone(value[3])
 
+    def test_network_archive_content_inherits_analyze_url_source_context(self):
+        output = BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("book.txt", "network")
+        runtime = LegadoJsRuntime()
+        captured = []
+
+        def request(value, headers=None, base_url=None, cookie_enabled=True,
+                    cookie_tag=None, allow_webview=True):
+            captured.append((value, headers, base_url, cookie_enabled, cookie_tag,
+                             allow_webview))
+            return json.dumps({
+                "body": "", "bodyBytes": list(output.getvalue()),
+                "headers": {}, "status": 200, "url": value,
+            })
+
+        runtime._request_json = request
+        source = SimpleNamespace(
+            bookSourceUrl="https://source.test/root/", enabledCookieJar=False,
+            header='@js:JSON.stringify({"X-Dynamic":source.get("token"),'
+                   '"proxy":"http://proxy.test:8080"})',
+        )
+        request_url = ('https://files.test/book.zip,'
+                       '{"headers":{"X-Option":"yes"},"retry":"2",'
+                       '"webView":true}')
+        value = runtime.evaluate(
+            '@js:source.put("token","yes");'
+            'source.putLoginHeader(\'{"X-Login":"ok"}\');'
+            f'java.getZipStringContent({json.dumps(request_url)},"book.txt","utf-8")',
+            JsContext(source=source))
+        self.assertEqual(value, "network")
+        self.assertEqual(captured, [(
+            request_url,
+            {"X-Dynamic": "yes", "proxy": "http://proxy.test:8080",
+             "User-Agent": runtime.default_headers["User-Agent"], "X-Login": "ok"},
+            "https://source.test/root/", False, "https://source.test/root/", False,
+        )])
+
+    def test_network_archive_non_2xx_keeps_body_and_cookie_jar_semantics(self):
+        output = BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("book.txt", "forbidden-body")
+
+        class Response:
+            status = 403
+            reason = "Forbidden"
+            version = 11
+
+            def __init__(self):
+                self.headers = Message()
+                self.headers["Content-Type"] = "application/zip"
+                self.headers["Set-Cookie"] = "session_key=memory; Path=/private"
+                self.headers["Set-Cookie"] = (
+                    "persistent_key=disk; Max-Age=3600; Path=/private; Secure")
+
+            def read(self):
+                return output.getvalue()
+
+            def geturl(self):
+                return "https://files.example.com/private/book.zip"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            runtime._open_with_retry = lambda *_args: Response()
+            enabled = SimpleNamespace(
+                bookSourceUrl="https://source.example.com/",
+                enabledCookieJar=True, header="")
+            value = runtime.evaluate(
+                '@js:java.getZipStringContent('
+                '"https://files.example.com/private/book.zip","book.txt","utf-8")',
+                JsContext(source=enabled))
+            self.assertEqual(value, "forbidden-body")
+            self.assertEqual(runtime.export_cookie_header(
+                "http://api.example.com/other"),
+                "session_key=memory; persistent_key=disk")
+            restored = LegadoJsRuntime(state_dir=directory)
+            self.assertEqual(restored.export_cookie_header(
+                "http://api.example.com/other"), "persistent_key=disk")
+
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            runtime._open_with_retry = lambda *_args: Response()
+            disabled = SimpleNamespace(
+                bookSourceUrl="https://source.example.com/",
+                enabledCookieJar=False, header="")
+            value = runtime.evaluate(
+                '@js:java.getZipStringContent('
+                '"https://files.example.com/private/book.zip","book.txt","utf-8")',
+                JsContext(source=disabled))
+            self.assertEqual(value, "forbidden-body")
+            self.assertEqual(runtime.export_cookie_header(
+                "https://api.example.com/other"), "")
+
+    def test_network_archive_transport_exception_is_not_converted_to_empty_content(self):
+        runtime = LegadoJsRuntime()
+        runtime._open_with_retry = lambda *_args: (_ for _ in ()).throw(
+            URLError("archive transport failed"))
+        source = SimpleNamespace(
+            bookSourceUrl="https://source.example.com/",
+            enabledCookieJar=True, header="")
+        with self.assertRaisesRegex(Exception, "archive transport failed"):
+            runtime.evaluate(
+                '@js:java.getZipByteArrayContent('
+                '"https://files.example.com/book.zip","book.txt")',
+                JsContext(source=source))
+
+    def test_network_archive_http_error_branch_saves_response_cookie(self):
+        output = BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("book.txt", "error-body")
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+
+            def fail(*_args):
+                headers = Message()
+                headers["Content-Type"] = "application/zip"
+                headers["Set-Cookie"] = "challenge=accepted; Max-Age=3600"
+                raise HTTPError(
+                    "https://files.example.com/book.zip", 429,
+                    "Too Many Requests", headers, BytesIO(output.getvalue()))
+
+            runtime._open_with_retry = fail
+            source = SimpleNamespace(
+                bookSourceUrl="https://source.example.com/",
+                enabledCookieJar=True, header="")
+            value = runtime.evaluate(
+                '@js:java.getZipStringContent('
+                '"https://files.example.com/book.zip","book.txt","utf-8")',
+                JsContext(source=source))
+            self.assertEqual(value, "error-body")
+            self.assertEqual(runtime.export_cookie_header(
+                "https://api.example.com/"), "challenge=accepted")
+
+    def test_js_extensions_webview_nullable_arguments_and_public_overloads(self):
+        runtime = LegadoJsRuntime()
+        calls = []
+
+        def browser(url, title, options):
+            calls.append((url, title, options))
+            return {"body": "html-result", "source": "source-result",
+                    "overrideUrl": "https://override.test/"}
+
+        runtime.browser_fetcher = browser
+        source = SimpleNamespace(
+            bookSourceUrl="https://source.test/base", header="")
+        value = runtime.evaluate('''@js:
+            function npe(call){try{call();return false}catch(e){return e.javaException
+              instanceof Packages.java.lang.NullPointerException}}
+            function type(call){try{call();return false}catch(e){return e instanceof TypeError}}
+            [java.webView("<p>x</p>",null,null),
+             java.webViewGetSource(null,"https://page.test",null,".*\\.js"),
+             java.webViewGetOverrideUrl(null,"https://page.test",null,"https://.*"),
+             npe(()=>java.webViewGetSource(null,null,null,null)),
+             npe(()=>java.webViewGetOverrideUrl(null,null,null,null)),
+             type(()=>java.webView(null,null)),
+             type(()=>java.webViewGetSource(null,null,null)),
+             type(()=>java.webViewGetOverrideUrl(null,null,null,null,"extra"))];''',
+            JsContext(source=source, base_url="https://source.test/base"))
+        self.assertEqual(value, [
+            "html-result", "source-result", "https://override.test/",
+            True, True, True, True, True,
+        ])
+        first = calls[0][2]
+        self.assertEqual(first["html"], "<p>x</p>")
+        self.assertIsNone(first["url"])
+        self.assertIsNone(first["javaScript"])
+
+    def test_fixed_js_extensions_public_methods_are_all_registered(self):
+        source = Path(
+            "base_history/legado-3.23.110211/app/src/main/java/"
+            "io/legado/app/help/JsExtensions.kt").read_text(encoding="utf-8")
+        fixed = set(re.findall(
+            r"(?m)^    (?:(?:override|suspend)\s+)*fun\s+([A-Za-z0-9_]+)\s*\(",
+            source))
+        self.assertEqual(fixed - SUPPORTED_JAVA_APIS, set())
+
+    def test_fixed_analyze_hosts_public_sync_methods_are_all_registered(self):
+        root = Path(
+            "base_history/legado-3.23.110211/app/src/main/java/"
+            "io/legado/app/model/analyzeRule")
+        fixed = set()
+        for filename in ("AnalyzeRule.kt", "AnalyzeUrl.kt"):
+            source = (root / filename).read_text(encoding="utf-8")
+            fixed.update(re.findall(
+                r"(?m)^    (?:override\s+)?fun\s+([A-Za-z0-9_]+)\s*\(",
+                source))
+        self.assertEqual(fixed - SUPPORTED_JAVA_APIS, set())
+
+    def test_fixed_source_entity_public_methods_are_all_registered(self):
+        root = Path(
+            "base_history/legado-3.23.110211/app/src/main/java/"
+            "io/legado/app/data/entities")
+        fixed = set()
+        for filename in ("BaseSource.kt", "BookSource.kt"):
+            source = (root / filename).read_text(encoding="utf-8")
+            fixed.update(re.findall(
+                r"(?m)^    (?:override\s+)?fun\s+([A-Za-z0-9_]+)\s*\(",
+                source))
+        self.assertEqual(fixed - SUPPORTED_OBJECT_APIS["source"], set())
+
+    def test_analyze_rule_set_redirect_url_state_and_host_isolation(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.test/"})
+        value = runtime.evaluate('''@js:
+            function npe(call){try{call();return false}catch(e){return e.javaException
+              instanceof Packages.java.lang.NullPointerException}}
+            function type(call){try{call();return false}catch(e){return e instanceof TypeError}}
+            var first=java.setRedirectUrl("https://target.test/a?q=1");
+            var invalid=java.setRedirectUrl("not a url");
+            [String(first),first.getHost(),first.getPath(),invalid===first,
+             java.redirectUrl===first,npe(()=>java.setRedirectUrl(null)),
+             type(()=>java.setRedirectUrl())];''', JsContext(source=source))
+        self.assertEqual(value, [
+            "https://target.test/a?q=1", "target.test", "/a", True,
+            True, True, True,
+        ])
+        self.assertEqual(runtime.evaluate(
+            '@js:[typeof java.setRedirectUrl,java.redirectUrl]',
+            JsContext(source=source, host_kind="url",
+                      base_url="https://source.test/path")),
+            ["undefined", "https://source.test/path"])
+
+    def test_analyze_rule_set_content_and_base_url_return_this(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.test/"})
+        value = runtime.evaluate('''@js:
+            function type(call){try{call();return false}catch(e){return e instanceof TypeError}}
+            function fails(call){try{call();return false}catch(e){return /Content cannot be null/.test(String(e))}}
+            var contentReturn=java.setContent("<p>A</p>","https://one.test/");
+            var first=[contentReturn===java,java.baseUrl,java.getString("p@text")];
+            var nullReturn=java.setBaseUrl(null),afterNull=java.baseUrl;
+            var baseReturn=java.setBaseUrl("https://two.test/");
+            first.concat([nullReturn===java,afterNull,baseReturn===java,java.baseUrl,
+              fails(()=>java.setContent(null)),type(()=>java.setContent()),
+              type(()=>java.setContent("x",null,"extra")),type(()=>java.setBaseUrl())]);''',
+            JsContext(source=source))
+        self.assertEqual(value, [
+            True, "https://one.test/", "A", True, "https://one.test/",
+            True, "https://two.test/", True, True, True, True,
+        ])
+
+    def test_analyze_rule_split_source_rule_cache_and_eval_js(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.test/"})
+        value = runtime.evaluate('''@js:
+            function type(call){try{call();return false}catch(e){return e instanceof TypeError}}
+            function npe(call){try{call();return false}catch(e){return e.javaException
+              instanceof Packages.java.lang.NullPointerException}}
+            var first=java.splitSourceRuleCacheString("@Json:$.a<js>result</js>");
+            var cached=java.splitSourceRuleCacheString("@Json:$.a<js>result</js>");
+            var regex=java.splitSourceRule(":a+",true);
+            var inherited=java.splitSourceRule("b+");
+            [first.length,first[0].mode,first[0].rule,first[1].mode,
+             cached===first,regex[0].mode,inherited[0].mode,
+             java.evalJS("result+1",4),java.evalJS("baseUrl"),
+             java.splitSourceRuleCacheString(null).length,
+             type(()=>java.splitSourceRule()),type(()=>java.splitSourceRule("x",false,1)),
+             npe(()=>java.evalJS(null)),type(()=>java.evalJS())];''',
+            JsContext(source=source, result='{"a":1}',
+                      base_url="https://source.test/base"))
+        self.assertEqual(value, [
+            2, "json", "$.a", "js", True, "regex", "regex",
+            5, "https://source.test/base", 0, True, True, True, True,
+        ])
+
+    def test_analyze_url_user_agent_is_post_and_eval_js(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.test/", "header": ""})
+        value = runtime.evaluate('''@js:
+            function type(call){try{call();return false}catch(e){return e instanceof TypeError}}
+            [java.getUserAgent(),java.isPost(),java.evalJS("result.x",{x:7}),
+             typeof java.splitSourceRule,type(()=>java.getUserAgent(1)),
+             type(()=>java.isPost(1))];''', JsContext(
+                 source=source, host_kind="url",
+                 base_url='https://api.test/path,{"method":"post"}',
+                 request_headers={"User-Agent": "option-agent"}))
+        self.assertEqual(value, [
+            "option-agent", True, 7, "undefined", True, True,
+        ])
+
+    def test_analyze_url_init_url_replays_initial_public_state_and_returns_unit(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.test/"})
+        value = runtime.evaluate('''@js:
+            function type(call){try{call();return false}catch(e){return e instanceof TypeError}}
+            java.ruleUrl="changed";java.url="changed";baseUrl="changed-base";
+            [String(java.initUrl()),java.ruleUrl,java.url,type(()=>java.initUrl(1))];''',
+            JsContext(source=source, host_kind="url",
+                      base_url="https://source.test/original"))
+        self.assertEqual(value, [
+            "undefined", "https://source.test/original",
+            "https://source.test/original", True,
+        ])
+
+    def test_analyze_url_nullable_source_disables_cookie_jar_and_binds_null(self):
+        runtime = LegadoJsRuntime()
+        calls = []
+        runtime._request_json = lambda *args: (
+            calls.append(args) or json.dumps({
+                "body": "ok", "bodyBytes": [], "headers": {},
+                "status": 200, "url": str(args[0])}))
+        value = runtime.evaluate(
+            '@js:[source===null,java.getStrResponse().body()]',
+            JsContext(source=None, host_kind="url",
+                      base_url="https://source.test/data"))
+        self.assertEqual(value, [True, "ok"])
+        self.assertIs(calls[0][3], False)
+        self.assertEqual(calls[0][4], "")
+
+    def test_analyze_rule_refresh_methods_delegate_and_return_unit(self):
+        runtime = LegadoJsRuntime()
+        calls = []
+        runtime.reget_book_handler = lambda source, book: (
+            calls.append(("reget", source, book)), setattr(book, "url", "new-url"))
+        runtime.refresh_book_handler = lambda source, book: (
+            calls.append(("refresh", source, book)), setattr(book, "toc_url", "new-toc"))
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.test/"})
+        book = BookItem(name="Book", url="old-url")
+        value = runtime.evaluate('''@js:
+            function type(call){try{call();return false}catch(e){return e instanceof TypeError}}
+            [String(java.reGetBook()),book.bookUrl,String(java.refreshBook()),
+             book.tocUrl,String(java.refreshTocUrl()),book.tocUrl,
+             type(()=>java.reGetBook(1)),type(()=>java.refreshBook(1)),
+             type(()=>java.refreshTocUrl(1))];''',
+            JsContext(source=source, book=book))
+        self.assertEqual(value, [
+            "undefined", "new-url", "undefined", "new-toc",
+            "undefined", "new-toc", True, True, True,
+        ])
+        self.assertEqual([item[0] for item in calls], ["reget", "refresh", "refresh"])
+        self.assertEqual(runtime.evaluate(
+            '@js:[typeof java.reGetBook,typeof java.refreshBook,typeof java.refreshTocUrl]',
+            JsContext(source=source, book=book, host_kind="url")),
+            ["undefined", "undefined", "undefined"])
+
+    def test_reading_engine_refresh_handlers_follow_precise_search_side_effects(self):
+        async def create_engine():
+            return LegadoReadingEngine()
+
+        engine = asyncio.run(create_engine())
+        source = SimpleNamespace(bookSourceUrl="https://source.test/")
+        book = BookItem(name="Book", author="Author", url="old",
+                        variables={"kept": "yes"})
+        detail_calls = []
+
+        async def search(_source, _name, _page):
+            return [
+                BookItem(name="Book", author="Wrong", url="wrong"),
+                BookItem(name="Book", author="Author", url="new",
+                         variables={"token": "fresh"}),
+            ]
+
+        async def book_info(_source, target):
+            detail_calls.append(target.url)
+            target.toc_url = target.url + "/toc"
+            return target
+
+        engine.search = search
+        engine.book_info = book_info
+        engine._js_reget_book(source, book)
+        self.assertEqual((book.url, book.toc_url, book.variables), (
+            "new", "new/toc", {"kept": "yes", "token": "fresh"}))
+        engine._js_refresh_book(source, book)
+        self.assertEqual(detail_calls, ["new", "new"])
+
+        book.author = "Missing"
+        with self.assertRaisesRegex(RuntimeError, "未搜索到"):
+            engine._js_reget_book(source, book)
+
+    def test_analyze_url_get_glide_url_merges_cookie_and_marker(self):
+        runtime = LegadoJsRuntime()
+        runtime.store_set_cookie("https://img.example.com/", "saved=1; same=old")
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.test/", "header": "",
+            "enabledCookieJar": True})
+        value = runtime.evaluate('''@js:
+            function type(call){try{call();return false}catch(e){return e instanceof TypeError}}
+            var glide=java.getGlideUrl(),headers=glide.getHeaders();
+            [String(glide),glide.getCacheKey(),headers.Cookie,headers.CookieJar,
+             type(()=>java.getGlideUrl(1))];''', JsContext(
+                 source=source, host_kind="url",
+                 base_url="https://img.example.com/cover.jpg",
+                 request_headers={"Cookie": "same=new; temporary=2"}))
+        self.assertEqual(value, [
+            "https://img.example.com/cover.jpg",
+            "https://img.example.com/cover.jpg",
+            "saved=1; same=new; temporary=2", "1", True,
+        ])
+
     def test_js_extensions_download_and_external_cache_file_operations(self):
         with TemporaryDirectory() as directory:
             runtime = LegadoJsRuntime(state_dir=directory)
@@ -2237,6 +3654,82 @@ class RuleParserTests(unittest.TestCase):
             self.assertEqual(value[1][1:3], [True, "\u9605\u8bfb"])
             self.assertEqual(bytes(item & 255 for item in value[1][3]), "\u9605\u8bfb".encode())
             self.assertEqual(value[2:], [True, False])
+
+    def test_js_extensions_file_and_archive_signatures_match_kotlin(self):
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            source = SimpleNamespace(to_dict=lambda: {
+                "bookSourceUrl": "https://source"})
+            value = runtime.evaluate('''@js:
+                function npe(call){try{call();return false}catch(e){return e.javaException
+                  instanceof Packages.java.lang.NullPointerException}}
+                function type(call){try{call();return false}catch(e){return e instanceof TypeError}}
+                [java.readFile("missing"),java.readTxtFile("missing"),
+                 java.deleteFile("missing"),java.unArchiveFile(""),
+                 npe(()=>java.getFile(null)),npe(()=>java.readFile(null)),
+                 npe(()=>java.readTxtFile("x",null)),npe(()=>java.deleteFile(null)),
+                 npe(()=>java.unzipFile(null)),npe(()=>java.getTxtInFolder(null)),
+                 npe(()=>java.getZipByteArrayContent(null,"x")),
+                 npe(()=>java.getZipStringContent("00","x",null)),
+                 type(()=>java.getFile()),type(()=>java.readTxtFile()),
+                 type(()=>java.readTxtFile("x","utf-8","extra")),
+                 type(()=>java.unArchiveFile()),
+                 type(()=>java.getZipByteArrayContent("00")),
+                 type(()=>java.getZipStringContent("00"))];''',
+                JsContext(source=source))
+        self.assertEqual(value, [
+            None, "", False, "", True, True, True, True, True, True,
+            True, True, True, True, True, True, True, True,
+        ])
+
+    def test_download_file_single_url_uses_source_analyze_url_headers_and_cookie_flag(self):
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            captured = []
+
+            def request(value, headers=None, base_url=None, cookie_enabled=True):
+                captured.append((value, headers, base_url, cookie_enabled))
+                return json.dumps({"body": "file", "bodyBytes": [102, 105, 108, 101],
+                                   "headers": {}, "status": 200, "url": value})
+
+            runtime._request_json = request
+            source = SimpleNamespace(
+                bookSourceUrl="https://source", enabledCookieJar=False,
+                header='{"X-Source":"yes"}',
+            )
+            path = runtime.evaluate(
+                "@js:java.downloadFile('https://host/file.txt')",
+                JsContext(source=source))
+            self.assertEqual(runtime.evaluate(
+                f"@js:java.readTxtFile({json.dumps(path)})",
+                JsContext(source=source)), "file")
+        self.assertEqual(captured[0][0], "https://host/file.txt")
+        self.assertEqual(captured[0][1]["X-Source"], "yes")
+        self.assertEqual(captured[0][2], "https://source")
+        self.assertFalse(captured[0][3])
+        self.assertTrue(LegadoJsRuntime._download_name(
+            "https://host/file.txt#fragment").endswith(".ext"))
+
+    def test_cache_file_records_relative_path_in_cache_manager(self):
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            calls = []
+            runtime._request_json = lambda value, *_args: (
+                calls.append(value) or json.dumps({
+                    "body": "cached", "bodyBytes": list(b"cached"),
+                    "headers": {}, "status": 200, "url": value}))
+            source = SimpleNamespace(bookSourceUrl="https://source", header="",
+                                     enabledCookieJar=True)
+            value = runtime.evaluate('''@js:
+                var url='https://host/library.js';
+                var first=java.cacheFile(url,60),second=java.cacheFile(url,60);
+                var imported=java.importScript('https://host/other.js');
+                [first,second,cache.get(java.md5Encode16(url)),imported];
+            ''', JsContext(source=source))
+        self.assertEqual(value[:2], ["cached", "cached"])
+        self.assertRegex(value[2], r"^/[0-9a-f]{16}\.js$")
+        self.assertEqual(value[3], "cached")
+        self.assertEqual(calls, ["https://host/library.js", "https://host/other.js"])
 
     def test_import_script_uri_provider_and_blank_content_failure(self):
         runtime = LegadoJsRuntime()
@@ -2265,8 +3758,47 @@ class RuleParserTests(unittest.TestCase):
                 JsContext(source=source),
             )
             self.assertRegex(value[0], r"^ArchiveTemp\\[0-9a-f]{16}$")
-            self.assertEqual(value[1], "A\nB")
+            # EncodingDetect.getEncode(File) probes an 8,000-byte zero-padded
+            # buffer.  For these one-byte files fixed ICU selects UTF-32LE and
+            # Java String decoding yields the replacement character.
+            self.assertEqual(value[1], "�\n�")
             self.assertFalse(value[2])
+
+    def test_unarchive_initializes_temp_once_and_reuses_same_archive_folder(self):
+        first, second = BytesIO(), BytesIO()
+        with zipfile.ZipFile(first, "w") as archive:
+            archive.writestr("kept.txt", "old")
+            archive.writestr("changed.txt", "first")
+        with zipfile.ZipFile(second, "w") as archive:
+            archive.writestr("changed.txt", "second")
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            stale = runtime._file_path("ArchiveTemp/stale.txt")
+            stale.parent.mkdir(parents=True, exist_ok=True)
+            stale.write_text("remove-on-first-use", encoding="utf-8")
+            archive_path = runtime._file_path("same.zip")
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            archive_path.write_bytes(first.getvalue())
+            folder = runtime._unarchive_file("same.zip")
+            self.assertFalse(stale.exists())
+            archive_path.write_bytes(second.getvalue())
+            self.assertEqual(runtime._unarchive_file("same.zip"), folder)
+            target = runtime._file_path(folder)
+            self.assertEqual((target / "kept.txt").read_text(), "old")
+            self.assertEqual((target / "changed.txt").read_text(), "second")
+
+    def test_get_txt_in_folder_consumes_existing_non_directory(self):
+        with TemporaryDirectory() as directory:
+            runtime = LegadoJsRuntime(state_dir=directory)
+            target = runtime._file_path("single.txt")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("content", encoding="utf-8")
+            source = SimpleNamespace(to_dict=lambda: {
+                "bookSourceUrl": "https://source"})
+            value = runtime.evaluate(
+                '@js:[java.getTxtInFolder("single.txt"),java.getFile("single.txt").exists()]',
+                JsContext(source=source))
+            self.assertEqual(value, ["", False])
 
     def test_js_extensions_7z_content_and_directory_extraction(self):
         import py7zr
@@ -2318,6 +3850,45 @@ class RuleParserTests(unittest.TestCase):
         )
         self.assertEqual(request["url"], "https://example.com/list/2.html")
         self.assertEqual(request["headers"], {"User-Agent": "custom-agent"})
+
+    def test_url_option_normalization_matches_getters_and_atomic_gson_failure(self):
+        option = normalize_url_option({
+            "method": "put", "retry": "2", "serverID": "7",
+            "headers": {"Null": None, "Flag": True, "Nested": {"x": 1}},
+            "body": {"q": "书"}, "webView": 0,
+        })
+        self.assertEqual(option["method"], "GET")
+        self.assertEqual(option["retry"], 2)
+        self.assertEqual(option["serverID"], 7)
+        self.assertEqual(option["headers"], {
+            "Null": "null", "Flag": "true", "Nested": "{x=1}"})
+        self.assertEqual(option["body"], '{"q":"书"}')
+        self.assertEqual(normalize_url_option({
+            "method": "POST", "retry": "not-an-int", "body": "ignored"}), {})
+        self.assertEqual(ReaderEngine._request_retry_count({"retry": -1}), -1)
+
+    def test_empty_type_is_non_null_and_requests_hex_body(self):
+        async def run():
+            return await ReaderEngine()._request_transport({
+                "url": "data:text/plain;base64,QUI=", "method": "GET", "type": ""})
+        body, content_type, final_url = asyncio.run(run())
+        self.assertEqual((body, content_type, final_url),
+                         ("4142", "text/plain", "data:text/plain;base64,QUI="))
+
+    def test_lenient_gson_option_parser_preserves_quoted_apostrophes(self):
+        self.assertEqual(parse_request_config(
+            '''{method:'post',body:"author=O'Reilly",headers:{X:'yes'},}'''), {
+                "method": "post", "body": "author=O'Reilly",
+                "headers": {"X": "yes"},
+            })
+
+    def test_invalid_url_option_is_ignored_without_discarding_base_url(self):
+        request = parse_search_url(
+            '/search, {"method":"POST","retry":"bad","body":"q=x"}',
+            "https://source.example", "", 1)
+        self.assertEqual(request["url"], "https://source.example/search")
+        self.assertEqual(request["method"], "GET")
+        self.assertIsNone(request["headers"])
 
     def test_text_selector_and_attribute(self):
         label = "\u67e5\u770b\u66f4\u591a\u7ae0\u8282"
@@ -2848,7 +4419,7 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
 
         class Response:
             status, charset, content_type = 200, "utf-8", "text/plain"
-            headers, url = {}, "https://host/page"
+            headers, url = {}, "https://host.example/page"
             async def __aenter__(self): return self
             async def __aexit__(self, *_args): return False
             async def read(self): return b"ok"
@@ -2864,17 +4435,22 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         source = SimpleNamespace(
             bookSourceUrl="https://source", concurrentRate="",
             enabledCookieJar=False,
-            header={"User-Agent": "null", "Cache-Control": "source-value"})
+            header={"User-Agent": "null", "Cache-Control": "source-value",
+                    "Cookie": "sid=temporary; local=1"})
+        engine = ReaderEngine()
+        engine.js.set_cookie("https://host.example/", "sid=stored; shared=1")
         with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
                 patch("app.services.rule_engine.aiohttp.TCPConnector",
                       lambda **_kwargs: object()):
-            await ReaderEngine()._request({"url": "https://host/page"}, source)
+            await engine._request({"url": "https://host.example/page"}, source)
         headers = captured[0]
         self.assertNotIn("User-Agent", headers)
         self.assertEqual(headers.getall("Keep-Alive"), ["300"])
         self.assertEqual(headers.getall("Connection"), ["Keep-Alive"])
         self.assertEqual(headers.getall("Cache-Control"),
                          ["source-value", "no-cache"])
+        self.assertEqual(headers["Cookie"],
+                         "sid=temporary; shared=1; local=1")
 
     async def test_okhttp_transparent_gzip_conditions_and_headers(self):
         payload = b"fixed gzip body"
@@ -2986,7 +4562,7 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         engine = ReaderEngine()
         self.assertEqual(engine._request_retry_count({}), 0)
         self.assertEqual(engine._request_retry_count({"retry": 3}), 3)
-        self.assertEqual(engine._request_retry_count({"retry": -1}), 0)
+        self.assertEqual(engine._request_retry_count({"retry": -1}), -1)
         self.assertEqual(engine._request_retry_count({"retry": "invalid"}), 0)
 
     def test_custom_url_python_port_preserves_attributes_and_serialization(self):
@@ -3103,6 +4679,29 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
                          "返回正文")
         self.assertEqual(ReaderEngine._decode_response_body(gbk, None),
                          '<meta charset="gbk">中文')
+
+        class Response:
+            status = 200
+            headers = Message()
+            headers["Content-Type"] = "text/plain; charset=utf-8"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return utf8
+
+            def geturl(self):
+                return "https://source.example"
+
+        runtime = LegadoJsRuntime()
+        runtime.opener = SimpleNamespace(open=lambda *_args, **_kwargs: Response())
+        response = json.loads(runtime._request_json(
+            'https://source.example,{"charset":"gbk"}'))
+        self.assertEqual(response["body"], utf8.decode("utf-8"))
 
     def test_html_encoding_meta_scan_matches_fixed_encoding_detect(self):
         declared = (b'<meta http-equiv="content-type" '
@@ -3309,13 +4908,17 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
                 return Response()
 
         socks_connector = object()
+        source = SimpleNamespace(
+            bookSourceUrl="https://source", enabledCookieJar=False,
+            header='{"proxy":"socks5://127.0.0.1:1080@user@pass"}',
+        )
         with patch("app.services.rule_engine.ProxyConnector.from_url",
                    return_value=socks_connector) as make_socks, \
                 patch("app.services.rule_engine.aiohttp.ClientSession", Session):
             result = await ReaderEngine()._request({
                 "url": "https://host/page",
-                "proxy": "socks5://127.0.0.1:1080@user@pass",
-            })
+                "proxy": "socks5://ignored.example:1080",
+            }, source)
         self.assertEqual(result[0], "ok")
         make_socks.assert_called_once_with(
             "socks5://user:pass@127.0.0.1:1080", ssl=False)
@@ -3390,6 +4993,12 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(first_jar, engine._cookie_jar_for_source(first))
         self.assertIsNot(first_jar, engine._cookie_jar_for_source(second))
         self.assertIsInstance(engine._cookie_jar_for_source(disabled),
+                              aiohttp.DummyCookieJar)
+        self.assertIsInstance(engine._cookie_jar_for_source(None),
+                              aiohttp.DummyCookieJar)
+        nullable = SimpleNamespace(bookSourceUrl="https://nullable",
+                                   enabledCookieJar=None)
+        self.assertIsInstance(engine._cookie_jar_for_source(nullable),
                               aiohttp.DummyCookieJar)
 
     async def test_source_cookie_jar_persists_between_engine_instances(self):
@@ -3484,8 +5093,22 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         source = SimpleNamespace(**source_data, to_dict=lambda: source_data)
         headers = await engine._resolved_source_headers(
             source, "https://source.example/chapter/1")
-        self.assertEqual(headers, {
-            "Referer": "https://source.example/chapter/1", "X-Token": "dynamic"})
+        self.assertEqual(headers["Referer"], "https://source.example")
+        self.assertEqual(headers["X-Token"], "dynamic")
+        self.assertIn("User-Agent", headers)
+
+    async def test_request_source_headers_overlay_cached_login_header(self):
+        engine = ReaderEngine()
+        source = SimpleNamespace(
+            bookSourceUrl="https://source.example", header='{"A":"source"}',
+            enabledCookieJar=True,
+        )
+        engine.js.evaluate(
+            '@js:source.putLoginHeader(\'{"A":"login","Authorization":"token"}\')',
+            JsContext(source=source, variables=engine.js_variables))
+        headers = await engine._resolved_source_headers(source)
+        self.assertEqual(headers["A"], "login")
+        self.assertEqual(headers["Authorization"], "token")
 
     async def test_book_list_put_variables_are_applied_per_record(self):
         engine = ReaderEngine()
@@ -3716,12 +5339,12 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://x")
         node = {"id": 7}
         self.assertEqual(
-            engine._field_value(node, "https://x/{{$.id}}/{{page+1}}", "json",
+            engine._field_value(node, "https://x/{{$.id}}/{{result.id+1}}", "json",
                                 source, "", page=2),
-            "https://x/7/3",
+            "https://x/7/8",
         )
         self.assertEqual(
-            engine._field_value(node, '{{key;java.put("saved",key)}}', "json",
+            engine._field_value(node, '{{java.put("saved","novel")}}', "json",
                                 source, "", key="novel"),
             "novel",
         )
@@ -4264,7 +5887,9 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
                 "chapterList": "li",
                 "chapterName": "a@text",
                 "chapterUrl": "a@href",
-                "formatJs": 'gInt++;title+"-"+index+"-"+gInt',
+                "formatJs": 'if(typeof java!=="undefined"||typeof source!=="undefined"'
+                            '||typeof book!=="undefined"||typeof result!=="undefined")'
+                            'throw "leaked";gInt++;title+"-"+index+"-"+gInt',
             },
             to_dict=lambda: {"bookSourceUrl": "https://source.example"},
         )
@@ -4654,17 +6279,59 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.js_variables["cid"], "42")
 
     async def test_desktop_browser_response_imports_cookies(self):
+        browser_cookies = iter(("token=verified", ""))
         async def browser(url, source):
-            return {"body": "<main>ok</main>", "url": "https://source.example/final",
+            return {"body": "<main>ok</main>", "url": "https://verify.other/final",
                     "headers": {"content-type": "text/html; charset=utf-8"},
-                    "status": 200, "cookie": "token=verified"}
+                    "status": 200, "cookie": next(browser_cookies)}
 
         engine = LegadoReadingEngine(webview_fetcher=browser)
         source = SimpleNamespace(bookSourceUrl="https://source.example", to_dict=lambda: {})
+        engine.js.set_cookie(source.bookSourceUrl, "old=stale")
         value = await engine._fetch_browser_response("https://source.example/check", source)
-        self.assertEqual(value, ("<main>ok</main>", "text/html", "https://source.example/final"))
-        self.assertIn("token=verified", engine.js.export_cookie_header(
-            "https://source.example/final"))
+        self.assertEqual(value, ("<main>ok</main>", "text/html", "https://verify.other/final"))
+        self.assertEqual(engine.js.export_cookie_header(source.bookSourceUrl),
+                         "token=verified")
+        self.assertEqual(engine.js.export_cookie_header("https://verify.other/final"), "")
+        await engine._fetch_browser_response("https://source.example/check", source)
+        self.assertEqual(engine.js.export_cookie_header(source.bookSourceUrl), "")
+
+    def test_url_option_webview_uses_kotlin_when_not_python_truthiness(self):
+        use = LegadoReadingEngine._url_option_uses_webview
+        self.assertEqual(
+            [use(value) for value in (None, "", False, "false", 0, "False",
+                                      True, "true", [], {})],
+            [False, False, False, False, True, True, True, True, True, True],
+        )
+
+    async def test_post_webview_runs_http_first_then_login_check(self):
+        events = []
+
+        async def browser(url, _source, options):
+            events.append(("browser", url, options.get("html")))
+            return {"body": "rendered", "url": url + "/web",
+                    "headers": {"content-type": "text/html"}}
+
+        class Engine(LegadoReadingEngine):
+            async def _request_transport(self, request, source=None):
+                events.append(("http", request["method"], request.get("body")))
+                self.last_response = {
+                    "body": "posted", "bodyBytes": list(b"posted"), "headers": {},
+                    "status": 200, "url": "https://source/redirect"}
+                return "posted", "text/html", "https://source/redirect"
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://source", enabledCookieJar=False,
+            loginCheckJs="result", to_dict=lambda: {
+                "bookSourceUrl": "https://source", "enabledCookieJar": False})
+        value = await Engine(webview_fetcher=browser)._request({
+            "url": "https://source/start", "method": "POST", "body": "q=x",
+            "webView": True}, source)
+        self.assertEqual(events, [
+            ("http", "POST", "q=x"),
+            ("browser", "https://source/redirect", "posted")])
+        self.assertEqual(value, ("rendered", "text/html",
+                                 "https://source/redirect/web"))
 
     async def test_edge_cookie_header_only_includes_matching_domain(self):
         cookies = [
@@ -4749,6 +6416,27 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         )
         value = await engine.decode_cover(source, "https://source/cover.bin")
         self.assertEqual(value, "data:image/jpeg;base64,AQIDBA==")
+
+    async def test_cover_decode_rejects_non_byte_results_and_runs_on_empty_body(self):
+        class Engine(LegadoReadingEngine):
+            async def _request(self, request, source=None):
+                self.last_response = {"bodyBytes": [], "url": request["url"]}
+                return "", "application/octet-stream", request["url"]
+
+        engine = Engine()
+        source = SimpleNamespace(
+            coverDecodeJs='"AQID"',
+            to_dict=lambda: {"bookSourceUrl": "https://source"}, header="",
+        )
+        self.assertEqual(await engine.decode_cover(
+            source, "https://source/cover.bin"), "")
+        source.coverDecodeJs = "throw new Error('decode failed')"
+        self.assertEqual(await engine.decode_cover(
+            source, "https://source/cover.bin"), "")
+        source.coverDecodeJs = "[9]"
+        self.assertEqual(await engine.decode_cover(
+            source, "https://source/cover.bin"),
+            "data:image/jpeg;base64,CQ==")
 
     async def test_verification_code_is_available_while_resolving_url(self):
         async def get_code(image, source):

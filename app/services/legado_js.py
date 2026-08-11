@@ -7,9 +7,11 @@ import hashlib
 import hmac
 import html
 import io
+import ipaddress
 import gzip
 import json
 import os
+import random
 import re
 import ssl
 import time
@@ -48,11 +50,18 @@ class _NoRedirectHandler(HTTPRedirectHandler):
 @dataclass
 class JsContext:
     source: object
+    # The object bound as ``java`` is not one universal Legado API.  Rules use
+    # AnalyzeRule, URL expressions use AnalyzeUrl, and BaseSource.evalJS binds
+    # the source entity itself.
+    host_kind: str = "rule"
     key: str = ""
     page: int = 1
     result: str = ""
     base_url: str = ""
-    variables: dict = field(default_factory=dict)
+    variables: dict | None = None
+    # Whether AnalyzeRule/AnalyzeUrl was constructed with a RuleDataInterface.
+    # ``variables`` is its Python variableMap representation.
+    rule_data_present: bool | None = None
     get_string: object = None
     get_string_list: object = None
     get_elements: object = None
@@ -88,14 +97,16 @@ class LegadoJsRuntime:
     def __init__(self, timeout: int = 15, state_dir: str | Path | None = None):
         self.timeout = timeout
         self.cookies = CookieJar()
+        self._session_persistent_shadow = {}
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
         self.opener = build_opener(HTTPCookieProcessor(self.cookies), HTTPSHandler(context=ssl_context))
         self.default_headers = {
             "User-Agent": (
-                "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
-                "Chrome/120 Mobile Safari/537.36"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/119.0.0.0 Safari/537.36"
             ),
         }
         self.base_url = ""
@@ -107,6 +118,7 @@ class LegadoJsRuntime:
             prefix="legado-js-")
         self.file_root = ((self.state_dir / "external-cache") if self.state_dir else
                           Path(self._temporary_files.name))
+        self._archive_temp_initialized = False
         self.persistent_state = self._load_persistent_state()
         self._hydrate_cookie_state()
         self._hydrate_cache_state()
@@ -117,6 +129,8 @@ class LegadoJsRuntime:
         self.font_store = {}
         self.bitmap_store = {}
         self.dom_store = {}
+        self.reget_book_handler = None
+        self.refresh_book_handler = None
         # SharedJsScope keeps the evaluated jsLib scope alive.  A JSON
         # snapshot is insufficient because function closures, object identity
         # and non-enumerable state must survive later rule evaluations.
@@ -155,19 +169,28 @@ class LegadoJsRuntime:
 
     def _hydrate_cookie_state(self) -> None:
         """Restore the persistent CookieManager surface used by JS requests."""
+        from app.services.public_suffix import effective_tld_plus_one
+
         for item in self.persistent_state.get("cookies", []):
             if not isinstance(item, dict) or not item.get("name"):
                 continue
             try:
+                raw_domain = str(item.get("domain", "")).lstrip(".")
+                cookie_domain = effective_tld_plus_one(raw_domain)
+                try:
+                    ipaddress.ip_address(cookie_domain)
+                    domain_specified = False
+                except ValueError:
+                    domain_specified = "." in cookie_domain
+                stored_domain = f".{cookie_domain}" if domain_specified else cookie_domain
                 self.cookies.set_cookie(Cookie(
                     version=0, name=str(item["name"]),
                     value=str(item.get("value", "")), port=None,
-                    port_specified=False, domain=str(item.get("domain", "")),
-                    domain_specified=bool(item.get("domainSpecified")),
-                    domain_initial_dot=bool(item.get("domainInitialDot")),
-                    path=str(item.get("path") or "/"),
-                    path_specified=bool(item.get("pathSpecified")),
-                    secure=bool(item.get("secure")), expires=item.get("expires"),
+                    port_specified=False, domain=stored_domain,
+                    domain_specified=domain_specified,
+                    domain_initial_dot=domain_specified,
+                    path="/", path_specified=True,
+                    secure=False, expires=item.get("expires"),
                     discard=False, comment=None, comment_url=None,
                     rest=dict(item.get("rest") or {}), rfc2109=False))
             except (KeyError, TypeError, ValueError):
@@ -176,6 +199,19 @@ class LegadoJsRuntime:
     def _persist_cookie_state(self) -> None:
         if self.state_dir is None:
             return
+        persistent = [item for item in self.cookies
+                      if not bool((item._rest or {}).get("LegadoSession"))]
+        by_key = {(str(item.domain).lstrip("."), item.name): item
+                  for item in persistent}
+        for key, item in self._session_persistent_shadow.items():
+            by_key.setdefault(key, item)
+        ordered = []
+        for old in self.persistent_state.get("cookies", []):
+            key = (str(old.get("domain", "")).lstrip("."), str(old.get("name", "")))
+            item = by_key.pop(key, None)
+            if item is not None:
+                ordered.append(item)
+        persistent = ordered + list(by_key.values())
         self.persistent_state["cookies"] = [{
             "name": item.name, "value": item.value,
             "domain": item.domain,
@@ -184,14 +220,42 @@ class LegadoJsRuntime:
             "path": item.path, "pathSpecified": item.path_specified,
             "secure": item.secure, "expires": item.expires,
             "rest": dict(item._rest or {}),
-        } for item in self.cookies]
+        } for item in persistent]
         self._save_persistent_state()
 
     def _hydrate_source_state(self, context: JsContext, source_key: str) -> None:
         values = (self.persistent_state.get("sources", {}).get(source_key, {})
                   if source_key else {})
         for key, value in values.items():
+            if key == "source:loginInfo" and value is not None:
+                value = self._decrypt_login_info(str(value))
             context.variables.setdefault(str(key), value)
+
+    def _login_info_key(self) -> bytes:
+        return self.device_id.encode("utf-8")[:16].ljust(16, b"\0")
+
+    def _encrypt_login_info(self, value: str) -> str:
+        from Crypto.Cipher import AES
+        raw = str(value).encode("utf-8")
+        padding = 16 - len(raw) % 16
+        encrypted = AES.new(self._login_info_key(), AES.MODE_ECB).encrypt(
+            raw + bytes([padding]) * padding)
+        return base64.b64encode(encrypted).decode("ascii")
+
+    def _decrypt_login_info(self, value: str) -> str | None:
+        """Decrypt fixed BaseSource state; invalid ciphertext is unreadable."""
+        from Crypto.Cipher import AES
+        try:
+            raw = AES.new(self._login_info_key(), AES.MODE_ECB).decrypt(
+                base64.b64decode(value, validate=True))
+            padding = raw[-1]
+            if padding < 1 or padding > 16 or raw[-padding:] != bytes([padding]) * padding:
+                raise ValueError("invalid PKCS5 padding")
+            return raw[:-padding].decode("utf-8")
+        except (ValueError, UnicodeDecodeError, binascii.Error):
+            # BaseSource.getLoginInfo catches Hutool/AES failures and returns
+            # null; exposing old plaintext would add a non-Legado fallback.
+            return None
 
     def _hydrate_cache_state(self) -> None:
         now = time.time()
@@ -290,6 +354,7 @@ class LegadoJsRuntime:
             ");return JSON.stringify({url:__optionValue==null?java.url:String(__optionValue),"
             "headers:java.headerMap});})()"
         )
+        context.host_kind = "url"
         value = self.evaluate(wrapper, context)
         try:
             result = json.loads(value) if isinstance(value, str) else value
@@ -322,7 +387,22 @@ class LegadoJsRuntime:
         except ImportError as exc:
             raise JsRuntimeUnavailable("缺少 quickjs，请执行 pip install quickjs") from exc
 
-        source_data = context.source.to_dict() if hasattr(context.source, "to_dict") else dict(context.source)
+        rule_data_present = (context.variables is not None if
+                             context.rule_data_present is None else
+                             bool(context.rule_data_present))
+        context.rule_data_present = rule_data_present
+        if context.variables is None:
+            context.variables = {}
+        source_is_null = context.source is None
+        if source_is_null:
+            source_data = {}
+        elif hasattr(context.source, "to_dict"):
+            source_data = context.source.to_dict()
+        elif isinstance(context.source, dict):
+            source_data = dict(context.source)
+        else:
+            source_data = {str(name): value for name, value in
+                           vars(context.source).items() if not callable(value)}
         for name in getattr(context.source, "__dataclass_fields__", {}):
             source_data.setdefault(name, getattr(context.source, name, None))
         raw_headers = source_data.get("header", {}) or {}
@@ -334,9 +414,19 @@ class LegadoJsRuntime:
         if not isinstance(raw_headers, dict):
             raw_headers = {}
         evaluation_base = context.base_url or source_data.get("bookSourceUrl", "")
+        # JsExtensions uses ``getSource()?.enabledCookieJar == true``:
+        # an explicit Kotlin null disables the jar, while an omitted field is
+        # the BookSource constructor default (true).
+        cookie_enabled = (not source_is_null and
+                          source_data.get("enabledCookieJar", True) is True)
+        source_key = str(source_data.get("bookSourceUrl") or "")
 
         raw_js_lib = source_data.get("jsLib", "")
-        js_lib_key = hashlib.md5(str(raw_js_lib or "").encode()).hexdigest()
+        if context.host_kind == "format":
+            raw_js_lib = ""
+        if raw_js_lib is None or not str(raw_js_lib).strip():
+            raw_js_lib = ""
+        js_lib_key = hashlib.md5(str(raw_js_lib).encode()).hexdigest()
         if js_lib_key not in self._js_lib_code_cache:
             self._js_lib_code_cache[js_lib_key] = self._clean_script(
                 self._resolve_js_lib(raw_js_lib))
@@ -349,17 +439,43 @@ class LegadoJsRuntime:
             if js_lib:
                 self._shared_js_contexts[js_lib_key] = ctx
         self._thread_state.bridge_error = ""
-        ctx.add_callable("__ajax", lambda value: self._bridge_call(
-            self._ajax, value, raw_headers, evaluation_base))
-        ctx.add_callable("__request", lambda value: self._bridge_call(
-            self._request_json, value, raw_headers, evaluation_base))
-        ctx.add_callable("__connect", lambda value: self._connect_json(
-            value, raw_headers, evaluation_base))
-        ctx.add_callable("__ajax_all", lambda values: self._bridge_call(
-            self._ajax_all, values, raw_headers, evaluation_base))
-        ctx.add_callable("__post", lambda url, body="": self._ajax(
+        def network_call(method, *args):
+            return method(*args, cookie_enabled, source_key)
+
+        def bridge_headers(value=None):
+            if not value:
+                return {}
+            try:
+                parsed = json.loads(str(value))
+                return parsed if isinstance(parsed, dict) else {}
+            except (TypeError, json.JSONDecodeError):
+                return {}
+
+        def invoke_book_handler(handler, source, book):
+            self._bridge_call(handler, source, book)
+            data = ({name: getattr(book, name) for name in
+                     getattr(book, "__dataclass_fields__", {})}
+                    if book is not None else {})
+            data["bookUrl"] = data.get("url", "")
+            data["tocUrl"] = data.get("toc_url", "")
+            data["variable"] = data.get("variables", {})
+            return json.dumps(data, ensure_ascii=False, default=str)
+
+        ctx.add_callable("__ajax", lambda value, headers=None: self._bridge_call(
+            network_call, self._ajax, value, bridge_headers(headers), evaluation_base))
+        ctx.add_callable("__request", lambda value, headers=None: self._bridge_call(
+            network_call, self._request_json, value, bridge_headers(headers), evaluation_base))
+        ctx.add_callable("__request_mode", lambda value, headers=None, allow_webview=False,
+                         webview_js=None, source_regex=None: self._bridge_call(
+            self._request_json, value, bridge_headers(headers), evaluation_base,
+            cookie_enabled, source_key, bool(allow_webview), webview_js, source_regex))
+        ctx.add_callable("__connect", lambda value, headers=None: network_call(
+            self._connect_json, value, bridge_headers(headers), evaluation_base))
+        ctx.add_callable("__ajax_all", lambda values, headers=None: self._bridge_call(
+            network_call, self._ajax_all, values, bridge_headers(headers), evaluation_base))
+        ctx.add_callable("__post", lambda url, body="": network_call(self._ajax,
             f'{url},{{"method":"POST","body":{json.dumps(str(body))}}}',
-            raw_headers, evaluation_base))
+            {}, evaluation_base))
         ctx.add_callable("__md5", lambda value: hashlib.md5(str(value).encode()).hexdigest())
         ctx.add_callable("__digest", self._digest)
         ctx.add_callable("__digest_base64", self._digest_base64)
@@ -397,11 +513,27 @@ class LegadoJsRuntime:
             self._context_get_list(context, rule, content, is_url), ensure_ascii=False))
         ctx.add_callable("__get_elements", lambda rule, content=None: json.dumps(
             self._context_get_elements(context, rule, content), ensure_ascii=False))
+        ctx.add_callable("__split_source_rule", lambda value, all_in_one=False,
+                         is_json=False, is_regex=False: json.dumps([
+                             {"mode": stage.mode, "rule": stage.rule,
+                              "raw": stage.raw, "putRule": stage.put_rule}
+                             for stage in __import__(
+                                 "app.services.source_rule", fromlist=[
+                                     "compile_rule_program"]).compile_rule_program(
+                                         str(value), bool(all_in_one), bool(is_json),
+                                         bool(is_regex)).stages
+                         ], ensure_ascii=False))
         ctx.add_callable("__put", lambda name, value: self._bridge_call(
             self._put, context, name, value))
+        ctx.add_callable("__java_get", lambda name: self._bridge_call(
+            self._java_get, context, name, rule_data_present))
+        ctx.add_callable("__java_put", lambda name, value: self._bridge_call(
+            self._java_put, context, name, value, rule_data_present))
         ctx.add_callable("__cookie_get", lambda url: self._cookie_string(str(url)))
-        ctx.add_callable("__cookie_set", self.set_cookie)
+        ctx.add_callable("__cookie_set", self.store_set_cookie)
+        ctx.add_callable("__cookie_replace", self.store_replace_cookie)
         ctx.add_callable("__cookie_remove", self.remove_cookie)
+        ctx.add_callable("__cookie_clear", self.store_clear_cookies)
         ctx.add_callable("__crypto", lambda *args: self._bridge_call(
             self._crypto, *args))
         ctx.add_callable("__unsupported", lambda name: self._unsupported(name))
@@ -427,14 +559,32 @@ class LegadoJsRuntime:
         ctx.add_callable("__t2s", self._traditional_to_simplified)
         ctx.add_callable("__s2t", self._simplified_to_traditional)
         ctx.add_callable("__html_format", self._html_format)
-        ctx.add_callable("__zip_content", self._zip_content)
-        ctx.add_callable("__archive_content", self._archive_content)
+        ctx.add_callable("__zip_content", lambda value, member, as_bytes=False,
+                         charset="", headers="{}": self._bridge_call(
+                             self._zip_content, value, member, as_bytes, charset,
+                             bridge_headers(headers), evaluation_base,
+                             cookie_enabled, source_key))
+        ctx.add_callable("__archive_content", lambda archive_type, value, member,
+                         as_bytes=False, charset="", headers="{}":
+                         self._bridge_call(
+                             self._archive_content, archive_type, value, member,
+                             as_bytes, charset, bridge_headers(headers),
+                             evaluation_base, cookie_enabled, source_key))
         ctx.add_callable("__file_path", lambda value: str(self._file_path(value)))
         ctx.add_callable("__file_read", self._file_read)
         ctx.add_callable("__file_delete", self._file_delete)
-        ctx.add_callable("__download_file", self._download_file)
-        ctx.add_callable("__cache_file", self._cache_file)
-        ctx.add_callable("__import_script", self._import_script)
+        ctx.add_callable("__download_file", lambda value, url="", headers="{}":
+                         self._download_file(
+                             value, url, json.loads(headers or "{}"),
+                             evaluation_base, cookie_enabled))
+        ctx.add_callable("__cache_file", lambda url, save_time=0, headers="{}":
+                         self._cache_file(
+                             url, save_time, json.loads(headers or "{}"),
+                             evaluation_base, cookie_enabled))
+        ctx.add_callable("__import_script", lambda path, headers="{}":
+                         self._import_script(
+                             path, json.loads(headers or "{}"),
+                             evaluation_base, cookie_enabled))
         ctx.add_callable("__unarchive_file", self._unarchive_file)
         ctx.add_callable("__text_in_folder", self._text_in_folder)
         ctx.add_callable("__font_query", self._query_font)
@@ -451,7 +601,11 @@ class LegadoJsRuntime:
         ctx.add_callable("__bitmap_draw", self._bitmap_draw)
         ctx.add_callable("__bitmap_encode", self._bitmap_encode)
         ctx.add_callable("__browser", self._browser)
-        ctx.add_callable("__webview", self._webview)
+        ctx.add_callable("__webview", lambda html_value, url, js, source_regex,
+                         override_regex, headers=None: self._webview(
+                             html_value, url, js, source_regex, override_regex,
+                             cookie_tag=source_key,
+                             header_map=bridge_headers(headers)))
         ctx.add_callable("__browser_start", self._start_browser)
         ctx.add_callable("__verification", self._verification_code)
         ctx.add_callable("__to_url", self._to_url)
@@ -463,16 +617,39 @@ class LegadoJsRuntime:
         ctx.add_callable("__sign_op", self._sign_operation)
         ctx.add_callable("__sym_generate", self._symmetric_generate)
         ctx.add_callable("__sleep", lambda milliseconds: time.sleep(float(milliseconds) / 1000))
+        ctx.add_callable("__reget_book", lambda: invoke_book_handler(
+            self.reget_book_handler, context.source, context.book)
+                         if self.reget_book_handler is not None else "{}")
+        ctx.add_callable("__refresh_book", lambda: invoke_book_handler(
+            self.refresh_book_handler, context.source, context.book)
+                         if self.refresh_book_handler is not None else "{}")
 
         self._thread_state.dom_store = {}
         self._thread_state.dom_reverse = {}
         self._hydrate_source_state(context, str(source_data.get("bookSourceUrl", "")))
+        for prefix, target in (("book:", context.book),
+                               ("chapter:", context.chapter)):
+            variables = self._object_variables(target)
+            if variables is not None:
+                for name, value in variables.items():
+                    context.variables.setdefault(prefix + str(name), value)
         if isinstance(raw_headers, dict):
             raw_headers = dict(raw_headers)
             if isinstance(context.request_headers, dict):
                 raw_headers.update({str(k): str(v)
                                     for k, v in context.request_headers.items()})
         self.base_url = context.base_url or source_data.get("bookSourceUrl", "")
+        request_method = "GET"
+        if context.host_kind == "url":
+            try:
+                from test_book_sources_async import parse_request_config, split_post_url
+                from app.services.request_compat import normalize_url_option
+                parts = split_post_url(str(evaluation_base))
+                if parts:
+                    request_method = str(normalize_url_option(
+                        parse_request_config(parts[1])).get("method") or "GET")
+            except Exception:
+                request_method = "GET"
         def plain(value):
             if value is None:
                 return {}
@@ -543,12 +720,14 @@ class LegadoJsRuntime:
                 json.dumps(context.response_data, ensure_ascii=False)) + ")")
         bootstrap = f"""
         const __global = globalThis;
+        const __hostKind = {json.dumps(context.host_kind)};
         var key = {json.dumps(context.key)};
         var page = {int(context.page)};
         var result = {result_expression};
         var src = {src_expression};
         const __resultHtmlNodes = {str(bool(context.result_html_nodes)).lower()};
         var baseUrl = {json.dumps(context.base_url or source_data.get('bookSourceUrl', ''))};
+        const __initialAnalyzeUrl = baseUrl;
         var title = {json.dumps(context.title or chapter_data.get('title') or chapter_data.get('name') or '')};
         var nextChapterUrl = {json.dumps(context.next_chapter_url or '')};
         var speakText = {json.dumps(context.speak_text or '')};
@@ -593,28 +772,57 @@ class LegadoJsRuntime:
         }}
         Error = __RhinoError;
         const __sourceData = {json.dumps(source_data, ensure_ascii=False)};
+        const __staticSourceHeaders = {json.dumps(
+            raw_headers if isinstance(raw_headers, dict) else {}, ensure_ascii=False)};
+        const __requestHeaderData = {json.dumps(
+            context.request_headers if isinstance(context.request_headers, dict) else {},
+            ensure_ascii=False)};
+        const __requestMethod = {json.dumps(request_method)};
         const __bookData = {json.dumps(book_data, ensure_ascii=False)};
         const __chapterData = {json.dumps(chapter_data, ensure_ascii=False)};
         var book = Object.assign({{}}, __bookData, {{
-          getVariable: name => __get('book:' + String(name)) || '',
-          putVariable: (name, value) => __put('book:' + String(name), value),
-          getCustomVariable: name => __get('book:' + String(name)) || '',
-          putCustomVariable: value => __put('book:custom', value),
-          setReverseToc: value => {{ book.reverseToc = Boolean(value); return book.reverseToc; }},
-          getReverseToc: () => Boolean(book.reverseToc || (book.readConfig || {{}}).reverseToc),
+          getVariable: function(name) {{
+            if (arguments.length!==1) throw new TypeError("Can't find method BaseBook.getVariable");
+            return __get('book:' + __nonnullString(name,'key')) || '';
+          }},
+          putVariable: function(name,value) {{
+            if (arguments.length!==2) throw new TypeError("Can't find method BaseBook.putVariable");
+            __put('book:' + __nonnullString(name,'key'), value===null?null:String(value));
+            return true;
+          }},
+          getCustomVariable: () => __get('book:custom') || '',
+          putCustomVariable: function(value) {{
+            if (arguments.length!==1) throw new TypeError("Can't find method BaseBook.putCustomVariable");
+            __put('book:custom',value===null?null:String(value));
+          }},
+          setReverseToc: value => {{
+            if (!book.readConfig || typeof book.readConfig!=='object') book.readConfig={{}};
+            book.readConfig.reverseToc=Boolean(value);
+          }},
+          getReverseToc: () => Boolean((book.readConfig || {{}}).reverseToc),
           getKindList: () => [book.wordCount].concat(String(book.kind || '').split(/[,\\n]/))
             .map(value=>String(value || '').trim()).filter(Boolean),
-          getDisplayTag: () => book.customTag || book.kind || '',
           getDisplayCover: () => book.customCoverUrl || book.coverUrl || '',
           getDisplayIntro: () => book.customIntro || book.intro || '',
           getUnreadChapterNum: () => Math.max(Number(book.totalChapterNum || 0)-Number(book.durChapterIndex || 0)-1,0)
         }});
         var chapter = Object.assign({{}}, __chapterData, {{
-          getVariable: name => __get('chapter:' + String(name)) || '',
-          putVariable: (name, value) => __put('chapter:' + String(name), value),
-          isVip: () => Boolean(__chapterData.isVip || __chapterData.is_vip ||
-                               __chapterData.isPay || __chapterData.is_pay)
+          getVariable: function(name) {{
+            if (arguments.length!==1) throw new TypeError("Can't find method BookChapter.getVariable");
+            return __get('chapter:' + __nonnullString(name,'key')) || '';
+          }},
+          putVariable: function(name,value) {{
+            if (arguments.length!==2) throw new TypeError("Can't find method BookChapter.putVariable");
+            __put('chapter:' + __nonnullString(name,'key'),value===null?null:String(value));
+            return true;
+          }},
+          isVip: () => Boolean(__chapterData.isVip || __chapterData.is_vip)
         }});
+        if (__hostKind === 'url') {{
+          chapter=undefined;title=undefined;src=undefined;nextChapterUrl=undefined;
+        }} else {{
+          key=undefined;page=undefined;speakText=undefined;speakSpeed=undefined;
+        }}
         function __map(value) {{
           const target=value && typeof value === 'object' ? value : {{}};
           if (!Object.prototype.hasOwnProperty.call(target,'get')) Object.defineProperties(target,{{
@@ -673,58 +881,336 @@ class LegadoJsRuntime:
             if(at>0)result[first.slice(0,at).trim()]=first.slice(at+1).trim();
           }});return __map(result);
         }}
+        function __stringMap(value) {{
+          if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+          const result={{}};
+          Object.keys(value).forEach(key=>{{
+            const item=value[key];
+            result[key]=item == null ? null :
+              (typeof item === 'object' ? JSON.stringify(item) : String(item));
+          }});
+          return __map(result);
+        }}
+        function __javaStringHash(value) {{
+          let hash=0;for(const char of String(value)){{
+            const code=char.codePointAt(0);
+            if(code>0xffff){{
+              const n=code-0x10000;
+              hash=Math.imul(31,hash)+(0xd800+(n>>10));hash|=0;
+              hash=Math.imul(31,hash)+(0xdc00+(n&1023));hash|=0;
+            }} else {{hash=Math.imul(31,hash)+code;hash|=0;}}
+          }}return hash;
+        }}
+        function __nonnullString(value,name) {{
+          if (value === null) throw __wrappedJavaException(
+            new __NullPointerException('Parameter specified as non-null is null: '+name));
+          return String(value);
+        }}
+        function __sourceArity(name,actual,expected) {{
+          if (actual !== expected)
+            throw new TypeError("Can't find method BaseSource."+name+" with "+actual+" arguments");
+        }}
         var source = Object.assign({{}}, __sourceData, {{
+          getTag: () => __sourceData.bookSourceName || '',
           getKey: () => __sourceData.bookSourceUrl || '',
           getSource: () => source,
-          getHeaderMap: () => __map(java.headerMap),
-          getVariable: () => __get('sourceVariable') || '',
-          setVariable: value => __put('sourceVariable', String(value)),
-          putVariable: value => __put('sourceVariable', String(value)),
-          getLoginHeader: () => __get('source:loginHeader') || '',
-          putLoginHeader: value => __put('source:loginHeader', String(value)),
-          removeLoginHeader: () => __put('source:loginHeader', ''),
-          getLoginHeaderMap: () => {{
-            const value=__get('source:loginHeader') || '';
-            try {{ return __map(typeof value === 'string' ? JSON.parse(value.replace(/^&/,'')) : value); }}
-            catch (_) {{ return __map({{}}); }}
+          getHeaderMap: hasLoginHeader => {{
+            const headers=__resolvedSourceHeaders();
+            if (hasLoginHeader) {{
+              const login=source.getLoginHeaderMap();
+              if (login) Object.assign(headers,login);
+            }}
+            return __map(headers);
           }},
-          getLoginInfo: () => __get('source:loginInfo') || '',
-          putLoginInfo: value => __put('source:loginInfo', typeof value === 'string' ? value : JSON.stringify(value)),
-          removeLoginInfo: () => __put('source:loginInfo', ''),
+          getVariable: () => __get('sourceVariable') || '',
+          setVariable: function(value) {{
+            __sourceArity('setVariable',arguments.length,1);
+            __put('sourceVariable', value === null ? null : String(value));
+          }},
+          put: function(name,value) {{
+            __sourceArity('put',arguments.length,2);
+            const key=__nonnullString(name,'key'),text=__nonnullString(value,'value');
+            __put('source:data:'+key,text);return text;
+          }},
+          get: function(name) {{
+            __sourceArity('get',arguments.length,1);
+            return __get('source:data:'+__nonnullString(name,'key')) || '';
+          }},
+          getLoginHeader: () => __get('source:loginHeader'),
+          putLoginHeader: function(value) {{
+            __sourceArity('putLoginHeader',arguments.length,1);
+            const text=__nonnullString(value,'header');
+            try {{
+              const headers=JSON.parse(text);
+              const value=headers.Cookie == null ? headers.cookie : headers.Cookie;
+              if (value != null) cookie.replaceCookie(source.getKey(),String(value));
+            }} catch (_) {{}}
+            __put('source:loginHeader',text);
+          }},
+          removeLoginHeader: () => {{
+            __put('source:loginHeader',null);cookie.removeCookie(source.getKey());
+          }},
+          getLoginHeaderMap: () => {{
+            const value=__get('source:loginHeader');
+            if (value == null) return null;
+            try {{ return __stringMap(typeof value === 'string' ? JSON.parse(value) : value); }}
+            catch (_) {{ return null; }}
+          }},
+          getLoginInfo: () => __get('source:loginInfo'),
+          putLoginInfo: function(value) {{
+            __sourceArity('putLoginInfo',arguments.length,1);
+            const text=__nonnullString(value,'info');
+            try {{__put('source:loginInfo',text);return true;}}
+            catch (_) {{return false;}}
+          }},
+          removeLoginInfo: () => {{__put('source:loginInfo',null);}},
           getLoginInfoMap: () => {{
-            const value=__get('source:loginInfo') || '';
-            try {{ return __map(typeof value === 'string' ? JSON.parse(value) : value); }}
-            catch (_) {{ return __map({{}}); }}
+            const value=__get('source:loginInfo');
+            if (value == null) return null;
+            try {{ return __stringMap(typeof value === 'string' ? JSON.parse(value) : value); }}
+            catch (_) {{ return null; }}
+          }},
+          loginUi: () => {{
+            try {{const value=JSON.parse(String(__sourceData.loginUi || ''));return Array.isArray(value)?value:null;}}
+            catch (_) {{return null;}}
+          }},
+          getLoginJs: () => {{
+            const value=__sourceData.loginUrl;
+            if (value == null) return null;
+            const text=String(value);
+            if (text.startsWith('@js:')) return text.slice(4);
+            if (text.startsWith('<js>')) {{
+              const end=text.lastIndexOf('<');
+              if (end < 4) throw new RangeError('substring range');
+              return text.slice(4,end);
+            }}
+            return text;
+          }},
+          login: function() {{
+            const script=source.getLoginJs();
+            if (script == null || String(script).trim() === '') return;
+            const run=function() {{
+              eval(String(script));
+              if (typeof login === 'function') login.apply(this);
+              else throw 'Function login not implements!!!';
+            }};
+            return run.call(__global);
+          }},
+          evalJS: value => (function(java,source,baseUrl,cookie,cache,key,page,
+              result,src,book,chapter,title,nextChapterUrl,speakText,speakSpeed) {{
+            return eval(String(value));
+          }})(source,source,source.getKey(),cookie,cache,undefined,undefined,
+             undefined,undefined,undefined,undefined,undefined,undefined,
+             undefined,undefined),
+          getShareScope: () => (__sourceData.jsLib != null &&
+            String(__sourceData.jsLib).trim() !== '') ? __global : null,
+          hashCode: () => __javaStringHash(source.bookSourceUrl || ''),
+          equals: other => !!other && String(other.bookSourceUrl || '') === String(source.bookSourceUrl || ''),
+          getSearchRule: () => source.ruleSearch || (source.ruleSearch={{}}),
+          getExploreRule: () => source.ruleExplore || (source.ruleExplore={{}}),
+          getBookInfoRule: () => source.ruleBookInfo || (source.ruleBookInfo={{}}),
+          getTocRule: () => source.ruleToc || (source.ruleToc={{}}),
+          getContentRule: () => source.ruleContent || (source.ruleContent={{}}),
+          getReviewRule: () => source.ruleReview || (source.ruleReview={{}}),
+          getDisPlayNameGroup: () => String(source.bookSourceGroup || '').trim()
+            ? String(source.bookSourceName || '')+' ('+String(source.bookSourceGroup)+')'
+            : String(source.bookSourceName || ''),
+          addGroup: function(groups) {{
+            __sourceArity('addGroup',arguments.length,1);
+            const incoming=__nonnullString(groups,'groups');
+            if (source.bookSourceGroup !== null && source.bookSourceGroup !== undefined) {{
+              const values=__sourceGroups(source.bookSourceGroup);
+              __sourceGroups(incoming).forEach(value=>values.add(value));
+              source.bookSourceGroup=Array.from(values).join(',');
+            }}
+            if (!String(source.bookSourceGroup||'').trim()) source.bookSourceGroup=incoming;
+            return source;
+          }},
+          removeGroup: function(groups) {{
+            __sourceArity('removeGroup',arguments.length,1);
+            if (source.bookSourceGroup === null || source.bookSourceGroup === undefined)
+              return source;
+            const removed=__sourceGroups(__nonnullString(groups,'groups'));
+            const values=Array.from(__sourceGroups(source.bookSourceGroup))
+              .filter(value=>!removed.has(value));
+            source.bookSourceGroup=values.join(',');return source;
+          }},
+          hasGroup: function(group) {{
+            __sourceArity('hasGroup',arguments.length,1);
+            return __sourceGroups(source.bookSourceGroup)
+              .has(__nonnullString(group,'group'));
+          }},
+          getInvalidGroupNames: () => Array.from(__sourceGroups(source.bookSourceGroup))
+            .filter(value=>value.includes('失效')||value==='校验超时').join(', '),
+          removeInvalidGroups: () => {{source.removeGroup(source.getInvalidGroupNames());}},
+          getDisplayVariableComment: function(otherComment) {{
+            __sourceArity('getDisplayVariableComment',arguments.length,1);
+            const other=__nonnullString(otherComment,'otherComment');
+            return String(source.variableComment||'').trim()
+              ? String(source.variableComment)+'\\n'+other : other;
+          }},
+          equal: other => {{
+            if (!other || typeof other !== 'object') return false;
+            const texts=['bookSourceName','bookSourceUrl','bookSourceGroup',
+              'bookUrlPattern','bookSourceComment','concurrentRate','header',
+              'loginUrl','loginUi','loginCheckJs','coverDecodeJs','exploreUrl','searchUrl'];
+            if (texts.some(key=>!__sourceTextEqual(source[key],other[key]))) return false;
+            const scalars=['bookSourceType','customOrder','enabled','enabledExplore','enabledCookieJar'];
+            if (scalars.some(key=>source[key]!==other[key])) return false;
+            return ['ruleSearch','ruleExplore','ruleBookInfo','ruleToc','ruleContent']
+              .every(key=>__stableJson(source[key]||{{}})===__stableJson(other[key]||{{}}));
           }},
           key: __sourceData.bookSourceUrl || ''
         }});
+        function __sourceGroups(value) {{
+          return new Set(String(value == null?'':value).split(/[,;，；]/)
+            .map(item=>item.trim()).filter(Boolean));
+        }}
+        function __sourceTextEqual(left,right) {{
+          return left===right || ((left==null||left==='')&&(right==null||right===''));
+        }}
+        function __stableJson(value) {{
+          if (Array.isArray(value)) return '['+value.map(__stableJson).join(',')+']';
+          if (value && typeof value==='object') return '{{'+Object.keys(value).sort()
+            .filter(key=>value[key]!==undefined).map(key=>JSON.stringify(key)+':'+__stableJson(value[key]))
+            .join(',')+'}}';
+          return JSON.stringify(value);
+        }}
+        source.tag=source.getTag();
+        // Rhino can resolve the Kotlin loginUi property as text and the
+        // loginUi() method as a call.  A callable value with source-text
+        // coercion preserves both observable forms in JavaScript.
+        const __loginUiRaw=String(__sourceData.loginUi || '');
+        function __gsonString(value) {{
+          if (value == null) return null;
+          if (typeof value === 'boolean') return value ? 'true' : 'false';
+          if (typeof value === 'object') return JSON.stringify(value);
+          return String(value);
+        }}
+        source.loginUi=function(){{
+          try {{
+            const value=JSON.parse(__loginUiRaw);
+            if (!Array.isArray(value)) return null;
+            return value.map(item=>{{
+              if (!item || typeof item !== 'object' || Array.isArray(item))
+                throw new TypeError('Expected BEGIN_OBJECT');
+              const row={{name:null,type:null,action:null}};
+              ['name','type','action'].forEach(key=>{{
+                if (Object.prototype.hasOwnProperty.call(item,key))
+                  row[key]=__gsonString(item[key]);
+              }});
+              return row;
+            }});
+          }} catch (_) {{return null;}}
+        }};
+        source.loginUi.toString=()=>__loginUiRaw;
+        source.loginUi.valueOf=()=>__loginUiRaw;
+        function __resolvedSourceHeaders() {{
+          let headers=Object.assign({{}},__staticSourceHeaders);
+          const declaration=__sourceData.header;
+          if (typeof declaration === 'string') {{
+            let script=declaration,dynamic=false;
+            if (/^@js:/i.test(script)) {{script=script.slice(4);dynamic=true;}}
+            else if (/^<js>/i.test(script)) {{
+              const end=script.lastIndexOf('<');
+              if (end < 4) throw new RangeError('substring range');
+              script=script.slice(4,end);dynamic=true;
+            }}
+            if (dynamic) {{
+              const previousBaseUrl=baseUrl;
+              baseUrl=String(source.getKey());
+              let evaluated;
+              try {{evaluated=String(eval(script));}}
+              finally {{baseUrl=previousBaseUrl;}}
+              try {{
+                const value=JSON.parse(evaluated);
+                if (value && typeof value === 'object' && !Array.isArray(value))
+                  headers=Object.assign({{}},value);
+              }} catch (_) {{headers={{}};}}
+            }}
+          }}
+          if (!Object.keys(headers).some(key=>key.toLowerCase()==='user-agent'))
+            headers['User-Agent']={json.dumps(self.default_headers.get('User-Agent', ''), ensure_ascii=False)};
+          return __stringMap(headers) || __map({{}});
+        }}
         function __response(raw) {{
           const data = JSON.parse(raw);
-          return {{
+          const kind=String(data.responseKind || 'str');
+          const multi=data.headersMulti || {{}};
+          const headerValues=name=>{{
+            const key=String(name).toLowerCase();
+            return Array.isArray(multi[key]) ? multi[key].map(String) :
+              (data.headers[key] == null ? [] : [String(data.headers[key])]);
+          }};
+          const headerData=__map(Object.assign({{}},data.headers || {{}}));
+          headerData.get=name=>{{const values=headerValues(name);return values.length?values[values.length-1]:null;}};
+          headerData.values=name=>headerValues(name);
+          const headers=new Proxy(headerData,{{get:(target,name)=>{{
+            if(typeof name==='symbol'||Object.prototype.hasOwnProperty.call(target,name))return target[name];
+            const key=Object.keys(target).find(item=>item.toLowerCase()===String(name).toLowerCase());
+            return key===undefined?undefined:target[key];
+          }},has:(target,name)=>Object.keys(target).some(
+            item=>item.toLowerCase()===String(name).toLowerCase())}});
+          const response={{
             body: () => data.body,
-            bodyAsBytes: () => __byteArray(Array.isArray(data.bodyBytes) ? data.bodyBytes :
-              JSON.parse(__strbytes(String(data.body || ''), 'utf-8'))),
-            header: name => data.headers[String(name).toLowerCase()] || '',
-            headers: name => name === undefined ? data.headers :
-              (data.headers[String(name).toLowerCase()] == null ? [] :
-                [data.headers[String(name).toLowerCase()]]),
             code: () => data.status,
-            status: () => data.status,
-            statusCode: () => data.status,
-            statusMessage: () => String(data.message || ''),
             message: () => String(data.message || ''),
+            headers: () => headers,
             isSuccessful: () => data.status >= 200 && data.status < 300,
-            errorBody: () => data.status >= 200 && data.status < 300 ? null : data.body,
-            cookies: () => __responseCookies(data.headers),
+            errorBody: () => null,
             url: () => data.url,
             raw: () => ({{
               code: () => data.status,
-              headers: () => data.headers,
+              message: () => String(data.message || ''),
+              headers: () => headers,
               request: () => ({{url: () => data.url}})
             }}),
-            toString: () => data.body,
-            valueOf: () => data.body
+            toString: () => 'Response{{protocol='+String(data.protocol || 'http/1.1')+
+              ', code='+Number(data.status)+
+              ', message='+String(data.message || '')+', url='+String(data.url)+'}}'
           }};
+          if(kind==='jsoup'){{
+            response.bodyAsBytes=()=>__byteArray(Array.isArray(data.bodyBytes) ? data.bodyBytes :
+              JSON.parse(__strbytes(String(data.body || ''), 'utf-8')));
+            response.header=name=>{{const values=headerValues(name);return values.length?values[values.length-1]:'';}};
+            response.headers=name=>name===undefined?headers:headerValues(name);
+            response.status=()=>data.status;
+            response.statusCode=()=>data.status;
+            response.statusMessage=()=>String(data.message || '');
+            response.cookies=()=>__responseCookies(Object.assign({{}},data.headers,{{
+              'set-cookie':headerValues('set-cookie').join(',')
+            }}));
+          }}
+          if(kind==='okhttp'){{
+            response.header=(name,defaultValue)=>{{const value=headers.get(name);
+              return value===null?(defaultValue===undefined?null:defaultValue):value;}};
+            const bodyObject={{
+              bytes:()=>__byteArray(Array.isArray(data.bodyBytes)?data.bodyBytes:[]),
+              string:()=>String(data.body==null?'':data.body),
+              byteStream:()=>__inputStream(Array.isArray(data.bodyBytes)?data.bodyBytes:[]),
+              contentType:()=>headers.get('content-type'),
+              contentLength:()=>Array.isArray(data.bodyBytes)?data.bodyBytes.length:-1,
+              close:()=>undefined
+            }};
+            response.body=()=>bodyObject;
+            response.close=()=>undefined;
+            response.request=()=>({{url:()=>data.url}});
+            response.protocol=()=>String(data.protocol || 'http/1.1');
+            delete response.errorBody;delete response.raw;
+          }}
+          return response;
+        }}
+        function __responseKind(raw,kind){{const data=JSON.parse(raw);
+          data.responseKind=kind;return JSON.stringify(data);}}
+        function __responseBytes(raw) {{
+          const data=JSON.parse(raw);
+          return __byteArray(Array.isArray(data.bodyBytes) ? data.bodyBytes :
+            JSON.parse(__strbytes(String(data.body || ''), 'utf-8')));
+        }}
+        function __analyzeUrlDataBytes() {{
+          const target=String(java.ruleUrl||java.url||baseUrl).split('?',1)[0];
+          const match=/data:.*?;base64,(.*)/.exec(target);
+          return match ? __byteArray(JSON.parse(__b64bytes(match[1]))) : null;
         }}
         function __inputStream(bytes) {{
           const data=Array.from(bytes || []).map(value => Number(value) & 255);
@@ -773,7 +1259,8 @@ class LegadoJsRuntime:
         function __http(method, url, body, headers, followRedirects) {{
           return __response(__request(String(url) + ',' + JSON.stringify({{
             method: method, body: body == null ? '' : String(body),
-            headers: headers || {{}}, followRedirects: followRedirects !== false
+            headers: headers || {{}}, __followRedirects: followRedirects !== false,
+            __rawJsoupRequest: true
           }})));
         }}
         function __element(value) {{
@@ -1410,6 +1897,9 @@ class LegadoJsRuntime:
         __RuntimeException.prototype=Object.create(__Exception.prototype);
         __RuntimeException.prototype.constructor=__RuntimeException;
         __RuntimeException.prototype.toString=function(){{return 'java.lang.RuntimeException'+(this.message?': '+this.message:'')}};
+        const __NullPointerException=__javaException('java.lang.NullPointerException');
+        __NullPointerException.prototype=Object.create(__RuntimeException.prototype);
+        __NullPointerException.prototype.constructor=__NullPointerException;
         const __IllegalArgumentException=__javaException('java.lang.IllegalArgumentException');
         __IllegalArgumentException.prototype=Object.create(__RuntimeException.prototype);
         __IllegalArgumentException.prototype.constructor=__IllegalArgumentException;
@@ -1530,6 +2020,7 @@ class LegadoJsRuntime:
         __BooleanBox.prototype.getClass=()=>null;__BooleanBox.prototype.toJSON=__BooleanBox.prototype.booleanValue;
         Packages.java.lang = {{String:__JavaString,Thread:{{sleep:value=>__sleep(Number(value))}},
           Throwable:__Throwable,Exception:__Exception,RuntimeException:__RuntimeException,
+          NullPointerException:__NullPointerException,
           IllegalArgumentException:__IllegalArgumentException,
           IndexOutOfBoundsException:__IndexOutOfBoundsException,
           NumberFormatException:__NumberFormatException,
@@ -1602,10 +2093,11 @@ class LegadoJsRuntime:
           }}
           function OkHttpClient() {{
             this.newCall=request=>({{execute:()=>{{
-              const response=__response(__request(String(request.url)+','+JSON.stringify({{
+              const raw=__request(String(request.url)+','+JSON.stringify({{
                 method:'GET',headers:request.headers||{{}}
-              }})));
-              return {{body:()=>({{bytes:()=>response.bodyAsBytes()}}),
+              }}));
+              const response=__response(raw);
+              return {{body:()=>({{bytes:()=>__responseBytes(raw)}}),
                        code:()=>response.code(),headers:()=>response.headers(),
                        close:()=>undefined}};
             }}}});
@@ -1659,6 +2151,12 @@ class LegadoJsRuntime:
             readBytes:()=>{{const raw=__file_read(String(value || ''),false,'__bytes__');return raw === '' ? null : __byteArray(JSON.parse(raw));}},
             toString:()=>path
           }};
+        }}
+        function __oneArchive(args,value,name) {{
+          if(args.length!==1)throw new TypeError("Can't find method JsExtensions."+name);
+          if(value===null)throw __wrappedJavaException(new __NullPointerException(
+            'Parameter specified as non-null is null: zipPath'));
+          return __unarchive_file(String(value));
         }}
         function __asymmetric(algorithm) {{
           const generated=JSON.parse(__asym_generate(String(algorithm)));
@@ -1715,7 +2213,22 @@ class LegadoJsRuntime:
           concat: arrays => Array.prototype.concat.apply([], Array.from(arrays || []).map(x => Array.from(x)))
         }};
         var java = {{
-          ajax: value => __ajax(String(Array.isArray(value) ? value[0] : value)),
+          evalJS: function(jsValue,resultValue) {{
+            if(arguments.length!==1&&arguments.length!==2)
+              throw new TypeError("Can't find method evalJS");
+            if(jsValue===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: jsStr'));
+            if(arguments.length===2)return (function(result){{return eval(String(jsValue));}})(resultValue);
+            return eval(String(jsValue));
+          }},
+          ajax: function(value) {{
+            if (arguments.length!==1) throw new TypeError("Can't find method JsExtensions.ajax");
+            if (value===null) throw __wrappedJavaException(
+              new __NullPointerException('Parameter specified as non-null is null: url'));
+            const target=Array.isArray(value)?(value.length?value[0]:null):value;
+            return __ajax(String(target),JSON.stringify(
+              Object.assign({{}},source.getHeaderMap(true))));
+          }},
           getString: (rule, content, isUrl) =>
             __get_string(String(rule), content === undefined && __contentChanged
               ? __currentContent : content, Boolean(isUrl)),
@@ -1741,31 +2254,102 @@ class LegadoJsRuntime:
           getElements: (rule, content) =>
             __ruleElementList(JSON.parse(__get_elements(String(rule),
               content === undefined && __contentChanged ? __currentContent : content))),
-          setContent: (value, parent) => {{
-            __currentContent = String(value == null ? '' : value);
+          setContent: function(value,parent) {{
+            if(arguments.length!==1&&arguments.length!==2)
+              throw new TypeError("Can't find method AnalyzeRule.setContent");
+            if(value===null)throw new Error('内容不可空（Content cannot be null）');
+            __currentContent = value;
             __contentChanged = true;
-            if (parent != null && String(parent)) {{ baseUrl=String(parent); java.url=baseUrl; }}
-            return __currentContent;
+            if (arguments.length===2&&parent != null) {{
+              baseUrl=String(parent);java.baseUrl=baseUrl;
+            }}
+            return java;
           }},
-          get: name => __get(String(name)),
-          put: (name, value) => __put(String(name), value),
-          get: (value, headers) => (headers !== undefined || /^https?:\\/\\//i.test(String(value)))
-            ? __response(__request(String(value) + ',' + JSON.stringify({{
-                method:'GET', headers:headers || {{}}, followRedirects:false
-              }})))
-            : __get(String(value)),
-          post: (url, body, headers) => __http('POST', url, body, headers, false),
-          head: (url, headers) => __http('HEAD', url, '', headers, false),
-          ajaxAll: urls => JSON.parse(__ajax_all(JSON.stringify(Array.from(urls || []))))
-            .map(raw => __response(JSON.stringify(raw))),
-          getStrResponse: value => __response(__request(String(value || java.ruleUrl || baseUrl))),
-          getByteArray: value => __response(__request(String(value || java.ruleUrl || baseUrl))).bodyAsBytes(),
-          getInputStream: value => __inputStream(
-            __response(__request(String(value || java.ruleUrl || baseUrl))).bodyAsBytes()),
-          getResponse: () => __response(__request(String(java.ruleUrl || java.url || baseUrl))),
+          get: function(value, headers) {{
+            if (arguments.length!==1 && arguments.length!==2)
+              throw new TypeError("Can't find method AnalyzeRule.get");
+            if (value===null || (arguments.length===2 && headers==null))
+              throw __wrappedJavaException(new __NullPointerException(
+                'Parameter specified as non-null is null'));
+            if (__hostKind==='url') {{
+              if (arguments.length!==1) throw new TypeError("Can't find method AnalyzeUrl.get");
+              return __java_get(String(value));
+            }}
+            if (arguments.length===2) return __response(__request(
+              String(value)+','+JSON.stringify({{method:'GET',headers:headers,
+                __followRedirects:false}})));
+            return __java_get(String(value));
+          }},
+          put: function(name,value) {{
+            if (arguments.length!==2) throw new TypeError("Can't find method AnalyzeRule.put");
+            if (name===null || value===null) throw __wrappedJavaException(
+              new __NullPointerException('Parameter specified as non-null is null'));
+            const text=String(value);return __java_put(String(name),text);
+          }},
+          post: function(url,body,headers) {{
+            if (arguments.length!==3) throw new TypeError("Can't find method JsExtensions.post");
+            if (url===null || body===null || headers==null) throw __wrappedJavaException(
+              new __NullPointerException('Parameter specified as non-null is null'));
+            return __http('POST',url,body,headers,false);
+          }},
+          head: function(url,headers) {{
+            if (arguments.length!==2) throw new TypeError("Can't find method JsExtensions.head");
+            if (url===null || headers==null) throw __wrappedJavaException(
+              new __NullPointerException('Parameter specified as non-null is null'));
+            return __http('HEAD',url,'',headers,false);
+          }},
+          ajaxAll: function(urls) {{
+            if (arguments.length!==1) throw new TypeError("Can't find method JsExtensions.ajaxAll");
+            if (urls===null) throw __wrappedJavaException(
+              new __NullPointerException('Parameter specified as non-null is null: urlList'));
+            return JSON.parse(__ajax_all(JSON.stringify(Array.from(urls)),JSON.stringify(
+              Object.assign({{}},source.getHeaderMap(true)))))
+              .map(raw => __response(JSON.stringify(raw)));
+          }},
+          getStrResponse: function(jsStr,sourceRegex,useWebView) {{
+            if(arguments.length>3)throw new TypeError("Can't find method AnalyzeUrl.getStrResponse");
+            return __response(__request_mode(String(java.ruleUrl||java.url||baseUrl),
+              JSON.stringify(Object.assign({{}},java.headerMap)),
+              arguments.length<3?true:Boolean(useWebView),
+              jsStr==null?null:String(jsStr),sourceRegex==null?null:String(sourceRegex)));
+          }},
+          getByteArray: function() {{
+            if(arguments.length!==0)throw new TypeError("Can't find method AnalyzeUrl.getByteArray");
+            const embedded=__analyzeUrlDataBytes();if(embedded!==null)return embedded;
+            return __responseBytes(__request_mode(String(java.ruleUrl||java.url||baseUrl),
+              JSON.stringify(Object.assign({{}},java.headerMap)),false,null,null));
+          }},
+          getInputStream: function() {{
+            if(arguments.length!==0)throw new TypeError("Can't find method AnalyzeUrl.getInputStream");
+            const embedded=__analyzeUrlDataBytes();if(embedded!==null)return __inputStream(embedded);
+            return __inputStream(__responseBytes(__request_mode(String(java.ruleUrl||java.url||baseUrl),
+              JSON.stringify(Object.assign({{}},java.headerMap)),false,null,null)));
+          }},
+          getResponse: function() {{
+            if(arguments.length!==0)throw new TypeError("Can't find method AnalyzeUrl.getResponse");
+            return __response(__responseKind(__request_mode(String(java.ruleUrl||java.url||baseUrl),
+              JSON.stringify(Object.assign({{}},java.headerMap)),false,null,null),'okhttp'));
+          }},
+          getGlideUrl: function() {{
+            if(arguments.length!==0)throw new TypeError("Can't find method AnalyzeUrl.getGlideUrl");
+            const stored=cookie.cookieToMap(__cookie_get(String(java.url||baseUrl)));
+            const temporary=cookie.cookieToMap(java.headerMap.Cookie||'');
+            const merged=Object.assign({{}},stored,temporary);
+            const cookieText=cookie.mapToCookie(merged);
+            if(cookieText)java.headerMap.Cookie=cookieText;
+            if(__sourceData.enabledCookieJar===true)java.headerMap.CookieJar='1';
+            const target={{url:String(java.url||baseUrl),headers:java.headerMap}};
+            target.toString=()=>target.url;target.getCacheKey=()=>target.url;
+            target.getHeaders=()=>target.headers;return target;
+          }},
           getHeaderMap: () => java.headerMap,
-          getCookie: (url, name) => name === undefined
-            ? __cookie_get(String(url || baseUrl)) : cookie.getKey(url, name),
+          getCookie: function(url,name) {{
+            if (arguments.length!==1 && arguments.length!==2)
+              throw new TypeError("Can't find method JsExtensions.getCookie");
+            if (url===null) throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: tag'));
+            return name == null ? __cookie_get(String(url)) : cookie.getKey(url,name);
+          }},
           getKey: (url, name) => cookie.getKey(url, name),
           setCookie: (url, value) => cookie.setCookie(url, value),
           replaceCookie: (url, value) => cookie.replaceCookie(url, value),
@@ -1852,39 +2436,115 @@ class LegadoJsRuntime:
           s2t: value => __s2t(String(value)),
           utf8ToGbk: value => __utf8_to_gbk(String(value)),
           htmlFormat: value => __html_format(String(value)),
-          getZipByteArrayContent: (value, path) => {{
-            const raw=__zip_content(String(value),String(path),true,'');
+          getZipByteArrayContent: function(value, path) {{
+            if(arguments.length!==2)throw new TypeError("Can't find method JsExtensions.getZipByteArrayContent");
+            if(value===null||path===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null'));
+            const raw=__zip_content(String(value),String(path),true,'',
+              JSON.stringify(Object.assign({{}},source.getHeaderMap(true))));
             return raw === '' ? null : __byteArray(JSON.parse(raw));
           }},
-          getZipStringContent: (value, path, charset) =>
-            __zip_content(String(value),String(path),false,String(charset || '')),
-          get7zByteArrayContent: (value, path) => {{
-            const raw=__archive_content('7z',String(value),String(path),true,'');
+          getZipStringContent: function(value, path, charset) {{
+            if(arguments.length!==2&&arguments.length!==3)
+              throw new TypeError("Can't find method JsExtensions.getZipStringContent");
+            if(value===null||path===null||(arguments.length===3&&charset===null))
+              throw __wrappedJavaException(new __NullPointerException(
+                'Parameter specified as non-null is null'));
+            return __zip_content(String(value),String(path),false,
+              arguments.length===3?String(charset):'',
+              JSON.stringify(Object.assign({{}},source.getHeaderMap(true))));
+          }},
+          get7zByteArrayContent: function(value, path) {{
+            if(arguments.length!==2)throw new TypeError("Can't find method JsExtensions.get7zByteArrayContent");
+            if(value===null||path===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null'));
+            const raw=__archive_content('7z',String(value),String(path),true,'',
+              JSON.stringify(Object.assign({{}},source.getHeaderMap(true))));
             return raw === '' ? null : __byteArray(JSON.parse(raw));
           }},
-          get7zStringContent: (value, path, charset) =>
-            __archive_content('7z',String(value),String(path),false,String(charset || '')),
-          getRarByteArrayContent: (value, path) => {{
-            const raw=__archive_content('rar',String(value),String(path),true,'');
+          get7zStringContent: function(value, path, charset) {{
+            if(arguments.length!==2&&arguments.length!==3)
+              throw new TypeError("Can't find method JsExtensions.get7zStringContent");
+            if(value===null||path===null||(arguments.length===3&&charset===null))
+              throw __wrappedJavaException(new __NullPointerException(
+                'Parameter specified as non-null is null'));
+            return __archive_content('7z',String(value),String(path),false,
+              arguments.length===3?String(charset):'',
+              JSON.stringify(Object.assign({{}},source.getHeaderMap(true))));
+          }},
+          getRarByteArrayContent: function(value, path) {{
+            if(arguments.length!==2)throw new TypeError("Can't find method JsExtensions.getRarByteArrayContent");
+            if(value===null||path===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null'));
+            const raw=__archive_content('rar',String(value),String(path),true,'',
+              JSON.stringify(Object.assign({{}},source.getHeaderMap(true))));
             return raw === '' ? null : __byteArray(JSON.parse(raw));
           }},
-          getRarStringContent: (value, path, charset) =>
-            __archive_content('rar',String(value),String(path),false,String(charset || '')),
-          getFile: value => __file(value),
-          readFile: value => {{
-            const raw=__file_read(String(value || ''),false,'__bytes__');
+          getRarStringContent: function(value, path, charset) {{
+            if(arguments.length!==2&&arguments.length!==3)
+              throw new TypeError("Can't find method JsExtensions.getRarStringContent");
+            if(value===null||path===null||(arguments.length===3&&charset===null))
+              throw __wrappedJavaException(new __NullPointerException(
+                'Parameter specified as non-null is null'));
+            return __archive_content('rar',String(value),String(path),false,
+              arguments.length===3?String(charset):'',
+              JSON.stringify(Object.assign({{}},source.getHeaderMap(true))));
+          }},
+          getFile: function(value) {{
+            if(arguments.length!==1)throw new TypeError("Can't find method JsExtensions.getFile");
+            if(value===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: path'));
+            return __file(String(value));
+          }},
+          readFile: function(value) {{
+            if(arguments.length!==1)throw new TypeError("Can't find method JsExtensions.readFile");
+            if(value===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: path'));
+            const raw=__file_read(String(value),false,'__bytes__');
             return raw === '' ? null : __byteArray(JSON.parse(raw));
           }},
-          readTxtFile: (value, charset) =>
-            __file_read(String(value || ''),false,String(charset || '')),
-          deleteFile: value => __file_delete(String(value || '')),
-          downloadFile: (value, url) => __download_file(String(value || ''),String(url || '')),
-          cacheFile: (url, saveTime) => __cache_file(String(url || ''),Number(saveTime || 0)),
-          unzipFile: value => __unarchive_file(String(value || '')),
-          un7zFile: value => __unarchive_file(String(value || '')),
-          unrarFile: value => __unarchive_file(String(value || '')),
-          unArchiveFile: value => __unarchive_file(String(value || '')),
-          getTxtInFolder: value => __text_in_folder(String(value || '')),
+          readTxtFile: function(value, charset) {{
+            if(arguments.length!==1&&arguments.length!==2)
+              throw new TypeError("Can't find method JsExtensions.readTxtFile");
+            if(value===null||(arguments.length===2&&charset===null))
+              throw __wrappedJavaException(new __NullPointerException(
+                'Parameter specified as non-null is null'));
+            return __file_read(String(value),false,
+              arguments.length===2?String(charset):'');
+          }},
+          deleteFile: function(value) {{
+            if(arguments.length!==1)throw new TypeError("Can't find method JsExtensions.deleteFile");
+            if(value===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: path'));
+            return __file_delete(String(value));
+          }},
+          downloadFile: function(value,url) {{
+            if (arguments.length!==1 && arguments.length!==2)
+              throw new TypeError("Can't find method JsExtensions.downloadFile");
+            if (value===null || (arguments.length===2 && url===null))
+              throw __wrappedJavaException(new __NullPointerException(
+                'Parameter specified as non-null is null'));
+            return __download_file(String(value),arguments.length===2?String(url):'',
+              JSON.stringify(Object.assign({{}},source.getHeaderMap(true))));
+          }},
+          cacheFile: function(url,saveTime) {{
+            if (arguments.length!==1 && arguments.length!==2)
+              throw new TypeError("Can't find method JsExtensions.cacheFile");
+            if (url===null) throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: urlStr'));
+            return __cache_file(String(url),arguments.length===2?Number(saveTime):0,
+              JSON.stringify(Object.assign({{}},source.getHeaderMap(true))));
+          }},
+          unzipFile: function(value) {{return __oneArchive(arguments,value,'unzipFile');}},
+          un7zFile: function(value) {{return __oneArchive(arguments,value,'un7zFile');}},
+          unrarFile: function(value) {{return __oneArchive(arguments,value,'unrarFile');}},
+          unArchiveFile: function(value) {{return __oneArchive(arguments,value,'unArchiveFile');}},
+          getTxtInFolder: function(value) {{
+            if(arguments.length!==1)throw new TypeError("Can't find method JsExtensions.getTxtInFolder");
+            if(value===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: path'));
+            return __text_in_folder(String(value));
+          }},
           queryTTF: value => value == null ? null : __font(__font_query(String(value))),
           queryBase64TTF: value => value == null || String(value).trim() === ''
             ? null : __font(__font_query(String(value))),
@@ -1896,35 +2556,121 @@ class LegadoJsRuntime:
           lang: 'zh-CN',
           encodeURI: (value, charset) => __encode_uri(String(value),String(charset || 'utf-8')),
           log: value => value,
-          logType: value => value,
+          logType: function(value) {{
+            if(arguments.length!==1)throw new TypeError("Can't find method JsExtensions.logType");
+            return undefined;
+          }},
           toast: value => undefined,
           longToast: value => undefined,
           refreshExplore: () => undefined,
-          refreshTocUrl: () => undefined,
-          initUrl: () => baseUrl,
-          reGetBook: () => book,
-          toURL: (value, parent) => {{
-            const absolute = JSON.parse(__to_url(String(value || ''), String(parent || baseUrl)));
+          refreshTocUrl: function() {{
+            if(arguments.length!==0)throw new TypeError("Can't find method AnalyzeRule.refreshTocUrl");
+            Object.assign(book,JSON.parse(__refresh_book()));return undefined;
+          }},
+          initUrl: function() {{
+            if(arguments.length!==0)throw new TypeError("Can't find method AnalyzeUrl.initUrl");
+            java.ruleUrl=__initialAnalyzeUrl;java.url=__initialAnalyzeUrl;
+            return undefined;
+          }},
+          reGetBook: function() {{
+            if(arguments.length!==0)throw new TypeError("Can't find method AnalyzeRule.reGetBook");
+            Object.assign(book,JSON.parse(__reget_book()));return undefined;
+          }},
+          refreshBook: function() {{
+            if(arguments.length!==0)throw new TypeError("Can't find method AnalyzeRule.refreshBook");
+            Object.assign(book,JSON.parse(__refresh_book()));return undefined;
+          }},
+          toURL: function(value, parent) {{
+            if(arguments.length!==1&&arguments.length!==2)
+              throw new TypeError("Can't find method JsExtensions.toURL");
+            if(value===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: url'));
+            const absolute = JSON.parse(__to_url(String(value),
+              arguments.length===1?'':String(parent==null?'':parent)));
             absolute.searchParams=absolute.searchParams == null ? null : __map(absolute.searchParams);
             return absolute;
           }},
-          setBaseUrl: value => {{ baseUrl = String(value); java.url = baseUrl; return baseUrl; }},
-          importScript: value => __import_script(String(value)),
-          webView: (htmlValue, url, js) => __webview(
-            String(htmlValue == null ? '' : htmlValue),String(url || baseUrl),
-            String(js == null ? '' : js),'',''),
-          webViewGetOverrideUrl: (htmlValue, url, js, regex) => __webview(
-            String(htmlValue == null ? '' : htmlValue),String(url || baseUrl),
-            String(js == null ? '' : js),'',String(regex || '')),
-          webViewGetSource: (htmlValue, url, js, sourceRegex) => __webview(
-            String(htmlValue == null ? '' : htmlValue),String(url || baseUrl),
-            String(js == null ? '' : js),String(sourceRegex || ''),''),
-          connect: (value, header) => {{
+          setRedirectUrl: function(value) {{
+            if(arguments.length!==1)throw new TypeError(
+              "Can't find method AnalyzeRule.setRedirectUrl");
+            if(value===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: url'));
+            const text=String(value),match=text.match(
+              /^([A-Za-z][A-Za-z0-9+.-]*):\\/\\/([^\\/?#]+)([^?#]*)/);
+            if(!match)return java.redirectUrl;
+            const protocol=match[1],host=match[2].replace(/:\\d+$/,''),path=match[3]||'';
+            const target={{host:host,path:path,protocol:protocol,toString:()=>text,
+              getHost:()=>host,getPath:()=>path,getProtocol:()=>protocol}};
+            java.redirectUrl=target;return target;
+          }},
+          splitSourceRule: function(value,allInOne) {{
+            if(arguments.length!==1&&arguments.length!==2)
+              throw new TypeError("Can't find method AnalyzeRule.splitSourceRule");
+            const text=value==null?'':String(value),all=arguments.length===2?Boolean(allInOne):false;
+            const lead=String(__currentContent==null?result:__currentContent).trim();
+            const isJson=lead.startsWith('{{')||lead.startsWith('[');
+            const stages=JSON.parse(__split_source_rule(text,all,isJson,__ruleRegexMode));
+            if(all&&text.startsWith(':'))__ruleRegexMode=true;
+            return stages;
+          }},
+          splitSourceRuleCacheString: function(value) {{
+            if(arguments.length!==1)throw new TypeError(
+              "Can't find method AnalyzeRule.splitSourceRuleCacheString");
+            const text=value==null?'':String(value);
+            if(!Object.prototype.hasOwnProperty.call(__sourceRuleCache,text))
+              __sourceRuleCache[text]=java.splitSourceRule(text,false);
+            return __sourceRuleCache[text];
+          }},
+          setBaseUrl: function(value) {{
+            if(arguments.length!==1)throw new TypeError(
+              "Can't find method AnalyzeRule.setBaseUrl");
+            if(value!==null){{baseUrl=String(value);java.baseUrl=baseUrl;}}
+            return java;
+          }},
+          importScript: function(value) {{
+            if (arguments.length!==1) throw new TypeError("Can't find method JsExtensions.importScript");
+            if (value===null) throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: path'));
+            return __import_script(String(value),JSON.stringify(
+              Object.assign({{}},source.getHeaderMap(true))));
+          }},
+          webView: function(htmlValue,url,js) {{
+            if(arguments.length!==3)throw new TypeError("Can't find method JsExtensions.webView");
+            return __webview(htmlValue==null?null:String(htmlValue),
+              url==null?null:String(url),js==null?null:String(js),'','',JSON.stringify(
+                Object.assign({{}},source.getHeaderMap(true))));
+          }},
+          webViewGetOverrideUrl: function(htmlValue,url,js,regex) {{
+            if(arguments.length!==4)throw new TypeError(
+              "Can't find method JsExtensions.webViewGetOverrideUrl");
+            if(regex===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: overrideUrlRegex'));
+            return __webview(htmlValue==null?null:String(htmlValue),
+              url==null?null:String(url),js==null?null:String(js),'',String(regex),
+              JSON.stringify(Object.assign({{}},source.getHeaderMap(true))));
+          }},
+          webViewGetSource: function(htmlValue,url,js,sourceRegex) {{
+            if(arguments.length!==4)throw new TypeError(
+              "Can't find method JsExtensions.webViewGetSource");
+            if(sourceRegex===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: sourceRegex'));
+            return __webview(htmlValue==null?null:String(htmlValue),
+              url==null?null:String(url),js==null?null:String(js),String(sourceRegex),'',
+              JSON.stringify(Object.assign({{}},source.getHeaderMap(true))));
+          }},
+          connect: function(value, header) {{
+            if (arguments.length!==1 && arguments.length!==2)
+              throw new TypeError("Can't find method JsExtensions.connect");
+            if (value===null) throw __wrappedJavaException(
+              new __NullPointerException('Parameter specified as non-null is null: urlStr'));
             let headers={{}};
             if (header != null && String(header)) {{
-              try {{ headers=typeof header === 'string' ? JSON.parse(header) : header; }} catch (_) {{ headers={{}}; }}
+              try {{ headers=JSON.parse(String(header)); }} catch (_) {{ headers={{}}; }}
             }}
-            return __response(__connect(String(value)+','+JSON.stringify({{headers:headers}})));
+            const inherited=arguments.length===1
+              ? Object.assign({{}},source.getHeaderMap(true)) : {{}};
+            return __response(__connect(String(value)+','+JSON.stringify({{headers:headers}}),
+              JSON.stringify(inherited)));
           }},
           // Android starts an Activity and the Java method returns Unit.
           startBrowser: (url, title) => {{__browser_start(String(url),String(title));return undefined;}},
@@ -1946,11 +2692,39 @@ class LegadoJsRuntime:
           createAsymmetricCrypto: transformation => __asymmetric(String(transformation)),
           createSign: algorithm => __signer(String(algorithm))
         }};
-        java.ruleUrl = baseUrl;
-        java.redirectUrl = baseUrl;
-        java.url = baseUrl;
-        java.key = key;
-        java.headerMap = __map({json.dumps(raw_headers if isinstance(raw_headers, dict) else {}, ensure_ascii=False)});
+        var __sourceRuleCache={{}};var __ruleRegexMode=false;
+        if (__hostKind !== 'url') {{
+          delete java.getStrResponse; delete java.getByteArray;
+          delete java.getInputStream; delete java.getResponse;
+          delete java.getHeaderMap; delete java.initUrl;
+          delete java.getUserAgent; delete java.isPost;
+          delete java.getGlideUrl;
+        }} else {{
+          delete java.getString; delete java.getElement;
+          delete java.getStringList; delete java.getElements;
+          delete java.setContent; delete java.setBaseUrl;
+          delete java.setRedirectUrl;
+          delete java.splitSourceRule;delete java.splitSourceRuleCacheString;
+          delete java.reGetBook;delete java.refreshBook;delete java.refreshTocUrl;
+        }}
+        if (__hostKind === 'url') {{
+          java.ruleUrl=baseUrl;java.redirectUrl=baseUrl;java.url=baseUrl;java.key=key;
+          java.headerMap=__map(Object.assign({{}},source.getHeaderMap(true),
+            __requestHeaderData));
+          java.getUserAgent=function(){{
+            if(arguments.length!==0)throw new TypeError("Can't find method AnalyzeUrl.getUserAgent");
+            for(const key of Object.keys(java.headerMap))
+              if(String(key).toLowerCase()==='user-agent')return String(java.headerMap[key]);
+            return String(__staticSourceHeaders['User-Agent']||'');
+          }};
+          java.isPost=function(){{
+            if(arguments.length!==0)throw new TypeError("Can't find method AnalyzeUrl.isPost");
+            return __requestMethod==='POST';
+          }};
+        }} else {{
+          delete java.ruleUrl;java.redirectUrl=null;delete java.url;java.baseUrl=baseUrl;
+          delete java.key;delete java.headerMap;
+        }}
         java.webViewUA = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36';
         java.getWebViewUA = () => java.webViewUA;
         const __deviceId = {json.dumps(self.device_id)};
@@ -1963,13 +2737,14 @@ class LegadoJsRuntime:
         java = new Proxy(java, {{
           get: (target, name) => Object.prototype.hasOwnProperty.call(target, name)
             ? target[name]
-            : ((...args) => __unsupported('java.' + String(name)))
+            : undefined
         }});
         function replace(pattern, replacement) {{
           result = String(result == null ? '' : result).replace(pattern, replacement);
           return result;
         }}
-        function Reload(url) {{ return __ajax(String(url)); }}
+        function Reload(url) {{ return __ajax(String(url),JSON.stringify(
+          Object.assign({{}},source.getHeaderMap(true)))); }}
         var cache = {{
           get: key => {{
             const raw = __cache_get(String(key));
@@ -1999,26 +2774,63 @@ class LegadoJsRuntime:
           deleteMemory: key => __memory_cache_delete(String(key))
         }};
         var cookie = {{
-          getCookie: url => __cookie_get(String(url)),
-          getKey: (url, name) => {{
+          getCookie: function(url) {{
+            if(arguments.length!==1)throw new TypeError("Can't find method CookieStore.getCookie");
+            if(url===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: url'));
+            return __cookie_get(String(url));
+          }},
+          getKey: function(url, name) {{
+            if(arguments.length!==2)throw new TypeError("Can't find method CookieStore.getKey");
+            if(url===null||name===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null'));
             const all = __cookie_get(String(url));
-            const found = all.split(';').map(x => x.trim().split('=')).find(x => x[0] === name);
+            const found = all.split(';').map(x => x.trim().split('=')).find(x => x[0] === String(name));
             return found ? found.slice(1).join('=') : '';
           }},
-          mapToCookie: value => {{
+          cookieToMap: function(value) {{
+            if(arguments.length!==1)throw new TypeError("Can't find method CookieStore.cookieToMap");
+            if(value===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: cookie'));
+            const result={{}};
+            String(value).split(/;\\s*/).forEach(pair=>{{const at=pair.indexOf('=');
+              if(at<0)return;const key=pair.slice(0,at).trim(),item=pair.slice(at+1).trim();
+              if(item||item==='null')result[key]=item;}});
+            return __map(result);
+          }},
+          mapToCookie: function(value) {{
+            if(arguments.length!==1)throw new TypeError("Can't find method CookieStore.mapToCookie");
+            if(value===null)return null;
             let data = value;
             if (typeof data === 'string') {{
               try {{ data = JSON.parse(data); }} catch (_) {{ return data; }}
             }}
-            if (!data || typeof data !== 'object') return '';
-            return Object.keys(data).map(key => key + '=' + data[key]).join('; ');
+            if (!data || typeof data !== 'object') return null;
+            const keys=Object.keys(data);return keys.length?
+              keys.map(key => key + '=' + data[key]).join('; '):null;
           }},
-          setCookie: (url, value) => __cookie_set(String(url || baseUrl), String(value || '')),
-          replaceCookie: (url, value) => {{
-            __cookie_remove(String(url || baseUrl));
-            return __cookie_set(String(url || baseUrl), String(value || ''));
+          setCookie: function(url, value) {{
+            if(arguments.length!==2)throw new TypeError("Can't find method CookieStore.setCookie");
+            if(url===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: url'));
+            __cookie_set(String(url),value==null?'':String(value));return undefined;
           }},
-          removeCookie: url => __cookie_remove(String(url || baseUrl))
+          replaceCookie: function(url, value) {{
+            if(arguments.length!==2)throw new TypeError("Can't find method CookieStore.replaceCookie");
+            if(url===null||value===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null'));
+            __cookie_replace(String(url),String(value));return undefined;
+          }},
+          removeCookie: function(url) {{
+            if(arguments.length!==1)throw new TypeError("Can't find method CookieStore.removeCookie");
+            if(url===null)throw __wrappedJavaException(new __NullPointerException(
+              'Parameter specified as non-null is null: url'));
+            __cookie_remove(String(url));return undefined;
+          }},
+          clear: function() {{
+            if(arguments.length!==0)throw new TypeError("Can't find method CookieStore.clear");
+            __cookie_clear();return undefined;
+          }}
         }};
         function __infoDefault(name) {{
           const pools = [];
@@ -2035,13 +2847,19 @@ class LegadoJsRuntime:
           try {{ let value=JSON.parse(__get_json('infoMap')); if(typeof value==='string') value=JSON.parse(value); return value && typeof value==='object' ? value : {{}}; }}
           catch (_) {{ return {{}}; }}
         }})();
-        const infoMap = new Proxy(__infoStored, {{
+        var infoMap = new Proxy(__infoStored, {{
           get: (target, name) => name === 'save' ? (() => {{
             __put('infoMap', JSON.stringify(target)); return true;
           }}) :
             (Object.prototype.hasOwnProperty.call(target, name) ? target[name] : __infoDefault(name)),
           set: (target, name, value) => {{ target[name] = value; return true; }}
         }});
+        if (__hostKind === 'format') {{
+          java=undefined;source=undefined;book=undefined;result=undefined;
+          src=undefined;baseUrl=undefined;key=undefined;page=undefined;
+          speakText=undefined;speakSpeed=undefined;nextChapterUrl=undefined;
+          cookie=undefined;cache=undefined;infoMap=undefined;
+        }}
         """
         clean = self._clean_script(script)
         # Rhino book-source scripts frequently redeclare injected context
@@ -2096,8 +2914,9 @@ class LegadoJsRuntime:
             # same fresh lexical scope while its jsLib functions and closures
             # remain in the persistent global scope.
             if js_lib:
-                rule_program = (";(function(){return eval(" +
-                                json.dumps(clean, ensure_ascii=False) + ")})()")
+                rule_program = (";(function(source){return eval(" +
+                                json.dumps(clean, ensure_ascii=False) + ")})(" +
+                                ("null" if source_is_null else "source") + ")")
                 library_program = js_lib if is_new_shared_context else ""
                 value = ctx.eval(
                     bootstrap + "\n;delete __global.globalThis;\n" +
@@ -2107,11 +2926,16 @@ class LegadoJsRuntime:
                     r"\s*(?:(?:var|let|const)\s+[^;]+;|"
                     r"(?:async\s+)?function\s+[A-Za-z_$][\w$]*\s*\([\s\S]*|"
                     r"class\s+[A-Za-z_$][\w$]*[\s\S]*)\s*", clean))
-                rule_program = (";eval(" + json.dumps(clean, ensure_ascii=False) + ")"
-                                if declaration_only else clean)
+                if source_is_null:
+                    rule_program = (";(function(source){return eval(" +
+                                    json.dumps(clean, ensure_ascii=False) + ")})(null)")
+                else:
+                    rule_program = (";eval(" + json.dumps(clean, ensure_ascii=False) + ")"
+                                    if declaration_only else clean)
                 value = ctx.eval(bootstrap + "\n;delete __global.globalThis;\n" +
                                  rule_program)
             self._sync_context_objects(ctx, context)
+            self._sync_rule_variables(context)
             if hasattr(value, "json"):
                 return json.loads(value.json())
             return value
@@ -2195,7 +3019,8 @@ class LegadoJsRuntime:
                     value = getattr(context.chapter, "name", "") or getattr(
                         context.chapter, "title", "")
                 else:
-                    value = context.variables.get(name, "")
+                    value = self._java_get(
+                        context, name, bool(context.rule_data_present))
                 pieces.append("" if value is None else str(value))
             else:
                 expression = (match.group(2) or "").strip()
@@ -2210,10 +3035,13 @@ class LegadoJsRuntime:
                         value = nested.evaluate(
                             "@js:" + expression,
                             JsContext(
-                                source=context.source, key=context.key,
+                                source=context.source, host_kind=context.host_kind,
+                                key=context.key,
                                 page=context.page, result=native,
                                 base_url=context.base_url,
-                                variables=context.variables, book=context.book,
+                                variables=context.variables,
+                                rule_data_present=context.rule_data_present,
+                                book=context.book,
                                 chapter=context.chapter, title=context.title,
                                 next_chapter_url=context.next_chapter_url,
                                 src=context.src,
@@ -2370,7 +3198,6 @@ class LegadoJsRuntime:
                     "durChapterPos": "dur_chapter_pos", "durChapterTime": "dur_chapter_time",
                     "originOrder": "origin_order", "readConfig": "read_config",
                     "infoHtml": "info_html", "tocHtml": "toc_html",
-                    "variable": "variables",
                 }.items():
                     if legado_name in values:
                         values[python_name] = values[legado_name]
@@ -2385,11 +3212,14 @@ class LegadoJsRuntime:
                     "startFragmentId": "start_fragment_id",
                     "endFragmentId": "end_fragment_id",
                     "isVip": "is_vip", "isPay": "is_pay",
-                    "variable": "variables",
                 }.items():
                     if legado_name in values:
                         values[python_name] = values[legado_name]
             for key, value in values.items():
+                # RuleDataInterface.variableMap is updated through get/put;
+                # the serialized entity field is not a mutable JS property.
+                if key in {"variables", "variableMap", "variable"}:
+                    continue
                 if isinstance(target, dict):
                     if key in target:
                         target[key] = value
@@ -2398,6 +3228,22 @@ class LegadoJsRuntime:
                         setattr(target, key, value)
                     except (AttributeError, TypeError):
                         pass
+
+    @classmethod
+    def _sync_rule_variables(cls, context: JsContext) -> None:
+        for prefix, target in (("book:", context.book),
+                               ("chapter:", context.chapter)):
+            variables = cls._object_variables(target)
+            if variables is None:
+                continue
+            for name, value in list(context.variables.items()):
+                if not str(name).startswith(prefix):
+                    continue
+                key = str(name)[len(prefix):]
+                if value is None:
+                    variables.pop(key, None)
+                else:
+                    variables[key] = str(value)
 
     @staticmethod
     @lru_cache(maxsize=2048)
@@ -2435,11 +3281,75 @@ class LegadoJsRuntime:
         value = re.sub(r"(?<=[\]\)])；", ";", value)
         return value
 
+    @staticmethod
+    def _object_variables(value) -> dict | None:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            variables = value.get("variables")
+            return variables if isinstance(variables, dict) else None
+        variables = getattr(value, "variables", None)
+        return variables if isinstance(variables, dict) else None
+
+    def _java_get(self, context: JsContext, name, rule_data_present: bool) -> str:
+        """Mirror the distinct AnalyzeRule/AnalyzeUrl variable fallback chains."""
+        key = str(name)
+        if key == "bookName" and context.book is not None:
+            return str(getattr(context.book, "name", "") or "")
+        if key == "title" and context.chapter is not None:
+            return str(getattr(context.chapter, "title", None) or
+                       getattr(context.chapter, "name", "") or "")
+        targets = [self._object_variables(context.chapter)]
+        targets.append(self._object_variables(context.book))
+        if rule_data_present:
+            targets.append(context.variables)
+        for target in targets:
+            if isinstance(target, dict):
+                value = target.get(key)
+                if value is not None and str(value) != "":
+                    return str(value)
+        if context.host_kind != "url":
+            value = context.variables.get("source:data:" + key)
+            if value is not None and str(value) != "":
+                return str(value)
+        return ""
+
+    def _java_put(self, context: JsContext, name, value,
+                  rule_data_present: bool) -> str:
+        key, text = str(name), str(value)
+        chapter_variables = self._object_variables(context.chapter)
+        if chapter_variables is not None:
+            chapter_variables[key] = text
+            context.variables["chapter:" + key] = text
+            return text
+        book_variables = self._object_variables(context.book)
+        if book_variables is not None:
+            book_variables[key] = text
+            context.variables["book:" + key] = text
+            return text
+        if rule_data_present:
+            context.variables[key] = text
+            return text
+        if context.host_kind != "url":
+            self._put(context, "source:data:" + key, text)
+        return text
+
     def _put(self, context: JsContext, name, value):
-        context.variables[str(name)] = value
-        if str(name) in {"sourceVariable", "source:loginHeader", "source:loginInfo", "infoMap"}:
-            source_data = (context.source.to_dict() if hasattr(context.source, "to_dict")
-                           else dict(context.source))
+        name = str(name)
+        persistent = (name in {"sourceVariable", "source:loginHeader", "source:loginInfo", "infoMap"}
+                      or name.startswith("source:data:"))
+        if persistent and value is None:
+            context.variables.pop(name, None)
+        else:
+            context.variables[name] = value
+        if persistent:
+            if hasattr(context.source, "to_dict"):
+                source_data = context.source.to_dict()
+            elif isinstance(context.source, dict):
+                source_data = dict(context.source)
+            else:
+                source_data = {str(key): item for key, item in
+                               vars(context.source).items() if not callable(item)}
             source_key = str(source_data.get("bookSourceUrl", ""))
             if source_key:
                 with self._PERSIST_LOCK:
@@ -2447,7 +3357,12 @@ class LegadoJsRuntime:
                     if self.device_id:
                         disk_state.setdefault("deviceId", self.device_id)
                     sources = disk_state.setdefault("sources", {})
-                    sources.setdefault(source_key, {})[str(name)] = value
+                    source_state = sources.setdefault(source_key, {})
+                    if value is None:
+                        source_state.pop(name, None)
+                    else:
+                        source_state[name] = (self._encrypt_login_info(str(value))
+                                              if name == "source:loginInfo" else value)
                     self.persistent_state = disk_state
                     self._save_persistent_state()
         return value
@@ -2644,7 +3559,7 @@ class LegadoJsRuntime:
     def _utf8_to_gbk(value: str) -> str:
         # JsExtensions encodes the Unicode string as GBK and constructs the
         # final Java String with Android's UTF-8 default charset.
-        return str(value).encode("gb18030", errors="replace").decode(
+        return str(value).encode("gbk", errors="replace").decode(
             "utf-8", errors="replace")
 
     @staticmethod
@@ -2666,8 +3581,7 @@ class LegadoJsRuntime:
     def _gzip(cls, value, charset="") -> str:
         raw = gzip.decompress(cls._byte_values(value))
         if charset:
-            encoding = str(charset).replace("GBK", "gb18030").replace(
-                "ISO-8859-1", "latin-1")
+            encoding = str(charset).replace("ISO-8859-1", "latin-1")
             return raw.decode(encoding, errors="replace")
         return json.dumps(list(raw))
 
@@ -2721,7 +3635,7 @@ class LegadoJsRuntime:
         return base64.b64encode(result).decode() if as_base64 else result.hex()
 
     def _resolve_js_lib(self, value) -> str:
-        """Load Legado jsLib mappings while preserving inline library code."""
+        """Load only JSON-object URL mappings; evaluate every other value whole."""
         if not value:
             return ""
         data = value
@@ -2731,10 +3645,10 @@ class LegadoJsRuntime:
                 data = json.loads(text)
             except json.JSONDecodeError:
                 return text
+            if not isinstance(data, dict):
+                return text
         if isinstance(data, dict):
             entries = data.values()
-        elif isinstance(data, list):
-            entries = data
         else:
             return str(data)
         scripts = []
@@ -2742,8 +3656,6 @@ class LegadoJsRuntime:
             text = str(entry or "").strip()
             if text.startswith(("http://", "https://")):
                 scripts.append(self._ajax(text))
-            elif text and not isinstance(data, dict):
-                scripts.append(text)
         return "\n".join(scripts)
 
     @staticmethod
@@ -3432,15 +4344,16 @@ class LegadoJsRuntime:
         except ImportError as exc:
             raise JsBridgeError("missing simplified/traditional conversion dependency") from exc
 
-    def _zip_content(self, value: str, member: str, as_bytes=False, charset="") -> str:
+    def _zip_content(self, value: str, member: str, as_bytes=False, charset="",
+                     source_headers=None, base_url=None, cookie_enabled=True,
+                     cookie_tag=None) -> str:
         """Mirror JsExtensions.getZip*Content for a URL or hexadecimal archive."""
         try:
             if re.match(r"^https?://", value, re.I):
-                if self.opener is None:
-                    raise JsBridgeError("JS HTTP runtime has been closed")
-                with self.opener.open(Request(value, headers=self.default_headers),
-                                      timeout=self.timeout) as response:
-                    raw = response.read()
+                response = json.loads(self._request_json(
+                    value, source_headers, base_url, cookie_enabled, cookie_tag,
+                    False))
+                raw = bytes(response.get("bodyBytes") or [])
             else:
                 raw = bytes.fromhex(value)
             with zipfile.ZipFile(io.BytesIO(raw)) as archive:
@@ -3456,44 +4369,49 @@ class LegadoJsRuntime:
                 return json.dumps(list(content))
             if charset:
                 return content.decode(charset)
-            for encoding in ("utf-8-sig", "gb18030"):
-                try:
-                    return content.decode(encoding)
-                except UnicodeDecodeError:
-                    pass
-            return content.decode("utf-8", errors="replace")
+            return self._decode_detected_text(content)
         except (OSError, ValueError, zipfile.BadZipFile, LookupError) as exc:
             raise JsBridgeError(f"zip content read failed: {exc}") from None
 
-    def _archive_input(self, value: str) -> bytes:
+    def _archive_input(self, value: str, source_headers=None, base_url=None,
+                       cookie_enabled=True, cookie_tag=None) -> bytes:
         if re.match(r"^https?://", value, re.I):
-            if self.opener is None:
-                raise JsBridgeError("JS HTTP runtime has been closed")
-            with self.opener.open(Request(value, headers=self.default_headers),
-                                  timeout=self.timeout) as response:
-                return response.read()
+            response = json.loads(self._request_json(
+                value, source_headers, base_url, cookie_enabled, cookie_tag,
+                False))
+            return bytes(response.get("bodyBytes") or [])
         try:
             return bytes.fromhex(value)
         except ValueError as exc:
             raise JsBridgeError(f"archive hex decode failed: {exc}") from None
 
-    @staticmethod
-    def _decode_archive_text(content: bytes, charset="") -> str:
+    @classmethod
+    def _decode_archive_text(cls, content: bytes, charset="") -> str:
         if charset:
             try:
                 return content.decode(charset)
             except (LookupError, UnicodeDecodeError) as exc:
                 raise JsBridgeError(f"archive text decode failed: {exc}") from None
-        for encoding in ("utf-8-sig", "gb18030"):
-            try:
-                return content.decode(encoding)
-            except UnicodeDecodeError:
-                pass
-        return content.decode("utf-8", errors="replace")
+        return cls._decode_detected_text(content)
+
+    @staticmethod
+    def _decode_detected_text(content: bytes, file_sample=False) -> str:
+        """Port EncodingDetect.getEncode for byte arrays and File samples."""
+        from app.services.icu_charset import detect_charset
+        sample = content
+        if file_sample:
+            sample = content[:8000] + b"\0" * max(0, 8000 - len(content[:8000]))
+        encoding = detect_charset(sample) or "UTF-8"
+        try:
+            return content.decode(encoding, errors="replace")
+        except LookupError as exc:
+            raise JsBridgeError(f"unsupported detected charset: {encoding}") from exc
 
     def _archive_content(self, archive_type: str, value: str, member: str,
-                         as_bytes=False, charset="") -> str:
-        raw = self._archive_input(value)
+                         as_bytes=False, charset="", source_headers=None,
+                         base_url=None, cookie_enabled=True, cookie_tag=None) -> str:
+        raw = self._archive_input(value, source_headers, base_url,
+                                  cookie_enabled, cookie_tag)
         try:
             if archive_type == "7z":
                 import py7zr
@@ -3550,12 +4468,7 @@ class LegadoJsRuntime:
                 return content.decode(charset)
             except (LookupError, UnicodeDecodeError) as exc:
                 raise JsBridgeError(f"file decode failed: {exc}") from None
-        for encoding in ("utf-8-sig", "gb18030"):
-            try:
-                return content.decode(encoding)
-            except UnicodeDecodeError:
-                pass
-        return content.decode("utf-8", errors="replace")
+        return self._decode_detected_text(content, file_sample=True)
 
     def _file_delete(self, value: str) -> bool:
         path = self._file_path(value)
@@ -3568,7 +4481,8 @@ class LegadoJsRuntime:
             path.unlink()
         return True
 
-    def _download_file(self, value: str, url="") -> str:
+    def _download_file(self, value: str, url="", source_headers=None,
+                       base_url=None, cookie_enabled=True) -> str:
         target_url = str(url or value)
         if url:
             file_type = self._download_config_type(target_url)
@@ -3580,11 +4494,10 @@ class LegadoJsRuntime:
                 raise JsBridgeError(f"download hex decode failed: {exc}") from None
             name = hashlib.md5(target_url.encode()).hexdigest()[8:24] + "." + file_type
         else:
-            if self.opener is None:
-                raise JsBridgeError("JS HTTP runtime has been closed")
-            with self.opener.open(Request(target_url, headers=self.default_headers),
-                                  timeout=self.timeout) as response:
-                content = response.read()
+            args = (target_url, source_headers, base_url)
+            response = (self._request_json(*args) if cookie_enabled
+                        else self._request_json(*args, False))
+            content = bytes(json.loads(response).get("bodyBytes") or [])
             name = self._download_name(target_url)
         path = self._file_path(name)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -3603,25 +4516,33 @@ class LegadoJsRuntime:
         custom_url = CustomUrl(target_url)
         request_url = custom_url.get_url()
         default = custom_url.get_attr().get("type")
-        parsed = urlsplit(request_url)
-        suffix = Path(parsed.path).suffix.lstrip(".")
+        suffix = request_url.rsplit(".", 1)[1] if "." in request_url else ""
+        suffix = suffix.split("?", 1)[0]
         if len(suffix) > 5 or not re.fullmatch(r"[A-Za-z0-9]+", suffix or ""):
             suffix = str(default or "ext")
         return hashlib.md5(target_url.encode()).hexdigest()[8:24] + "." + suffix
 
-    def _cache_file(self, url: str, save_time=0) -> str:
-        relative = "/" + self._download_name(url)
-        path = self._file_path(relative)
-        max_age = max(0, int(save_time or 0))
-        fresh = path.is_file() and (max_age == 0 or time.time() - path.stat().st_mtime <= max_age)
-        if not fresh:
-            self._download_file(url)
+    def _cache_file(self, url: str, save_time=0, source_headers=None,
+                    base_url=None, cookie_enabled=True) -> str:
+        key = hashlib.md5(str(url).encode()).hexdigest()[8:24]
+        cached = self._cache_get(key)
+        try:
+            relative = json.loads(cached) if cached else ""
+        except json.JSONDecodeError:
+            relative = cached
+        path = self._file_path(relative) if relative else None
+        if path is None or not path.exists():
+            relative = self._download_file(
+                url, "", source_headers, base_url, cookie_enabled)
+            self._cache_put(key, json.dumps(relative), save_time)
         return self._file_read(relative, False, "")
 
-    def _import_script(self, path_value: str) -> str:
+    def _import_script(self, path_value: str, source_headers=None,
+                       base_url=None, cookie_enabled=True) -> str:
         path_value = str(path_value)
         if path_value.startswith("http"):
-            result = self._cache_file(path_value, 0)
+            result = self._cache_file(
+                path_value, 0, source_headers, base_url, cookie_enabled)
         elif re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", path_value):
             if self.uri_reader is not None:
                 result = str(self.uri_reader(path_value) or "")
@@ -3644,22 +4565,21 @@ class LegadoJsRuntime:
     @staticmethod
     def _read_absolute_text(path: Path) -> str:
         raw = path.read_bytes()
-        for encoding in ("utf-8-sig", "gb18030"):
-            try:
-                return raw.decode(encoding)
-            except UnicodeDecodeError:
-                pass
         return raw.decode("utf-8", errors="replace")
 
     def _unarchive_file(self, value: str) -> str:
         archive_path = self._file_path(value)
         if not value or not archive_path.is_file():
             return ""
+        archive_root = self._file_path("ArchiveTemp")
+        if not self._archive_temp_initialized:
+            if archive_root.exists():
+                self._file_delete("ArchiveTemp")
+            archive_root.mkdir(parents=True, exist_ok=True)
+            self._archive_temp_initialized = True
         destination_relative = ("ArchiveTemp/" + hashlib.md5(
             archive_path.name.encode()).hexdigest()[8:24])
         destination = self._file_path(destination_relative)
-        if destination.exists():
-            self._file_delete(destination_relative)
         destination.mkdir(parents=True, exist_ok=True)
         try:
             root = destination.resolve()
@@ -3714,7 +4634,10 @@ class LegadoJsRuntime:
 
     def _text_in_folder(self, value: str) -> str:
         folder = self._file_path(value)
+        if not folder.exists():
+            return ""
         if not folder.is_dir():
+            self._file_delete(value)
             return ""
         values = []
         for path in folder.iterdir():
@@ -3722,14 +4645,7 @@ class LegadoJsRuntime:
                 raw = path.read_bytes()
             except OSError as exc:
                 raise JsBridgeError(f"folder entry read failed: {exc}") from None
-            for encoding in ("utf-8-sig", "gb18030"):
-                try:
-                    values.append(raw.decode(encoding))
-                    break
-                except UnicodeDecodeError:
-                    pass
-            else:
-                values.append(raw.decode("utf-8", errors="replace"))
+            values.append(self._decode_detected_text(raw, file_sample=True))
         if not values:
             raise JsBridgeError("StringBuilder deleteCharAt(-1)")
         self._file_delete(value)
@@ -3778,15 +4694,58 @@ class LegadoJsRuntime:
         result.setdefault("status", 200)
         result.setdefault("url", url)
         result.setdefault("body", "")
+        cookie_tag = str(options.get("cookieTag") or "")
+        # BackstageWebView reads Android CookieManager for the finished page,
+        # then stores that string under source.getKey(), not the redirected URL.
+        if cookie_tag and "cookie" in result:
+            cookie_text = str(result.get("cookie") or "")
+            self.store_set_cookie(cookie_tag, cookie_text)
         return result
 
+    @staticmethod
+    def _bridge_response_payload(result: dict, response_kind="str") -> dict:
+        """Normalize browser/HTTP results without collapsing repeated headers."""
+        raw_headers = result.get("headers") or {}
+        headers: dict[str, str] = {}
+        multi: dict[str, list[str]] = {}
+        for name, value in raw_headers.items():
+            key = str(name).lower()
+            values = ([str(item) for item in value] if isinstance(value, (list, tuple))
+                      else [str(value)])
+            multi[key] = values
+            if values:
+                headers[key] = values[-1]
+        body = result.get("body")
+        if isinstance(body, (bytes, bytearray)):
+            body_bytes = bytes(body)
+            body_text = body_bytes.decode("utf-8", errors="replace")
+        else:
+            body_text = str(body or "")
+            body_bytes = body_text.encode("utf-8")
+        return {
+            "body": body_text, "bodyBytes": list(body_bytes),
+            "headers": headers, "headersMulti": multi,
+            "status": int(result.get("status") or 200),
+            "message": str(result.get("message") or
+                           ("OK" if str(response_kind) == "str" else "")),
+            "url": str(result.get("url") or ""),
+            "responseKind": str(response_kind),
+            "protocol": str(result.get("protocol") or "http/1.1"),
+        }
+
     def _webview(self, html_value: str, url: str, js: str,
-                 source_regex: str, override_regex: str) -> str:
+                 source_regex: str, override_regex: str,
+                 cookie_tag: str | None = None,
+                 header_map: dict | None = None) -> str:
         options = {
-            "mode": "webView", "html": str(html_value or ""),
-            "url": str(url or self.base_url), "javaScript": str(js or ""),
+            "mode": "webView",
+            "html": None if html_value is None else str(html_value),
+            "url": None if url is None else str(url),
+            "javaScript": None if js is None else str(js),
             "sourceRegex": str(source_regex or ""),
             "overrideUrlRegex": str(override_regex or ""),
+            "cookieTag": str(cookie_tag or ""),
+            "headerMap": {str(k): str(v) for k, v in (header_map or {}).items()},
         }
         result = self._browser_result(options)
         if source_regex:
@@ -3932,10 +4891,38 @@ class LegadoJsRuntime:
         url = self._cookie_url(url)
         request = Request(url)
         self.cookies.add_cookie_header(request)
-        return request.get_header("Cookie", "")
+        value = request.get_header("Cookie", "")
+        pairs = self._cookie_store_pairs(value)
+        changed = False
+        while len("; ".join(f"{k}={v}" for k, v in pairs.items())) > 4096 and pairs:
+            key = random.choice(list(pairs))
+            self._remove_cookie_key(url, key, persist=False)
+            pairs.pop(key, None)
+            changed = True
+        if changed:
+            self._persist_cookie_state()
+        return "; ".join(f"{key}={item}" for key, item in pairs.items())
 
-    def set_cookie(self, url: str, cookie_text: str) -> bool:
+    def _remove_cookie_key(self, url: str, name: str, persist: bool = True) -> bool:
+        from app.services.public_suffix import effective_tld_plus_one
+        host = urlsplit(self._cookie_url(url)).hostname or ""
+        domain = effective_tld_plus_one(host)
+        removed = False
+        for item in list(self.cookies):
+            if (item.name == str(name) and effective_tld_plus_one(
+                    str(item.domain).lstrip(".")) == domain):
+                self._discard_cookie(item.domain, item.path, item.name)
+                removed = True
+        if self._session_persistent_shadow.pop((domain, str(name)), None) is not None:
+            removed = True
+        if removed and persist:
+            self._persist_cookie_state()
+        return removed
+
+    def set_cookie(self, url: str, cookie_text: str, session: bool = False,
+                   persist: bool = True) -> bool:
         """Import a Cookie/Set-Cookie string into the JS HTTP cookie jar."""
+        from app.services.public_suffix import effective_tld_plus_one
         target = urlsplit(self._cookie_url(url))
         domain = target.hostname or ""
         if not domain:
@@ -3943,35 +4930,172 @@ class LegadoJsRuntime:
         parsed = SimpleCookie()
         parsed.load(str(cookie_text or ""))
         for name, morsel in parsed.items():
-            cookie_domain = (morsel["domain"] or domain).lstrip(".")
-            path = morsel["path"] or "/"
-            secure = bool(morsel["secure"])
-            self._discard_cookie(cookie_domain, path, name)
-            self.cookies.set_cookie(Cookie(
+            cookie_domain = effective_tld_plus_one(
+                (morsel["domain"] or domain).lstrip("."))
+            try:
+                ipaddress.ip_address(cookie_domain)
+                domain_cookie = False
+            except ValueError:
+                domain_cookie = "." in cookie_domain
+            stored_domain = ("." + cookie_domain if domain_cookie else cookie_domain)
+            path = "/"
+            secure = False
+            matching = [existing for existing in list(self.cookies)
+                        if (existing.name == name and effective_tld_plus_one(
+                            str(existing.domain).lstrip(".")) == cookie_domain)]
+            session_existing = next((item for item in matching if bool(
+                (item._rest or {}).get("LegadoSession"))), None)
+            for existing in matching:
+                is_session = bool((existing._rest or {}).get("LegadoSession"))
+                if session:
+                    if not is_session:
+                        self._session_persistent_shadow[(cookie_domain, name)] = existing
+                    self._discard_cookie(existing.domain, existing.path, name)
+                elif not is_session:
+                    self._discard_cookie(existing.domain, existing.path, name)
+            rest = ({"HttpOnly": morsel["httponly"]}
+                    if morsel["httponly"] else {})
+            if session:
+                rest["LegadoSession"] = True
+            cookie_item = Cookie(
                 version=0, name=name, value=morsel.value, port=None,
-                port_specified=False, domain=cookie_domain,
-                domain_specified=bool(morsel["domain"]),
-                domain_initial_dot=str(morsel["domain"]).startswith("."),
-                path=path, path_specified=bool(morsel["path"]), secure=secure,
+                port_specified=False, domain=stored_domain,
+                domain_specified=domain_cookie, domain_initial_dot=domain_cookie,
+                path=path, path_specified=False, secure=secure,
                 expires=None, discard=True, comment=None, comment_url=None,
-                rest={"HttpOnly": morsel["httponly"]} if morsel["httponly"] else {},
+                rest=rest,
                 rfc2109=False,
-            ))
+            )
+            if not session and session_existing is not None:
+                self._session_persistent_shadow[(cookie_domain, name)] = cookie_item
+            else:
+                if not session:
+                    self._session_persistent_shadow.pop((cookie_domain, name), None)
+                self.cookies.set_cookie(cookie_item)
         changed = bool(parsed)
-        if changed:
+        if changed and persist:
             self._persist_cookie_state()
         return changed
 
+    def save_response_cookies(self, url: str, headers) -> None:
+        """Port CookieManager.saveCookiesFromHeaders persistent/session split."""
+        values = []
+        if headers is not None:
+            if hasattr(headers, "get_all"):
+                values = list(headers.get_all("Set-Cookie") or [])
+            elif hasattr(headers, "getall"):
+                values = list(headers.getall("Set-Cookie", []) or [])
+            elif isinstance(headers, dict):
+                value = headers.get("Set-Cookie") or headers.get("set-cookie")
+                values = value if isinstance(value, list) else ([value] if value else [])
+        changed = False
+        for value in values:
+            parsed = SimpleCookie()
+            parsed.load(str(value or ""))
+            for name, morsel in parsed.items():
+                cookie = f"{name}={morsel.value}"
+                session = not bool(morsel["expires"] or morsel["max-age"])
+                changed = self.set_cookie(
+                    url, cookie, session=session, persist=False) or changed
+        if changed:
+            self._persist_cookie_state()
+
+    @staticmethod
+    def _cookie_store_pairs(cookie_text: str) -> dict[str, str]:
+        result = {}
+        for pair in re.split(r";\s*", str(cookie_text or "")):
+            if "=" not in pair:
+                continue
+            key, value = pair.split("=", 1)
+            key, value = key.strip(), value.strip()
+            if value or value == "null":
+                result[key] = value
+        return result
+
+    def _persistent_cookie_pairs(self, url: str) -> dict[str, str]:
+        from app.services.public_suffix import effective_tld_plus_one
+        host = urlsplit(self._cookie_url(url)).hostname or ""
+        domain = effective_tld_plus_one(host)
+        result = {}
+        for item in self.cookies:
+            if (effective_tld_plus_one(str(item.domain).lstrip(".")) == domain and
+                    not bool((item._rest or {}).get("LegadoSession"))):
+                result[item.name] = item.value
+        for (item_domain, name), item in self._session_persistent_shadow.items():
+            if item_domain == domain:
+                result[name] = item.value
+        return result
+
+    def store_set_cookie(self, url: str, cookie_text: str | None) -> bool:
+        """CookieStore.setCookie replaces only the persistent domain string."""
+        from app.services.public_suffix import effective_tld_plus_one
+        target = self._cookie_url(url)
+        host = urlsplit(target).hostname or ""
+        if not host:
+            return False
+        domain = effective_tld_plus_one(host)
+        for item in list(self.cookies):
+            if (effective_tld_plus_one(str(item.domain).lstrip(".")) == domain and
+                    not bool((item._rest or {}).get("LegadoSession"))):
+                self._discard_cookie(item.domain, item.path, item.name)
+        for key in [key for key in self._session_persistent_shadow if key[0] == domain]:
+            self._session_persistent_shadow.pop(key, None)
+        for name, value in self._cookie_store_pairs(str(cookie_text or "")).items():
+            try:
+                ipaddress.ip_address(domain)
+                domain_cookie = False
+            except ValueError:
+                domain_cookie = "." in domain
+            stored_domain = "." + domain if domain_cookie else domain
+            cookie_item = Cookie(
+                version=0, name=name, value=value, port=None,
+                port_specified=False, domain=stored_domain,
+                domain_specified=domain_cookie, domain_initial_dot=domain_cookie,
+                path="/", path_specified=False, secure=False, expires=None,
+                discard=True, comment=None, comment_url=None, rest={}, rfc2109=False)
+            session_item = next((item for item in self.cookies
+                                 if item.name == name and bool(
+                                     (item._rest or {}).get("LegadoSession")) and
+                                 effective_tld_plus_one(str(item.domain).lstrip(".")) == domain),
+                                None)
+            if session_item is not None:
+                self._session_persistent_shadow[(domain, name)] = cookie_item
+            else:
+                self.cookies.set_cookie(cookie_item)
+        self._persist_cookie_state()
+        return True
+
+    def store_replace_cookie(self, url: str, cookie_text: str) -> bool:
+        """CookieStore.replaceCookie merges new persistent keys over old keys."""
+        if not str(url or "") or not str(cookie_text or ""):
+            return False
+        values = self._persistent_cookie_pairs(url)
+        values.update(self._cookie_store_pairs(cookie_text))
+        merged = "; ".join(f"{name}={value}" for name, value in values.items())
+        return self.store_set_cookie(url, merged)
+
+    def store_clear_cookies(self) -> None:
+        """CookieStore.clear deletes the persistent OkHttp table, not sessions."""
+        for item in list(self.cookies):
+            if not bool((item._rest or {}).get("LegadoSession")):
+                self._discard_cookie(item.domain, item.path, item.name)
+        self._session_persistent_shadow.clear()
+        self._persist_cookie_state()
+
     def remove_cookie(self, url: str) -> bool:
         """Remove cookies visible to *url*, matching Legado's CookieStore API."""
+        host = urlsplit(self._cookie_url(url)).hostname or ""
         visible = {(item.domain, item.path, item.name) for item in self.cookies
-                   if self._domain_matches(
-                       urlsplit(self._cookie_url(url)).hostname or "", item.domain)}
+                   if self._domain_matches(host, item.domain)}
         for domain, path, name in visible:
             self._discard_cookie(domain, path, name)
-        if visible:
+        shadow = [key for key in self._session_persistent_shadow
+                  if self._domain_matches(host, key[0])]
+        for key in shadow:
+            self._session_persistent_shadow.pop(key, None)
+        if visible or shadow:
             self._persist_cookie_state()
-        return bool(visible)
+        return bool(visible or shadow)
 
     def import_cookie_header(self, url: str, cookie_text: str) -> None:
         if cookie_text:
@@ -4269,28 +5393,35 @@ class LegadoJsRuntime:
         except Exception as exc:
             raise JsBridgeError(f"signature operation failed: {exc}") from None
 
-    def _ajax(self, request_value: str, source_headers=None, base_url=None) -> str:
+    def _ajax(self, request_value: str, source_headers=None, base_url=None,
+              cookie_enabled=True, cookie_tag=None) -> str:
         try:
-            return json.loads(self._request_json(
-                request_value, source_headers, base_url))["body"]
+            args = (request_value, source_headers, base_url)
+            raw = self._request_json(*args, cookie_enabled, cookie_tag)
+            return json.loads(raw)["body"]
         except Exception:
             # JsExtensions.ajax wraps the complete AnalyzeUrl request in runCatching
             # and exposes the exception stack as the JavaScript return value.
             return traceback.format_exc()
 
     def _connect_json(self, request_value: str, source_headers=None,
-                      base_url=None) -> str:
+                      base_url=None, cookie_enabled=True, cookie_tag=None) -> str:
         try:
-            return self._request_json(request_value, source_headers, base_url)
+            args = (request_value, source_headers, base_url)
+            return self._request_json(*args, cookie_enabled, cookie_tag)
         except Exception:
             raw_url = re.split(r",\s*\{", str(request_value), maxsplit=1)[0]
             resolved = urljoin(str(base_url or self.base_url), raw_url.strip())
             return json.dumps({
                 "body": traceback.format_exc(), "bodyBytes": [], "headers": {},
-                "status": 200, "message": "", "url": resolved,
+                "headersMulti": {}, "status": 200, "message": "OK",
+                "url": (resolved if urlsplit(resolved).scheme in {"http", "https"}
+                        and urlsplit(resolved).netloc else "http://localhost/"),
+                "responseKind": "str", "protocol": "http/1.1",
             }, ensure_ascii=False)
 
-    def _ajax_all(self, values: str, source_headers=None, base_url=None) -> str:
+    def _ajax_all(self, values: str, source_headers=None, base_url=None,
+                  cookie_enabled=True, cookie_tag=None) -> str:
         try:
             urls = json.loads(values)
         except (TypeError, json.JSONDecodeError) as exc:
@@ -4301,13 +5432,16 @@ class LegadoJsRuntime:
             return "[]"
         with ThreadPoolExecutor(max_workers=len(urls),
                                 thread_name_prefix="legado-ajax") as executor:
-            futures = [executor.submit(self._request_json, str(url), source_headers,
-                                       base_url) for url in urls]
+            futures = [
+                executor.submit(self._request_json, str(url), source_headers, base_url,
+                                cookie_enabled, cookie_tag)
+                for url in urls
+            ]
             responses = [json.loads(future.result()) for future in futures]
         return json.dumps(responses, ensure_ascii=False)
 
     def _open_with_retry(self, request: Request, retry=0, opener=None):
-        attempts = max(0, int(retry or 0)) + 1
+        attempts = int(retry or 0) + 1
         for attempt in range(attempts):
             try:
                 return (opener or self.opener).open(request, timeout=self.timeout)
@@ -4316,9 +5450,13 @@ class LegadoJsRuntime:
                     return exc
                 exc.close()
 
-    def _request_json(self, request_value: str, source_headers=None, base_url=None) -> str:
+    def _request_json(self, request_value: str, source_headers=None, base_url=None,
+                      cookie_enabled=True, cookie_tag=None,
+                      allow_webview=True, webview_js=None,
+                      source_regex=None) -> str:
         from test_book_sources_async import encode_url, parse_request_config, split_post_url
-        from app.services.request_compat import escape_form, escape_url_query
+        from app.services.request_compat import (escape_form, escape_url_query,
+                                                 normalize_url_option)
 
         url = request_value
         config = {}
@@ -4326,28 +5464,17 @@ class LegadoJsRuntime:
             parts = split_post_url(request_value)
             if parts:
                 url, raw_config = parts
-                config = parse_request_config(raw_config) or {}
-        method = str(config.get("method", "GET")).upper()
+                config = normalize_url_option(parse_request_config(raw_config))
+        method = str(config.get("method", "GET"))
         body = config.get("body")
         if isinstance(body, (dict, list)):
             body = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
         request_charset = str(config.get("charset") or "utf-8")
-        if request_charset.lower() == "escape":
-            if (body is not None and
-                    not str(body).lstrip().startswith(("{", "[", "<"))):
-                body = escape_form(str(body))
-                request_charset = "ascii"
-            else:
-                request_charset = "utf-8"
-        if request_charset.lower() in {"gbk", "gb2312", "gb_2312-80"}:
-            request_charset = "gb18030"
-        data = (str(body).encode(request_charset, errors="replace")
-                if body is not None else None)
         headers = dict(self.default_headers)
         source_headers = dict(source_headers or {})
-        proxy = config.get("proxy")
+        proxy = None
         for name in list(source_headers):
-            if str(name).lower() == "proxy":
+            if str(name) == "proxy":
                 proxy = proxy or source_headers.pop(name)
         headers.update({str(k): str(v) for k, v in source_headers.items()})
         request_headers = config.get("headers") or {}
@@ -4363,17 +5490,46 @@ class LegadoJsRuntime:
                 "application/json; charset=UTF-8" if str(body or "").lstrip().startswith(
                     ("{", "[")) else
                 "application/x-www-form-urlencoded; charset=UTF-8")
+        if body is not None:
+            from app.services.rule_engine import ReaderEngine
+            content_type = next((str(value) for key, value in headers.items()
+                                 if str(key).lower() == "content-type"), "")
+            data = ReaderEngine._encode_request_body(
+                body, request_charset, content_type)
+        else:
+            data = None
         url = urljoin(str(base_url if base_url is not None else self.base_url), url.strip())
         if str(config.get("charset") or "").lower() == "escape":
             url = escape_url_query(url)
+        from app.services.rule_engine import ReaderEngine
+        # AnalyzeUrl always merges CookieStore into the request.  The direct
+        # JsExtensions get/post/head helpers only opt into CookieManager via
+        # the CookieJar marker, so a disabled jar must not load stored cookies.
+        if cookie_enabled or config.get("__rawJsoupRequest") is not True:
+            merged_cookie = ReaderEngine._merge_cookie_header(
+                self._cookie_string(url), headers.get("Cookie"))
+            if merged_cookie:
+                headers["Cookie"] = merged_cookie
         request = Request(encode_url(url), data=data, headers=headers, method=method)
         if self.opener is None:
             raise JsBridgeError("JS HTTP runtime has been closed")
+        webview_value = config.get("webView")
+        use_webview = bool(allow_webview) and not (
+            webview_value is None or webview_value is False or
+            isinstance(webview_value, str) and webview_value in {"", "false"})
+        if use_webview and method != "POST" and self.browser_fetcher is not None:
+            browser = self._browser_result({
+                **config, "mode": "webView", "url": url,
+                "headerMap": dict(headers), "cookieTag": str(cookie_tag or ""),
+                "javaScript": config.get("webJs") or webview_js,
+                "sourceRegex": source_regex,
+            })
+            return json.dumps(self._bridge_response_payload(browser), ensure_ascii=False)
         try:
             request_opener = None
-            if proxy or config.get("followRedirects") is False:
-                handlers = [HTTPCookieProcessor(self.cookies)]
-                if config.get("followRedirects") is False:
+            if proxy or config.get("__followRedirects") is False or not cookie_enabled:
+                handlers = ([HTTPCookieProcessor(self.cookies)] if cookie_enabled else [])
+                if config.get("__followRedirects") is False:
                     handlers.append(_NoRedirectHandler())
                 ssl_context = ssl.create_default_context()
                 ssl_context.check_hostname = False
@@ -4383,42 +5539,74 @@ class LegadoJsRuntime:
                 proxy = str(proxy).strip()
                 proxy = proxy if "://" in proxy else "http://" + proxy
                 handlers.append(ProxyHandler({"http": proxy, "https": proxy}))
-            if proxy or config.get("followRedirects") is False:
+            if proxy or config.get("__followRedirects") is False or not cookie_enabled:
                 request_opener = build_opener(*handlers)
             with self._open_with_retry(request, config.get("retry", 0), request_opener) as response:
                 raw = b"" if method == "HEAD" else response.read()
-                charset = config.get("charset") or response.headers.get_content_charset() or "utf-8"
-                if str(charset).lower() in {"gbk", "gb2312", "gb_2312-80"}:
-                    charset = "gb18030"
+                from app.services.rule_engine import ReaderEngine
+                charset = response.headers.get_content_charset()
+                content_type = response.headers.get("Content-Type", "")
+                text_raw = (raw if config.get("__rawJsoupRequest") is True else
+                            ReaderEngine._uncompress_response_body(raw, content_type))
+                body_text = ReaderEngine._decode_response_body(text_raw, charset)
+                if config.get("__rawJsoupRequest") is not True:
+                    body_text = ReaderEngine._normalize_response_text(
+                        body_text, content_type)
                 result = {
-                    "body": (raw.hex() if config.get("type") not in (None, "") else
-                             raw.decode(charset, errors="replace")),
+                    "body": (raw.hex() if config.get("type") is not None else body_text),
                     "bodyBytes": list(raw),
                     "headers": {str(k).lower(): str(v) for k, v in response.headers.items()},
+                    "headersMulti": {
+                        str(name).lower(): [str(item) for item in
+                                            (response.headers.get_all(name) or [])]
+                        for name in dict(response.headers.items())
+                    },
                     "status": int(getattr(response, "status", None) or 200),
+                    "message": str(getattr(response, "reason", "") or ""),
                     "url": response.geturl(),
+                    "responseKind": ("jsoup" if config.get("__rawJsoupRequest") is True
+                                     else "str"),
+                    "protocol": ({10: "http/1.0", 11: "http/1.1"}.get(
+                        getattr(response, "version", 11), "http/1.1")),
                 }
-                self._persist_cookie_state()
+                if use_webview and method == "POST" and self.browser_fetcher is not None:
+                    browser = self._browser_result({
+                        **config, "mode": "webView", "url": result["url"],
+                        "html": result["body"], "initialHtml": result["body"],
+                        "initialUrl": result["url"], "headerMap": dict(headers),
+                        "cookieTag": str(cookie_tag or ""),
+                        "javaScript": config.get("webJs") or webview_js,
+                        "sourceRegex": source_regex,
+                    })
+                    result = self._bridge_response_payload(browser)
+                if cookie_enabled:
+                    self.save_response_cookies(result["url"], response.headers)
                 return json.dumps(result, ensure_ascii=False)
         except HTTPError as exc:
             try:
                 raw = b"" if method == "HEAD" else exc.read()
-                charset = config.get("charset")
-                if not charset and exc.headers:
-                    charset = exc.headers.get_content_charset()
-                charset = charset or "utf-8"
-                if str(charset).lower() in {"gbk", "gb2312", "gb_2312-80"}:
-                    charset = "gb18030"
+                from app.services.rule_engine import ReaderEngine
+                charset = exc.headers.get_content_charset() if exc.headers else None
                 result = {
-                    "body": (raw.hex() if config.get("type") not in (None, "") else
-                             raw.decode(charset, errors="replace")),
+                    "body": (raw.hex() if config.get("type") is not None else
+                             ReaderEngine._decode_response_body(raw, charset)),
                     "bodyBytes": list(raw),
                     "headers": ({str(k).lower(): str(v) for k, v in exc.headers.items()}
                                 if exc.headers else {}),
+                    "headersMulti": ({
+                        str(name).lower(): [str(item) for item in
+                                            (exc.headers.get_all(name) or [])]
+                        for name in dict(exc.headers.items())
+                    } if exc.headers else {}),
                     "status": int(exc.code),
+                    "message": str(getattr(exc, "reason", "") or ""),
                     "url": exc.geturl() or url,
+                    "responseKind": ("jsoup" if config.get("__rawJsoupRequest") is True
+                                     else "str"),
+                    "protocol": "http/1.1",
                 }
-                self._persist_cookie_state()
+                if cookie_enabled:
+                    self.save_response_cookies(result["url"], exc.headers)
                 return json.dumps(result, ensure_ascii=False)
             finally:
                 exc.close()
