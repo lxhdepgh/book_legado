@@ -8,6 +8,8 @@ from pathlib import Path
 import flet as ft
 
 from app.services.source_service import SourceService
+from app.services.theme_service import ThemeService
+from app.views.appearance_view import AppearanceView
 from app.views.book_source_view import BookSourceView
 from app.views.reading_view import ReadingView
 
@@ -18,6 +20,8 @@ class BookSourceApp:
     def __init__(self, resource_dir: str | Path):
         self.resource_dir = Path(resource_dir)
         self.service = SourceService(self.resource_dir)
+        self.theme_service = ThemeService(self.service.data_dir)
+        self.theme_service.load()
 
         # 页面引用
         self._book_source_view: BookSourceView | None = None
@@ -33,11 +37,7 @@ class BookSourceApp:
 
         # 应用配置
         page.title = "Legado 书源管理工具"
-        page.theme_mode = ft.ThemeMode.SYSTEM
-        page.theme = ft.Theme(
-            color_scheme_seed=ft.Colors.BLUE,
-            use_material3=True,
-        )
+        self.theme_service.apply(page)
         page.padding = 0
         page.spacing = 0
         self._configure_window(page)
@@ -61,6 +61,11 @@ class BookSourceApp:
             on_imported=self._on_imported,
             discover_view=self._discover_view,
         )
+        self._appearance_view = AppearanceView(
+            self.theme_service,
+            on_preview=self._preview_appearance,
+            on_saved=self._appearance_message,
+        )
 
         # 主页容器
         content = ft.Container(
@@ -83,6 +88,11 @@ class BookSourceApp:
                     icon=ft.Icons.MENU_BOOK_OUTLINED,
                     selected_icon=ft.Icons.MENU_BOOK,
                     label="阅读",
+                ),
+                ft.NavigationBarDestination(
+                    icon=ft.Icons.PALETTE_OUTLINED,
+                    selected_icon=ft.Icons.PALETTE,
+                    label="外观",
                 ),
             ],
         )
@@ -122,7 +132,12 @@ class BookSourceApp:
         index = e.control.selected_index
         if index == self._current_index:
             return
+        previous_index = self._current_index
         self._current_index = index
+
+        # Leaving the settings page must not retain an unsaved live preview.
+        if previous_index == 2:
+            self._appearance_view.cancel_preview()
 
         if index == 0:
             self._content_container.content = self._book_source_view
@@ -131,7 +146,20 @@ class BookSourceApp:
             # 更新数据后由下方的 page.update() 一次性完成挂载和渲染。
             self._reading_view.refresh_bookshelf(update=False)
             self._content_container.content = self._reading_view
+        elif index == 2:
+            self._appearance_view.sync_from_saved()
+            self._content_container.content = self._appearance_view
 
+        self._page.update()
+
+    def _preview_appearance(self, settings):
+        """Apply a temporary preview without touching persisted settings."""
+        self.theme_service.apply(self._page, settings)
+        self._page.update()
+
+    def _appearance_message(self, message: str):
+        self.theme_service.apply(self._page)
+        self._page.show_snack_bar(ft.SnackBar(content=ft.Text(message)))
         self._page.update()
 
     def _on_imported(self, result: dict):
