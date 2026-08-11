@@ -3215,6 +3215,42 @@ class RuleParserTests(unittest.TestCase):
         )
         self.assertEqual(value, [[-128, -1, 127], [-1], "ÿ"])
 
+    def test_iso_8859_1_binary_string_preserves_nul_and_all_byte_values(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var bytes=[]; for(var i=0;i<256;i++) bytes.push(i);
+            var text=java.bytesToStr(bytes,"ISO-8859-1");
+            var roundTrip=java.strToBytes(text,"ISO-8859-1");
+            [text.length,text.charCodeAt(0),text.charCodeAt(255),
+             roundTrip.length,roundTrip[0],roundTrip[128],roundTrip[255],
+             text.getBytes("latin-1").length];''',
+            JsContext(source=source),
+        )
+        self.assertEqual(value, [256, 0, 255, 256, 0, -128, -1, 256])
+
+    def test_latin1_binary_split_keeps_cbc_ciphertext_block_aligned(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        value = runtime.evaluate(
+            '''@js:
+            var key=java.strToBytes("1234567890abcdef","UTF-8");
+            var iv=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15];
+            var cipher=java.createSymmetricCrypto("AES/CBC/PKCS7Padding",key,iv);
+            var encrypted=cipher.encrypt(java.strToBytes("binary bridge","UTF-8"));
+            var raw=iv.concat(encrypted);
+            var binary=java.bytesToStr(raw,"ISO-8859-1");
+            var restoredIv=java.strToBytes(binary.substring(0,16),"ISO-8859-1");
+            var restoredCipher=java.strToBytes(binary.substring(16),"ISO-8859-1");
+            var decryptor=java.createSymmetricCrypto(
+              "AES/CBC/PKCS7Padding",key,restoredIv);
+            [binary.length,restoredCipher.length,
+             java.bytesToStr(decryptor.decrypt(restoredCipher),"UTF-8")];''',
+            JsContext(source=source),
+        )
+        self.assertEqual(value, [32, 16, "binary bridge"])
+
     def test_js_extensions_s2t_and_zip_content_overloads(self):
         output = BytesIO()
         with zipfile.ZipFile(output, "w") as archive:

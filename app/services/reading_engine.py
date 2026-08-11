@@ -261,12 +261,13 @@ def parse_content_blocks(value: str, base_url: str) -> ChapterContent:
                 document.blocks.append(ContentBlock(kind, url, headers))
             return document
 
-    image_tags = list(re.finditer(r'<img\s+src="([^"]*)">', value, flags=re.I))
+    image_tags = list(_CONTENT_IMAGE_PATTERN.finditer(value))
     if image_tags:
         cursor = 0
         for match in image_tags:
             append_text(value[cursor:match.start()])
-            url, headers = _media_request(match.group(1), base_url)
+            source = match.group(1) or match.group(2) or match.group(3) or ""
+            url, headers = _media_request(source, base_url)
             document.blocks.append(ContentBlock("image", url, headers))
             cursor = match.end()
         append_text(value[cursor:])

@@ -79,6 +79,11 @@ class ReadingView(ft.Column):
         self._section = "shelf"
         self._detail_resume = None
         self._bookshelf_update_task = None
+        self._source_switch_task = None
+        self._source_switch_dialog = None
+        self._source_switch_results = None
+        self._source_switch_status = None
+        self._source_switch_query = None
         self._bookshelf_layout = "list"
         self._bookshelf_query = ft.TextField(
             hint_text="搜索书名或作者", prefix_icon=ft.Icons.SEARCH,
@@ -1015,6 +1020,9 @@ class ReadingView(ft.Column):
             ], tight=True, spacing=8)),
             actions=[
                 ft.TextButton("关闭", on_click=lambda e: self.page.pop_dialog()),
+                ft.TextButton("切换书源", icon=ft.Icons.SWAP_HORIZ,
+                              on_click=lambda e, selected=item:
+                              self._show_source_switch(selected)),
                 ft.TextButton("清除缓存", on_click=lambda e, selected=item:
                               self._clear_shelf_cache(selected)),
                 ft.TextButton("保存分组", on_click=lambda e, selected=item,
@@ -1026,6 +1034,154 @@ class ReadingView(ft.Column):
                           self._remove_from_manage(selected)),
             ])
         self.page.show_dialog(dialog)
+
+    def _show_source_switch(self, item):
+        self.page.pop_dialog()
+        self._source_switch_query = ft.TextField(
+            label="搜索书名", value=item.get("name") or "",
+            autofocus=True, on_submit=lambda e: self._start_source_switch(item))
+        self._source_switch_status = ft.Text(
+            "将在其他已启用书源中搜索同名书籍。",
+            color=ft.Colors.GREY_600)
+        self._source_switch_results = ft.ListView(expand=True, spacing=4)
+        self._source_switch_dialog = ft.AlertDialog(
+            modal=True, title=ft.Text("切换书源"),
+            content=ft.Container(width=620, height=520, content=ft.Column([
+                self._source_switch_query,
+                self._source_switch_status,
+                ft.Divider(height=1),
+                self._source_switch_results,
+            ], spacing=8)),
+            actions=[
+                ft.TextButton("关闭", on_click=self._close_source_switch),
+                ft.Button("搜索其他书源", icon=ft.Icons.SEARCH,
+                          on_click=lambda e: self._start_source_switch(item)),
+            ])
+        self.page.show_dialog(self._source_switch_dialog)
+
+    def _close_source_switch(self, _=None):
+        if self._source_switch_task and not self._source_switch_task.done():
+            self._source_switch_task.cancel()
+        self._source_switch_task = None
+        self.page.pop_dialog()
+
+    def _start_source_switch(self, item):
+        if self._source_switch_task and not self._source_switch_task.done():
+            return
+        keyword = str(self._source_switch_query.value or "").strip()
+        if not keyword:
+            self._source_switch_status.value = "请输入要搜索的书名"
+            self.update()
+            return
+        self._source_switch_task = self.page.run_task(
+            self._run_source_switch, item, keyword)
+
+    async def _run_source_switch(self, item, keyword):
+        sources = [source for source in self.service.sources
+                   if source.enabled and source.searchUrl and
+                   source.bookSourceUrl != item.get("source_url")]
+        self._source_switch_results.controls.clear()
+        self._source_switch_status.value = f"正在搜索 0/{len(sources)} 个书源…"
+        self.update()
+        queue = asyncio.Queue()
+        for source in sources:
+            queue.put_nowait(source)
+        matches = []
+        completed = 0
+
+        async def worker():
+            nonlocal completed
+            while True:
+                try:
+                    source = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                engine = LegadoReadingEngine(state_dir=self.service.data_dir)
+                try:
+                    books = await engine.search(source, keyword, 1)
+                    for book in books:
+                        if keyword.casefold() in str(book.name or "").casefold():
+                            matches.append((source, book))
+                except Exception:
+                    pass
+                finally:
+                    engine.js.close()
+                    queue.task_done()
+                    completed += 1
+                    if completed % 5 == 0 or completed == len(sources):
+                        self._render_source_switch_results(item, matches)
+                        self._source_switch_status.value = (
+                            f"正在搜索 {completed}/{len(sources)} 个书源，"
+                            f"找到 {len(matches)} 个结果…")
+                        self.update()
+
+        try:
+            workers = [asyncio.create_task(worker())
+                       for _ in range(min(6, len(sources)))]
+            if workers:
+                await asyncio.gather(*workers)
+            self._render_source_switch_results(item, matches)
+            self._source_switch_status.value = (
+                f"搜索完成：检查 {len(sources)} 个书源，找到 {len(matches)} 个结果")
+        except asyncio.CancelledError:
+            self._source_switch_status.value = "搜索已取消"
+            raise
+        finally:
+            self._source_switch_task = None
+            self.update()
+
+    def _render_source_switch_results(self, item, matches):
+        def rank(pair):
+            source, book = pair
+            exact_name = str(book.name or "").casefold() == str(item.get("name") or "").casefold()
+            same_author = bool(item.get("author")) and (
+                str(book.author or "").casefold() == str(item.get("author") or "").casefold())
+            return (not exact_name, not same_author, source.bookSourceName)
+
+        ordered = sorted(matches, key=rank)
+        self._source_switch_results.controls = [ft.ListTile(
+            leading=ft.Icon(ft.Icons.LANGUAGE),
+            title=ft.Text(book.name or "未命名"),
+            subtitle=ft.Text(" · ".join(filter(None, [
+                source.bookSourceName, book.author, book.last_chapter]))),
+            trailing=ft.Button(
+                "切换", on_click=lambda e, selected_source=source,
+                selected_book=book: self._confirm_source_switch(
+                    item, selected_source, selected_book)),
+        ) for source, book in ordered[:100]]
+
+    def _confirm_source_switch(self, item, source, book):
+        if self._source_switch_task and not self._source_switch_task.done():
+            self._source_switch_task.cancel()
+        self.page.pop_dialog()
+        dialog = ft.AlertDialog(
+            modal=True, title=ft.Text("确认切换书源"),
+            content=ft.Text(
+                f"将《{item.get('name') or '未命名'}》从“{item.get('source_name') or '未知'}”"
+                f"切换到“{source.bookSourceName}”。\n"
+                "阅读章节将按原章节序号在新目录中续接，旧书源缓存会被清除。"),
+            actions=[
+                ft.TextButton("取消", on_click=lambda e: self.page.pop_dialog()),
+                ft.Button("确认切换", on_click=lambda e:
+                          self._apply_source_switch(item, source, book)),
+            ])
+        self.page.show_dialog(dialog)
+
+    def _apply_source_switch(self, item, source, book):
+        old_source = item.get("source_url", "")
+        old_url = item.get("url", "")
+        try:
+            changed = self.service.switch_bookshelf_source(item, source, book)
+            if not changed:
+                self._status.value = "切换失败：该书源版本已在书架中"
+            else:
+                self.reading_cache.remove_book(old_source, old_url)
+                self._status.value = f"已切换到书源：{source.bookSourceName}"
+        except Exception as exc:
+            self._status.value = f"切换书源失败：{exc}"
+        self.page.pop_dialog()
+        self._render_bookshelf()
+        self.update()
 
     def _save_shelf_group(self, item, field):
         self.service.update_bookshelf_options(

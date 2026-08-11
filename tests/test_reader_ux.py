@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock, patch, PropertyMock
 
 from app.models.book_source import BookSource
 from app.services.reading_cache import ReadingCache
-from app.services.reading_engine import ChapterContent, ContentBlock
+from app.services.reading_engine import (ChapterContent, ContentBlock,
+                                         parse_content_blocks)
 from app.services.rule_engine import BookItem, ChapterItem
 from app.services.source_service import SourceService
 from app.views.reading_view import ReadingView
@@ -42,6 +43,16 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(full["width"], float("inf"))
         text = ReadingView._image_render_options("TEXT", 18)
         self.assertEqual(text, {"height": 18.0, "fit": ft.BoxFit.CONTAIN})
+
+    async def test_image_tag_with_legado_request_options_keeps_headers(self):
+        document = parse_content_blocks(
+            '<img src="https://img.test/1.jpg,{"headers":{"Referer":"https://source/"}}">',
+            "https://source/chapter")
+
+        self.assertEqual(len(document.blocks), 1)
+        self.assertEqual(document.blocks[0].kind, "image")
+        self.assertEqual(document.blocks[0].value, "https://img.test/1.jpg")
+        self.assertEqual(document.blocks[0].headers, {"Referer": "https://source/"})
 
     async def test_webview_sniffer_matches_full_resource_and_override_urls(self):
         self.view._webview_initial_url = "https://host/start"
@@ -211,6 +222,24 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PersistentReadingTests(unittest.TestCase):
+    def test_desktop_window_uses_wide_layout_and_mobile_keeps_native_size(self):
+        desktop = SimpleNamespace(
+            platform=ft.PagePlatform.WINDOWS, window=SimpleNamespace(
+                width=None, height=None, min_width=None, min_height=None))
+        BookSourceApp._configure_window(desktop)
+        self.assertEqual((desktop.window.width, desktop.window.height), (1100, 780))
+        self.assertEqual(
+            (desktop.window.min_width, desktop.window.min_height), (720, 600))
+
+        mobile = SimpleNamespace(
+            platform=ft.PagePlatform.ANDROID, window=SimpleNamespace(
+                width=None, height=None, min_width=None, min_height=None))
+        BookSourceApp._configure_window(mobile)
+        self.assertEqual(
+            (mobile.window.width, mobile.window.height,
+             mobile.window.min_width, mobile.window.min_height),
+            (None, None, None, None))
+
     def test_app_defaults_to_reading_navigation(self):
         with TemporaryDirectory() as directory:
             app = BookSourceApp(Path(directory))
@@ -236,6 +265,61 @@ class PersistentReadingTests(unittest.TestCase):
             self.assertEqual(item["latestChapterTitle"], "chapter 8")
             self.assertEqual(item["lastCheckCount"], 8)
             self.assertEqual(item["groupName"], "追更")
+
+    def test_switch_bookshelf_source_keeps_user_progress_and_group(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = SourceService(root, data_dir=root / "data")
+            old_source = BookSource(
+                bookSourceName="old", bookSourceUrl="https://old")
+            new_source = BookSource(
+                bookSourceName="new", bookSourceUrl="https://new")
+            old_book = BookItem("book", author="author", url="https://old/book")
+            new_book = BookItem(
+                "book", author="author", url="https://new/book",
+                last_chapter="chapter 20")
+            chapter = ChapterItem("chapter 8", "https://old/chapter/8", index=7)
+            self.assertTrue(service.add_to_bookshelf(old_source, old_book))
+            service.update_bookshelf_options(
+                old_source.bookSourceUrl, old_book.url, groupName="追更", order=9)
+            service.update_bookshelf_state(
+                old_source.bookSourceUrl, old_book.url, chapter=chapter,
+                scroll_offset=200, scroll_ratio=0.4, font_size=20)
+            item = service.bookshelf[0]
+
+            self.assertTrue(service.switch_bookshelf_source(
+                item, new_source, new_book))
+
+            self.assertEqual(item["source_url"], new_source.bookSourceUrl)
+            self.assertEqual(item["source_name"], new_source.bookSourceName)
+            self.assertEqual(item["url"], new_book.url)
+            self.assertEqual(item["groupName"], "追更")
+            self.assertEqual(item["order"], 9)
+            self.assertEqual(item["reading"]["chapter_index"], 7)
+            self.assertEqual(item["reading"]["chapter_url"], "")
+            self.assertEqual(item["reading"]["font_size"], 20)
+            self.assertEqual(item["reading"]["scroll_offset"], 0.0)
+
+            reopened = SourceService(root, data_dir=root / "data")
+            reopened.load_bookshelf()
+            self.assertEqual(reopened.bookshelf[0]["origin"], "https://new")
+
+    def test_switch_bookshelf_source_rejects_duplicate_target(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = SourceService(root, data_dir=root / "data")
+            old_source = BookSource(
+                bookSourceName="old", bookSourceUrl="https://old")
+            new_source = BookSource(
+                bookSourceName="new", bookSourceUrl="https://new")
+            old_book = BookItem("book", url="https://old/book")
+            new_book = BookItem("book", url="https://new/book")
+            service.add_to_bookshelf(old_source, old_book)
+            service.add_to_bookshelf(new_source, new_book)
+
+            self.assertFalse(service.switch_bookshelf_source(
+                service.bookshelf[0], new_source, new_book))
+            self.assertEqual(service.bookshelf[0]["source_url"], "https://old")
 
     def test_catalog_and_content_survive_cache_reopen(self):
         with TemporaryDirectory() as directory:

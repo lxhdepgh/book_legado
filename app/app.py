@@ -40,12 +40,7 @@ class BookSourceApp:
         )
         page.padding = 0
         page.spacing = 0
-        # Desktop uses a phone-like portrait viewport. Mobile platforms use
-        # the physical screen size and safely ignore these desktop defaults.
-        page.window.width = 430
-        page.window.height = 820
-        page.window.min_width = 360
-        page.window.min_height = 600
+        self._configure_window(page)
 
         # 初始化数据
         try:
@@ -107,6 +102,20 @@ class BookSourceApp:
         # FilePicker 作为服务注册到页面（Flet 0.86.x 服务化架构）
         page.services.append(self._book_source_view.file_picker)
         page.update()
+
+    @staticmethod
+    def _configure_window(page: ft.Page):
+        """Apply window geometry only where the platform owns a desktop window."""
+        desktop = {
+            ft.PagePlatform.WINDOWS, ft.PagePlatform.MACOS,
+            ft.PagePlatform.LINUX,
+        }
+        if page.platform not in desktop:
+            return
+        page.window.width = 1100
+        page.window.height = 780
+        page.window.min_width = 720
+        page.window.min_height = 600
 
     def _on_nav_change(self, e):
         """导航切换"""

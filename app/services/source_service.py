@@ -180,6 +180,54 @@ class SourceService:
             return True
         return False
 
+    def switch_bookshelf_source(self, item: dict, source: BookSource, book) -> bool:
+        """Replace one shelf entry's origin while retaining user-owned state."""
+        if item not in self.bookshelf:
+            return False
+        new_key = (source.bookSourceUrl, book.url)
+        if any(other is not item and
+               (other.get("source_url"), other.get("url")) == new_key
+               for other in self.bookshelf):
+            return False
+        previous = dict(item)
+        try:
+            identity = {
+                "name": book.name, "author": book.author,
+                "intro": book.intro, "url": book.url,
+                "cover_url": book.cover_url,
+                "toc_url": getattr(book, "toc_url", ""),
+                "kind": getattr(book, "kind", ""),
+                "last_chapter": getattr(book, "last_chapter", ""),
+                "word_count": getattr(book, "word_count", ""),
+                "download_urls": getattr(book, "download_urls", ""),
+                "variables": dict(getattr(book, "variables", {}) or {}),
+                "source_url": source.bookSourceUrl,
+                "source_name": source.bookSourceName,
+                "bookUrl": book.url,
+                "tocUrl": getattr(book, "toc_url", ""),
+                "origin": source.bookSourceUrl,
+                "originName": source.bookSourceName,
+                "latestChapterTitle": getattr(book, "last_chapter", ""),
+                "lastCheckTime": int(time.time() * 1000),
+                "lastCheckCount": 0,
+                "latestChapterTime": 0,
+                "totalChapterNum": 0,
+                "updateError": "",
+            }
+            item.update(identity)
+            # Chapter URLs belong to the old origin. Keep semantic progress so
+            # the new catalog can resume by chapter index/title instead.
+            if item.get("reading"):
+                item["reading"] = dict(item["reading"])
+                item["reading"]["chapter_url"] = ""
+                item["reading"]["scroll_offset"] = 0.0
+            self.save_bookshelf()
+            return True
+        except Exception:
+            item.clear()
+            item.update(previous)
+            raise
+
     def update_bookshelf_check(self, source_url: str, book_url: str, *,
                                latest_title: str = "",
                                total_chapters: int | None = None,

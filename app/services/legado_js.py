@@ -874,6 +874,21 @@ class LegadoJsRuntime:
             return number > 127 ? number - 256 : number;
           }});
         }}
+        function __isLatin1(charset) {{
+          return String(charset || '').replace(/[-_\\s]/g,'').toLowerCase() === 'iso88591' ||
+            String(charset || '').replace(/[-_\\s]/g,'').toLowerCase() === 'latin1';
+        }}
+        function __latin1BytesToString(value) {{
+          let output='';
+          for (const item of Array.from(value || []))
+            output += String.fromCharCode(Number(item) & 255);
+          return output;
+        }}
+        function __latin1StringToBytes(value) {{
+          const text=String(value), output=[];
+          for (let index=0;index<text.length;index++) output.push(text.charCodeAt(index)&255);
+          return __byteArray(output);
+        }}
         function __responseCookies(headers) {{
           const raw=String((headers||{{}})['set-cookie']||'');const result={{}};
           raw.split(/,(?=[^;,=]+=[^;,]+)/).forEach(cookie=>{{
@@ -1735,6 +1750,7 @@ class LegadoJsRuntime:
         org.jsoup.select={{NodeFilter:{{FilterResult:{{CONTINUE:'CONTINUE',SKIP_CHILDREN:'SKIP_CHILDREN',
           SKIP_ENTIRELY:'SKIP_ENTIRELY',REMOVE:'REMOVE',STOP:'STOP'}}}},NodeVisitor:function(){{}}}};
         String.prototype.getBytes = function(charset) {{
+          if (__isLatin1(charset)) return __latin1StringToBytes(this);
           return __byteArray(JSON.parse(__strbytes(String(this), String(charset || 'utf-8'))));
         }};
         const __NativeDate=Date;
@@ -2371,8 +2387,12 @@ class LegadoJsRuntime:
             ? value.map(x => (Number(x) & 255).toString(16).padStart(2, '0')).join('')
             : Array.from(unescape(encodeURIComponent(String(value))))
                 .map(x => x.charCodeAt(0).toString(16).padStart(2, '0')).join(''),
-          strToBytes: (value, charset) => __byteArray(JSON.parse(__strbytes(String(value), String(charset || 'utf-8')))),
-          bytesToStr: (value, charset) => __bytesstr(JSON.stringify(Array.from(value || [])), String(charset || 'utf-8')),
+          strToBytes: (value, charset) => __isLatin1(charset)
+            ? __latin1StringToBytes(value)
+            : __byteArray(JSON.parse(__strbytes(String(value), String(charset || 'utf-8')))),
+          bytesToStr: (value, charset) => __isLatin1(charset)
+            ? __latin1BytesToString(value)
+            : __bytesstr(JSON.stringify(Array.from(value || [])), String(charset || 'utf-8')),
           digestHex: (value, algorithm) => __digest(String(value), String(algorithm || 'MD5')),
           digestBase64Str: (value, algorithm) => __digest_base64(
             String(value), String(algorithm || 'MD5')),
