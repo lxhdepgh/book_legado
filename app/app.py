@@ -31,6 +31,7 @@ class BookSourceApp:
 
         # 当前选中的底栏索引
         self._current_index = 1
+        self._reader_immersive = False
 
     def build(self, page: ft.Page):
         """构建应用 (flet.app target)"""
@@ -56,7 +57,9 @@ class BookSourceApp:
 
         # 创建视图
         self._discover_view = ReadingView(self.service, discovery_only=True)
-        self._reading_view = ReadingView(self.service)
+        self._reading_view = ReadingView(
+            self.service, on_section_change=self._on_reading_section_change,
+            on_open_settings=lambda: self._navigate_to(2))
         self._book_source_view = BookSourceView(
             self.service,
             on_imported=self._on_imported,
@@ -66,6 +69,7 @@ class BookSourceApp:
             self.theme_service,
             on_preview=self._preview_appearance,
             on_saved=self._appearance_message,
+            reader_view=self._reading_view,
         )
 
         # 主页容器
@@ -75,43 +79,43 @@ class BookSourceApp:
         )
         self._content_container = content
 
-        # 底栏导航
+        destinations = [
+            ("书源", ft.Icons.LIBRARY_BOOKS_OUTLINED, ft.Icons.LIBRARY_BOOKS),
+            ("阅读", ft.Icons.MENU_BOOK_OUTLINED, ft.Icons.MENU_BOOK),
+            ("配置", ft.Icons.SETTINGS_OUTLINED, ft.Icons.SETTINGS),
+        ]
         nav_bar = ft.NavigationBar(
             selected_index=1,
             on_change=self._on_nav_change,
-            destinations=[
-                ft.NavigationBarDestination(
-                    icon=ft.Icons.LIBRARY_BOOKS_OUTLINED,
-                    selected_icon=ft.Icons.LIBRARY_BOOKS,
-                    label="书源",
-                ),
-                ft.NavigationBarDestination(
-                    icon=ft.Icons.MENU_BOOK_OUTLINED,
-                    selected_icon=ft.Icons.MENU_BOOK,
-                    label="阅读",
-                ),
-                ft.NavigationBarDestination(
-                    icon=ft.Icons.SETTINGS_OUTLINED,
-                    selected_icon=ft.Icons.SETTINGS,
-                    label="配置",
-                ),
-            ],
+            destinations=[ft.NavigationBarDestination(
+                label=label, icon=icon, selected_icon=selected_icon)
+                for label, icon, selected_icon in destinations],
         )
+        self._bottom_nav = nav_bar
+        self._side_nav = ft.NavigationRail(
+            selected_index=1, min_width=64, min_extended_width=176,
+            use_indicator=True, on_change=self._on_nav_change,
+            destinations=[ft.NavigationRailDestination(
+                label=label, icon=icon, selected_icon=selected_icon)
+                for label, icon, selected_icon in destinations],
+        )
+        self._side_divider = ft.VerticalDivider(width=1)
+        self._navigation_shell = ft.SafeArea(
+            expand=True, content=ft.Row(expand=True, spacing=0, controls=[
+                self._side_nav, self._side_divider, content,
+            ]))
 
         # 页面布局
         page.add(
-            ft.Column(
-                spacing=0,
-                expand=True,
-                controls=[
-                    content,
-                ],
-            ),
+            self._navigation_shell,
             nav_bar,
         )
 
         # FilePicker 作为服务注册到页面（Flet 0.86.x 服务化架构）
         page.services.append(self._book_source_view.file_picker)
+        page.on_resize = self._on_page_resize
+        page.on_keyboard_event = self._on_keyboard_event
+        self._apply_navigation_layout()
         page.update()
 
     @staticmethod
@@ -130,11 +134,17 @@ class BookSourceApp:
 
     def _on_nav_change(self, e):
         """导航切换"""
-        index = e.control.selected_index
+        self._navigate_to(e.control.selected_index)
+
+    def _navigate_to(self, index):
         if index == self._current_index:
             return
         previous_index = self._current_index
         self._current_index = index
+        if index != 1:
+            self._reader_immersive = False
+        self._bottom_nav.selected_index = index
+        self._side_nav.selected_index = index
 
         # Leaving the settings page must not retain an unsaved live preview.
         if previous_index == 2:
@@ -143,15 +153,44 @@ class BookSourceApp:
         if index == 0:
             self._content_container.content = self._book_source_view
         elif index == 1:
-            # 此时 ReadingView 尚未挂载，不能调用 update。
-            # 更新数据后由下方的 page.update() 一次性完成挂载和渲染。
-            self._reading_view.refresh_bookshelf(update=False)
             self._content_container.content = self._reading_view
+            self._reader_immersive = self._reading_view._section == "reader"
         elif index == 2:
             self._settings_view.sync_from_saved()
             self._content_container.content = self._settings_view
 
+        self._apply_navigation_layout()
         self._page.update()
+
+    def _on_page_resize(self, _=None):
+        self._apply_navigation_layout()
+        if self._page:
+            self._page.update()
+
+    def _on_keyboard_event(self, event):
+        if (self._current_index == 1 and self._reading_view is not None and
+                self._reading_view._section == "reader"):
+            self._reading_view._on_reader_key(event)
+
+    def _apply_navigation_layout(self):
+        if not self._page:
+            return
+        width = float(self._page.width or self._page.window.width or 430)
+        compact = width < 600
+        self._bottom_nav.visible = compact and not self._reader_immersive
+        self._side_nav.visible = not compact and not self._reader_immersive
+        self._side_divider.visible = self._side_nav.visible
+        self._side_nav.extended = width >= 900
+        self._side_nav.label_type = (
+            ft.NavigationRailLabelType.NONE if self._side_nav.extended
+            else ft.NavigationRailLabelType.SELECTED)
+
+    def _on_reading_section_change(self, section: str):
+        immersive = section == "reader" and self._current_index == 1
+        if immersive == self._reader_immersive:
+            return
+        self._reader_immersive = immersive
+        self._apply_navigation_layout()
 
     def _preview_appearance(self, settings):
         """Apply a temporary preview without touching persisted settings."""

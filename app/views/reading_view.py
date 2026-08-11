@@ -27,9 +27,12 @@ class ReadingView(ft.Column):
     PREFETCH_CHAPTER_COUNT = 10
     PREFETCH_CACHE_LIMIT = 64 * 1024 * 1024
 
-    def __init__(self, service, discovery_only=False):
+    def __init__(self, service, discovery_only=False, on_section_change=None,
+                 on_open_settings=None):
         super().__init__(spacing=0, expand=True)
         self.service = service
+        self._on_section_change = on_section_change
+        self._on_open_settings = on_open_settings
         self.reading_cache = ReadingCache(getattr(service, "cache_dir", service.data_dir))
         self.whole_book_cache = WholeBookCacheService(
             getattr(service, "cache_dir", service.data_dir), service.data_dir)
@@ -59,7 +62,10 @@ class ReadingView(ft.Column):
         self._pending_scroll_offset = 0.0
         self._pending_scroll_ratio = 0.0
         self._scroll_save_generation = 0
-        self._font_size = 16
+        self._reader_preferences_path = service.data_dir / "reader-layout.json"
+        self._reader_preferences = self._load_reader_preferences()
+        self._font_size = int(self._reader_preferences["font_size"])
+        self._reader_dialog = None
         self._reading_loading = False
         self._prefetch_task = None
         self._chapter_cache = {}
@@ -91,6 +97,7 @@ class ReadingView(ft.Column):
         self._source_switch_status = None
         self._source_switch_query = None
         self._bookshelf_layout = "list"
+        self._bookshelf_filter_generation = 0
         self._bookshelf_query = ft.TextField(
             hint_text="搜索书名或作者", prefix_icon=ft.Icons.SEARCH,
             dense=True, height=42, expand=True,
@@ -137,6 +144,8 @@ class ReadingView(ft.Column):
             expand=True, max_extent=190, child_aspect_ratio=0.72,
             spacing=8, run_spacing=8)
         self._bookshelf_render_generation = 0
+        self._bookshelf_rendered = False
+        self._continue_reading_host = ft.Container(visible=False)
         self._bookshelf_host = ft.Column(
             expand=True, spacing=0, controls=[
                 ft.Container(padding=ft.Padding(8, 4, 8, 4), content=ft.ResponsiveRow([
@@ -144,6 +153,7 @@ class ReadingView(ft.Column):
                     self._bookshelf_sort,
                     self._bookshelf_layout_btn, self._bookshelf_refresh_btn,
                 ], columns=12, spacing=6, run_spacing=4)),
+                self._continue_reading_host,
                 ft.Divider(height=1), self._bookshelf,
             ])
         self._chapters = ft.ListView(
@@ -170,7 +180,8 @@ class ReadingView(ft.Column):
             ], spacing=2),
         )
         self._title = ft.Text("正文", size=22, weight=ft.FontWeight.BOLD)
-        self._content_host = ft.Column(spacing=12)
+        self._content_host = ft.Column(
+            spacing=float(self._reader_preferences["paragraph_spacing"]))
         self._reader_progress = ft.Text(
             "未选择章节", size=12, expand=True, text_align=ft.TextAlign.CENTER)
         self._top_prev_btn = ft.IconButton(
@@ -181,11 +192,14 @@ class ReadingView(ft.Column):
             on_click=self._next_chapter)
         self._font_size_label = ft.Text(str(self._font_size), size=12)
         self._reader_toolbar = ft.Container(
+            visible=False,
             padding=ft.Padding(6, 2, 6, 2),
             content=ft.Row([
                 self._top_prev_btn,
-                ft.IconButton(ft.Icons.ARROW_BACK, tooltip="返回书籍详情与目录",
+                ft.IconButton(ft.Icons.ARROW_BACK, tooltip="返回书籍详情",
                               on_click=self._show_directory),
+                ft.IconButton(ft.Icons.FORMAT_LIST_BULLETED, tooltip="目录",
+                              on_click=self._open_reader_directory),
                 self._reader_progress,
                 ft.IconButton(ft.Icons.TEXT_DECREASE, tooltip="减小字号",
                               on_click=lambda e: self._change_font_size(-1)),
@@ -193,13 +207,35 @@ class ReadingView(ft.Column):
                        spacing=3, tight=True),
                 ft.IconButton(ft.Icons.TEXT_INCREASE, tooltip="增大字号",
                               on_click=lambda e: self._change_font_size(1)),
+                ft.IconButton(ft.Icons.TEXT_FIELDS, tooltip="阅读设置",
+                              on_click=self._open_reader_settings),
                 self._top_next_btn,
             ], spacing=0),
         )
-        self._reader = ft.ListView(
-            expand=True, scroll_interval=200, on_scroll=self._on_reader_scroll,
-            controls=[self._title, ft.Divider(), self._content_host],
+        self._reader_document = ft.Container(
+            width=float(self._reader_preferences["max_width"]),
+            padding=ft.Padding(16, 20, 16, 28),
+            on_click=self._on_reader_tap,
+            content=ft.Column([
+                self._title, ft.Divider(), self._content_host,
+            ], spacing=12),
         )
+        self._reader = ft.Column(
+            expand=True, scroll=ft.ScrollMode.AUTO,
+            scroll_interval=200, on_scroll=self._on_reader_scroll,
+            controls=[ft.Row(
+                [self._reader_document],
+                alignment=ft.MainAxisAlignment.CENTER,
+                vertical_alignment=ft.CrossAxisAlignment.START)],
+        )
+        self._reader_status_bar = ft.Container(
+            visible=bool(self._reader_preferences["show_status"]),
+            padding=ft.Padding(12, 2, 12, 4),
+            content=ft.Text(
+                "", size=11, text_align=ft.TextAlign.CENTER,
+                color=ft.Colors.ON_SURFACE_VARIANT),
+        )
+        self._reader_interaction = self._reader
         self._detail_title = ft.Text("书籍详情", size=22, weight=ft.FontWeight.BOLD,
                                      expand=True)
         self._detail_author = ft.Text("", color=ft.Colors.GREY_700)
@@ -232,7 +268,8 @@ class ReadingView(ft.Column):
             ])
         self._reader_page = ft.Column(
             expand=True, spacing=0, visible=False, controls=[
-                self._reader_toolbar, ft.Divider(height=1), self._reader,
+                self._reader_toolbar, self._reader_interaction,
+                self._reader_status_bar,
             ])
         self._section_host = ft.Stack(
             expand=True,
@@ -254,20 +291,192 @@ class ReadingView(ft.Column):
         else:
             self._page_title = ft.Text(
                 "我的书架", size=28, weight=ft.FontWeight.BOLD)
+            self._reading_header = ft.Container(
+                padding=12, content=ft.Column([
+                    self._page_title, self._status,
+                ]))
             self.controls = [
-                ft.Container(padding=12, content=ft.Column([
-                    self._page_title,
-                    self._status,
-                ])),
+                self._reading_header,
                 self._section_host,
             ]
+        self._apply_reader_preferences()
+
+    def _load_reader_preferences(self):
+        defaults = {
+            "font_size": 16, "line_height": 1.7,
+            "paragraph_spacing": 12, "max_width": 760,
+            "indent": True, "text_align": "start",
+            "background": "follow", "show_status": True,
+            "shortcuts": {
+                "previous": "left", "next": "right",
+                "page_up": "pageup", "page_down": "pagedown",
+                "directory": "f", "settings": "comma",
+                "close": "escape",
+            },
+        }
+        try:
+            value = json.loads(self._reader_preferences_path.read_text(
+                encoding="utf-8"))
+            if isinstance(value, dict):
+                defaults.update({key: value[key] for key in defaults if key in value})
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        try:
+            defaults["font_size"] = max(13, min(28, int(defaults["font_size"])))
+        except (TypeError, ValueError):
+            defaults["font_size"] = 16
+        try:
+            defaults["line_height"] = max(
+                1.3, min(2.2, float(defaults["line_height"])))
+        except (TypeError, ValueError):
+            defaults["line_height"] = 1.7
+        try:
+            defaults["paragraph_spacing"] = max(
+                4, min(24, float(defaults["paragraph_spacing"])))
+        except (TypeError, ValueError):
+            defaults["paragraph_spacing"] = 12
+        try:
+            defaults["max_width"] = float(defaults["max_width"])
+        except (TypeError, ValueError):
+            defaults["max_width"] = 760.0
+        if defaults["max_width"] not in {620.0, 700.0, 760.0}:
+            defaults["max_width"] = 760.0
+        if defaults["text_align"] not in {"start", "justify"}:
+            defaults["text_align"] = "start"
+        if defaults["background"] not in {
+                "follow", "paper", "eye", "night", "eink"}:
+            defaults["background"] = "follow"
+        defaults["indent"] = bool(defaults["indent"])
+        defaults["show_status"] = bool(defaults["show_status"])
+        shortcut_defaults = {
+            "previous": "left", "next": "right",
+            "page_up": "pageup", "page_down": "pagedown",
+            "directory": "f", "settings": "comma",
+            "close": "escape",
+        }
+        shortcuts = defaults.get("shortcuts")
+        if not isinstance(shortcuts, dict):
+            shortcuts = {}
+        migrated = {"ctrl+f": "f", "ctrl+comma": "comma"}
+        defaults["shortcuts"] = {
+            name: migrated.get(
+                str(shortcuts.get(name) or binding).lower(),
+                str(shortcuts.get(name) or binding).lower())
+            for name, binding in shortcut_defaults.items()
+        }
+        return defaults
+
+    def _save_reader_preferences(self):
+        try:
+            self._reader_preferences_path.parent.mkdir(parents=True, exist_ok=True)
+            temp = self._reader_preferences_path.with_suffix(".tmp")
+            temp.write_text(json.dumps(
+                self._reader_preferences, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+            temp.replace(self._reader_preferences_path)
+        except OSError:
+            pass
+
+    def _apply_reader_preferences(self):
+        preferences = self._reader_preferences
+        self._font_size = int(preferences["font_size"])
+        self._font_size_label.value = str(self._font_size)
+        self._content_host.spacing = float(preferences["paragraph_spacing"])
+        self._reader_document.width = float(preferences["max_width"])
+        self._reader_status_bar.visible = bool(preferences["show_status"])
+        palette = {
+            "follow": (None, None), "paper": ("#F5EEDC", "#332F27"),
+            "eye": ("#DCE8D5", "#243025"), "night": ("#151515", "#D8D8D8"),
+            "eink": ("#FFFFFF", "#000000"),
+        }
+        background, foreground = palette[preferences["background"]]
+        self._reader_document.bgcolor = background
+        self._title.color = foreground
+        alignment = (ft.TextAlign.JUSTIFY
+                     if preferences["text_align"] == "justify"
+                     else ft.TextAlign.START)
+        for control in self._content_host.controls:
+            role = getattr(control, "data", None)
+            if role not in {"reader-text", "reader-heading"}:
+                continue
+            control.size = self._font_size + (2 if role == "reader-heading" else 0)
+            control.style = ft.TextStyle(
+                height=(1.45 if role == "reader-heading"
+                        else float(preferences["line_height"])))
+            control.text_align = alignment
+            control.color = foreground
+            if role == "reader-text":
+                raw = str(control.value or "").lstrip("　")
+                if preferences["indent"] and not raw.startswith(
+                        ("•", "·", "- ", "— ")):
+                    control.value = "　　" + raw
+                elif not preferences["indent"]:
+                    control.value = raw
+        self._save_reader_preferences()
+
+    def _set_reader_preference(self, key, value):
+        self._reader_preferences[key] = value
+        self._apply_reader_preferences()
+        try:
+            self.update()
+        except RuntimeError:
+            pass
+
+    def _set_reader_shortcut(self, action, binding):
+        shortcuts = self._reader_preferences["shortcuts"]
+        binding = str(binding or "").lower()
+        previous = shortcuts.get(action, "")
+        for name, value in shortcuts.items():
+            if name != action and value == binding:
+                shortcuts[name] = previous
+                break
+        shortcuts[action] = binding
+        self._save_reader_preferences()
+
+    @staticmethod
+    def _normalize_reader_key(value):
+        aliases = {
+            "arrow left": "left", "arrowleft": "left",
+            "arrow right": "right", "arrowright": "right",
+            "arrow up": "up", "arrowup": "up",
+            "arrow down": "down", "arrowdown": "down",
+            "page up": "pageup", "page down": "pagedown",
+            " ": "space", ",": "comma", "keyf": "f",
+            "keycomma": "comma", "esc": "escape",
+            "control left": "ctrl", "control right": "ctrl",
+            "controlleft": "ctrl", "controlright": "ctrl",
+            "ctrl left": "ctrl", "ctrl right": "ctrl",
+            "shift left": "shift", "shift right": "shift",
+            "shiftleft": "shift", "shiftright": "shift",
+            "alt left": "alt", "alt right": "alt",
+            "altleft": "alt", "altright": "alt",
+        }
+        key = str(value or "").strip().lower().replace("_", " ")
+        if key.startswith("key ") and len(key) == 5:
+            key = key[-1]
+        return aliases.get(key, key)
+
+    def _reader_key_binding(self, event):
+        return self._normalize_reader_key(getattr(event, "key", ""))
+
+    def _on_reader_key_down(self, event):
+        key = self._normalize_reader_key(getattr(event, "key", ""))
+        if key in {"ctrl", "shift", "alt"}:
+            return
+        self._on_reader_key(event)
+
+    def _on_reader_key_repeat(self, event):
+        key = self._normalize_reader_key(getattr(event, "key", ""))
+        if key not in {"ctrl", "shift", "alt"}:
+            self._on_reader_key(event)
 
     def did_mount(self):
         if self.discovery_only:
             self.refresh_sources()
             self.page.run_task(self._load_categories, self.current_source, True)
         else:
-            self._render_bookshelf()
+            if not self._bookshelf_rendered:
+                self._render_bookshelf()
 
     def will_unmount(self):
         if self._webview_future and not self._webview_future.done():
@@ -873,6 +1082,7 @@ class ReadingView(ft.Column):
             self.update()
 
     def _render_bookshelf(self):
+        self._bookshelf_rendered = True
         query = str(self._bookshelf_query.value or "").strip().lower()
         groups = sorted({str(item.get("groupName") or "").strip()
                          for item in self.service.bookshelf
@@ -913,6 +1123,40 @@ class ReadingView(ft.Column):
         else:
             items.sort(key=lambda item: int((self.service.reading_state(item) or {}).get(
                 "last_read_at") or 0), reverse=True)
+        recent = max(
+            self.service.bookshelf,
+            key=lambda item: int((self.service.reading_state(item) or {}).get(
+                "last_read_at") or 0), default=None)
+        recent_state = self.service.reading_state(recent) if recent else None
+        self._continue_reading_host.visible = bool(
+            recent and recent_state and recent_state.get("chapter_name"))
+        if self._continue_reading_host.visible:
+            total = max(0, int(recent.get("totalChapterNum", 0) or 0))
+            chapter_index = max(0, int(recent_state.get("chapter_index", 0) or 0))
+            progress = min(1.0, (chapter_index + 1) / total) if total else 0.0
+            self._continue_reading_host.padding = ft.Padding(8, 4, 8, 8)
+            self._continue_reading_host.content = ft.Card(content=ft.Container(
+                padding=12,
+                on_click=lambda e, selected=recent: self._open_shelf_item(selected),
+                content=ft.Column([
+                    ft.Row([
+                        ft.Icon(ft.Icons.PLAY_CIRCLE_OUTLINE),
+                        ft.Column([
+                            ft.Text("继续阅读", size=11,
+                                    color=ft.Colors.ON_SURFACE_VARIANT),
+                            ft.Text(recent.get("name") or "未命名",
+                                    weight=ft.FontWeight.BOLD),
+                            ft.Text(recent_state.get("chapter_name") or "",
+                                    size=12, max_lines=1,
+                                    overflow=ft.TextOverflow.ELLIPSIS),
+                        ], expand=True, spacing=1),
+                        self._cache_status_control(recent, compact=True),
+                        ft.Icon(ft.Icons.CHEVRON_RIGHT),
+                    ]),
+                    ft.ProgressBar(value=progress, height=3,
+                                   semantics_label="全书阅读进度",
+                                   semantics_value=round(progress * 100)),
+                ], spacing=8)))
         list_controls = [self._shelf_control(item) for item in items]
         grid_controls = [self._shelf_grid_control(item) for item in items]
         if not self.service.bookshelf:
@@ -948,7 +1192,23 @@ class ReadingView(ft.Column):
             ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
         )
 
-    def _filter_bookshelf(self, _):
+    def _filter_bookshelf(self, event):
+        if getattr(event, "control", None) is self._bookshelf_query:
+            self._bookshelf_filter_generation += 1
+            try:
+                self.page.run_task(
+                    self._filter_bookshelf_after_delay,
+                    self._bookshelf_filter_generation)
+                return
+            except RuntimeError:
+                pass
+        self._render_bookshelf()
+        self.update()
+
+    async def _filter_bookshelf_after_delay(self, generation):
+        await asyncio.sleep(0.25)
+        if generation != self._bookshelf_filter_generation:
+            return
         self._render_bookshelf()
         self.update()
 
@@ -965,6 +1225,10 @@ class ReadingView(ft.Column):
 
     def _shelf_control(self, item):
         reading = self.service.reading_state(item) or {}
+        total_chapters = max(0, int(item.get("totalChapterNum", 0) or 0))
+        chapter_index = max(0, int(reading.get("chapter_index", 0) or 0))
+        book_progress = (min(1.0, (chapter_index + 1) / total_chapters)
+                         if total_chapters and reading.get("chapter_name") else 0.0)
         details = list(filter(None, [item.get("author"), item.get("source_name")]))
         if reading.get("chapter_name"):
             details.append(f"上次读到：{reading['chapter_name']}")
@@ -989,13 +1253,21 @@ class ReadingView(ft.Column):
                               fit=ft.BoxFit.COVER)
                      if item.get("cover_url") else ft.Icon(ft.Icons.BOOK)),
             title=ft.Text(item.get("name") or "未命名"),
-            subtitle=ft.Text(" · ".join(details)),
+            subtitle=ft.Column([
+                ft.Text(" · ".join(details)),
+                ft.ProgressBar(
+                    value=book_progress, height=2,
+                    visible=book_progress > 0,
+                    semantics_label="全书阅读进度",
+                    semantics_value=round(book_progress * 100)),
+            ], spacing=3),
             trailing=ft.Row([
                 self._cache_status_control(item),
                 ft.Container(
                     visible=unread > 0, padding=ft.Padding(7, 2, 7, 2),
-                    border_radius=12, bgcolor=ft.Colors.BLUE_100,
-                    content=ft.Text(str(unread), size=11)),
+                    border_radius=12, bgcolor=ft.Colors.PRIMARY_CONTAINER,
+                    content=ft.Text(str(unread), size=11,
+                                    color=ft.Colors.ON_PRIMARY_CONTAINER)),
                 ft.IconButton(
                     ft.Icons.MORE_VERT, tooltip="书籍管理",
                     on_click=lambda e, selected=item: self._show_shelf_manage(selected)),
@@ -1005,6 +1277,10 @@ class ReadingView(ft.Column):
 
     def _shelf_grid_control(self, item):
         reading = self.service.reading_state(item) or {}
+        total_chapters = max(0, int(item.get("totalChapterNum", 0) or 0))
+        chapter_index = max(0, int(reading.get("chapter_index", 0) or 0))
+        book_progress = (min(1.0, (chapter_index + 1) / total_chapters)
+                         if total_chapters and reading.get("chapter_name") else 0.0)
         unread = max(0, int(item.get("totalChapterNum", 0) or 0) -
                      int(item.get("durChapterIndex", 0) or 0) - 1)
         cover = (ft.Image(src=item.get("cover_url"), height=150,
@@ -1017,13 +1293,18 @@ class ReadingView(ft.Column):
             content=ft.Column([
                 ft.Stack([cover, ft.Container(
                     visible=unread > 0, right=4, top=4, padding=5,
-                    border_radius=12, bgcolor=ft.Colors.BLUE_100,
-                    content=ft.Text(str(unread), size=11))]),
+                    border_radius=12, bgcolor=ft.Colors.PRIMARY_CONTAINER,
+                    content=ft.Text(str(unread), size=11,
+                                    color=ft.Colors.ON_PRIMARY_CONTAINER))]),
                 ft.Text(item.get("name") or "未命名", max_lines=2,
                         overflow=ft.TextOverflow.ELLIPSIS,
                         weight=ft.FontWeight.BOLD),
                 ft.Text(reading.get("chapter_name") or item.get("author") or "",
                         size=11, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                ft.ProgressBar(
+                    value=book_progress, height=2, visible=book_progress > 0,
+                    semantics_label="全书阅读进度",
+                    semantics_value=round(book_progress * 100)),
                 self._cache_status_control(item, compact=True),
                 ft.Row([ft.Text(item.get("source_name") or "", size=10, expand=True,
                                 max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
@@ -1552,7 +1833,10 @@ class ReadingView(ft.Column):
         self._shelf_page.visible = section == "shelf"
         self._detail_page.visible = section == "detail"
         self._reader_page.visible = section == "reader"
+        if self._on_section_change:
+            self._on_section_change(section)
         if hasattr(self, "_page_title"):
+            self._reading_header.visible = section != "reader"
             self._page_title.value = {
                 "shelf": "我的书架",
                 "detail": "书籍详情",
@@ -1856,6 +2140,7 @@ class ReadingView(ft.Column):
                         self._current_book.url, chapter.url, content)
             if (open_generation is not None and
                     open_generation != self._book_open_generation):
+                self._reading_loading = False
                 return
             rendered = self._render_content(content)
             if append:
@@ -1886,15 +2171,22 @@ class ReadingView(ft.Column):
             self._show_section("reader")
         except Exception as exc:
             self._show_error(exc)
+        # Mount the new document while input remains locked. Restoring the
+        # saved offset after unlocking lets an early wheel event race with the
+        # final scroll_to(0), which visibly snaps the chapter back to its top.
+        try:
+            self.update()
+            if not append:
+                target_offset = max(0.0, float(restore_offset or 0))
+                self._pending_scroll_offset = target_offset
+                await self._reader.scroll_to(
+                    offset=target_offset, duration=150)
         finally:
             self._reading_loading = False
-        self.update()
+            self.update()
         if self._current_chapter is chapter:
-            self._prefetch_task = self.page.run_task(self._prefetch_next_chapters, chapter)
-        if not append:
-            target_offset = max(0.0, float(restore_offset or 0))
-            self._pending_scroll_offset = target_offset
-            await self._reader.scroll_to(offset=target_offset, duration=150)
+            self._prefetch_task = self.page.run_task(
+                self._prefetch_next_chapters, chapter)
 
     def _cancel_prefetch(self, clear_cache=False):
         if self._prefetch_task and not self._prefetch_task.done():
@@ -1974,21 +2266,188 @@ class ReadingView(ft.Column):
             position = self.chapters.index(self._current_chapter) + 1
             self._reader_progress.value = (
                 f"{position}/{len(self.chapters)} · {self._current_chapter.name}")
+            percent = int(position * 100 / max(1, len(self.chapters)))
+            self._reader_status_bar.content.value = (
+                f"{self._current_chapter.name} · {position}/{len(self.chapters)} · {percent}%")
         else:
             self._reader_progress.value = "未选择章节"
+            self._reader_status_bar.content.value = ""
 
     def _change_font_size(self, delta):
         new_size = max(13, min(28, self._font_size + int(delta)))
         if new_size == self._font_size:
             return
-        self._font_size = new_size
-        self._font_size_label.value = str(new_size)
-        for control in self._content_host.controls:
-            if getattr(control, "data", None) == "reader-text":
-                control.size = new_size
-            elif getattr(control, "data", None) == "reader-heading":
-                control.size = new_size + 2
+        self._reader_preferences["font_size"] = new_size
+        self._apply_reader_preferences()
         self.update()
+
+    def _toggle_reader_chrome(self, _=None):
+        self._reader_toolbar.visible = not self._reader_toolbar.visible
+        self.update()
+
+    def _on_reader_tap(self, event):
+        position = getattr(event, "local_position", None)
+        x = float(getattr(position, "x", 0) or 0)
+        width = float(self.page.width or 430)
+        if x and x < width * 0.22:
+            self._previous_chapter(None)
+        elif x and x > width * 0.78:
+            self._next_chapter(None)
+        else:
+            self._toggle_reader_chrome()
+
+    def _open_reader_directory(self, _=None):
+        if not self.chapters:
+            return
+        query = ft.TextField(
+            hint_text="搜索章节", prefix_icon=ft.Icons.SEARCH,
+            autofocus=True, dense=True)
+        chapter_list = ft.ListView(height=440, spacing=1)
+        title = ft.Text(f"目录 · {len(self.chapters)} 章")
+
+        def choose(chapter):
+            self.page.pop_dialog()
+            self._reader_dialog = None
+            self._load_content(chapter)
+
+        def render(_=None):
+            keyword = str(query.value or "").strip().lower()
+            chapters = [item for item in self.chapters
+                        if not item.is_volume and
+                        (not keyword or keyword in item.name.lower())]
+            if self._directory_reversed:
+                chapters.reverse()
+            chapter_list.controls = [ft.ListTile(
+                dense=True, title=ft.Text(item.name),
+                selected=item is self._current_chapter,
+                leading=(ft.Icon(ft.Icons.PLAY_ARROW, size=18)
+                         if item is self._current_chapter else None),
+                on_click=lambda e, selected=item: choose(selected))
+                for item in chapters[:500]]
+            if self._reader_dialog:
+                title.value = f"目录 · {len(chapters)} 章"
+                try:
+                    self._reader_dialog.update()
+                except RuntimeError:
+                    pass
+
+        query.on_change = render
+        reverse = ft.IconButton(
+            ft.Icons.SWAP_VERT, tooltip="正序/倒序",
+            on_click=lambda e: self._toggle_reader_dialog_order(render))
+        panel = ft.Container(
+            width=460, padding=12, content=ft.Column([
+                ft.Row([title, ft.IconButton(
+                    ft.Icons.CLOSE, tooltip="关闭",
+                    on_click=self._close_reader_dialog)]),
+                ft.Row([query, reverse]), chapter_list,
+            ], tight=True))
+        if float(self.page.width or 430) < 600:
+            self._reader_dialog = ft.BottomSheet(
+                content=panel, show_drag_handle=True, use_safe_area=True)
+        else:
+            self._reader_dialog = ft.AlertDialog(
+                modal=False, alignment=ft.Alignment.CENTER_RIGHT,
+                inset_padding=ft.Padding(24, 24, 24, 24), content=panel)
+        render()
+        self.page.show_dialog(self._reader_dialog)
+
+    def _toggle_reader_dialog_order(self, render):
+        self._directory_reversed = not self._directory_reversed
+        render()
+
+    def _open_reader_settings(self, _=None):
+        preferences = self._reader_preferences
+
+        def slider(label, key, minimum, maximum, divisions):
+            return ft.Column([
+                ft.Text(label, size=12),
+                ft.Slider(
+                    value=float(preferences[key]), min=minimum, max=maximum,
+                    divisions=divisions, label="{value}",
+                    on_change=lambda e, name=key: self._set_reader_preference(
+                        name, float(e.control.value))),
+            ], spacing=0)
+
+        width = ft.Dropdown(
+            label="正文宽度", value=str(int(preferences["max_width"])),
+            options=[ft.dropdown.Option("620", "窄"),
+                     ft.dropdown.Option("700", "标准"),
+                     ft.dropdown.Option("760", "宽")],
+            on_select=lambda e: self._set_reader_preference(
+                "max_width", float(e.control.value)))
+        alignment = ft.Dropdown(
+            label="文本对齐", value=preferences["text_align"],
+            options=[ft.dropdown.Option("start", "左对齐"),
+                     ft.dropdown.Option("justify", "两端对齐")],
+            on_select=lambda e: self._set_reader_preference(
+                "text_align", e.control.value))
+        background = ft.Dropdown(
+            label="阅读背景", value=preferences["background"],
+            options=[ft.dropdown.Option("follow", "跟随主题"),
+                     ft.dropdown.Option("paper", "纸张"),
+                     ft.dropdown.Option("eye", "护眼"),
+                     ft.dropdown.Option("night", "夜间"),
+                     ft.dropdown.Option("eink", "墨水屏")],
+            on_select=lambda e: self._set_reader_preference(
+                "background", e.control.value))
+        indent = ft.Switch(
+            label="段首缩进", value=bool(preferences["indent"]),
+            on_change=lambda e: self._set_reader_preference(
+                "indent", bool(e.control.value)))
+        status = ft.Switch(
+            label="显示底部阅读状态", value=bool(preferences["show_status"]),
+            on_change=lambda e: self._set_reader_preference(
+                "show_status", bool(e.control.value)))
+        panel = ft.Container(width=420, padding=12, content=ft.Column([
+                ft.Row([ft.Text("阅读设置", size=20, weight=ft.FontWeight.BOLD),
+                        ft.IconButton(ft.Icons.CLOSE, tooltip="关闭",
+                                      on_click=self._close_reader_dialog)]),
+                slider("字号", "font_size", 13, 28, 15),
+                slider("行距", "line_height", 1.3, 2.2, 9),
+                slider("段距", "paragraph_spacing", 4, 24, 10),
+                ft.ResponsiveRow([width, alignment], columns=12),
+                background, indent, status,
+            ], tight=True))
+        if float(self.page.width or 430) < 600:
+            self._reader_dialog = ft.BottomSheet(
+                content=panel, show_drag_handle=True, use_safe_area=True,
+                scrollable=True)
+        else:
+            self._reader_dialog = ft.AlertDialog(
+                modal=False, alignment=ft.Alignment.CENTER_RIGHT,
+                inset_padding=ft.Padding(24, 24, 24, 24),
+                scrollable=True, content=panel)
+        width.col = 6
+        alignment.col = 6
+        self.page.show_dialog(self._reader_dialog)
+
+    def _close_reader_dialog(self, _=None):
+        if self._reader_dialog:
+            self.page.pop_dialog()
+            self._reader_dialog = None
+
+    def _on_reader_key(self, event):
+        binding = self._reader_key_binding(event)
+        shortcuts = self._reader_preferences["shortcuts"]
+        if binding == shortcuts["directory"]:
+            self._open_reader_directory()
+        elif binding == shortcuts["settings"] and self._on_open_settings:
+            self._on_open_settings()
+        elif binding == shortcuts["previous"]:
+            self._previous_chapter(None)
+        elif binding == shortcuts["next"]:
+            self._next_chapter(None)
+        elif binding == shortcuts["page_up"]:
+            self.page.run_task(self._reader.scroll_to, delta=-560, duration=120)
+        elif binding == shortcuts["page_down"]:
+            self.page.run_task(self._reader.scroll_to, delta=560, duration=120)
+        elif binding == shortcuts["close"]:
+            if self._reader_dialog:
+                self._close_reader_dialog()
+            else:
+                self._show_directory(None)
+                self.update()
 
     def _previous_chapter(self, _):
         chapter = self._adjacent_chapter(-1)
@@ -2007,6 +2466,8 @@ class ReadingView(ft.Column):
     def _on_reader_scroll(self, event):
         pixels = getattr(event, "pixels", 0) or 0
         maximum = getattr(event, "max_scroll_extent", 0) or 0
+        if self._reading_loading:
+            return
         if self._current_chapter is None:
             return
         self._pending_scroll_offset = max(0.0, float(pixels))
@@ -2070,10 +2531,15 @@ class ReadingView(ft.Column):
                 for value, is_heading in self._novel_paragraphs(block.value):
                     controls.append(ft.Text(
                         value,
-                        selectable=True,
+                        selectable=False,
                         size=self._font_size + (2 if is_heading else 0),
                         weight=(ft.FontWeight.W_600 if is_heading else None),
-                        style=ft.TextStyle(height=1.45 if is_heading else 1.7),
+                        style=ft.TextStyle(
+                            height=(1.45 if is_heading else float(
+                                self._reader_preferences["line_height"]))),
+                        text_align=(ft.TextAlign.JUSTIFY
+                                    if self._reader_preferences["text_align"] == "justify"
+                                    else ft.TextAlign.START),
                         data="reader-heading" if is_heading else "reader-text",
                     ))
             elif block.kind == "image":
@@ -2100,8 +2566,7 @@ class ReadingView(ft.Column):
                 ))
         return controls
 
-    @staticmethod
-    def _novel_paragraphs(value):
+    def _novel_paragraphs(self, value):
         """Turn source text into readable novel paragraphs without changing data."""
         normalized = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
         normalized = normalized.replace("\xa0", " ")
@@ -2115,7 +2580,8 @@ class ReadingView(ft.Column):
             if not line:
                 continue
             is_heading = len(line) <= 48 and bool(heading_pattern.match(line))
-            if not is_heading and not line.startswith(("　　", "•", "·", "- ", "— ")):
+            if (self._reader_preferences["indent"] and not is_heading and
+                    not line.startswith(("　　", "•", "·", "- ", "— "))):
                 line = f"　　{line.lstrip('　')}"
             paragraphs.append((line, is_heading))
         return paragraphs

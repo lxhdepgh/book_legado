@@ -5,6 +5,7 @@ Legado 书源管理工具 - Flet GUI 入口
 启动方式:
     python main.py
 """
+import os
 import sys
 from pathlib import Path
 
@@ -31,21 +32,31 @@ def smoke_test():
     import quickjs  # noqa: F401
 
     from app.services.legado_js import JsContext, LegadoJsRuntime
+    from app.services.public_suffix import _DATA as public_suffix_data
+
+    assert (_ROOT / "resource" / "bookSource.json").is_file()
+    assert public_suffix_data.is_file()
 
     source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://smoke"})
     runtime = LegadoJsRuntime()
-    assert runtime.evaluate("@js:java.md5Encode('ok').length", JsContext(source)) == 32
-    assert OpenCC("t2s").convert("閱讀") == "阅读"
-    image = Image.new("RGB", (2, 2), "white")
-    output = io.BytesIO()
-    image.save(output, format="PNG")
-    assert runtime._bitmap_info(runtime._bitmap_decode(
-        __import__("json").dumps(list(output.getvalue())))) == "[2, 2]"
+    try:
+        assert runtime.evaluate(
+            "@js:java.md5Encode('ok').length", JsContext(source)) == 32
+        assert OpenCC("t2s").convert("閱讀") == "阅读"
+        image = Image.new("RGB", (2, 2), "white")
+        output = io.BytesIO()
+        image.save(output, format="PNG")
+        assert runtime._bitmap_info(runtime._bitmap_decode(
+            __import__("json").dumps(list(output.getvalue())))) == "[2, 2]"
+    finally:
+        runtime.close()
 
 
 def main():
     if "--smoke-test" in sys.argv:
         smoke_test()
+        if getattr(sys, "frozen", False):
+            os._exit(0)
         return
     resource_dir = _ROOT / "resource"
     app = BookSourceApp(resource_dir)

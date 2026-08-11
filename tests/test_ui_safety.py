@@ -5,6 +5,7 @@ from unittest.mock import patch
 from app.models.book_source import BookSource
 from app.services import check_service
 from app.views.manage_view import ManageView
+from app.views.check_view import CheckView
 from app.ui_feedback import show_snack_bar
 
 
@@ -26,6 +27,14 @@ class UiSafetyTests(unittest.TestCase):
             view._toggle_enabled(source, False)
 
         self.assertTrue(source.enabled)
+
+    def test_background_check_can_update_after_view_unmounts(self):
+        view = CheckView(SimpleNamespace())
+        view.update = unittest.mock.Mock(side_effect=RuntimeError("not mounted"))
+
+        view._safe_update()
+
+        view.update.assert_called_once()
 
 
 class CheckSafetyTests(unittest.IsolatedAsyncioTestCase):

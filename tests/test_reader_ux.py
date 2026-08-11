@@ -30,9 +30,14 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.view.engine.js.close()
         self.directory.cleanup()
 
-    async def test_reader_toolbar_keeps_navigation_and_font_controls_visible(self):
-        self.assertEqual(len(self.view._reader_toolbar.content.controls), 7)
+    async def test_reader_toolbar_is_immersive_and_keeps_core_actions(self):
+        self.assertEqual(len(self.view._reader_toolbar.content.controls), 9)
+        self.assertFalse(self.view._reader_toolbar.visible)
         self.assertEqual(self.view._font_size, 16)
+        self.assertIs(self.view._reader_interaction, self.view._reader)
+        self.assertIsInstance(self.view._reader, ft.Column)
+        self.assertEqual(self.view._reader.scroll, ft.ScrollMode.AUTO)
+        self.assertIsNotNone(self.view._reader_document.on_click)
 
     async def test_text_novel_content_uses_paragraph_reading_layout(self):
         document = ChapterContent([ContentBlock(
@@ -48,7 +53,7 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controls[0].style.height, 1.45)
         self.assertEqual(controls[1].data, "reader-text")
         self.assertEqual(controls[1].style.height, 1.7)
-        self.assertTrue(all(control.selectable for control in controls))
+        self.assertTrue(all(not control.selectable for control in controls))
 
     async def test_font_size_preserves_text_heading_hierarchy(self):
         self.view._content_host.controls = self.view._render_content(
@@ -59,10 +64,116 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.view._content_host.controls[0].size, 20)
         self.assertEqual(self.view._content_host.controls[1].size, 18)
-        self.assertEqual(len(self.view._reader.controls), 3)
-        self.assertIs(self.view._reader.controls[0], self.view._title)
-        self.assertIs(self.view._reader.controls[2], self.view._content_host)
-        self.assertFalse(hasattr(self.view, "_reader_nav"))
+        self.assertEqual(len(self.view._reader.controls), 1)
+        self.assertIs(self.view._reader_document.content.controls[0], self.view._title)
+        self.assertIs(self.view._reader_document.content.controls[2],
+                      self.view._content_host)
+        self.assertEqual(self.view._reader_document.width, 760)
+
+    async def test_reader_preferences_persist_and_apply(self):
+        self.view.update = lambda: None
+        self.view._set_reader_preference("line_height", 2.0)
+        self.view._set_reader_preference("max_width", 620.0)
+
+        reopened = ReadingView(self.view.service)
+        try:
+            self.assertEqual(reopened._reader_preferences["line_height"], 2.0)
+            self.assertEqual(reopened._reader_document.width, 620.0)
+        finally:
+            reopened.engine.js.close()
+
+    async def test_invalid_reader_preferences_fall_back_safely(self):
+        self.view._reader_preferences_path.write_text(
+            '{"font_size":"bad","line_height":null,"max_width":999}',
+            encoding="utf-8")
+        reopened = ReadingView(self.view.service)
+        try:
+            self.assertEqual(reopened._font_size, 16)
+            self.assertEqual(reopened._reader_preferences["line_height"], 1.7)
+            self.assertEqual(reopened._reader_document.width, 760)
+        finally:
+            reopened.engine.js.close()
+
+    async def test_reader_tap_zones_keep_middle_for_chrome(self):
+        page = SimpleNamespace(width=1000)
+        with patch.object(type(self.view), "page", new_callable=PropertyMock,
+                          return_value=page):
+            self.view._previous_chapter = unittest.mock.Mock()
+            self.view._next_chapter = unittest.mock.Mock()
+            self.view.update = lambda: None
+            offset = lambda x: SimpleNamespace(local_position=SimpleNamespace(x=x))
+
+            self.view._on_reader_tap(offset(100))
+            self.view._on_reader_tap(offset(900))
+            self.view._on_reader_tap(offset(500))
+
+        self.view._previous_chapter.assert_called_once()
+        self.view._next_chapter.assert_called_once()
+        self.assertTrue(self.view._reader_toolbar.visible)
+
+    async def test_reader_shortcuts_can_be_rebound_and_swap_conflicts(self):
+        self.view._set_reader_shortcut("previous", "right")
+
+        shortcuts = self.view._reader_preferences["shortcuts"]
+        self.assertEqual(shortcuts["previous"], "right")
+        self.assertEqual(shortcuts["next"], "left")
+
+        reopened = ReadingView(self.view.service)
+        try:
+            self.assertEqual(
+                reopened._reader_preferences["shortcuts"], shortcuts)
+        finally:
+            reopened.engine.js.close()
+
+    async def test_reader_key_handler_uses_custom_binding(self):
+        self.view._reader_preferences["shortcuts"]["previous"] = "home"
+        self.view._previous_chapter = unittest.mock.Mock()
+
+        self.view._on_reader_key(SimpleNamespace(
+            key="Home", ctrl=False, control=False))
+
+        self.view._previous_chapter.assert_called_once_with(None)
+
+    async def test_reader_normalizes_windows_physical_key_name(self):
+        self.view._open_reader_directory = unittest.mock.Mock()
+
+        self.view._on_reader_key_down(SimpleNamespace(key="Key F"))
+
+        self.view._open_reader_directory.assert_called_once_with()
+
+    async def test_reader_listener_handles_repeat_events(self):
+        self.view._previous_chapter = unittest.mock.Mock()
+
+        self.view._on_reader_key_repeat(SimpleNamespace(key="Arrow Left"))
+
+        self.view._previous_chapter.assert_called_once_with(None)
+
+    async def test_bookshelf_shows_recent_continue_card(self):
+        item = {"name": "Book", "source_url": "source", "url": "book",
+                "totalChapterNum": 10}
+        reading = {"chapter_name": "Chapter 3", "chapter_index": 2,
+                   "last_read_at": 100}
+        self.view.service.bookshelf = [item]
+        self.view.service.reading_state = lambda selected: reading
+
+        self.view._render_bookshelf()
+
+        self.assertTrue(self.view._continue_reading_host.visible)
+        row = self.view._continue_reading_host.content.content.content.controls[0]
+        labels = row.controls[1].controls
+        self.assertEqual(labels[1].value, "Book")
+        self.assertEqual(labels[2].value, "Chapter 3")
+        progress = self.view._continue_reading_host.content.content.content.controls[1]
+        self.assertEqual(progress.semantics_value, 30)
+        self.assertIsInstance(progress.semantics_value, int)
+
+    async def test_remount_reuses_existing_bookshelf_controls(self):
+        self.view._bookshelf_rendered = True
+        self.view._render_bookshelf = unittest.mock.Mock()
+
+        self.view.did_mount()
+
+        self.view._render_bookshelf.assert_not_called()
 
     async def test_bookshelf_refresh_uses_stable_unique_control_keys(self):
         first = {"name": "One", "source_url": "https://source-a",
@@ -328,9 +439,59 @@ class PersistentReadingTests(unittest.TestCase):
             service = ThemeService(directory)
             service.load()
             view = SettingsView(service, lambda _value: None, lambda _value: None)
-            self.assertEqual(1, view.tabs.length)
+            self.assertEqual(2, view.tabs.length)
             self.assertIs(view.tabs.content.controls[1].controls[0],
                           view.appearance_view)
+            self.assertIs(view.tabs.content.controls[1].controls[1],
+                          view.shortcut_help_view)
+
+    def test_settings_adds_reader_layout_as_second_tab(self):
+        with TemporaryDirectory() as directory:
+            from app.services.theme_service import ThemeService
+            service = ThemeService(directory)
+            service.load()
+            reader = SimpleNamespace(
+                _reader_preferences={
+                    "font_size": 16, "line_height": 1.7,
+                    "paragraph_spacing": 12, "max_width": 760,
+                    "indent": True, "text_align": "start",
+                    "background": "follow", "show_status": True,
+                    "shortcuts": {
+                        "previous": "left", "next": "right",
+                        "page_up": "pageup", "page_down": "pagedown",
+                        "directory": "f", "settings": "comma",
+                        "close": "escape"}},
+                _set_reader_preference=lambda key, value: None,
+                _set_reader_shortcut=lambda action, binding: None)
+            view = SettingsView(
+                service, lambda _value: None, lambda _value: None,
+                reader_view=reader)
+
+            self.assertEqual(3, view.tabs.length)
+            self.assertIs(view.tabs.content.controls[1].controls[1],
+                          view.reader_layout_view)
+            self.assertIs(view.tabs.content.controls[1].controls[2],
+                          view.shortcut_help_view)
+            self.assertEqual(7, len(view.shortcut_help_view.shortcut_fields))
+            options = view.shortcut_help_view.shortcut_fields[
+                "page_up"].options
+            values = [option.key for option in options]
+            self.assertIn("up", values)
+            self.assertIn("down", values)
+
+    def test_shortcut_help_lists_keyboard_and_mouse_wheel(self):
+        with TemporaryDirectory() as directory:
+            from app.services.theme_service import ThemeService
+            service = ThemeService(directory)
+            service.load()
+            view = SettingsView(service, lambda _value: None, lambda _value: None)
+            labels = [
+                control.leading.content.value
+                for control in view.shortcut_help_view.controls
+                if isinstance(control, ft.ListTile)]
+            self.assertIn("F", labels)
+            self.assertIn(",", labels)
+            self.assertIn("滚轮", labels)
 
     def test_platform_paths_never_depend_on_executable_directory(self):
         home = Path("/users/tester")
@@ -411,6 +572,47 @@ class PersistentReadingTests(unittest.TestCase):
                     "LEGADO_BOOKSOURCE_CACHE_DIR": str(root / "cache")}, clear=False):
                 app = BookSourceApp(root)
             self.assertEqual(app._current_index, 1)
+
+    def test_page_keyboard_event_dispatches_only_in_reader(self):
+        with TemporaryDirectory() as directory:
+            app = BookSourceApp(Path(directory))
+        reader = SimpleNamespace(
+            _section="reader", _on_reader_key=unittest.mock.Mock())
+        app._reading_view = reader
+        app._current_index = 1
+        event = SimpleNamespace(key="Page Down")
+
+        app._on_keyboard_event(event)
+        reader._on_reader_key.assert_called_once_with(event)
+
+        reader._section = "detail"
+        app._on_keyboard_event(event)
+        reader._on_reader_key.assert_called_once_with(event)
+
+    def test_app_navigation_adapts_without_rebuilding_views(self):
+        with TemporaryDirectory() as directory:
+            app = BookSourceApp(Path(directory))
+        app._bottom_nav = SimpleNamespace(visible=None)
+        app._side_nav = SimpleNamespace(
+            visible=None, extended=None, label_type=None)
+        app._side_divider = SimpleNamespace(visible=None)
+        app._page = SimpleNamespace(
+            width=430, window=SimpleNamespace(width=1100))
+
+        app._apply_navigation_layout()
+        self.assertTrue(app._bottom_nav.visible)
+        self.assertFalse(app._side_nav.visible)
+
+        app._page.width = 1100
+        app._apply_navigation_layout()
+        self.assertFalse(app._bottom_nav.visible)
+        self.assertTrue(app._side_nav.visible)
+        self.assertTrue(app._side_nav.extended)
+
+        app._reader_immersive = True
+        app._apply_navigation_layout()
+        self.assertFalse(app._bottom_nav.visible)
+        self.assertFalse(app._side_nav.visible)
 
     def test_bookshelf_refresh_and_group_state_survive_reopen(self):
         with TemporaryDirectory() as directory:

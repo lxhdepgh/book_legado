@@ -27,6 +27,13 @@ READING_STAGE_LABELS = {
 class CheckView(ft.Column):
     RESULT_UPDATE_BATCH_SIZE = 10
 
+    def _safe_update(self):
+        """Keep background detection alive while this view is unmounted."""
+        try:
+            self.update()
+        except RuntimeError:
+            pass
+
     def __init__(self, service):
         super().__init__(expand=True, spacing=12)
         self.service = service
@@ -81,7 +88,7 @@ class CheckView(ft.Column):
     def _on_auto_disable_change(self, _):
         self._start.text = ("检测并自动停用" if self._auto_disable.value
                             else "开始检测")
-        self.update()
+        self._safe_update()
 
     def _confirm_start_check(self, _):
         self.page.pop_dialog()
@@ -95,7 +102,7 @@ class CheckView(ft.Column):
         sources = ([source for source in self.service.sources if source.enabled]
                    if self._enabled_only.value else list(self.service.sources))
         self._summary.value = f"准备检测 {len(sources)} 个书源…"
-        self.update()
+        self._safe_update()
         pending_rows = []
         latest_progress = [0, len(sources)]
 
@@ -108,7 +115,7 @@ class CheckView(ft.Column):
             done, total = latest_progress
             self._progress.value = done / max(total, 1)
             self._summary.value = f"检测进度：{done}/{total}"
-            self.update()
+            self._safe_update()
 
         def receive(result, done, total):
             latest_progress[:] = [done, total]
@@ -188,4 +195,4 @@ class CheckView(ft.Column):
         finally:
             self._running = False
             self._start.disabled = False
-            self.update()
+            self._safe_update()

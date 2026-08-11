@@ -12,9 +12,9 @@ from app.services.rule_engine import UnsupportedRule, resolve_explore_categories
 from app.services.reading_engine import LegadoReadingEngine
 
 
-CHECK_CONCURRENCY = 24
-TAG_PAGE_CONCURRENCY = 12
-JS_CHECK_CONCURRENCY = 3
+CHECK_CONCURRENCY = 8
+TAG_PAGE_CONCURRENCY = 4
+JS_CHECK_CONCURRENCY = 2
 SOURCE_TAG_TIMEOUT = 60
 READING_CHAIN_TIMEOUT = 30
 
