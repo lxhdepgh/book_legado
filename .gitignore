@@ -31,3 +31,6 @@ edge-webview-profile/
 # Temporary files and logs produced by tools
 *.tmp
 *.log
+
+# Vendored reference sources downloaded for comparison
+other_history/
