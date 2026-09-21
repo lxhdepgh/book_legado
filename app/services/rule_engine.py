@@ -82,8 +82,16 @@ def _format_word_count(value: str) -> str:
     return f"{rendered}万字"
 
 
+_RAW_INTRO_PREFIXES = ("<usehtml>", "<md>", "<useweb>")
+
+
 def _format_book_intro(value: str) -> str:
     text = str(value or "")
+    # BookInfo.analyzeBookInfo: a raw intro tagged for special rendering is
+    # stored verbatim, bypassing HtmlFormatter entirely.
+    trimmed = text.lstrip()
+    if trimmed.startswith(_RAW_INTRO_PREFIXES):
+        return trimmed
     text = re.sub(r"(?:&nbsp;)+", " ", text)
     text = re.sub(r"&ensp;|&emsp;", " ", text)
     text = re.sub(r"&thinsp;|&zwnj;|&zwj;", "", text)
@@ -277,7 +285,8 @@ def _expand_page_template(value: str, page: int) -> str:
 
 def _is_js(value: str) -> bool:
     value = (value or "").strip()
-    return value.startswith(("@js:", "<js")) or "java." in value
+    return (value.lower().startswith(("@js:", "@webjs:")) or
+            value.startswith("<js") or "java." in value)
 
 
 def _split_rule(rule: str) -> tuple[str, str]:
@@ -388,7 +397,7 @@ def select_nodes(text: str, content_type: str, rule: str) -> tuple[list, str]:
         except (json.JSONDecodeError, TypeError):
             pass
     soup = parse_markup(text, content_type)
-    nodes = evaluate(soup, rule, "html")
+    nodes = evaluate(soup, rule, "html", list_context=True)
     if nodes:
         return nodes, "html"
     # A valid selector with no matching records is an ordinary empty search,
@@ -1155,7 +1164,7 @@ class ReaderEngine:
         program = compile_rule_program(
             remaining, is_json=analyzer_kind == "json")
         mode = program.stages[0].mode if program.stages else "default"
-        if mode == "js":
+        if mode in {"js", "webjs"}:
             return transformed, analyzer_kind, transformed
         if mode == "json":
             if isinstance(transformed, (dict, list)):
@@ -1284,7 +1293,8 @@ class ReaderEngine:
         if get_matches:
             value = re.sub(
                 r"@get:\{([^{}]+)\}",
-                lambda match: str(self.js_variables.get(match.group(1), "")), rule)
+                lambda match: self._get_variable(match.group(1), book, chapter),
+                rule)
             stripped_value = value.strip()
             js_positions = [position for position in
                             (stripped_value.find("@js:"), stripped_value.find("<js>"))
@@ -1343,6 +1353,29 @@ class ReaderEngine:
                 transformed = self.js.evaluate(script, context)
                 value = "" if transformed is None else transformed
                 continue
+            if remaining.lower().startswith("@webjs:"):
+                script, regex_suffix = remaining, ""
+                if "##" in remaining:
+                    script, regex_body = script.split("##", 1)
+                    regex_suffix = "##" + regex_body
+                context = JsContext(
+                    source=source, key=key, page=page, result=value,
+                    base_url=base_url, variables=self.js_variables,
+                    get_string=lambda nested: extract_value(node, nested, kind, base_url),
+                    get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
+                    get_elements=lambda nested: [_legado_value_string(item)
+                                                  for item in evaluate(node, nested, kind)],
+                    book=book, chapter=chapter, title=title,
+                    next_chapter_url=next_chapter_url,
+                    src=(raw_result if isinstance(raw_result, str) else
+                         (str(node) if kind == "html" else "")),
+                )
+                value = self.js.evaluate(script, context)
+                if regex_suffix:
+                    value = _apply_regex_suffix(
+                        "" if value is None else str(value), regex_suffix)
+                remaining = ""
+                continue
             if remaining.startswith("@js:"):
                 script, regex_suffix = remaining, ""
                 if "##" in remaining:
@@ -1394,9 +1427,50 @@ class ReaderEngine:
             nested_rule = nested_rule.strip().strip("'\"")
             if not name:
                 continue
-            self.js_variables[name] = self._field_value(
-                node, nested_rule, kind, source, base_url, key, page,
-                book, chapter, raw_result)
+            self._put_variable(
+                name, self._field_value(
+                    node, nested_rule, kind, source, base_url, key, page,
+                    book, chapter, raw_result), book, chapter)
+
+    @staticmethod
+    def _variable_owner(book, chapter):
+        """AnalyzeRule scope order: chapter, then book (the rule data)."""
+        for owner in (chapter, book):
+            variables = getattr(owner, "variables", None) if owner is not None else None
+            if isinstance(variables, dict):
+                return variables
+        return None
+
+    def _put_variable(self, name: str, value: str, book=None,
+                      chapter=None) -> str:
+        # AnalyzeRule.put: chapter ?: book ?: ruleData ?: source preferences.
+        target = self._variable_owner(book, chapter)
+        if target is None:
+            self.js_variables[name] = value
+        else:
+            target[name] = value
+        return value
+
+    def _get_variable(self, name: str, book=None, chapter=None) -> str:
+        # AnalyzeRule.get: bookName/title special cases, then the
+        # chapter ?: book ?: ruleData ?: source-preferences lookup chain.
+        # Values found on an entity never fall through even when empty.
+        if name == "bookName" and book is not None:
+            return str(getattr(book, "name", "") or "")
+        if name == "title" and chapter is not None:
+            return str(getattr(chapter, "name", "") or "")
+        for owner in (chapter, book):
+            variables = getattr(owner, "variables", None) if owner is not None else None
+            if isinstance(variables, dict) and variables.get(name) is not None:
+                value = str(variables[name])
+                if value != "":
+                    return value
+        for key in (name, "source:data:" + name):
+            if key in self.js_variables and self.js_variables[key] is not None:
+                value = str(self.js_variables[key])
+                if value != "":
+                    return value
+        return ""
 
     def _book_from_node(self, node, kind: str, rules: dict, base_url: str,
                         source=None, key: str = "", page: int = 1) -> BookItem:
@@ -1524,7 +1598,7 @@ class ReaderEngine:
                 if value:
                     program = compile_rule_program(
                         value, is_json=analyzer_kind == "json")
-                    if program.stages and program.stages[0].mode != "js":
+                    if program.stages and program.stages[0].mode not in {"js", "webjs"}:
                         root, kind, _ = self._payload_for_compiled_stage(
                             transformed, value, analyzer_kind)
                         pending_root = (root, kind)
@@ -1564,7 +1638,7 @@ class ReaderEngine:
             else:
                 root, kind = parse_markup(text, content_type), "html"
             selector, suffix = self._field_parts(value, kind)
-            nodes = evaluate(root, selector, kind) if selector else (
+            nodes = evaluate(root, selector, kind, list_context=True) if selector else (
                 root if isinstance(root, list) else [root])
             if not suffix:
                 break
@@ -1585,7 +1659,7 @@ class ReaderEngine:
             if value:
                 program = compile_rule_program(
                     value, is_json=analyzer_kind == "json")
-                if program.stages and program.stages[0].mode != "js":
+                if program.stages and program.stages[0].mode not in {"js", "webjs"}:
                     root, kind, _ = self._payload_for_compiled_stage(
                         transformed, value, analyzer_kind)
                     pending_root = (root, kind)
@@ -1621,8 +1695,7 @@ class ReaderEngine:
         raw = await self._resolve_rule_url(source.searchUrl, source, keyword, page)
         req = parse_search_url(raw, source.bookSourceUrl, keyword, page)
         if not req:
-            if not req:
-                raise RuntimeError("搜索地址格式暂时无法解析")
+            raise RuntimeError("搜索地址格式暂时无法解析")
         text, ctype, final_url = await self._request(req, source)
         pattern = str(getattr(source, "bookUrlPattern", "") or "")
         if pattern and re.fullmatch(pattern, final_url):
@@ -1772,7 +1845,7 @@ class ReaderEngine:
                                 page: int = 1) -> str:
         """Run fixed-version ``AnalyzeUrl.analyzeJs`` stage semantics."""
         program = compile_rule_program(value)
-        if not any(stage.mode == "js" for stage in program.stages):
+        if not any(stage.mode in {"js", "webjs"} for stage in program.stages):
             return await self._render_templates(value, source, key, page)
 
         # AnalyzeUrl starts with the complete rule as result.  Every non-JS
@@ -1780,7 +1853,7 @@ class ReaderEngine:
         # preceding value as its `result` binding.
         result = str(value or "")
         for stage in program.stages:
-            if stage.mode != "js":
+            if stage.mode not in {"js", "webjs"}:
                 fragment = stage.raw.strip()
                 if fragment:
                     result = fragment.replace("@result", result)

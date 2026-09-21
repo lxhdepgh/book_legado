@@ -21,6 +21,7 @@ from app.services.reading_cache import ReadingCache
 from app.services.desktop_browser import EdgeCdpSession
 from app.services.book_cache_service import WholeBookCacheService
 from app.services.reading_progress import ReadingProgressStore, ReadingSession
+from app.ui_feedback import show_snack_bar
 
 
 class ReadingView(ft.Column):
@@ -54,6 +55,7 @@ class ReadingView(ft.Column):
         self._verification_dialog = None
         self._webview_marker = ""
         self._webview_capture_pending = False
+        self._webview_rule_mode = False
         self._webview_script = ""
         self._webview_delay = 0
         self._webview_source_regex = ""
@@ -95,6 +97,10 @@ class ReadingView(ft.Column):
         self._detail_book = None
         self._book_open_generation = 0
         self._book_open_task = None
+        # Progress text of a background task.  Switching tabs only hides this
+        # view (app.py swaps the content container), so the work keeps running
+        # and its last message must come back with the tab.
+        self._background_status = None
         self._section = "shelf"
         self._detail_resume = None
         self._bookshelf_update_task = None
@@ -151,7 +157,6 @@ class ReadingView(ft.Column):
             expand=True, max_extent=190, child_aspect_ratio=0.72,
             spacing=8, run_spacing=8)
         self._bookshelf_render_generation = 0
-        self._bookshelf_rendered = False
         self._continue_reading_host = ft.Container(visible=False)
         self._bookshelf_host = ft.Column(
             expand=True, spacing=0, controls=[
@@ -481,21 +486,21 @@ class ReadingView(ft.Column):
         if self.discovery_only:
             self.refresh_sources()
             self.page.run_task(self._load_categories, self.current_source, True)
-        else:
-            if not self._bookshelf_rendered:
-                self._render_bookshelf()
+            return
+        # Tab switches reuse this view object, so the mount path is also the
+        # "came back into view" path: refresh the cards (offline badges follow
+        # the live task table) and re-show the progress of work that ran while
+        # the shelf was hidden.
+        self._render_bookshelf()
+        self._restore_background_status()
 
     def will_unmount(self):
+        # Unmount here means "hidden", not "closed": the app keeps this view
+        # alive and swaps it back in.  Only work that depends on a control in
+        # this subtree may be cancelled, otherwise a tab switch would kill
+        # whole-book caching, catalog loading and chapter prefetch.
         if self._webview_future and not self._webview_future.done():
             self._webview_future.cancel()
-        if self._verification_future and not self._verification_future.done():
-            self._verification_future.cancel()
-        self._cancel_prefetch(clear_cache=True)
-        for task in self._whole_book_tasks.values():
-            if task and not task.done():
-                task.cancel()
-        if self._book_open_task and not self._book_open_task.done():
-            self._book_open_task.cancel()
         self._persist_scroll_position()
 
     async def _get_verification_code(self, image, source):
@@ -558,6 +563,7 @@ class ReadingView(ft.Column):
         self._webview_future = loop.create_future()
         self._webview_marker = f"__LEGADO_HTML_{uuid.uuid4().hex}__"
         options = options or {}
+        self._webview_rule_mode = str(options.get("mode") or "") == "webJs"
         self._webview_script = str(options.get("webJs") or
                                    options.get("javaScript") or "")
         self._webview_delay = int(options.get("webViewDelayTime") or 0)
@@ -598,6 +604,8 @@ class ReadingView(ft.Column):
         self._status.value = "请在网页中完成验证；通过后会自动继续解析"
         self.update()
         try:
+            if self._webview_rule_mode:
+                return await self._await_rule_webview_result()
             return await self._webview_future
         finally:
             if self._desktop_webview:
@@ -606,12 +614,29 @@ class ReadingView(ft.Column):
             self._webview_future = None
             self._webview = None
             self._webview_capture_pending = False
+            self._webview_rule_mode = False
             self._webview_script = ""
             self._webview_delay = 0
             self._webview_source_regex = ""
             self._webview_override_regex = ""
             self._webview_html = ""
             self._webview_initial_url = ""
+
+    async def _await_rule_webview_result(self):
+        """BackstageWebView-style auto evaluation loop for @webjs: rules."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 15
+        while loop.time() < deadline:
+            if self._webview_future and self._webview_future.done():
+                break
+            if self._desktop_webview:
+                await self._capture_desktop_webview()
+            elif self._webview and not self._webview_capture_pending:
+                await self._capture_webview_dom()
+            await asyncio.sleep(0.6)
+        if self._webview_future and self._webview_future.done():
+            return await self._webview_future
+        raise RuntimeError("webjs 脚本执行超时，页面可能需要人工验证")
 
     def _webview_page_ended(self, _):
         if self._webview and not self._webview_capture_pending:
@@ -633,6 +658,21 @@ class ReadingView(ft.Column):
                 self._webview_html, self._webview_source_regex,
                 self._webview_override_regex)
             html = response.get("body", "")
+            if self._webview_rule_mode:
+                js_result = response.get("jsResult")
+                if isinstance(js_result, str) and \
+                        js_result.startswith("__LEGADO_JS_ERROR__:"):
+                    if not self._webview_future.done():
+                        self._webview_future.set_exception(RuntimeError(
+                            js_result[len("__LEGADO_JS_ERROR__:")]))
+                    self.page.pop_dialog()
+                    return
+                if js_result is None:
+                    return
+                if not self._webview_future.done():
+                    self._webview_future.set_result(response)
+                self.page.pop_dialog()
+                return
             waiting_for_source = bool(self._webview_source_regex and
                                       not response.get("source"))
             if ("Just a moment" in html or "challenge-platform" in html or
@@ -667,7 +707,8 @@ class ReadingView(ft.Column):
             script = ("console.log('" + self._webview_marker + "' + btoa(unescape("
                       "encodeURIComponent(JSON.stringify({html:document.documentElement.outerHTML,"
                       "url:location.href,resources:performance.getEntriesByType('resource')"
-                      ".map(e=>e.name)})))))")
+                      ".map(e=>e.name),jsResult:(typeof window.__legadoJsResult"
+                      "===undefined?null:window.__legadoJsResult)})))))")
             await self._webview.run_javascript(script)
         finally:
             self._webview_capture_pending = False
@@ -678,6 +719,8 @@ class ReadingView(ft.Column):
         final_url = str(payload.get("url") or self._webview_initial_url)
         result = {"body": html, "headers": {"content-type": "text/html"},
                   "status": 200, "url": final_url}
+        if payload.get("jsResult") is not None:
+            result["jsResult"] = payload.get("jsResult")
         if self._webview_source_regex:
             pattern = compile_pattern(self._webview_source_regex)
             matched = next((str(item) for item in payload.get("resources") or []
@@ -845,7 +888,10 @@ class ReadingView(ft.Column):
             categories = await resolve_explore_categories(source, self.engine.js)
         except Exception as exc:
             if source is self.current_source:
-                self._status.value = f"分类标签解析失败：{str(exc)[:100]}"
+                self._show_error(
+                    str(exc)[:100], label="分类标签解析失败",
+                    retry=lambda: self.page.run_task(
+                        self._load_categories, source))
                 self.update()
             return
         if (source is not self.current_source or
@@ -855,7 +901,7 @@ class ReadingView(ft.Column):
         if self.categories and run_first:
             await self._run_explore(0, True)
         elif not self.categories:
-            self._status.value = "该书源的发现分类未生成可用入口，可使用关键词搜索"
+            self._set_status("该书源的发现分类未生成可用入口，可使用关键词搜索")
         self.update()
 
     def _rebuild_category_tabs(self, categories=None):
@@ -913,10 +959,12 @@ class ReadingView(ft.Column):
             paging_text = "，可继续下拉加载" if self._has_more else (
                 "，固定榜单无后续分页" if not supports_paging else "，已加载全部结果"
             )
-            self._status.value = f"{category.title}：找到 {len(self.books)} 本书{paging_text}"
+            self._set_status(f"{category.title}：找到 {len(self.books)} 本书{paging_text}")
             self._show_section("shelf")
         except Exception as exc:
-            self._show_error(exc)
+            self._show_error(
+                exc, retry=lambda: self.page.run_task(
+                    self._run_explore, index, False))
             self._has_more = False
         finally:
             self._loading_more = False
@@ -943,10 +991,11 @@ class ReadingView(ft.Column):
             if self._has_more:
                 self._result_page += 1
             self._append_book_controls(added_books)
-            self._status.value = f"找到 {len(self.books)} 本书，点击书籍查看详情"
+            self._set_status(f"找到 {len(self.books)} 本书，点击书籍查看详情")
             self._show_section("shelf")
         except Exception as exc:
-            self._show_error(exc)
+            self._show_error(
+                exc, retry=lambda: self.page.run_task(self._run_search))
             self._has_more = False
         finally:
             self._loading_more = False
@@ -1078,8 +1127,8 @@ class ReadingView(ft.Column):
         if not self.current_source:
             return
         added = self.service.add_to_bookshelf(self.current_source, book)
-        self._status.value = (f"《{book.name}》已加入书架" if added else
-                              f"《{book.name}》已在书架中")
+        self._set_status(f"《{book.name}》已加入书架" if added else
+                         f"《{book.name}》已在书架中")
         self.update()
 
     def refresh_bookshelf(self, update=True):
@@ -1089,7 +1138,6 @@ class ReadingView(ft.Column):
             self.update()
 
     def _render_bookshelf(self):
-        self._bookshelf_rendered = True
         query = str(self._bookshelf_query.value or "").strip().lower()
         groups = sorted({str(item.get("groupName") or "").strip()
                          for item in self.service.bookshelf
@@ -1184,6 +1232,9 @@ class ReadingView(ft.Column):
         self._bookshelf_host.controls[-1] = (
             self._bookshelf_grid if self._bookshelf_layout == "grid"
             else self._bookshelf)
+        # Only the visible line is replaced here: a running background task
+        # keeps its own text in `_background_status` so did_mount can put it
+        # back when the tab returns.
         self._status.value = (f"书架中有 {len(self.service.bookshelf)} 本书"
                               + (f"，当前显示 {len(items)} 本" if query else ""))
 
@@ -1254,8 +1305,11 @@ class ReadingView(ft.Column):
             details.append(
                 f"已缓存 {item.get('cachedChapterCount', 0)}/"
                 f"{item.get('cacheTotalChapterCount', 0)} 章")
-        return ft.ListTile(
+        return ft.GestureDetector(
             key=self._shelf_control_key(item, "list"),
+            on_secondary_tap_down=lambda e, selected=item: self._show_shelf_manage(selected),
+            on_long_press=lambda e, selected=item: self._show_shelf_manage(selected),
+            content=ft.ListTile(
             leading=(ft.Image(src=item.get("cover_url"), width=42, height=56,
                               fit=ft.BoxFit.COVER)
                      if item.get("cover_url") else ft.Icon(ft.Icons.BOOK)),
@@ -1280,7 +1334,7 @@ class ReadingView(ft.Column):
                     on_click=lambda e, selected=item: self._show_shelf_manage(selected)),
             ], tight=True),
             on_click=lambda e, selected=item: self._open_shelf_item(selected),
-        )
+        ))
 
     def _shelf_grid_control(self, item):
         reading = self.service.reading_state(item) or {}
@@ -1295,7 +1349,11 @@ class ReadingView(ft.Column):
                  if item.get("cover_url") else
                  ft.Container(height=150, alignment=ft.Alignment.CENTER,
                               content=ft.Icon(ft.Icons.BOOK, size=54)))
-        return ft.Card(key=self._shelf_control_key(item, "grid"), content=ft.Container(
+        return ft.GestureDetector(
+            key=self._shelf_control_key(item, "grid"),
+            on_secondary_tap_down=lambda e, selected=item: self._show_shelf_manage(selected),
+            on_long_press=lambda e, selected=item: self._show_shelf_manage(selected),
+            content=ft.Card(content=ft.Container(
             padding=8, on_click=lambda e, selected=item: self._open_shelf_item(selected),
             content=ft.Column([
                 ft.Stack([cover, ft.Container(
@@ -1318,7 +1376,7 @@ class ReadingView(ft.Column):
                         ft.IconButton(ft.Icons.MORE_VERT, icon_size=18,
                                       on_click=lambda e, selected=item:
                                       self._show_shelf_manage(selected))], spacing=0),
-            ], spacing=4)))
+            ], spacing=4))))
 
     def _cache_status_control(self, item, compact=False):
         key = self._book_task_key(item)
@@ -1573,12 +1631,12 @@ class ReadingView(ft.Column):
         try:
             changed = self.service.switch_bookshelf_source(item, source, book)
             if not changed:
-                self._status.value = "切换失败：该书源版本已在书架中"
+                self._show_notice("切换失败：该书源版本已在书架中")
             else:
                 self.reading_cache.remove_book(old_source, old_url)
                 self._status.value = f"已切换到书源：{source.bookSourceName}"
         except Exception as exc:
-            self._status.value = f"切换书源失败：{exc}"
+            self._show_error(exc, label="切换书源失败")
         self.page.pop_dialog()
         self._render_bookshelf()
         self.update()
@@ -1615,13 +1673,24 @@ class ReadingView(ft.Column):
         if task and not task.done():
             task.cancel()
 
+    async def _restart_whole_book_cache(self, item):
+        """Retry entry point: run_task rejects the synchronous toggle handler."""
+        key = self._book_task_key(item)
+        task = self._whole_book_tasks.get(key)
+        if task and not task.done():
+            return
+        self._whole_book_tasks[key] = self.page.run_task(
+            self._run_whole_book_cache, item)
+        self._render_bookshelf()
+        self.update()
+
     def _toggle_whole_book_cache(self, item):
         self.page.pop_dialog()
         key = self._book_task_key(item)
         task = self._whole_book_tasks.get(key)
         if task and not task.done():
             task.cancel()
-            self._status.value = f"正在停止《{item.get('name') or ''}》缓存…"
+            self._set_busy(f"正在停止《{item.get('name') or ''}》缓存…")
         else:
             self._whole_book_tasks[key] = self.page.run_task(
                 self._run_whole_book_cache, item)
@@ -1633,7 +1702,7 @@ class ReadingView(ft.Column):
         source = next((value for value in self.service.sources
                        if value.bookSourceUrl == item.get("source_url")), None)
         if source is None:
-            self._status.value = "缓存失败：原书源不存在"
+            self._show_notice("缓存失败：原书源不存在")
             self._whole_book_tasks.pop(key, None)
             self.update()
             return
@@ -1644,14 +1713,12 @@ class ReadingView(ft.Column):
             if (progress.cached + progress.failed == progress.total or
                     progress.cached + progress.failed - last_display[0] >= 10):
                 last_display[0] = progress.cached + progress.failed
-                self._status.value = (
+                self._set_busy(
                     f"正在缓存《{book.name}》：{progress.cached}/"
                     f"{progress.total}，失败 {progress.failed}"
                     + (f" · {progress.current}" if progress.current else ""))
-                self.update()
 
-        self._status.value = f"正在准备《{book.name}》目录与离线缓存…"
-        self.update()
+        self._set_busy(f"正在准备《{book.name}》目录与离线缓存…")
         try:
             result = await self.whole_book_cache.cache_book(
                 source, book, progress_changed)
@@ -1659,7 +1726,7 @@ class ReadingView(ft.Column):
                 *key, cachedChapterCount=result.cached,
                 cacheTotalChapterCount=result.total,
                 cacheErrorCount=result.failed, cacheUpdatedAt=int(time.time()))
-            self._status.value = (
+            self._set_status(
                 f"《{book.name}》缓存完成：{result.cached}/{result.total} 章"
                 + (f"，失败 {result.failed} 章，可再次缓存重试" if result.failed else ""))
         except asyncio.CancelledError:
@@ -1667,11 +1734,15 @@ class ReadingView(ft.Column):
             self.service.update_bookshelf_options(
                 *key, cachedChapterCount=cached,
                 cacheTotalChapterCount=total)
-            self._status.value = f"《{book.name}》缓存已停止：{cached}/{total} 章"
+            self._set_status(f"《{book.name}》缓存已停止：{cached}/{total} 章")
         except Exception as exc:
-            self._status.value = f"《{book.name}》缓存失败：{exc}"
+            self._show_error(
+                exc, label=f"《{book.name}》缓存失败",
+                retry=lambda: self.page.run_task(
+                    self._restart_whole_book_cache, item))
         finally:
             self._whole_book_tasks.pop(key, None)
+            self._background_status = None
             self._render_bookshelf()
             self.update()
 
@@ -1695,13 +1766,13 @@ class ReadingView(ft.Column):
         self._bookshelf_refresh_btn.disabled = True
         try:
             for index, item in enumerate(candidates, 1):
-                self._status.value = (
+                self._set_busy(
                     f"正在刷新书架 {index}/{len(candidates)}："
                     f"{item.get('name') or '未命名'}")
-                self.update()
                 await self._refresh_shelf_item(item, False)
         finally:
             self._bookshelf_refresh_btn.disabled = False
+            self._background_status = None
             self._render_bookshelf()
             self.update()
 
@@ -1730,12 +1801,14 @@ class ReadingView(ft.Column):
                 source.bookSourceUrl, book.url,
                 latest_title=latest, total_chapters=len(chapters))
             if show_result:
-                self._status.value = f"《{book.name}》目录已更新，共 {len(chapters)} 章"
+                self._set_status(f"《{book.name}》目录已更新，共 {len(chapters)} 章")
         except Exception as exc:
             self.service.update_bookshelf_check(
                 source.bookSourceUrl, book.url, error=str(exc))
             if show_result:
-                self._show_error(exc)
+                self._show_error(
+                    exc, retry=lambda: self.page.run_task(
+                        self._refresh_shelf_item, item, show_result))
         finally:
             update_engine.js.close()
             if show_result:
@@ -1831,8 +1904,7 @@ class ReadingView(ft.Column):
             "继续阅读" if self._detail_resume else "开始阅读")
         self._directory_status.value = f"《{book.name}》· 正在加载目录…"
         self._show_section("detail")
-        self._status.value = f"正在打开《{book.name}》"
-        self.update()
+        self._set_busy(f"正在打开《{book.name}》")
 
     def _cancel_shelf_open(self, _):
         self._book_open_generation += 1
@@ -1924,9 +1996,10 @@ class ReadingView(ft.Column):
             if self._has_more:
                 self._result_page += 1
             self._append_book_controls(added_books)
-            self._status.value = f"已加载 {len(self.books)} 本书"
+            self._set_status(f"已加载 {len(self.books)} 本书")
         except Exception as exc:
-            self._show_error(exc)
+            self._show_error(
+                exc, retry=lambda: self.page.run_task(self._run_search_more))
             self._has_more = False
         finally:
             self._loading_more = False
@@ -1990,7 +2063,9 @@ class ReadingView(ft.Column):
                     open_generation)
         except Exception as exc:
             if self._is_current_book_open(book, open_generation):
-                self._show_error(exc)
+                self._show_error(
+                    exc, retry=lambda: self.page.run_task(
+                        self._run_chapters, book, None, True))
                 self._directory_status.value = (
                     f"《{book.name}》目录加载失败，可点击刷新重试")
         self.update()
@@ -2024,8 +2099,8 @@ class ReadingView(ft.Column):
                 src=book.cover_url, width=76, height=104,
                 fit=ft.BoxFit.COVER,
                 error_content=ft.Icon(ft.Icons.BROKEN_IMAGE))
-        self._status.value = (f"《{book.name}》共 {len(chapters)} 章，"
-                              f"已加载 {self._chapter_visible_count} 章")
+        self._set_status(f"《{book.name}》共 {len(chapters)} 章，"
+                         f"已加载 {self._chapter_visible_count} 章")
         self._show_section("detail")
         self._detail_continue_btn.disabled = not any(
             not item.is_volume and item.url for item in chapters)
@@ -2225,11 +2300,12 @@ class ReadingView(ft.Column):
             self.progress_store.save(
                 self.reading_session.position, chapter, len(self.chapters))
             self._update_chapter_navigation()
-            self._status.value = (f"{chapter.name} · 已从缓存打开"
-                                  if content_from_cache else chapter.name)
+            self._set_status(f"{chapter.name} · 已从缓存打开"
+                             if content_from_cache else chapter.name)
             self._show_section("reader")
         except Exception as exc:
-            self._show_error(exc)
+            self._show_error(
+                exc, retry=lambda: self._load_content(chapter))
         # Mount the new document while input remains locked. Restoring the
         # saved offset after unlocking lets an early wheel event race with the
         # final scroll_to(0), which visibly snaps the chapter back to its top.
@@ -2723,9 +2799,41 @@ class ReadingView(ft.Column):
         return {"fit": ft.BoxFit.SCALE_DOWN}
 
     def _set_busy(self, text):
+        """Progress of a running task; re-shown when the tab comes back."""
+        self._background_status = text
         self._status.value = text
         self.update()
 
-    def _show_error(self, exc):
-        prefix = "当前书源暂不支持" if isinstance(exc, UnsupportedRule) else "操作失败"
-        self._status.value = f"{prefix}：{exc}"
+    def _set_status(self, text):
+        """Final message of a task: nothing left to restore on re-entry."""
+        self._background_status = None
+        self._status.value = text
+
+    def _restore_background_status(self):
+        if self._background_status:
+            self._status.value = self._background_status
+
+    def _show_notice(self, message, retry=None):
+        """Inline status line plus a dismissible SnackBar; errors add 重试."""
+        self._background_status = None
+        self._status.value = message
+        try:
+            page = self.page
+        except RuntimeError:
+            return
+        snack = ft.SnackBar(content=ft.Text(message, max_lines=3))
+        if retry is not None:
+            def _retry(_event=None):
+                try:
+                    page.pop_dialog()
+                except RuntimeError:
+                    pass
+                retry()
+            snack.action = "重试"
+            snack.on_action = _retry
+        show_snack_bar(page, snack)
+
+    def _show_error(self, exc, retry=None, label=None):
+        prefix = label or ("当前书源暂不支持" if isinstance(exc, UnsupportedRule)
+                           else "操作失败")
+        self._show_notice(f"{prefix}：{exc}", retry=retry)

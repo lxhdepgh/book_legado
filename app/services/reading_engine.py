@@ -196,9 +196,22 @@ _CONTENT_IMAGE_PATTERN = re.compile(
     r'<img[^>]*\ssrc\s*=\s*"([^">]*)"[^>]*>', re.I)
 
 
+_USE_HTML_PATTERN = re.compile(r"<usehtml>[\s\S]*?</usehtml>")
+
+
 def _format_content_page(value: str, redirect_url: str) -> str:
     """Port BookContent's per-page HtmlFormatter.formatKeepImg pipeline."""
     text = str(value or "")
+    # AppConfig.adaptSpecialStyle (default true): <usehtml> spans are stashed
+    # behind placeholders so the sanitizer leaves them verbatim, then restored.
+    preserved: dict[str, str] = {}
+
+    def stash(match: re.Match) -> str:
+        key = f"{{usehtml_{len(preserved)}}}"
+        preserved[key] = match.group(0)
+        return key
+
+    text = _USE_HTML_PATTERN.sub(stash, text)
     text = re.sub(r"(?:&nbsp;)+", " ", text)
     text = re.sub(r"&ensp;|&emsp;", " ", text)
     text = re.sub(r"&thinsp;|&zwnj;|&zwj;", "", text)
@@ -218,7 +231,10 @@ def _format_content_page(value: str, redirect_url: str) -> str:
             source = source[:option.start()]
         return f'<img src="{urljoin(redirect_url, source) + suffix}">'
 
-    return html.unescape(_CONTENT_IMAGE_PATTERN.sub(image_tag, text))
+    text = html.unescape(_CONTENT_IMAGE_PATTERN.sub(image_tag, text))
+    for key, original in preserved.items():
+        text = text.replace(key, original)
+    return text
 
 
 def _media_kind(url: str, hinted: str = "") -> str:
@@ -940,7 +956,7 @@ class LegadoReadingEngine(ReaderEngine):
                 if value:
                     program = compile_rule_program(
                         value, is_json=analyzer_kind == "json")
-                    if program.stages and program.stages[0].mode != "js":
+                    if program.stages and program.stages[0].mode not in {"js", "webjs"}:
                         root, kind, _ = self._payload_for_compiled_stage(
                             transformed, value, analyzer_kind)
                         pending_root = (root, kind)
@@ -989,7 +1005,7 @@ class LegadoReadingEngine(ReaderEngine):
             if value:
                 program = compile_rule_program(
                     value, is_json=analyzer_kind == "json")
-                if program.stages and program.stages[0].mode != "js":
+                if program.stages and program.stages[0].mode not in {"js", "webjs"}:
                     root, kind, _ = self._payload_for_compiled_stage(
                         transformed, value, analyzer_kind)
                     pending_root = (root, kind)
@@ -1121,7 +1137,9 @@ class LegadoReadingEngine(ReaderEngine):
             book.toc_url = value or base_url
             if book.toc_url == base_url:
                 book.toc_html = original_body
-        book.variables = dict(self.js_variables)
+        # Detail rules put chapter?:book scoped values directly onto the book
+        # entity; absorb engine-bag values without discarding those writes.
+        getattr(book, "variables", {}).update(self.js_variables)
 
     async def book_info(self, source, book: BookItem) -> BookItem:
         """Load book-detail rules without fetching the table of contents."""
@@ -1229,7 +1247,6 @@ class LegadoReadingEngine(ReaderEngine):
                     chapter.url = chapter.url or (
                         chapter.name + str(page_index)
                         if chapter.is_volume else final_url)
-                    chapter.variables = dict(self.js_variables)
                     chapters.append(chapter)
 
             page_root, page_kind = self._root(text, ctype)
@@ -1327,7 +1344,9 @@ class LegadoReadingEngine(ReaderEngine):
     async def content_document(self, source, chapter: ChapterItem,
                                next_chapter_url: str = "",
                                need_save: bool = True) -> ChapterContent:
-        self.js_variables.update(getattr(chapter, "variables", {}) or {})
+        # AnalyzeRule.put routes chapter-scoped values onto the chapter entity
+        # itself; the engine bag is ruleData-level only, so nothing is merged
+        # from chapter variables here.
         if not next_chapter_url and self.current_chapters:
             following = next((item.url for item in self.current_chapters
                               if item.index == chapter.index + 1), "")
@@ -1351,6 +1370,7 @@ class LegadoReadingEngine(ReaderEngine):
         pending_urls, visited, parts = [(chapter.url, None, True)], set(), []
         document_title = ""
         replace_context = None
+        first_body = None
         next_chapter_key = _media_request(next_chapter_url, chapter.url)[0] if next_chapter_url else ""
         while pending_urls:
             current_url, prefetched, discover_next = pending_urls.pop(0)
@@ -1369,6 +1389,7 @@ class LegadoReadingEngine(ReaderEngine):
             root, kind = self._root(text, ctype)
             if replace_context is None:
                 replace_context = (root, kind, final_url)
+                first_body = text
             if not document_title and content_rule.get("title"):
                 try:
                     document_title = self._strict_value(
@@ -1413,6 +1434,17 @@ class LegadoReadingEngine(ReaderEngine):
                     (item, response, False)
                     for item, response in zip(accepted, responses))
 
+        # BookContent: subContent is analyzed against the first page and its
+        # text is appended unformatted (online books take the raw add branch).
+        sub_rule = str(content_rule.get("subContent", "") or "").strip()
+        if sub_rule and replace_context is not None:
+            sub_value = self._strict_value(
+                replace_context[0], sub_rule, replace_context[1], source,
+                replace_context[2],
+                book=getattr(self, "current_book", None), chapter=chapter,
+                raw_result=first_body)
+            if sub_value:
+                parts.append(sub_value)
         joined = "\n".join(parts)
         replace_rule = str(content_rule.get("replaceRegex", "") or "").strip()
         joined = await self._replace_content_stages(

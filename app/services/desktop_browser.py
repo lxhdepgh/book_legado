@@ -104,6 +104,7 @@ class EdgeCdpSession:
                       html: str = "", source_regex: str = "",
                       override_regex: str = "") -> dict:
         await self._select_target()
+        script_value = None
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(self.target_ws, max_msg_size=64 * 1024 * 1024) as ws:
                 command_id = 1
@@ -116,12 +117,24 @@ class EdgeCdpSession:
                         "awaitPromise": True, "returnByValue": True})
                     command_id += 1
                 if script:
-                    await self._command(ws, command_id, "Runtime.evaluate", {
+                    evaluated = await self._command(ws, command_id, "Runtime.evaluate", {
                         "expression": str(script), "awaitPromise": True,
                         "returnByValue": True})
+                    script_value = (evaluated.get("result") or {}).get("value")
                     command_id += 1
                     if delay_ms:
                         await asyncio.sleep(max(0, delay_ms) / 1000)
+                # Re-read the value after any later navigation cleared it; the
+                # webjs rule protocol stores it on window.__legadoJsResult.
+                js_result = script_value
+                readback = await self._command(ws, command_id, "Runtime.evaluate", {
+                    "expression": ("window.__legadoJsResult===undefined"
+                                   "?null:window.__legadoJsResult"),
+                    "returnByValue": True})
+                command_id += 1
+                readback_value = (readback.get("result") or {}).get("value")
+                if readback_value is not None:
+                    js_result = readback_value
                 value = await self._command(ws, command_id, "Runtime.evaluate", {
                     "expression": ("({html:document.documentElement.outerHTML,url:location.href,"
                                    "resources:performance.getEntriesByType('resource').map(e=>e.name)})"),
@@ -135,6 +148,8 @@ class EdgeCdpSession:
             "status": 200, "url": final_url,
             "cookie": self.cookie_header(cookies.get("cookies") or [], final_url),
         }
+        if script:
+            result["jsResult"] = js_result
         from app.services.java_regex import compile_pattern
         if source_regex:
             pattern = compile_pattern(source_regex)

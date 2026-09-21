@@ -234,7 +234,10 @@ class ManageView(ft.Column):
 
     def _build_card(self, idx_in_filtered: int, source: BookSource):
         is_selected = idx_in_filtered in self._selected
-        return ft.Card(content=ft.Container(
+        return ft.Card(content=ft.GestureDetector(
+            on_secondary_tap_down=lambda e, s=source: self._show_source_menu(s),
+            on_long_press=lambda e, s=source: self._show_source_menu(s),
+            content=ft.Container(
             padding=ft.Padding(10, 6, 10, 6),
             bgcolor=ft.Colors.BLUE_50 if is_selected else None,
             content=ft.Row([
@@ -261,7 +264,7 @@ class ManageView(ft.Column):
                     tooltip="启用或停用书源",
                     on_change=lambda e, selected=source:
                     self._toggle_enabled(selected, e.control.value)),
-            ], vertical_alignment=ft.CrossAxisAlignment.CENTER)))
+            ], vertical_alignment=ft.CrossAxisAlignment.CENTER))))
 
     def _on_scroll(self, e):
         """接近底部时追加下一批，不重建已经显示的行。"""
@@ -305,6 +308,77 @@ class ManageView(ft.Column):
                 show_snack_bar(page, ft.SnackBar(
                     content=ft.Text(f"状态保存失败，已恢复原值：{exc}")))
         self._render_page()
+
+    # ── 行级右键/长按上下文菜单 ──
+
+    def _show_source_menu(self, source: BookSource):
+        group_input = ft.TextField(
+            label="分组", value=str(source.bookSourceGroup or ""),
+            hint_text="多个分组以逗号分隔，留空表示未分组")
+        dialog = ft.AlertDialog(
+            modal=True, title=ft.Text(source.display_name),
+            content=ft.Container(width=420, content=ft.Column([
+                ft.Text(source.bookSourceUrl or "", size=11,
+                        color=ft.Colors.GREY_600,
+                        max_lines=2, overflow=ft.TextOverflow.ELLIPSIS),
+                ft.Text(f"状态：{'启用' if source.enabled else '停用'}"
+                        f" · 分组：{source.display_group}"),
+                group_input,
+            ], tight=True, spacing=8)),
+            actions=[
+                ft.TextButton("关闭", on_click=lambda e: self.page.pop_dialog()),
+                ft.TextButton(
+                    "停用" if source.enabled else "启用",
+                    icon=(ft.Icons.CANCEL_OUTLINED if source.enabled
+                          else ft.Icons.CHECK_CIRCLE_OUTLINE),
+                    on_click=lambda e, s=source: self._menu_toggle_enabled(s)),
+                ft.TextButton("保存分组",
+                              on_click=lambda e, s=source, field=group_input:
+                              self._menu_save_group(s, field)),
+                ft.Button("删除", color=ft.Colors.RED, icon=ft.Icons.DELETE_OUTLINE,
+                          on_click=lambda e, s=source:
+                          self._menu_confirm_delete(s)),
+            ])
+        self.page.show_dialog(dialog)
+
+    def _menu_toggle_enabled(self, source: BookSource):
+        self.page.pop_dialog()
+        self._toggle_enabled(source)
+
+    def _menu_save_group(self, source: BookSource, field: ft.TextField):
+        previous = source.bookSourceGroup
+        source.bookSourceGroup = (field.value or "").strip() or None
+        error = None
+        try:
+            self.service.save()
+        except Exception as exc:
+            source.bookSourceGroup = previous
+            error = str(exc)
+        self.page.pop_dialog()
+        self._apply_filters(update_groups=True)
+        self._render_page()
+        if error and self.page:
+            show_snack_bar(self.page, ft.SnackBar(content=ft.Text(
+                f"分组保存失败，已恢复原值：{error}")))
+
+    def _menu_confirm_delete(self, source: BookSource):
+        self.page.pop_dialog()
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("删除书源？"),
+            content=ft.Text(f"将删除《{source.display_name}》，此操作不可撤销。"),
+            actions=[
+                ft.TextButton("取消", on_click=lambda e: self.page.pop_dialog()),
+                ft.Button("确认删除", color=ft.Colors.RED,
+                          on_click=lambda e, s=source: self._menu_delete(s)),
+            ])
+        self.page.show_dialog(dialog)
+
+    def _menu_delete(self, source: BookSource):
+        self.page.pop_dialog()
+        previous_sources = list(self.service.sources)
+        self.service.batch_delete([source])
+        self._finish_batch_action(previous_sources=previous_sources)
 
     # ── 选择逻辑 ──
 

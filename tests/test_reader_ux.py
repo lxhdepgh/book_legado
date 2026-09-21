@@ -1,4 +1,5 @@
 import json
+import asyncio
 import unittest
 import flet as ft
 from pathlib import Path
@@ -11,7 +12,7 @@ from app.services.reading_cache import ReadingCache
 from app.services.app_paths import default_app_paths
 from app.services.reading_engine import (ChapterContent, ContentBlock,
                                          parse_content_blocks)
-from app.services.rule_engine import BookItem, ChapterItem
+from app.services.rule_engine import (BookItem, ChapterItem, UnsupportedRule)
 from app.services.source_service import SourceService
 from app.views.reading_view import ReadingView
 from app.app import BookSourceApp
@@ -38,6 +39,48 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(self.view._reader, ft.Column)
         self.assertEqual(self.view._reader.scroll, ft.ScrollMode.AUTO)
         self.assertIsNotNone(self.view._reader_document.on_click)
+
+    async def test_shelf_rows_open_manage_menu_on_secondary_tap_and_long_press(self):
+        item = {"name": "Book", "url": "https://x/book",
+                "source_url": "https://x"}
+        self.view.service.reading_state = lambda selected: None
+        row = self.view._shelf_control(item)
+        card = self.view._shelf_grid_control(item)
+        self.assertIsInstance(row, ft.GestureDetector)
+        self.assertIsInstance(card, ft.GestureDetector)
+        self.assertEqual(row.key, self.view._shelf_control_key(item, "list"))
+        self.assertEqual(card.key, self.view._shelf_control_key(item, "grid"))
+        with patch.object(self.view, "_show_shelf_manage") as manage:
+            row.on_secondary_tap_down(object())
+            row.on_long_press(object())
+            card.on_secondary_tap_down(object())
+        self.assertEqual(manage.call_count, 3)
+        self.assertTrue(all(call.args[0] is item
+                            for call in manage.call_args_list))
+
+    async def test_error_feedback_is_snack_bar_with_retry_action(self):
+        shown = []
+        page = SimpleNamespace(
+            show_dialog=shown.append, pop_dialog=lambda: None,
+            run_task=lambda coro: coro.close())
+        retries = []
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=page):
+            self.view._show_error(RuntimeError("网络错误"),
+                                  retry=lambda: retries.append(1))
+        snack = shown[0]
+        self.assertIsInstance(snack, ft.SnackBar)
+        self.assertEqual(snack.content.value, "操作失败：网络错误")
+        self.assertEqual(snack.action, "重试")
+        self.assertEqual(self.view._status.value, "操作失败：网络错误")
+        snack.on_action(None)
+        self.assertEqual(retries, [1])
+
+    async def test_error_feedback_without_page_stays_inline(self):
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          side_effect=RuntimeError("not mounted")):
+            self.view._show_error(UnsupportedRule("缺引擎"))
+        self.assertEqual(self.view._status.value, "当前书源暂不支持：缺引擎")
 
     async def test_text_novel_content_uses_paragraph_reading_layout(self):
         document = ChapterContent([ContentBlock(
@@ -307,13 +350,57 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(progress.semantics_value, 30)
         self.assertIsInstance(progress.semantics_value, int)
 
-    async def test_remount_reuses_existing_bookshelf_controls(self):
-        self.view._bookshelf_rendered = True
-        self.view._render_bookshelf = unittest.mock.Mock()
+    async def test_remount_rerenders_shelf_and_restores_running_progress(self):
+        item = {"name": "Book", "source_url": "https://source",
+                "url": "https://book", "totalChapterNum": 10}
+        self.view.service.bookshelf = [item]
+        self.view.service.reading_state = lambda _item: None
+        self.view.update = lambda: None
+        self.view._whole_book_tasks[self.view._book_task_key(item)] = object()
+        self.view._set_busy("正在缓存《Book》：3/10，失败 0")
 
         self.view.did_mount()
 
-        self.view._render_bookshelf.assert_not_called()
+        self.assertEqual("正在缓存《Book》：3/10，失败 0", self.view._status.value)
+        badge = self.view._bookshelf.controls[0].content.trailing.controls[0]
+        self.assertEqual("缓存中", badge.content.controls[1].value)
+
+    async def test_remount_keeps_shelf_summary_without_background_work(self):
+        self.view.service.bookshelf = []
+        self.view.update = lambda: None
+
+        self.view.did_mount()
+
+        self.assertEqual("书架中有 0 本书", self.view._status.value)
+
+    async def test_unmount_cancels_only_webview_work(self):
+        class FakeTask:
+            def __init__(self):
+                self.cancelled = False
+                self.finished = False
+
+            def done(self):
+                return self.finished
+
+            def cancel(self):
+                self.cancelled = True
+
+        key = ("https://source", "https://book")
+        cache_task, book_task, prefetch_task = FakeTask(), FakeTask(), FakeTask()
+        self.view._whole_book_tasks[key] = cache_task
+        self.view._book_open_task = book_task
+        self.view._prefetch_task = prefetch_task
+        self.view._chapter_cache["chapter"] = "cached"
+        webview = asyncio.get_running_loop().create_future()
+        self.view._webview_future = webview
+
+        self.view.will_unmount()
+
+        self.assertFalse(cache_task.cancelled)
+        self.assertFalse(book_task.cancelled)
+        self.assertFalse(prefetch_task.cancelled)
+        self.assertEqual({"chapter": "cached"}, self.view._chapter_cache)
+        self.assertTrue(webview.cancelled())
 
     async def test_bookshelf_refresh_uses_stable_unique_control_keys(self):
         first = {"name": "One", "source_url": "https://source-a",
@@ -385,6 +472,44 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.view._whole_book_tasks[self.view._book_task_key(item)] = object()
         running = self.view._cache_status_control(item)
         self.assertEqual("缓存中", running.content.controls[1].value)
+
+    async def test_cache_retry_registers_a_tracked_task(self):
+        item = {"name": "Book", "source_url": "https://source",
+                "url": "https://book"}
+        started = []
+
+        class FakePage:
+            @staticmethod
+            def run_task(handler, *args):
+                started.append(handler)
+                return SimpleNamespace(done=lambda: False)
+
+        self.view.update = lambda: None
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=FakePage()):
+            await self.view._restart_whole_book_cache(item)
+
+        self.assertEqual([self.view._run_whole_book_cache], started)
+        self.assertIn(self.view._book_task_key(item),
+                      self.view._whole_book_tasks)
+
+    async def test_cache_retry_ignores_an_already_running_task(self):
+        item = {"name": "Book", "source_url": "https://source",
+                "url": "https://book"}
+        key = self.view._book_task_key(item)
+        running = SimpleNamespace(done=lambda: False)
+        self.view._whole_book_tasks[key] = running
+
+        class FakePage:
+            @staticmethod
+            def run_task(handler, *args):
+                raise AssertionError("must not start a second cache task")
+
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=FakePage()):
+            await self.view._restart_whole_book_cache(item)
+
+        self.assertIs(running, self.view._whole_book_tasks[key])
 
     async def test_image_style_maps_default_full_and_text_layout(self):
         self.assertEqual(ReadingView._image_render_options("DEFAULT", 18),

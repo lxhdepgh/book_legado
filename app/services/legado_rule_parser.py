@@ -892,45 +892,6 @@ def select_jsoup(context: Any, selector: str) -> list[Tag]:
     return nodes
 
 
-def _apply_predicates(nodes: list[Tag], predicates: list[str]) -> list[Tag]:
-    for predicate in predicates:
-        p = predicate.strip()
-        if p.isdigit():
-            index = int(p) - 1
-            nodes = [nodes[index]] if 0 <= index < len(nodes) else []
-            continue
-        if p == "last()":
-            nodes = nodes[-1:] 
-            continue
-        match = re.fullmatch(r"position\(\)\s*=\s*(\d+)", p)
-        if match:
-            index = int(match.group(1)) - 1
-            nodes = [nodes[index]] if 0 <= index < len(nodes) else []
-            continue
-        match = re.fullmatch(r"@([\w:-]+)\s*=\s*(['\"])(.*?)\2", p)
-        if match:
-            nodes = [n for n in nodes if _attr(n, match.group(1)) == match.group(3)]
-            continue
-        match = re.fullmatch(r"@([\w:-]+)", p)
-        if match:
-            nodes = [n for n in nodes if n.has_attr(match.group(1))]
-            continue
-        match = re.fullmatch(r"contains\(\s*@([\w:-]+)\s*,\s*(['\"])(.*?)\2\s*\)", p)
-        if match:
-            nodes = [n for n in nodes if match.group(3) in _attr(n, match.group(1))]
-            continue
-        match = re.fullmatch(r"contains\(\s*(?:text\(\)|\.)\s*,\s*(['\"])(.*?)\1\s*\)", p)
-        if match:
-            nodes = [n for n in nodes if match.group(2) in n.get_text(" ", strip=True)]
-            continue
-        match = re.fullmatch(r"text\(\)\s*=\s*(['\"])(.*?)\1", p)
-        if match:
-            nodes = [n for n in nodes if n.get_text("", strip=True) == match.group(2)]
-            continue
-        raise RuleParseError(f"暂不支持的 XPath 条件：[{p}]")
-    return nodes
-
-
 def xpath_values(root: Any, rule: str) -> list[Any]:
     # Legado delegates XPath to JXDocument. elementpath gives us the equivalent
     # XPath 1/2 implementation without a native extension, so Android builds stay portable.
@@ -1166,13 +1127,17 @@ def _jsoup_part(part: str) -> tuple[str, str, bool]:
         exclude = match.group(1) == "!"
         selection, part = match.group(2), part[:match.start()]
     else:
+        # AnalyzeByJSoup.findIndexSet: in bare (non-bracket) notation ':', '.'
+        # and '!' all separate standalone indexes; only '[...]' carries
+        # start:end:step range semantics.
         match = re.search(r"\.?(!)(-?\d+(?::-?\d+)*)$", part)
         if match:
-            exclude, selection, part = True, match.group(2), part[:match.start()]
+            exclude = True
+            selection, part = match.group(2).replace(":", ","), part[:match.start()]
         else:
             match = re.search(r"\.(-?\d+(?::-?\d+)*)$", part)
             if match:
-                selection, part = match.group(1), part[:match.start()]
+                selection, part = match.group(1).replace(":", ","), part[:match.start()]
     part = re.sub(r"\.(\d+)(?=\s|[>+~]|$)",
                   lambda match: f":nth-of-type({int(match.group(1)) + 1})", part)
     part = re.sub(r"(?:\./|\.)$", "", part)
@@ -1187,6 +1152,8 @@ def _jsoup_part(part: str) -> tuple[str, str, bool]:
 
 
 _VALUE_NAMES = {"text", "textnodes", "owntext", "html", "all"}
+# ElementsSingle treats these as selection steps, never as a trailing value.
+_STEP_NAMES = {"children"}
 _HTML_TAG_NAMES = {
     "a", "abbr", "address", "article", "aside", "audio", "b", "blockquote",
     "body", "br", "button", "canvas", "caption", "code", "col", "dd",
@@ -1248,6 +1215,12 @@ _JSOUP_EMPTY_TAGS = {
     "input", "keygen", "col", "command", "device", "area", "basefont",
     "bgsound", "menuitem", "param", "source", "track",
 }
+# jsoup's Element.text() (TextAccumulator.head) pads the accumulated text with a
+# space before each block-formatting child.  Verified against jsoup 1.16.2, where
+# that set is wider than the CSS block list: <svg>, <math>, <script>, <style>,
+# <title>, <audio>/<video>/<canvas>, <ins>/<del>, <link>/<meta>, <noscript> and
+# <template> all separate text runs even though they look inline in a browser.
+_JSOUP_TEXT_BOUNDARY_TAGS = _BLOCK_TAGS | _JSOUP_BLOCK_TAGS
 
 
 def _jsoup_escape(value: Any, attribute: bool = False,
@@ -1479,7 +1452,7 @@ def _jsoup_text(node: Tag) -> str:
             return
         if not isinstance(current, Tag):
             return
-        block = current.name.lower() in _BLOCK_TAGS
+        block = current.name.lower() in _JSOUP_TEXT_BOUNDARY_TAGS
         if current.name.lower() == "br" or block:
             _jsoup_boundary(buffer)
         for child in current.children:
@@ -1510,7 +1483,13 @@ def _ascii_trim(value: str) -> str:
                             "\x1e\x1f\x20")
 
 
-def jsoup_values(root: Any, rule: str) -> list[Any]:
+def jsoup_values(root: Any, rule: str, list_context: bool = False) -> list[Any]:
+    """Resolve a Jsoup rule.
+
+    list_context mirrors AnalyzeByJSoup.getElements, where every '@' segment is
+    a selector step; only the string path (getStringList -> getResultLast) reads
+    the trailing segment as text/html/attribute.
+    """
     if isinstance(root, ET.Element):
         root = BeautifulSoup(ET.tostring(root, encoding="unicode"), "html.parser")
     rule = re.sub(r"::text\s*$", "@text", str(rule), flags=re.I)
@@ -1518,7 +1497,7 @@ def jsoup_values(root: Any, rule: str) -> list[Any]:
         r"@([\w.:-]+):regex\(\s*(['\"])(.*?)\2\s*\)\s*$", rule)
     if regex_suffix:
         base_rule = rule[:regex_suffix.start()] + "@" + regex_suffix.group(1)
-        values = jsoup_values(root, base_rule)
+        values = jsoup_values(root, base_rule, list_context=list_context)
         try:
             pattern = compile_pattern(regex_suffix.group(3))
         except re.error as exc:
@@ -1537,12 +1516,14 @@ def jsoup_values(root: Any, rule: str) -> list[Any]:
     parts, _ = split_rule_expression(rule, ("@",), code=False)
     attr = ""
     terminal = parts[-1].lower() if parts else ""
-    if terminal in _VALUE_NAMES:
+    if list_context:
+        pass
+    elif terminal in _VALUE_NAMES:
         attr = parts.pop()
-    elif len(parts) > 1 and (
+    elif (terminal not in _STEP_NAMES and len(parts) > 1 and (
             terminal.startswith("attr.") or
             (terminal not in _HTML_TAG_NAMES and
-             re.fullmatch(r"[\w:-]+", parts[-1]))):
+             re.fullmatch(r"[\w:-]+", parts[-1])))):
         attr = parts.pop()
     if force_css:
         parts = ["@".join(parts)]
@@ -1932,7 +1913,8 @@ def _jsonpath_is_definite(expression: str) -> bool:
     return True
 
 
-def json_values(root: Any, rule: str, _preserve_array: bool = False) -> list[Any]:
+def json_values(root: Any, rule: str, _preserve_array: bool = False,
+                list_context: bool = False) -> list[Any]:
     if rule.lower().startswith("@json:"): rule = rule.split(":", 1)[1].strip()
     expression = rule.strip()
     expression = re.sub(r"\](?=[A-Za-z_$])", "].", expression)
@@ -1989,6 +1971,12 @@ def json_values(root: Any, rule: str, _preserve_array: bool = False) -> list[Any
                           parse(bracket_expression).find(root)]
     except Exception:
         values = jsonpath_get(root, rule)
+    if (list_context and values and _jsonpath_is_definite(expression)
+            and not isinstance(values[0], list)):
+        # Legado's list rules read the path with JSONPath.read(..., ArrayList),
+        # which throws on a JSON object or scalar.  The branch counts as failed
+        # so a || chain falls through to the next rule.
+        return []
     return ([JavaArrayNull() if item is None else item for item in values[0]]
             if (not _preserve_array and _jsonpath_is_definite(expression)
                 and len(values) == 1 and isinstance(values[0], list)) else values)
@@ -2020,28 +2008,60 @@ def regex_values(root: Any, rule: str) -> list[list[str]]:
         raise RuleParseError(f"无效的正则列表规则：{patterns[-1]}") from exc
 
 
-def evaluate(root: Any, rule: str, kind: str) -> list[Any]:
-    """Evaluate Legado || / && / %% combinations with the matching sub-engine."""
+def _is_json_payload(root: Any) -> bool:
+    return isinstance(root, dict) or (
+        isinstance(root, list) and bool(root) and
+        all(isinstance(item, (dict, list)) for item in root))
+
+
+def _json_root_for_rule(root: Any) -> Any:
+    """Legado keeps JSONObject types through its pipeline; our fetch layer can
+    mislabel JSON bodies as HTML when the server lies about Content-Type."""
+    if isinstance(root, (dict, list)):
+        return root
+    text = root.get_text() if hasattr(root, "get_text") else str(root or "")
+    try:
+        return parse_json_smart(text)
+    except Exception:
+        return root
+
+
+def evaluate(root: Any, rule: str, kind: str, list_context: bool = False) -> list[Any]:
+    """Evaluate Legado || / && / %% combinations with the matching sub-engine.
+
+    list_context marks a list-extraction rule (bookList / chapterList): Legado
+    resolves those with AnalyzeByJSoup.getElements, where no '@' segment is ever
+    read as a trailing text/attribute value.
+    """
     rule = (rule or "").strip()
     if not rule: return []
     if rule.startswith(":"):
         return regex_values(root, rule)
+    json_rule = (kind == "json" or rule.startswith(("$.", "$[")) or
+                 rule.lower().startswith("@json:"))
     parts, separator = split_rule_expression(
-        rule, ("&&", "||", "%%"), code=kind == "json")
+        rule, ("&&", "||", "%%"), code=json_rule)
     if separator:
         # Legado's fallback operator is lazy: once a branch yields values the
         # remaining selectors must not run (they may target a different payload).
         if separator == "||":
             for part in parts:
-                group = evaluate(root, part, kind)
+                group = evaluate(root, part, kind, list_context)
                 if group:
                     return group
             return []
-        groups = [evaluate(root, part, kind) for part in parts]
+        groups = [evaluate(root, part, kind, list_context) for part in parts]
         if separator == "&&": return [item for group in groups for item in group]
         return [group[i] for i in range(max(map(len, groups), default=0)) for group in groups if i < len(group)]
-    if kind == "json": return json_values(root, rule)
+    if kind == "json": return json_values(root, rule, list_context=list_context)
+    # RuleAnalyzer.getAnalyzeType: the rule prefix decides the analyzer even
+    # when the payload was sniffed as HTML.
+    if rule.startswith(("$.", "$[")) or rule.lower().startswith("@json:"):
+        return json_values(_json_root_for_rule(root), rule,
+                           list_context=list_context)
     if rule.startswith(("/", "./", "@XPath:", "@xpath:")):
         if rule.lower().startswith("@xpath:"): rule = rule.split(":", 1)[1].strip()
         return xpath_values(root, rule)
-    return jsoup_values(root, rule)
+    if _is_json_payload(root):
+        return json_values(root, rule, list_context=list_context)
+    return jsoup_values(root, rule, list_context)

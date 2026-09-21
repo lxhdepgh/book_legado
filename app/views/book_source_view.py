@@ -25,7 +25,7 @@ class BookSourceView(ft.Column):
             service,
             on_imported=self._on_import_tab_done,
         )
-        self.check_view = CheckView(service)
+        self.check_view = CheckView(service, file_picker=self.import_view.file_picker)
         self.discover_view = discover_view
 
         # 顶部 Tab 栏

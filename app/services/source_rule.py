@@ -7,6 +7,9 @@ from functools import lru_cache
 
 
 _JS_PATTERN = re.compile(r"<js>([\s\S]*?)</js>|@js:([\s\S]*)", re.I)
+# AppPattern.WebJS_PATTERN: only the @webjs: prefix exists in Legado 3.x, and
+# the script must be at least 5 characters long.
+_WEBJS_PATTERN = re.compile(r"@webjs:([\s\S]{5,})", re.I)
 _PUT_PATTERN = re.compile(r"@put:(\{[^}]+?\})", re.I)
 _EVAL_PATTERN = re.compile(r"@get:\{[^}]+?\}|\{\{[\s\S]*?\}\}", re.I)
 _CAPTURE_PATTERN = re.compile(r"\$\d{1,2}")
@@ -30,7 +33,7 @@ class PythonRuleProgram:
         return "".join(stage.raw for stage in self.stages)
 
     def leading_js(self) -> tuple[str | None, str]:
-        if self.stages and self.stages[0].mode == "js":
+        if self.stages and self.stages[0].mode in {"js", "webjs"}:
             return self.stages[0].raw, "".join(
                 stage.raw for stage in self.stages[1:]).strip()
         return None, self.original.strip()
@@ -38,9 +41,9 @@ class PythonRuleProgram:
     def selector_and_suffix(self) -> tuple[str, str]:
         if not self.stages:
             return self.original, ""
-        if self.stages[0].mode == "js":
+        if self.stages[0].mode in {"js", "webjs"}:
             return "", self.original.strip()
-        if len(self.stages) > 1 and self.stages[1].mode == "js":
+        if len(self.stages) > 1 and self.stages[1].mode in {"js", "webjs"}:
             return self.stages[0].rule.strip(), "".join(
                 stage.raw for stage in self.stages[1:]).strip()
         return self.original, ""
@@ -99,19 +102,28 @@ def compile_rule_program(value: str, all_in_one: bool = False,
     original = str(value or "")
     stages = []
     cursor = 0
+    matches = []
     for match in _JS_PATTERN.finditer(original):
-        if match.start() > cursor:
-            raw = original[cursor:match.start()]
+        script = (match.group(2) if match.group(2) is not None
+                  else match.group(1))
+        matches.append((match.start(), match.end(), "js", script or ""))
+    for match in _WEBJS_PATTERN.finditer(original):
+        matches.append((match.start(), match.end(), "webjs", match.group(1)))
+    matches.sort()
+    for start, end, script_mode, script in matches:
+        if start < cursor:
+            continue
+        if start > cursor:
+            raw = original[cursor:start]
             rule, put_rule = strip_put_rules(raw)
             if rule or put_rule:
                 mode, rule = _prepare_plain(
                     rule, all_in_one, is_json, is_regex)
                 stages.append(PythonSourceRule(
                     mode, rule, raw, put_rule))
-        raw = match.group(0)
-        script = match.group(2) if match.group(2) is not None else match.group(1)
-        stages.append(PythonSourceRule("js", script or "", raw))
-        cursor = match.end()
+        stages.append(PythonSourceRule(
+            script_mode, script, original[start:end]))
+        cursor = end
     if cursor < len(original):
         raw = original[cursor:]
         rule, put_rule = strip_put_rules(raw)

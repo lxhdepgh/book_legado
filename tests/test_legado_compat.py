@@ -30,7 +30,8 @@ from PIL import Image
 from app.models.book_source import BookSource
 from app.services.legado_rule_parser import (JavaDateValue, _jsoup_html_markup,
                                               _selection_indices,
-                                              evaluate, parse_markup,
+                                              evaluate, jsoup_values,
+                                              parse_markup,
                                               select_jsoup,
                                               split_rule_expression)
 from app.services.compat_audit import (SUPPORTED_JAVA_APIS, SUPPORTED_OBJECT_APIS,
@@ -55,6 +56,7 @@ from app.services.custom_url import CustomUrl
 from app.services.java_regex import search as java_regex_search, sub as java_regex_sub
 from app.services.public_suffix import effective_tld_plus_one
 from app.services.rule_engine import (BookItem, ChapterItem, ReaderEngine,
+                                      _format_book_intro,
                                       merge_search_items,
                                       parse_explore_categories,
                                       resolve_explore_categories, select_nodes)
@@ -141,6 +143,22 @@ class RuleParserTests(unittest.TestCase):
             '<img src="https://example.test/book/chapter/asset.png,'
             '{\"headers\":{\"X\":\"1\"}}">')
 
+    def test_content_page_keeps_usehtml_spans_verbatim(self):
+        formatted = _format_content_page(
+            '<p>普通 <usehtml><span style="color:red">红色&nbsp;文字</span>'
+            '<i>斜体</i></usehtml>尾巴</p>', "https://example.test/ch/1")
+        self.assertEqual(
+            formatted,
+            '　　普通 <usehtml><span style="color:red">红色&nbsp;文字</span>'
+            '<i>斜体</i></usehtml>尾巴')
+
+    def test_book_intro_with_raw_render_markers_bypasses_formatter(self):
+        for marker in ("<usehtml>", "<md>", "<useweb>"):
+            raw = f"  {marker}<b>简介</b>"
+            self.assertEqual(_format_book_intro(raw), f"{marker}<b>简介</b>")
+        self.assertEqual(_format_book_intro("<p>简介</p><br>正文"),
+                         "　　简介\n　　正文")
+
     def test_search_model_merge_origin_precision_and_rank_order(self):
         existing = [
             BookItem("Key", author="A", origin="s1", url="u1"),
@@ -225,6 +243,50 @@ class RuleParserTests(unittest.TestCase):
         self.assertEqual(evaluate(root, "ul@li!0@text", "html"), ["A1", "B1"])
         self.assertEqual(evaluate(root, "ul@li[-1:0]@text", "html"),
                          ["A1", "A0", "B1", "B0"])
+
+    def test_jsonpath_rule_dispatches_even_when_body_sniffed_as_html(self):
+        body = json.dumps({"data": {"list": [{"name": "A"}, {"name": "B"}]}},
+                          ensure_ascii=False)
+        root = parse_markup(body)
+        # Verified against Legado's own AnalyzeByJSonPath (json-path 2.10 +
+        # JsonSmart): a named step does NOT traverse arrays implicitly.
+        self.assertEqual(evaluate(root, "$.data.list.name", "html"), [])
+        self.assertEqual(evaluate(root, "$.data.list[*].name", "html"), ["A", "B"])
+        self.assertEqual(evaluate(root, "$.data.list[0].name", "html"), ["A"])
+        self.assertEqual(evaluate(root, "@json:$.data.list", "html"),
+                         [{"name": "A"}, {"name": "B"}])
+
+    def test_json_payload_root_dispatches_without_dollar_prefix(self):
+        payload = {"data": {"list": [{"name": "A"}]}}
+        self.assertEqual(evaluate(payload, "data.list[*].name", "html"), ["A"])
+
+    def test_json_filter_combinators_survive_html_kind_split(self):
+        body = json.dumps({"data": {"list": [{"name": "A", "ok": True},
+                                             {"name": "B", "ok": False}]}},
+                          ensure_ascii=False)
+        root = parse_markup(body)
+        self.assertEqual(
+            evaluate(root, "$.data.list[?@.ok==true].name", "html"), ["A"])
+
+    def test_html_root_with_non_json_text_still_uses_jsoup(self):
+        root = parse_markup("<main><p>hi</p></main>")
+        self.assertEqual(evaluate(root, "main@p@text", "html"), ["hi"])
+        self.assertEqual(evaluate(root, "$.data.list", "html"), [])
+
+    def test_jsoup_bare_colon_selects_standalone_indexes_not_range(self):
+        root = BeautifulSoup(
+            "<div><p>0</p><p>1</p><p>2</p><p>3</p><p>4</p></div>",
+            "html.parser")
+        self.assertEqual(evaluate(root, "div@p.0:2:4@text", "html"),
+                         ["0", "2", "4"])
+        self.assertEqual(evaluate(root, "div@p.3:1@text", "html"),
+                         ["3", "1"])
+        self.assertEqual(evaluate(root, "div@p.-1:2@text", "html"),
+                         ["4", "2"])
+        self.assertEqual(evaluate(root, "div@p!1:3@text", "html"),
+                         ["0", "2", "4"])
+        self.assertEqual(evaluate(root, "div@p[-1:1]@text", "html"),
+                         ["4", "3", "2", "1"])
 
     def test_jsoup_elements_single_index_truth_table(self):
         cases = {
@@ -372,6 +434,60 @@ class RuleParserTests(unittest.TestCase):
             evaluate(root, "$.data.chapters.*", "json"),
             root["data"]["chapters"],
         )
+
+    def test_jsonpath_recursive_descent_matches_jayway_sample_rules(self):
+        root = {"data": {"list": [{"name": "A"}, {"name": "B"}]}}
+        self.assertEqual(evaluate(root, "$..list[*]", "json"),
+                         root["data"]["list"])
+        self.assertEqual(evaluate(root, "$..data[*]", "json"), [root["data"]])
+        self.assertEqual(evaluate(root, "$..list[*].name", "json"), ["A", "B"])
+
+    def test_json_list_rule_falls_through_object_reads(self):
+        root = {"data": {"page": {"count": 2},
+                         "list": [{"name": "A"}, {"name": "B"}]}}
+        # Jayway reads a definite path into ArrayList; a JSON object throws, so
+        # Legado's || chain keeps looking for a branch that yields an array.
+        self.assertEqual(evaluate(root, "$.data", "json"), [root["data"]])
+        self.assertEqual(evaluate(root, "$.data", "json", list_context=True),
+                         [])
+        self.assertEqual(
+            evaluate(root, "$.data||$.data.list", "json", list_context=True),
+            root["data"]["list"])
+        self.assertEqual(
+            evaluate(root, "$.data||$.data.list[*]", "json",
+                     list_context=True),
+            root["data"]["list"])
+
+    def test_jsoup_list_rule_keeps_trailing_segment_as_selector(self):
+        root = BeautifulSoup(
+            '<div class="list"><a href="/1">One</a><em>Two</em></div>',
+            "html.parser")
+        # AnalyzeByJSoup.getElements feeds every '@' segment to the selector
+        # engine; only the string path reads the last one as a value.
+        self.assertEqual(
+            [node.get_text() for node in
+             evaluate(root, "div.list@em", "html", list_context=True)],
+            ["Two"])
+        self.assertEqual(evaluate(root, "div.list@text", "html"), ["OneTwo"])
+        self.assertEqual(evaluate(root, "div.list@text", "html",
+                                  list_context=True), [])
+        self.assertEqual(
+            len(evaluate(root, "div.list@mio-tile", "html",
+                         list_context=True)), 0)
+
+    def test_jsoup_text_inserts_space_at_svg_and_script_boundaries(self):
+        node = BeautifulSoup(
+            '<em class="x"><svg><use xlink:href="#i-o"></use></svg>'
+            '<span class="vam">其他</span>'
+            '<svg><use xlink:href="#i-pen"></use></svg>'
+            '<span class="vam">连山会</span></em>', "html.parser").em
+        self.assertEqual(jsoup_values(node, "text"), ["其他 连山会"])
+        script = BeautifulSoup('<p class="x">one<script>a=1</script>'
+                               'two</p>', "html.parser").p
+        self.assertEqual(jsoup_values(script, "text"), ["one two"])
+        plain = BeautifulSoup('<p class="x"><span>one</span>'
+                              '<span>two</span></p>', "html.parser").p
+        self.assertEqual(jsoup_values(plain, "text"), ["onetwo"])
 
     def test_jsoup_at_chain_treats_terminal_html_tag_as_selector(self):
         root = BeautifulSoup(
@@ -693,6 +809,17 @@ class RuleParserTests(unittest.TestCase):
         self.assertEqual(source.ruleReview["reviewUrl"], "/review")
         self.assertEqual(source.to_dict()["ruleReview"]["contentRule"], ".text@text")
         self.assertNotIn("reviewList", source.ruleReview)
+
+    def test_book_source_keeps_current_content_rule_fields(self):
+        source = BookSource.from_dict({
+            "bookSourceUrl": "https://source",
+            "ruleContent": {"content": "p@text", "subContent": "#sub@html",
+                            "callBackJs": "result", "reviewList": "discard"},
+        })
+        self.assertEqual(source.ruleContent["subContent"], "#sub@html")
+        self.assertEqual(source.ruleContent["callBackJs"], "result")
+        self.assertNotIn("reviewList", source.ruleContent)
+        self.assertEqual(source.to_dict()["ruleContent"]["subContent"], "#sub@html")
 
     def test_book_source_gson_coercion_matches_fixed_deserializers(self):
         source = BookSource.from_dict({
@@ -3956,8 +4083,10 @@ class RuleParserTests(unittest.TestCase):
             '<div class="x"><i>0</i><i>1</i><i>2</i><i>3</i></div>',
             "html.parser",
         )
-        self.assertEqual(evaluate(root, "class.x@i.1:3@text", "html"), ["1", "2", "3"])
-        self.assertEqual(evaluate(root, "class.x@i!0:2@text", "html"), ["3"])
+        # Bare notation ':' separates standalone indexes (AnalyzeByJSoup
+        # findIndexSet), unlike the start:end:step range inside [...].
+        self.assertEqual(evaluate(root, "class.x@i.1:3@text", "html"), ["1", "3"])
+        self.assertEqual(evaluate(root, "class.x@i!0:2@text", "html"), ["1", "3"])
         self.assertEqual(evaluate(root, "class.x@i[-1:-2]@text", "html"), ["3", "2"])
         self.assertEqual(evaluate(root, "class.x@i[-2:]@text", "html"), ["2", "3"])
         self.assertEqual(evaluate(root, "class.x@i[2:]@text", "html"), ["2", "3"])
@@ -5268,6 +5397,56 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(program.stages[0].put_rule, "{id:$.id}")
         self.assertEqual(program.stages[1].rule, "result+'!'")
 
+    def test_python_source_rule_compiler_splits_webjs_stage(self):
+        program = compile_rule_program("$.list@webjs:JSON.stringify(result)")
+        self.assertEqual([stage.mode for stage in program.stages],
+                         ["json", "webjs"])
+        self.assertEqual(program.stages[1].rule, "JSON.stringify(result)")
+        leading = compile_rule_program("@webjs:document.title")
+        self.assertEqual(leading.stages[0].mode, "webjs")
+        self.assertEqual(leading.selector_and_suffix(),
+                         ("", "@webjs:document.title"))
+        # WebJS_PATTERN requires at least 5 characters, shorter stays plain.
+        self.assertEqual(compile_rule_program("@webjs:ab").stages[0].mode,
+                         "default")
+
+    def test_webjs_rule_stage_evaluates_in_browser_with_result_binding(self):
+        runtime = LegadoJsRuntime()
+        calls = []
+
+        def fetcher(url, _title, options):
+            calls.append((url, dict(options)))
+            return {"body": "", "url": url, "status": 200, "headers": {},
+                    "jsResult": "第一章"}
+
+        runtime.browser_fetcher = fetcher
+        source = SimpleNamespace(
+            to_dict=lambda: {"bookSourceUrl": "https://example"})
+        value = runtime.evaluate(
+            "@webjs:JSON.parse(result)[0] + '章'",
+            JsContext(source=source, result='["一","二"]',
+                      base_url="https://example.com/book/1",
+                      src="<html><body>page</body></html>"))
+        self.assertEqual(value, "第一章")
+        _url, options = calls[0]
+        self.assertEqual(options["mode"], "webJs")
+        self.assertEqual(options["url"], "https://example.com/book/1")
+        self.assertEqual(options["html"], "<html><body>page</body></html>")
+        self.assertIn('window.result = "[\\"一\\",\\"二\\"]"',
+                      options["javaScript"])
+        self.assertIn("__legadoJsResult", options["javaScript"])
+        self.assertIn("JSON.parse(result)[0]", options["javaScript"])
+
+    def test_webjs_rule_stage_reports_script_errors_and_missing_backend(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://e"})
+        with self.assertRaises(JsBridgeError):
+            runtime.evaluate("@webjs:any script text", JsContext(source=source))
+        runtime.browser_fetcher = lambda url, _title, options: {
+            "body": "", "jsResult": "__LEGADO_JS_ERROR__:ReferenceError: x is not defined"}
+        with self.assertRaises(JsBridgeError):
+            runtime.evaluate("@webjs:any script text", JsContext(source=source))
+
     def test_python_source_rule_compiler_matches_historical_mode_promotion(self):
         cases = {
             "@XPath://a": ("xpath", "//a"),
@@ -6088,6 +6267,55 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(cache.load_content(
                 source.bookSourceUrl, book.url, chapter.url))
 
+    async def test_put_rule_scopes_to_chapter_not_the_engine_bag(self):
+        class Engine(LegadoReadingEngine):
+            async def _request_value(self, url, *args, **kwargs):
+                page = "1" if url.endswith("/one") else "2"
+                return (f"<p>body{page}</p><b id='cid'>value{page}</b>",
+                        "text/html", url)
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://x",
+            ruleContent={"content": "@put:{token:#cid@text}p@text##body",
+                         "nextContentUrl": ""},
+            to_dict=lambda: {"bookSourceUrl": "https://x"})
+        engine = Engine()
+        book = BookItem("Book", url="https://x/book")
+        engine.current_book = book
+        first = ChapterItem("One", "https://x/one", index=0, book_url=book.url)
+        second = ChapterItem("Two", "https://x/two", index=1, book_url=book.url)
+        engine.current_chapters = [first, second]
+        await engine.content_document(source, first, need_save=False)
+        # AnalyzeRule.put routes to chapter ?: book ?: ruleData; a chapter
+        # variable must not leak into the engine bag or the next chapter.
+        self.assertEqual(first.variables["token"], "value1")
+        self.assertNotIn("token", engine.js_variables)
+        self.assertNotIn("token", second.variables)
+        self.assertEqual(engine._get_variable("token", book, first), "value1")
+        self.assertEqual(engine._get_variable("token", book, second), "")
+        await engine.content_document(source, second, need_save=False)
+        self.assertEqual(second.variables["token"], "value2")
+        self.assertEqual(first.variables["token"], "value1")
+
+    async def test_subcontent_appends_unformatted_value_after_pages(self):
+        class Engine(LegadoReadingEngine):
+            async def _request_value(self, *args, **kwargs):
+                return ("<h1>One</h1><div id='sub'><p>A</p><p>B</p></div>",
+                        "text/html", "https://x/chapter")
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://x",
+            ruleContent={"content": "h1@text", "subContent": "#sub@html"},
+            to_dict=lambda: {"bookSourceUrl": "https://x"})
+        chapter = ChapterItem("Chapter", "https://x/chapter")
+        document = await Engine().content_document(source, chapter,
+                                                   need_save=False)
+        # BookContent adds subContent raw (no HtmlFormatter) after the
+        # formatted page list, so the joined text keeps paragraph markup.
+        self.assertEqual(
+            document.raw_content,
+            "One\n<div id=\"sub\">\n <p>A</p>\n <p>B</p>\n</div>")
+
     async def test_empty_content_rule_and_synthetic_volume_bypass_request(self):
         class NoNetworkEngine(LegadoReadingEngine):
             async def _request_value(self, *args, **kwargs):
@@ -6380,7 +6608,10 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
             source, book, {"title": "Detail name", "id": 42}, "json",
             '{"title":"Detail name","id":42}', "https://source/book")
         self.assertEqual(book.name, "Search name")
-        self.assertEqual(engine.js_variables["cid"], "42")
+        # AnalyzeRule.put stores into chapter ?: book: detail parsing has no
+        # chapter, so the side effect belongs to the book entity, not the bag.
+        self.assertEqual(book.variables["cid"], "42")
+        self.assertNotIn("cid", engine.js_variables)
 
     async def test_desktop_browser_response_imports_cookies(self):
         browser_cookies = iter(("token=verified", ""))

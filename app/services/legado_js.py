@@ -367,6 +367,11 @@ class LegadoJsRuntime:
         return result if isinstance(result, dict) else {}
 
     def evaluate(self, script: str, context: JsContext):
+        stripped = str(script or "").strip()
+        if stripped.lower().startswith("@webjs:"):
+            # BackstageWebView rule mode: the script runs in the rendered page,
+            # never in the QuickJS runtime.
+            return self._evaluate_webjs(stripped[7:], context)
         if getattr(self._QUICKJS_THREAD, "active", False):
             # A Python callback made by QuickJS may evaluate another rule.
             # Running it inline avoids deadlocking the single worker.
@@ -3157,7 +3162,7 @@ class LegadoJsRuntime:
             if context.get_string_list:
                 return context.get_string_list(str(rule))
         root, kind = self._context_rule_root(context, content)
-        values = evaluate(root, str(rule), kind)
+        values = evaluate(root, str(rule), kind, list_context=True)
         is_xpath = str(rule).lstrip().lower().startswith("@xpath:") or str(
             rule).lstrip().startswith(("/", "("))
         if not is_xpath:
@@ -4787,6 +4792,43 @@ class LegadoJsRuntime:
                 return candidate
             return ""
         return str(result.get("body") or "")
+
+    def _evaluate_webjs(self, script: str, context: JsContext) -> str:
+        """BackstageWebView(isRule=true) equivalent for the @webjs: stage.
+
+        The browser exposes the previous stage value as the JSON string
+        ``window.result``; the rule script's completion value becomes the new
+        rule result.
+        """
+        if self.browser_fetcher is None:
+            raise JsBridgeError("@webjs: 规则需要浏览器后端，当前平台未配置")
+        result = context.result
+        result_json = result if isinstance(result, str) else json.dumps(
+            "" if result is None else result, ensure_ascii=False)
+        wrapped = (
+            "window.result = " + json.dumps(result_json, ensure_ascii=False) +
+            ";\nwindow.__legadoJsResult = (function(){try{return eval(" +
+            json.dumps(str(script or ""), ensure_ascii=False) +
+            ")}catch(error){return '__LEGADO_JS_ERROR__:' + error}})();")
+        html = context.src if isinstance(context.src, str) and context.src else (
+            context.result if isinstance(context.result, str)
+            and context.result.lstrip().startswith("<") else "")
+        fetched = self._browser_result({
+            "mode": "webJs",
+            "url": str(context.base_url or ""),
+            "html": html or None,
+            "javaScript": wrapped,
+            "sourceRegex": "",
+            "overrideUrlRegex": "",
+            "headerMap": {},
+        })
+        value = fetched.get("jsResult")
+        if isinstance(value, str) and value.startswith("__LEGADO_JS_ERROR__:"):
+            raise JsBridgeError(value[len("__LEGADO_JS_ERROR__:"):])
+        if value is None:
+            raise JsBridgeError("webjs 脚本未返回结果")
+        return value if isinstance(value, str) else json.dumps(
+            value, ensure_ascii=False)
 
     def _start_browser(self, url: str, title: str) -> None:
         if self.browser_starter is not None:

@@ -75,6 +75,100 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
         category_resolver.assert_awaited_once_with(
             unittest.mock.ANY, runtime=engine.js)
 
+    async def test_category_sampling_caps_checked_categories(self):
+        engine = SimpleNamespace(
+            explore=AsyncMock(return_value=[SimpleNamespace(name="book")]),
+            js=SimpleNamespace(close=lambda: None))
+        category_resolver = AsyncMock(return_value=[
+            ExploreCategory(f"分类{index}", f"/list{index}")
+            for index in range(5)])
+        with patch.object(
+                check_service, "resolve_explore_categories",
+                category_resolver):
+            results = await check_service.check_categories(
+                _source(), timeout=1, engine=engine, max_categories=2)
+
+        self.assertEqual(2, len(results))
+        self.assertEqual(2, engine.explore.await_count)
+
+    async def test_slow_explore_pool_does_not_serialize_searches(self):
+        search_peak = 0
+        search_active = 0
+        tag_peak = 0
+        tag_active = 0
+
+        async def fake_search(source, engine, timeout):
+            nonlocal search_peak, search_active
+            search_active += 1
+            search_peak = max(search_peak, search_active)
+            await asyncio.sleep(0.05)
+            search_active -= 1
+            return ({"search_status": "no_results", "book_count": 0,
+                     "search_keyword": "test", "search_method": "rule-engine",
+                     "search_error": None}, [])
+
+        async def fake_categories(source, session=None, sem=None, timeout=10,
+                                  engine=None, max_categories=None):
+            nonlocal tag_peak, tag_active
+            tag_active += 1
+            tag_peak = max(tag_peak, tag_active)
+            await asyncio.sleep(0.2)
+            tag_active -= 1
+            return []
+
+        async def fake_probe(*args, **kwargs):
+            return {"status": "ok", "status_code": 200,
+                    "response_time_ms": 1, "error": None}
+
+        class FakeEngine:
+            def __init__(self, **kwargs):
+                self.js = SimpleNamespace(close=lambda: None)
+
+        sources = [_source() for _ in range(8)]
+        with patch.object(check_service, "_engine_search_check", fake_search), \
+                patch.object(check_service, "check_categories", fake_categories), \
+                patch.object(check_service, "_probe_source", fake_probe), \
+                patch.object(check_service, "LegadoReadingEngine", FakeEngine):
+            await check_service.check_sources(
+                sources, concurrency=check_service.CHECK_CONCURRENCY,
+                timeout=1)
+
+        self.assertEqual(check_service.CHECK_CONCURRENCY, search_peak)
+        self.assertEqual(check_service.TAG_SOURCE_CONCURRENCY, tag_peak)
+
+    async def test_locally_blocked_host_skips_rule_stages(self):
+        called = []
+
+        async def fake_search(source, engine, timeout):
+            called.append("search")
+            return ({"search_status": "no_results", "book_count": 0,
+                     "search_keyword": "test", "search_method": "rule-engine",
+                     "search_error": None}, [])
+
+        async def fake_categories(*args, **kwargs):
+            called.append("categories")
+            return []
+
+        async def fake_probe(*args, **kwargs):
+            return {"status": "blocked", "status_code": 200,
+                    "response_time_ms": 1,
+                    "error": "本机安全软件已拦截该站点（火绒）"}
+
+        class FakeEngine:
+            def __init__(self, **kwargs):
+                self.js = SimpleNamespace(close=lambda: None)
+
+        with patch.object(check_service, "_engine_search_check", fake_search), \
+                patch.object(check_service, "check_categories", fake_categories), \
+                patch.object(check_service, "_probe_source", fake_probe), \
+                patch.object(check_service, "LegadoReadingEngine", FakeEngine):
+            results = await check_service.check_sources(
+                [_source()], concurrency=1, timeout=1)
+
+        self.assertEqual([], called)
+        self.assertEqual("blocked", results[0]["check_state"])
+        self.assertEqual("skip", results[0]["reading_status"])
+
     async def test_reading_chain_checks_detail_catalog_and_content(self):
         book = SimpleNamespace(name="book", url="https://example/book")
         chapter = SimpleNamespace(
@@ -92,9 +186,76 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["reading_status"], "ok")
         self.assertEqual(result["reading_stage"], "complete")
         self.assertEqual(result["chapter_count"], 1)
+        self.assertEqual(result["reading_tried"], 1)
         engine.book_info.assert_awaited_once()
         engine.chapters.assert_awaited_once()
         engine.content_document.assert_awaited_once()
+
+    def _multi_book_engine(self, content_outcomes, chapters=None):
+        good = SimpleNamespace(
+            blocks=[SimpleNamespace(kind="text", value="body")], raw_content="body")
+        empty = SimpleNamespace(blocks=[], raw_content="")
+        documents = [good if outcome == "ok" else empty
+                     for outcome in content_outcomes]
+        async def content_document(source, chapter, need_save=False):
+            return documents.pop(0)
+        return SimpleNamespace(
+            book_info=AsyncMock(side_effect=lambda s, b: b),
+            chapters=AsyncMock(return_value=chapters or [SimpleNamespace(
+                name="chapter", url="https://example/chapter", is_volume=False)]),
+            content_document=content_document)
+
+    async def test_reading_chain_retries_next_book_when_content_empty(self):
+        books = [SimpleNamespace(name=f"b{i}", url=f"https://example/b{i}")
+                 for i in range(3)]
+        engine = self._multi_book_engine(["empty", "ok"])
+
+        result = await check_service._reading_chain_check(
+            _source(), engine, books, timeout=5)
+
+        self.assertEqual(result["reading_status"], "ok")
+        self.assertEqual(result["reading_tried"], 2)
+        self.assertEqual(result["sample_book"], "b1")
+        self.assertIsNone(result["reading_error"])
+
+    async def test_reading_chain_stops_on_deterministic_rule_error(self):
+        from app.services.legado_rule_parser import RuleParseError
+        books = [SimpleNamespace(name=f"b{i}", url=f"https://example/b{i}")
+                 for i in range(3)]
+        engine = SimpleNamespace(
+            book_info=AsyncMock(
+                side_effect=RuleParseError("无法解析 JSoup 规则：$.data.list")),
+            chapters=AsyncMock(), content_document=AsyncMock())
+
+        result = await check_service._reading_chain_check(
+            _source(), engine, books, timeout=5)
+
+        self.assertEqual(result["reading_status"], "rule_error")
+        self.assertEqual(result["reading_tried"], 1)
+        engine.chapters.assert_not_awaited()
+
+    async def test_reading_chain_caps_candidates_and_total_time(self):
+        books = [SimpleNamespace(name=f"b{i}", url=f"https://example/b{i}")
+                 for i in range(6)]
+        engine = self._multi_book_engine(["empty"] * 6)
+
+        result = await check_service._reading_chain_check(
+            _source(), engine, books, timeout=5)
+
+        self.assertEqual(result["reading_tried"],
+                         check_service.READING_CHAIN_CANDIDATES)
+        self.assertEqual(result["reading_status"], "rule_error")
+
+    def test_locally_blocked_host_is_not_counted_as_source_failure(self):
+        block_page = ("<html><body><h1>拦截提示</h1>"
+                      "<p>火绒安全软件已阻止你访问该网站</p></body></html>")
+        self.assertEqual(check_service._blocked_notice(block_page), "火绒")
+        normal = ("<div class='result'><a href='/book/1'>书名</a></div>" * 100
+                  + "若页面被拦截请刷新重试")
+        self.assertIsNone(check_service._blocked_notice(normal))
+        self.assertEqual(check_service._classify_result({
+            "status": "blocked", "search_status": "no_results", "tag_valid": 0,
+            "reading_status": "skip"}), "blocked")
 
     def test_result_classification_distinguishes_reading_failures(self):
         self.assertEqual(check_service._classify_result({
@@ -105,6 +266,12 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
             "search_status": "ok", "tag_valid": 0,
             "reading_status": "ok", "status": "ok",
         }), "fully_usable")
+
+    def test_keyword_miss_is_not_classified_unusable(self):
+        self.assertEqual(check_service._classify_result({
+            "search_status": "no_results", "tag_valid": 0,
+            "reading_status": "skip", "status": "ok",
+        }), "search_only")
 
     async def test_explore_document_reuses_downloaded_response(self):
         engine = ReaderEngine()
