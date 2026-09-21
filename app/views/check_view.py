@@ -22,10 +22,10 @@ CHECK_STATE_LABELS = {
     "explore_only": "仅发现可用",
     "content_unavailable": "阅读链路失败",
     "unknown": "待确认",
-    "blocked": "本机拦截",
+    "blocked": "访问被拦截",
     "unusable": "不可用",
 }
-# 被本机安全软件拦截的主机不代表书源失效，重测只会再次触发拦截。
+# 被本机杀软或站点 WAF 拦截的主机不代表书源失效，重测只会再次触发拦截。
 FAILED_CHECK_STATES = {"content_unavailable", "unknown", "unusable"}
 CHECK_SAMPLE_SIZE = 50
 
@@ -111,7 +111,8 @@ class CheckView(ft.Column):
                     f"默认按列表顺序抽样前 {CHECK_SAMPLE_SIZE} 个书源；"
                     "检测会向每个书源主机发真实请求，部分站点已被安全软件标记，"
                     "全量检测前请先确认。默认只生成结果，不修改书源状态。"
-                    "被本机安全软件拦截的主机会很快记为“本机拦截”，不再等待各阶段超时。",
+                    "被本机安全软件或站点 WAF 拦截的主机会很快记为“访问被拦截”，"
+                    "不再等待各阶段超时。",
                     color=ft.Colors.GREY_600,
                 ),
                 self._enabled_only,
@@ -140,7 +141,7 @@ class CheckView(ft.Column):
         if self._scope.value == "all" and len(candidates) > CHECK_SAMPLE_SIZE:
             notices.append(
                 f"将向全部 {len(candidates)} 个书源主机发起真实请求。部分站点已被安全软件标记为风险域名，"
-                "本机可能弹出拦截告警；被拦截的书源会单独记为“本机拦截”，不判为书源不可用。")
+                "本机可能弹出拦截告警；被拦截的书源会单独记为“访问被拦截”，不判为书源不可用。")
         if self._auto_disable.value:
             notices.append("检测过程中，明确判定为不可用的书源会被停用。限流、超时和需要 JS 验证的书源不会被停用。")
         if not notices:
@@ -278,7 +279,8 @@ class CheckView(ft.Column):
                 f"标签可用 {tag_valid}/{tag_total}，"
                 f"{'自动停用 ' + str(disabled_count) + ' 个，' if self._auto_disable.value else ''}"
                 f"待确认 {uncertain} 个"
-                + (f"，本机拦截 {blocked} 个（安全软件阻断，未判为书源失效）" if blocked else ""))
+                + (f"，访问被拦截 {blocked} 个（本机杀软或站点 WAF 阻断，"
+                   "未判为书源失效）" if blocked else ""))
         except Exception as exc:
             push_updates(force=True)
             self._show_check_error(exc)
@@ -376,7 +378,7 @@ class CheckView(ft.Column):
             detail += (f" · 标签检测超过 {check_service.SOURCE_TAG_TIMEOUT} 秒"
                        "（保留启用）")
         elif result.get("tag_check_skipped"):
-            reason = ("主机被本机安全软件拦截" if result.get("status") == "blocked"
+            reason = ("主机被拦截" if result.get("status") == "blocked"
                       else "搜索已证明主机不可达")
             detail += f" · 分类未抽检（{reason}）"
         reading_stage = result.get("reading_stage")
@@ -396,7 +398,7 @@ class CheckView(ft.Column):
         elif result.get("check_state") == "unknown":
             detail += " · 待确认（限流、超时或 JS 规则，不停用）"
         elif state == "blocked":
-            detail += f" · {result.get('error') or '本机安全软件已拦截'}"
+            detail += f" · {result.get('error') or '访问被拦截'}"
         return detail
 
     def _build_row(self, result):

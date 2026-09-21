@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from app.services import check_service
+from app.services import block_pages, check_service
 from app.models.book_source import BookSource
 from app.services.legado_js import LegadoJsRuntime
 from app.services.rule_engine import ExploreCategory, ReaderEngine
@@ -451,13 +451,69 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
     def test_locally_blocked_host_is_not_counted_as_source_failure(self):
         block_page = ("<html><body><h1>拦截提示</h1>"
                       "<p>火绒安全软件已阻止你访问该网站</p></body></html>")
-        self.assertEqual(check_service._blocked_notice(block_page), "火绒")
+        self.assertEqual(block_pages.block_reason(block_page),
+                         "本机安全软件已拦截该站点（火绒）")
         normal = ("<div class='result'><a href='/book/1'>书名</a></div>" * 100
                   + "若页面被拦截请刷新重试")
-        self.assertIsNone(check_service._blocked_notice(normal))
+        self.assertIsNone(block_pages.block_reason(normal))
         self.assertEqual(check_service._classify_result({
             "status": "blocked", "search_status": "no_results", "tag_valid": 0,
             "reading_status": "skip"}), "blocked")
+
+    def test_remote_waf_page_is_read_as_interception(self):
+        # 半夏小说 answers every path with this page; parsing it yields no books,
+        # which used to be classified as "search only usable".
+        cloudflare = ("<!DOCTYPE html><html><head>"
+                      "<title>Attention Required! | Cloudflare</title>"
+                      "</head><body><h1>Sorry, you have been blocked</h1>"
+                      "<p>You are unable to access xbanxia.cc</p></body></html>")
+        self.assertEqual(block_pages.block_reason(cloudflare, 403),
+                         "目标站点拦截了本次访问（Cloudflare，HTTP 403）")
+        seen = block_pages.block_reason(
+            cloudflare.replace("Attention Required! | Cloudflare", "Notice"), 403)
+        self.assertEqual(seen, "目标站点拦截了本次访问（Cloudflare，HTTP 403）")
+        # The same wording inside real content is not interception.
+        article = ("<html><body><p>我只是被 Cloudflare 误伤的路人，网上有人说 "
+                   "Attention Required! | Cloudflare 很难受。</p></body></html>")
+        self.assertIsNone(block_pages.block_reason(article, 200))
+        # A challenge page arrives as a redirect/5xx, never as a plain 200.
+        challenge = ("<html><head><title>Just a moment...</title></head>"
+                     "<body>Checking your browser before accessing xbanxia.cc"
+                     "</body></html>")
+        self.assertIsNone(block_pages.block_reason(challenge, 200))
+        self.assertEqual(block_pages.block_reason(challenge, 503),
+                         "目标站点拦截了本次访问（Cloudflare 质询页，HTTP 503）")
+
+    def test_blocked_stages_are_reported_as_interception(self):
+        self.assertEqual(check_service._error_kind(
+            block_pages.SiteBlockedError("目标站点拦截了本次访问（Cloudflare，HTTP 403）")),
+            "blocked")
+        self.assertEqual(check_service._classify_result({
+            "status": "ok", "status_code": 403, "search_status": "no_results",
+            "tag_valid": 0, "reading_status": "skip"}), "blocked")
+        self.assertEqual(check_service._classify_result({
+            "status": "ok", "status_code": 200, "search_status": "blocked",
+            "tag_valid": 0, "reading_status": "skip"}), "blocked")
+        # A source whose search really works keeps its verdict even if the home
+        # page is protected.
+        self.assertEqual(check_service._classify_result({
+            "status": "err", "status_code": 403, "search_status": "ok",
+            "tag_valid": 0, "reading_status": "skip"}), "search_only")
+
+    async def test_rule_stage_raises_on_interception_page(self):
+        engine = ReaderEngine()
+        cloudflare = ("<html><head><title>Attention Required! | Cloudflare"
+                      "</title></head><body>Sorry, you have been blocked"
+                      "</body></html>")
+
+        async def transport(request, source=None):
+            engine.last_response = {"status": 403, "body": cloudflare}
+            return cloudflare, "text/html", str(request.get("url"))
+
+        engine._request_transport = transport
+        with self.assertRaises(block_pages.SiteBlockedError) as caught:
+            await engine._request({"url": "https://www.xbanxia.cc/"})
+        self.assertIn("Cloudflare", str(caught.exception))
 
     def test_result_classification_distinguishes_reading_failures(self):
         self.assertEqual(check_service._classify_result({

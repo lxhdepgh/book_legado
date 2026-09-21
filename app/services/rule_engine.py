@@ -28,6 +28,7 @@ from multidict import CIMultiDict
 
 from test_book_sources_async import (encode_url, jsonpath_get, parse_search_url,
                                      simplify_legado_selector, usable_non_js_rule)
+from app.services.block_pages import SiteBlockedError, block_reason
 from app.services.legado_js import (JsBridgeError, JsContext, LegadoJsRuntime,
                                     split_js_rule)
 from app.services.legado_rule_parser import (JavaArrayNull, JavaKeySet,
@@ -890,9 +891,17 @@ class ReaderEngine:
         request = await self._apply_request_option_js(request, source)
         rate_token = await self._acquire_concurrent_rate(source)
         try:
-            return await self._request_transport(request, source)
+            response = await self._request_transport(request, source)
         finally:
             self._release_concurrent_rate(rate_token)
+        # A WAF/anti-bot page or a local security notice is not content: every
+        # rule reading it silently yields an empty result, which is how a blocked
+        # source ends up looking like a source with nothing to show.
+        reason = block_reason(
+            response[0], (self.last_response or {}).get("status"))
+        if reason:
+            raise SiteBlockedError(reason)
+        return response
 
     async def _request_transport(self, request: dict, source=None) -> tuple[str, str, str]:
         request_url = str(request.get("url") or "")

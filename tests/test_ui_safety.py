@@ -347,7 +347,7 @@ class CheckResultViewTests(unittest.IsolatedAsyncioTestCase):
         view = self._view(sources=[blocked])
         view._store_result({**self._result("blocked", "https://blocked", "blocked"),
                             "error": "本机安全软件已拦截该站点（火绒）"})
-        self.assertIn("本机拦截", view.detail_text(
+        self.assertIn("访问被拦截", view.detail_text(
             view._result_for("https://blocked")))
         started = []
         page = SimpleNamespace(show_dialog=lambda snack: None, pop_dialog=lambda: None,

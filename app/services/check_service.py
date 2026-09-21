@@ -7,6 +7,7 @@ import time
 
 import aiohttp
 
+from app.services.block_pages import SiteBlockedError, block_reason
 from app.services.legado_js import JsBridgeError
 from app.services.rule_engine import UnsupportedRule, resolve_explore_categories
 from app.services.reading_engine import LegadoReadingEngine
@@ -44,15 +45,6 @@ HOST_UNREACHABLE_KINDS = {"network_error", "timeout", "js_error", "rate_limited"
 # Book-level flukes (paywalled or promotional entries) should not condemn the
 # whole source, so the chain retries with the next candidate on these errors.
 RETRYABLE_CHAIN_ERRORS = {"正文解析结果为空", "目录中没有可读取章节"}
-# Signatures of local security-software block pages (Huorong, Tencent PC
-# Manager, 360, SmartScreen).  Matched case-insensitively against the first
-# kilobytes of a response, and only for small bodies, so a novel site that
-# happens to mention 拦截 in its own text is not misread.
-_BLOCK_PAGE_MARKERS = (
-    "火绒", "安全响应中心", "腾讯电脑管家", "360安全卫士", "360手机卫士",
-    "smartscreen", "访问被拦截", "该网站已被拦截", "已阻止你访问该网站",
-    "危险网站", "恶意网站", "钓鱼网站", "拦截提示",
-)
 
 
 def _error_text(exc: Exception, limit: int = 180) -> str:
@@ -66,6 +58,8 @@ def _remaining(deadline: float, cap: float) -> float:
 
 def _error_kind(exc: Exception) -> str:
     message = _error_text(exc).lower()
+    if isinstance(exc, SiteBlockedError):
+        return "blocked"
     if isinstance(exc, asyncio.TimeoutError) or "timeout" in message:
         return "timeout"
     if isinstance(exc, UnsupportedRule):
@@ -103,19 +97,6 @@ def _has_readable_content(document) -> bool:
     return bool(str(getattr(document, "raw_content", "") or "").strip())
 
 
-def _blocked_notice(text: str) -> str | None:
-    """Return the marker when the body looks like a local security-software block page.
-
-    书源里不少域名已被安全厂商标记，本机杀软会返回一个本地拦截提示页代替真实内容。
-    把它算成"书源失效"既误判书源，也会诱导用户整批禁用。
-    """
-    body = str(text or "")
-    if not body or len(body) > 20000:
-        return None
-    lowered = body.casefold()
-    return next((marker for marker in _BLOCK_PAGE_MARKERS if marker in lowered), None)
-
-
 async def _probe_source(source, session, semaphore, timeout: int) -> dict:
     """Diagnose basic connectivity without deciding whether rules are usable."""
     url = str(getattr(source, "bookSourceUrl", "") or "").strip()
@@ -128,14 +109,16 @@ async def _probe_source(source, session, semaphore, timeout: int) -> dict:
             async with session.get(
                     url, allow_redirects=True,
                     timeout=aiohttp.ClientTimeout(total=timeout)) as response:
-                head = await response.content.read(4096)
+                head = await response.content.read(8192)
                 elapsed = (time.perf_counter() - started) * 1000
-                marker = _blocked_notice(head.decode("utf-8", errors="replace"))
+                marker = block_reason(
+                    head.decode("utf-8", errors="replace"), response.status)
                 if marker:
                     return {"status": "blocked", "status_code": response.status,
-                            "response_time_ms": elapsed,
-                            "error": f"本机安全软件已拦截该站点（{marker}）"}
-                status = "ok" if response.status < 500 else "err"
+                            "response_time_ms": elapsed, "error": marker}
+                # A rejected home page is not a working host; only a 2xx/3xx
+                # answer proves the site answered us.
+                status = "ok" if response.status < 400 else "err"
                 return {"status": status, "status_code": response.status,
                         "response_time_ms": elapsed,
                         "error": None if status == "ok" else f"HTTP {response.status}"}
@@ -327,8 +310,14 @@ def _classify_result(result: dict) -> str:
     if reading in uncertain:
         return "unknown"
     # 拦截页会被当成"搜索无结果"，必须排在 search_ok 判定之前；只有真的解析出
-    # 书籍或标签，才能证明本机确实访问到了该站点。
-    if (result.get("status") == "blocked" and
+    # 书籍或标签，才能证明本机确实访问到了该站点。远端 WAF 拦截（Cloudflare
+    # 403 等）由规则阶段抛出，和本机杀软拦截归为同一类结论。
+    if (result.get("status") == "blocked" or
+            result.get("search_status") == "blocked" or reading == "blocked"):
+        return "blocked"
+    # 首页被拒绝访问（401/403/429）而规则又没解析出任何东西时，站点是拦了我们
+    # 而不是书源失效；把它和"完全没有响应"区分开，用户才知道要换线路或代理。
+    if (result.get("status_code") in {401, 403, 429} and
             result.get("search_status") != "ok" and not explore_ok):
         return "blocked"
     if search_ok or explore_ok:
