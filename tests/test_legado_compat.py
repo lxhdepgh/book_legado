@@ -1842,6 +1842,25 @@ class RuleParserTests(unittest.TestCase):
         ''', JsContext(source=source))
         self.assertEqual(value, ["source", None, "login", "extra"])
 
+    def test_url_context_resolves_a_header_script_that_calls_js_extensions(self):
+        # AnalyzeUrl resolves source.getHeaderMap(true) while it is being built.
+        # 霹雳书屋's header calls java.getWebViewUA(), so resolving it before the
+        # bridge finished defining java failed the whole search with
+        # "TypeError: not a function".
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.example",
+            "header": '@js:\nJSON.stringify({"User-Agent": java.getWebViewUA(),\n'
+                      '  "Accept": "text/html"})',
+        })
+        value = runtime.evaluate(
+            "@js:[String(java.headerMap.get('User-Agent')),"
+            " String(java.headerMap.get('Accept'))]",
+            JsContext(source=source, host_kind="url", key="key", page=1,
+                      base_url="https://source.example"))
+        self.assertEqual(value[1], "text/html")
+        self.assertTrue(value[0].startswith("Mozilla/5.0"), value[0])
+
     def test_documented_chapter_and_tts_script_globals(self):
         source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
         chapter = SimpleNamespace(name="Chapter One")

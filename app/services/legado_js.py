@@ -2897,8 +2897,6 @@ class LegadoJsRuntime:
         }}
         if (__hostKind === 'url') {{
           java.ruleUrl=baseUrl;java.redirectUrl=baseUrl;java.url=baseUrl;java.key=key;
-          java.headerMap=__map(Object.assign({{}},source.getHeaderMap(true),
-            __requestHeaderData));
           java.getUserAgent=function(){{
             if(arguments.length!==0)throw new TypeError("Can't find method AnalyzeUrl.getUserAgent");
             for(const key of Object.keys(java.headerMap))
@@ -3058,6 +3056,16 @@ class LegadoJsRuntime:
           src=undefined;baseUrl=undefined;key=undefined;page=undefined;
           speakText=undefined;speakSpeed=undefined;nextChapterUrl=undefined;
           cookie=undefined;cache=undefined;infoMap=undefined;
+        }}
+        // AnalyzeUrl resolves the source header while it is constructed.  The
+        // resolution waits until here because a @js: header may call any of the
+        // JsExtensions the context defines further down (java.getWebViewUA,
+        // java.androidId, the Packages aliases, cookie...); running it in place
+        // would call them while java still lacks them and fail with
+        // "TypeError: not a function".
+        if (__hostKind === 'url') {{
+          java.headerMap=__map(Object.assign({{}},source.getHeaderMap(true),
+            __requestHeaderData));
         }}
         """
         clean = self._clean_script(script)
