@@ -35,8 +35,7 @@ from app.services.legado_rule_parser import (JavaDateValue, _jsoup_html_markup,
                                               parse_markup,
                                               select_jsoup,
                                               split_rule_expression)
-from app.services.compat_audit import (SUPPORTED_JAVA_APIS, SUPPORTED_OBJECT_APIS,
-                                       audit_source_corpus)
+from app.services.compat_audit import SUPPORTED_JAVA_APIS, SUPPORTED_OBJECT_APIS
 from app.services.desktop_browser import EdgeCdpSession
 from app.services.icu_charset import detect_charset
 from app.services.legado_js import JsBridgeError, JsContext, LegadoJsRuntime
@@ -805,23 +804,6 @@ class RuleParserTests(unittest.TestCase):
         self.assertEqual(evaluate(data, "$.items[*].tags", "json"), [["x", "y"]])
         self.assertEqual(evaluate(data, "$.items[?(@.tags)].tags", "json"),
                          [["x", "y"]])
-
-    def test_complete_source_corpus_loads_and_javascript_compiles(self):
-        audit = audit_source_corpus(Path("resource/bookSource.json"))
-        self.assertEqual(audit.source_count, 1066)
-        self.assertEqual(audit.model_count, audit.source_count)
-        self.assertGreater(audit.script_count, 1400)
-        self.assertGreater(audit.rule_count, 23000)
-        self.assertGreater(audit.regex_count, 400)
-        self.assertEqual(audit.syntax_issues, [])
-        self.assertEqual(audit.rule_syntax_issues, [])
-        self.assertEqual(audit.regex_syntax_issues, [])
-        self.assertEqual(audit.unknown_rule_fields, [])
-        self.assertEqual(audit.unsupported_java_apis, [])
-        self.assertEqual(audit.unsupported_object_apis, [])
-        self.assertEqual(audit.unsupported_jsoup_pseudos, [])
-        self.assertTrue(audit.successful)
-        self.assertNotIn("putVariable", SUPPORTED_OBJECT_APIS["source"])
 
     def test_every_fixed_js_extension_method_is_exposed_by_python_bridge(self):
         root = Path("base_history/legado-3.23.110211/app/src/main/java/io/legado/app/help")
@@ -5839,8 +5821,29 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ExploreCategoryTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _rank_source() -> BookSource:
+        """爱丽丝书屋's rank rules, which parse two different list layouts."""
+        return BookSource(
+            bookSourceName="爱丽丝书屋",
+            bookSourceUrl="https://alice.example/",
+            exploreUrl=json.dumps([{
+                "title": "总排行",
+                "url": "https://alice.example/other/rank_hits/order/hits.html",
+            }], ensure_ascii=False),
+            ruleExplore={
+                "author": ".four@text",
+                "bookList": "div.rec_rullist > ul, li:has(span.s2 > a)",
+                "bookUrl": ".two a@href||.s2 a@href",
+                "kind": ".sev a@text||.fenleibt@text",
+                "lastChapter": ".three a@text",
+                "name": ".two a@text||.s2 a@text##^\\[[^]]+\\]\\s*",
+                "wordCount": ".five@text",
+            },
+        )
+
     async def test_alice_rank_both_observed_list_layouts_are_parsed(self):
-        source = BookSource.from_json(Path("resource/bookSource.json"))[1]
+        source = self._rank_source()
         engine = LegadoReadingEngine()
         compact_html = '''
         <ul class="rank-list">

@@ -362,13 +362,6 @@ class SourceService:
             return True
         return False
 
-    def load_passed(self) -> list[BookSource]:
-        """加载已通过测试的书源"""
-        path = self.resource_dir / "bookSource_passed.json"
-        if path.exists():
-            return self.load(path)
-        return []
-
     def save(self, path: str | Path | None = None) -> bool:
         """保存书源列表到 JSON 文件"""
         if path is None:

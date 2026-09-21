@@ -102,7 +102,7 @@ async def check_source(index: int, source: BookSource, timeout: float) -> dict:
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", default="resource/bookSource.json")
+    parser.add_argument("--source", required=True, help="书源 JSON 路径")
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--concurrency", type=int, default=3)

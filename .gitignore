@@ -1,7 +1,8 @@
-# Python bytecode and tool caches
+# Python bytecode and test caches
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.cache/
 .mypy_cache/
 .ruff_cache/
 
@@ -27,6 +28,9 @@ Thumbs.db
 bookshelf.json
 reader-cache/
 edge-webview-profile/
+
+# Local book-source corpora under resource/ are user data, not source
+resource/*.json
 
 # Temporary files and logs produced by tools
 *.tmp

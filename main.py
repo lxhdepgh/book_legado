@@ -34,7 +34,6 @@ def smoke_test():
     from app.services.legado_js import JsContext, LegadoJsRuntime
     from app.services.public_suffix import _DATA as public_suffix_data
 
-    assert (_ROOT / "resource" / "bookSource.json").is_file()
     assert public_suffix_data.is_file()
 
     source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://smoke"})
