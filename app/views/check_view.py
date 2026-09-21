@@ -7,6 +7,7 @@ import time
 
 import flet as ft
 
+from app.services import check_service
 from app.services.check_service import (CHECK_CONCURRENCY, CHECK_MAX_CONCURRENCY,
                                         CHECK_TAG_CATEGORIES,
                                         READING_CHAIN_CANDIDATES,
@@ -101,9 +102,12 @@ class CheckView(ft.Column):
                 ft.Text(
                     f"检测服务器、搜索、分类，并抽检详情、目录和正文"
                     f"（每源最多试 {READING_CHAIN_CANDIDATES} 本，单本异常不判整源死刑）；"
-                    f"分类每源抽检前 {CHECK_TAG_CATEGORIES} 个，"
+                    f"分类每源最多抽检前 {CHECK_TAG_CATEGORIES} 个、命中一个可用分类即止，"
                     f"最多 {TAG_SOURCE_CONCURRENCY} 个书源同时抽检分类，"
-                    "其余阶段按并发书源数并行，真实连接数不超过该并发数。"
+                    "其余阶段按并发书源数并行；单个书源内部的规则请求是串行的，"
+                    "同一时刻的真实请求数不超过并发书源数的两倍（含连通性探测）。"
+                    "搜索已证明主机不可达时，同主机的分类与正文抽检会直接跳过，"
+                    "不重复等待超时。"
                     f"默认按列表顺序抽样前 {CHECK_SAMPLE_SIZE} 个书源；"
                     "检测会向每个书源主机发真实请求，部分站点已被安全软件标记，"
                     "全量检测前请先确认。默认只生成结果，不修改书源状态。"
@@ -369,7 +373,12 @@ class CheckView(ft.Column):
             if broken_pages:
                 detail += f" · 翻页失败 {broken_pages}"
         if result.get("tag_check_timeout"):
-            detail += " · 标签检测超过 60 秒（保留启用）"
+            detail += (f" · 标签检测超过 {check_service.SOURCE_TAG_TIMEOUT} 秒"
+                       "（保留启用）")
+        elif result.get("tag_check_skipped"):
+            reason = ("主机被本机安全软件拦截" if result.get("status") == "blocked"
+                      else "搜索已证明主机不可达")
+            detail += f" · 分类未抽检（{reason}）"
         reading_stage = result.get("reading_stage")
         tried = result.get("reading_tried") or 0
         sample = result.get("sample_book")

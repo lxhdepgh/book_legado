@@ -91,6 +91,208 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, len(results))
         self.assertEqual(2, engine.explore.await_count)
 
+    async def test_category_sampling_stops_at_first_valid_category(self):
+        engine = SimpleNamespace(
+            explore=AsyncMock(return_value=[SimpleNamespace(name="book")]),
+            js=SimpleNamespace(close=lambda: None))
+        category_resolver = AsyncMock(return_value=[
+            ExploreCategory(f"分类{index}", f"/list{index}")
+            for index in range(5)])
+        with patch.object(
+                check_service, "resolve_explore_categories",
+                category_resolver):
+            results = await check_service.check_categories(
+                _source(), timeout=1, engine=engine, max_categories=5,
+                stop_after_valid=True)
+
+        self.assertEqual(1, len(results))
+        self.assertTrue(results[0]["valid"])
+        engine.explore.assert_awaited_once()
+
+    async def test_blocked_categories_are_still_walked_to_the_sample_cap(self):
+        async def explore(source, category, page=1):
+            if str(category.title) == "分类2":
+                return [SimpleNamespace(name="book")]
+            return []
+
+        engine = SimpleNamespace(explore=explore,
+                                 js=SimpleNamespace(close=lambda: None))
+        category_resolver = AsyncMock(return_value=[
+            ExploreCategory(f"分类{index}", f"/list{index}")
+            for index in range(5)])
+        with patch.object(
+                check_service, "resolve_explore_categories",
+                category_resolver):
+            results = await check_service.check_categories(
+                _source(), timeout=1, engine=engine, max_categories=5,
+                stop_after_valid=True)
+
+        # A source whose categories are dead needs the samples: that is the
+        # evidence for the verdict, so the walk only stops on a success.
+        self.assertEqual(3, len(results))
+        self.assertEqual([item["valid"] for item in results],
+                         [False, False, True])
+
+    async def test_tag_stage_skipped_when_search_proves_host_unreachable(self):
+        called = []
+
+        async def fake_search(source, engine, timeout):
+            return ({"search_status": "network_error", "book_count": None,
+                     "search_keyword": "test", "search_method": "rule-engine",
+                     "search_error": "无法连接到主机"}, [])
+
+        async def fake_categories(*args, **kwargs):
+            called.append("categories")
+            return []
+
+        async def fake_probe(*args, **kwargs):
+            return {"status": "err", "status_code": None,
+                    "response_time_ms": 1, "error": "Cannot connect to host"}
+
+        class FakeEngine:
+            def __init__(self, **kwargs):
+                self.js = SimpleNamespace(close=lambda: None)
+
+        with patch.object(check_service, "_engine_search_check", fake_search), \
+                patch.object(check_service, "check_categories", fake_categories), \
+                patch.object(check_service, "_probe_source", fake_probe), \
+                patch.object(check_service, "LegadoReadingEngine", FakeEngine):
+            results = await check_service.check_sources(
+                [_source()], concurrency=1, timeout=1)
+
+        self.assertEqual([], called)
+        self.assertTrue(results[0]["tag_check_skipped"])
+        self.assertEqual("unknown", results[0]["check_state"])
+
+    async def test_tag_stage_still_runs_when_only_the_rules_failed(self):
+        called = []
+
+        async def fake_search(source, engine, timeout):
+            return ({"search_status": "rule_error", "book_count": None,
+                     "search_keyword": "test", "search_method": "rule-engine",
+                     "search_error": "选择器无匹配"}, [])
+
+        async def fake_categories(*args, **kwargs):
+            called.append("categories")
+            return []
+
+        async def fake_probe(*args, **kwargs):
+            return {"status": "ok", "status_code": 200,
+                    "response_time_ms": 1, "error": None}
+
+        class FakeEngine:
+            def __init__(self, **kwargs):
+                self.js = SimpleNamespace(close=lambda: None)
+
+        with patch.object(check_service, "_engine_search_check", fake_search), \
+                patch.object(check_service, "check_categories", fake_categories), \
+                patch.object(check_service, "_probe_source", fake_probe), \
+                patch.object(check_service, "LegadoReadingEngine", FakeEngine):
+            results = await check_service.check_sources(
+                [_source()], concurrency=1, timeout=1)
+
+        # A broken search rule still leaves a reachable host, so explore is
+        # the only remaining way to prove the source works.
+        self.assertEqual(["categories"], called)
+        self.assertFalse(results[0]["tag_check_skipped"])
+
+    async def test_probe_join_gives_up_on_a_blackholed_home_page(self):
+        async def fake_probe(*args, **kwargs):
+            await asyncio.sleep(30)
+            return {"status": "ok", "status_code": 200,
+                    "response_time_ms": 1, "error": None}
+
+        async def fake_search(source, engine, timeout):
+            return ({"search_status": "ok", "book_count": 1,
+                     "search_keyword": "test", "search_method": "rule-engine",
+                     "search_error": None},
+                    [SimpleNamespace(name="book", url="https://example/book")])
+
+        class FakeEngine:
+            def __init__(self, **kwargs):
+                self.js = SimpleNamespace(close=lambda: None)
+
+        with patch.object(check_service, "_engine_search_check", fake_search), \
+                patch.object(check_service, "_probe_source", fake_probe), \
+                patch.object(check_service, "LegadoReadingEngine", FakeEngine), \
+                patch.object(check_service, "PROBE_JOIN_BUDGET", 0.05):
+            started = time.perf_counter()
+            results = await check_service.check_sources(
+                [_source(enabledExplore=False, exploreUrl="")],
+                concurrency=1, timeout=1)
+            elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 5)
+        self.assertEqual("unknown", results[0]["status"])
+        self.assertIn("没有响应", results[0]["error"])
+
+    async def test_slow_source_cannot_outlive_its_total_budget(self):
+        async def fake_search(source, engine, timeout):
+            return ({"search_status": "ok", "book_count": 1,
+                     "search_keyword": "test", "search_method": "rule-engine",
+                     "search_error": None},
+                    [SimpleNamespace(name="book", url="https://example/book")])
+
+        async def fake_probe(*args, **kwargs):
+            return {"status": "ok", "status_code": 200,
+                    "response_time_ms": 1, "error": None}
+
+        async def slow_category(*args, **kwargs):
+            await asyncio.sleep(30)
+            return []
+
+        class SlowEngine:
+            def __init__(self, **kwargs):
+                self.js = SimpleNamespace(close=lambda: None)
+
+            async def book_info(self, source, book):
+                await asyncio.sleep(30)
+
+            async def chapters(self, source, book):
+                await asyncio.sleep(30)
+
+            async def content_document(self, source, chapter, need_save=False):
+                await asyncio.sleep(30)
+
+        with patch.object(check_service, "_engine_search_check", fake_search), \
+                patch.object(check_service, "check_categories", slow_category), \
+                patch.object(check_service, "_probe_source", fake_probe), \
+                patch.object(check_service, "LegadoReadingEngine", SlowEngine), \
+                patch.object(check_service, "SOURCE_CHECK_BUDGET", 0.15), \
+                patch.object(check_service, "SOURCE_TAG_TIMEOUT", 0.05), \
+                patch.object(check_service, "READING_CHAIN_TIMEOUT", 0.05), \
+                patch.object(check_service, "READING_CHAIN_BUDGET", 0.05):
+            started = time.perf_counter()
+            await check_service.check_sources(
+                [_source()], concurrency=1, timeout=1)
+            elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 2)
+
+    async def test_reading_chain_honours_the_caller_budget(self):
+        books = [SimpleNamespace(name=f"b{i}", url=f"https://example/b{i}")
+                 for i in range(3)]
+
+        class HangingEngine:
+            js = SimpleNamespace(close=lambda: None)
+
+            async def book_info(self, source, book):
+                await asyncio.sleep(30)
+
+            async def chapters(self, source, book):
+                await asyncio.sleep(30)
+
+            async def content_document(self, source, chapter, need_save=False):
+                await asyncio.sleep(30)
+
+        started = time.perf_counter()
+        result = await check_service._reading_chain_check(
+            _source(), HangingEngine(), books, timeout=30, budget=0.05)
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 2)
+        self.assertEqual("timeout", result["reading_status"])
+
     async def test_slow_explore_pool_does_not_serialize_searches(self):
         search_peak = 0
         search_active = 0
@@ -108,7 +310,7 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
                      "search_error": None}, [])
 
         async def fake_categories(source, session=None, sem=None, timeout=10,
-                                  engine=None, max_categories=None):
+                                  engine=None, max_categories=None, **kwargs):
             nonlocal tag_peak, tag_active
             tag_active += 1
             tag_peak = max(tag_peak, tag_active)

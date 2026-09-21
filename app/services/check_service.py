@@ -18,15 +18,29 @@ TAG_PAGE_CONCURRENCY = 4
 # Explore categories are the slowest stage (one request per category, several
 # categories per source).  They get their own narrow pool so they cannot idle
 # the workers that still have a search or reading chain to run.
-TAG_SOURCE_CONCURRENCY = 3
+TAG_SOURCE_CONCURRENCY = 4
 JS_CHECK_CONCURRENCY = 2
-SOURCE_TAG_TIMEOUT = 30
+SOURCE_TAG_TIMEOUT = 20
 CHECK_TAG_CATEGORIES = 6
 # A host intercepted by local security software answers with a block page, so
-# waiting for the rule stages only burns their timeouts.
-BLOCKED_PROBE_BUDGET = 3.0
-READING_CHAIN_TIMEOUT = 30
+# waiting for the rule stages only burns their timeouts.  Interception is local
+# and answers in milliseconds, so this budget only needs to cover scheduling
+# noise; a later block-page verdict still classifies the source correctly.
+BLOCKED_PROBE_BUDGET = 1.5
+# A source whose home page is a slow blackhole must not keep the source open
+# after every rule stage has already finished.
+PROBE_JOIN_BUDGET = 3.0
+READING_CHAIN_TIMEOUT = 15
 READING_CHAIN_CANDIDATES = 3
+# Upper bound for the whole reading chain of one source.  Three candidates at
+# the per-stage timeout each would otherwise hold a worker for minutes.
+READING_CHAIN_BUDGET = 30
+# Hard ceiling for everything one source may spend after its search stage, so a
+# single half-dead site cannot extend the tail of a long run.
+SOURCE_CHECK_BUDGET = 45
+# Explore and reading hit the same host the search stage just failed to reach,
+# so a host-level search error already answers what they would ask.
+HOST_UNREACHABLE_KINDS = {"network_error", "timeout", "js_error", "rate_limited"}
 # Book-level flukes (paywalled or promotional entries) should not condemn the
 # whole source, so the chain retries with the next candidate on these errors.
 RETRYABLE_CHAIN_ERRORS = {"正文解析结果为空", "目录中没有可读取章节"}
@@ -43,6 +57,11 @@ _BLOCK_PAGE_MARKERS = (
 
 def _error_text(exc: Exception, limit: int = 180) -> str:
     return str(exc or exc.__class__.__name__).strip()[:limit]
+
+
+def _remaining(deadline: float, cap: float) -> float:
+    """Stage timeout that never lets the source outlive its total budget."""
+    return max(1.0, min(float(cap), deadline - time.perf_counter()))
 
 
 def _error_kind(exc: Exception) -> str:
@@ -159,9 +178,31 @@ async def _locally_blocked_probe(probe_task, timeout):
     return None
 
 
+async def _await_probe(probe_task, timeout):
+    """Collect the probe verdict, giving up on a home page that never answers.
+
+    The rule stages are already done at this point, so a host that swallows the
+    probe request must not keep the source (and its worker) open any longer.
+    """
+    try:
+        return await asyncio.wait_for(probe_task, timeout=PROBE_JOIN_BUDGET)
+    except asyncio.TimeoutError:
+        return {"status": "unknown", "status_code": None,
+                "response_time_ms": None,
+                "error": f"站点首页 {PROBE_JOIN_BUDGET:.0f} 秒内没有响应"}
+
+
 async def check_categories(source, session=None, sem=None, timeout=10,
-                           engine=None, max_categories=None):
-    """Validate explore categories with the same engine used by real reading."""
+                           engine=None, max_categories=None,
+                           stop_after_valid=False):
+    """Validate explore categories with the same engine used by real reading.
+
+    With ``stop_after_valid`` the loop ends at the first category that parses:
+    for a connectivity verdict one working category already proves the explore
+    chain reaches the host, and the remaining samples would only add latency.
+    Failing categories are still walked to the sample cap, because that is when
+    the extra samples carry the evidence.
+    """
     del session  # Retained for API compatibility with older callers/tests.
     own_engine = engine is None
     engine = engine or LegadoReadingEngine(timeout=timeout)
@@ -209,13 +250,16 @@ async def check_categories(source, session=None, sem=None, timeout=10,
                 "page_results": page_results,
                 "books": first["books"],
             })
+            if stop_after_valid and first["valid"]:
+                break
         return output
     finally:
         if own_engine:
             engine.js.close()
 
 
-async def _reading_chain_check(source, engine, candidates, timeout: int) -> dict:
+async def _reading_chain_check(source, engine, candidates, timeout,
+                               budget=READING_CHAIN_BUDGET) -> dict:
     result = {"reading_status": "skip", "reading_stage": "none",
               "reading_error": None, "chapter_count": None,
               "sample_book": None, "sample_chapter": None,
@@ -225,7 +269,8 @@ async def _reading_chain_check(source, engine, candidates, timeout: int) -> dict
         return result
     books = books[:READING_CHAIN_CANDIDATES]
     result["sample_book"] = str(getattr(books[0], "name", "") or "")
-    deadline = time.perf_counter() + timeout * len(books)
+    deadline = (time.perf_counter()
+                + max(1.0, min(float(budget), timeout * len(books))))
     for book in books:
         remaining = deadline - time.perf_counter()
         if remaining <= 0:
@@ -324,7 +369,7 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
                         "search_status": "skip", "book_count": None,
                         "search_keyword": "", "search_method": "rule-engine",
                         "search_error": None}, []
-                    tags, tag_timeout = [], False
+                    tags, tag_timeout, tag_skipped = [], False, True
                     chain = {"reading_status": "skip", "reading_stage": "none",
                              "reading_error": None, "chapter_count": None,
                              "sample_book": None, "sample_chapter": None,
@@ -333,32 +378,42 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
                     async with limiter:
                         search, search_books = await _engine_search_check(
                             source, engine, timeout + 3)
-                        tags, tag_timeout = [], False
+                        deadline = time.perf_counter() + SOURCE_CHECK_BUDGET
+                        tags, tag_timeout, tag_skipped = [], False, False
                         if (getattr(source, "enabledExplore", True) and
                                 str(getattr(source, "exploreUrl", "") or "").strip()):
-                            try:
-                                async with tag_sem:
-                                    tags = await asyncio.wait_for(
-                                        check_categories(
-                                            source, timeout=min(timeout, 10),
-                                            engine=engine,
-                                            max_categories=CHECK_TAG_CATEGORIES),
-                                        timeout=SOURCE_TAG_TIMEOUT)
-                            except asyncio.TimeoutError:
-                                tag_timeout = True
+                            if search.get("search_status") in HOST_UNREACHABLE_KINDS:
+                                # Explore would ask the same unreachable host the
+                                # same question the search stage already failed.
+                                tag_skipped = True
+                            else:
+                                try:
+                                    async with tag_sem:
+                                        tags = await asyncio.wait_for(
+                                            check_categories(
+                                                source,
+                                                timeout=min(timeout, 10),
+                                                engine=engine,
+                                                max_categories=CHECK_TAG_CATEGORIES,
+                                                stop_after_valid=True),
+                                            timeout=_remaining(
+                                                deadline, SOURCE_TAG_TIMEOUT))
+                                except asyncio.TimeoutError:
+                                    tag_timeout = True
                         candidates = list(search_books)
                         for tag in tags:
                             candidates.extend(tag.pop("books", []))
                             for page in tag.get("page_results", []):
                                 page.pop("books", None)
                         chain = await _reading_chain_check(
-                            source, engine, candidates, READING_CHAIN_TIMEOUT)
-                    probe = await probe_task
+                            source, engine, candidates, READING_CHAIN_TIMEOUT,
+                            budget=_remaining(deadline, READING_CHAIN_BUDGET))
+                    probe = await _await_probe(probe_task, timeout)
                 result = {"idx": index, "name": source.bookSourceName,
                           "raw_url": source.bookSourceUrl, **probe,
                           **search, **chain, "category_results": tags,
                           "tag_check_timeout": tag_timeout,
-                          "tag_check_js_skipped": False}
+                          "tag_check_skipped": tag_skipped}
             finally:
                 if not probe_task.done():
                     probe_task.cancel()
@@ -402,6 +457,7 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
                         "check_state": "unknown", "reading_status": "skip",
                         "reading_stage": "none", "reading_error": None,
                         "auto_disabled": False, "tag_check_timeout": False,
+                        "tag_check_skipped": False,
                     }
                 finally:
                     queue.task_done()

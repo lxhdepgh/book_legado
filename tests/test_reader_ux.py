@@ -451,6 +451,28 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
                          self.view._status.value)
         self.assertEqual([], self.view._category_host.controls)
 
+    async def test_sampled_category_check_only_hides_proven_broken_tabs(self):
+        source = SimpleNamespace(
+            enabled=True, searchUrl="/search?key={{key}}",
+            exploreUrl="分类一::/l1\n分类二::/l2\n分类三::/l3",
+            display_name="站点", bookSourceUrl="https://source")
+        self.view.service.sources = [source]
+        self.view.current_source = source
+        self.view.update = lambda: None
+        # Detection samples a few categories and stops at the first working
+        # one, so an unsampled category is unknown rather than broken.
+        self.view.service.category_checks = {"https://source": [
+            {"url": "/l1", "title": "分类一", "valid": True},
+            {"url": "/l2", "title": "分类二", "valid": False},
+        ]}
+
+        self.view.refresh_sources(update=False)
+        await self.view._load_categories(source)
+
+        tab_bar = self.view._category_host.controls[0].content.controls[0]
+        self.assertEqual(["分类一", "分类三"],
+                         [tab.label for tab in tab_bar.tabs])
+
     async def test_cache_badges_distinguish_states_with_semantic_theme_colors(self):
         item = {"source_url": "https://source", "url": "https://book",
                 "totalChapterNum": 10}

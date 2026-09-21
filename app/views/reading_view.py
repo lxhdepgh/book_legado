@@ -912,8 +912,14 @@ class ReadingView(ft.Column):
             self.current_source.bookSourceUrl if self.current_source else ""
         )
         if checked is not None:
-            valid_urls = {item["url"] for item in checked if item.get("valid")}
-            self.categories = [category for category in self.categories if category.url in valid_urls]
+            # Detection only samples a few categories and stops at the first
+            # working one, so the list is not a full audit: hide the ones it
+            # proved broken and keep the rest instead of dropping everything
+            # that was never sampled.
+            broken_urls = {item["url"] for item in checked
+                           if not item.get("valid")}
+            self.categories = [category for category in self.categories
+                               if category.url not in broken_urls]
         if not self.categories:
             self._category_host.controls = []
             return
