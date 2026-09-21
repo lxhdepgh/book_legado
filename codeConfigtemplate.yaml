@@ -1,0 +1,155 @@
+# ============================================================
+#  codeConfig.template.yaml
+#  版本: 4.0
+#  角色: 【模板】由智能体在【首次开发 / 初始化】时读取并填充。
+#        填充完成后另存为 codeConfig.yaml，本模板文件保持原样不动。
+#
+#  ===== 智能体初始化填充规则（MUST FOLLOW）=====
+#  1. 首次会话时，先通读本文件，理解项目需要哪些信息。
+#  2. 对每一个标记为 "TODO" 或 "?" 的字段，主动向开发者提问确认，
+#     禁止凭空猜测填写。开发者回答后写入对应字段。
+#  3. 对于整块可选项（frontend / docker / database 等），
+#     若本项目不涉及，将其 enabled 置为 false（保留结构，便于未来启用）。
+#  4. 填充 knowledge_base 各文件路径时：
+#     - 若该文件在仓库中【已存在】，直接填写相对路径；
+#     - 若【尚不存在】，填写开发者【约定】的路径，并在生成后提醒其创建。
+#  5. 填充完成后，将本文件【另存为】 codeConfig.yaml，不要覆盖本模板。
+#  6. 严禁在本文件中写入任何真实密钥、令牌、密码或已填充的 .env 值。
+#  ============================================================
+
+
+# ---------- 元信息 ----------
+version: 4.0
+schema: codeConfig.template.yaml   # 指向本模板，便于回溯格式版本
+
+
+# ============================================================
+# 1. 项目基本信息
+# ============================================================
+project:
+  name: "?"                         # TODO: 项目名称（注意核对官方拼写）
+  root: "?"                         # TODO: 项目根目录绝对路径
+  platform: "?"                     # TODO: windows / linux / macos
+  shell: "?"                        # TODO: powershell / bash / zsh
+  timezone: "?"                     # TODO: 如 Asia/Shanghai
+  description: "?"                  # TODO: 一句话项目简介，帮助智能体理解业务
+  primary_language: "?"             # TODO: 主语言，如 python / typescript / go
+
+
+# ============================================================
+# 2. 知识库索引（核心）
+#    智能体在【后续会话】中按这些 location 加载上下文文件。
+#    每条均含：path（路径）+ required（是否必须存在）。
+#    首次填充时，若文件不存在，path 仍照约定填好并提醒开发者创建。
+# ============================================================
+knowledge_base:
+
+  # ---- 2.1 开发文档：架构、接口、部署等"是什么/怎么用" ----
+  docs:
+    design_doc:
+      path: "docs/current-system-design.md"
+      required: true                 # 系统设计文档，智能体必读
+    operations_manual:
+      path: "docs/backend-operations-manual.md"
+      required: false                # 运维手册
+    testing_guide:
+      path: "docs/local-testing-guide.md"
+      required: false                # 本地测试指南
+    # TODO: 按需追加其他文档，格式：key: { path: "相对路径", required: bool }
+
+  # ---- 2.2 开发约束：编码规范、架构红线、提交规范等"不许做什么" ----
+  constraints:
+    coding_style:
+      path: "docs/coding-style.md"
+      required: true                 # 代码风格（ruff/eslint 规则等）
+    architecture_rules:
+      path: "docs/architecture-rules.md"
+      required: false                # 架构约束（模块边界、依赖方向等）
+    git_workflow:
+      path: "docs/git-workflow.md"
+      required: false                # 分支/提交/PR 规范
+    secrets_policy:
+      path: "docs/secrets-policy.md"
+      required: true                 # 密钥管理策略（禁止入库等）
+      note: "严禁将令牌、密码、私钥、已填充的 .env 值写入仓库或本配置"
+
+  # ---- 2.3 开发日志：每次会话开始前的"续接点" ----
+  dev_logs:
+    root: "docs/dev-logs/"           # 日志目录（按日期命名，如 2026-09-01.md）
+    current: "docs/dev-logs/TODAY.md"  # TODO: 指向【最新】日志文件
+    required: true
+    note: >
+      智能体每次会话开始前必须读取 current 指向的日志，
+      了解上次进展、遗留问题与下一步计划；会话结束前更新该文件。
+
+  # ---- 2.4 问题记录：历史踩坑、已知缺陷、解决方案 ----
+  known_issues:
+    root: "docs/known-issues/"       # 问题记录目录
+    index: "docs/known-issues/README.md"  # 问题索引
+    required: false
+    note: >
+      遇到报错或异常行为时，智能体应先检索此目录是否已有同类记录，
+      避免重复踩坑；解决后补充条目。
+
+
+# ============================================================
+# 3. 运行时环境（按需启用，不涉及整块置 enabled: false，勿删除）
+# ============================================================
+
+python:
+  enabled: true                     # TODO: 本项目是否使用 Python
+  environment_manager: "?"          # TODO: conda / venv / poetry
+  environment_name: "?"
+  interpreter: "?"                  # TODO: 解释器绝对路径
+  activate: "?"                     # TODO: 激活环境的命令
+  version_requirement: "?"
+  commands:
+    test: "?"                       # TODO: 运行测试的命令
+    lint: "?"                       # TODO: 代码检查命令
+    syntax_check: "?"
+
+frontend:
+  enabled: false                    # TODO: 本项目是否有前端
+  directory: "?"
+  package_manager: "?"              # npm / yarn / pnpm
+  commands:
+    install: "?"
+    typecheck: "?"
+    build: "?"
+
+docker:
+  enabled: false                    # TODO: 本项目是否容器化
+  compose_file: "compose.yml"
+  validate: "docker compose config --quiet"
+
+database:
+  enabled: false                    # TODO: 是否有独立数据库
+  type: "?"                         # postgres / mysql / sqlite / redis ...
+  migrations_dir: "scripts/migrations"
+  migrate_command: "?"
+
+
+# ============================================================
+# 4. 工作流（智能体如何开始 / 结束一次会话）
+# ============================================================
+workflow:
+
+  # 会话开始时（续接上下文）
+  on_session_start:
+    - 读取 codeConfig.yaml，理解项目结构与约束
+    - 读取 knowledge_base.dev_logs.current，续接上次进度
+    - 读取 knowledge_base.constraints.*，明确红线
+    - 读取 knowledge_base.docs.design_doc，理解架构
+    - 检查 git status，保留开发者未提交的改动
+
+  # 改动完成后（验证）
+  on_change_verify:
+    - 按 python.commands.test 运行后端测试（enabled 时）
+    - 按 frontend.commands.typecheck + build（enabled 且改动前端时）
+    - 按 docker.validate 校验 compose（enabled 且改动部署时）
+
+  # 会话结束前（沉淀上下文）
+  on_session_end:
+    - 更新 knowledge_base.dev_logs.current（本次改动、遗留问题、下一步）
+    - 遇新问题时，在 knowledge_base.known_issues 追加记录
+    - 若约束/文档有变更，同步更新对应文件

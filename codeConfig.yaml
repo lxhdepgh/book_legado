@@ -1,0 +1,143 @@
+# ============================================================
+#  codeConfig.yaml
+#  由 codeConfigtemplate.yaml (v4.0) 初始化生成于 2026-09-01。
+#  事实源：本文件；模板文件保持原样不动。
+#  严禁在本文件中写入任何真实密钥、令牌、密码或已填充的 .env 值。
+# ============================================================
+
+
+# ---------- 元信息 ----------
+version: 4.0
+schema: codeConfigtemplate.yaml   # 指向模板，便于回溯格式版本
+
+
+# ============================================================
+# 1. 项目基本信息
+# ============================================================
+project:
+  name: "legodo_booksource_check"
+  root: "d:\\WorkSpace\\PycharmProjects\\legodo_booksource_check"
+  platform: "windows"
+  shell: "powershell"
+  timezone: "Asia/Shanghai"
+  description: "Legado 书源连通性/搜索可用性检测与内置阅读器的 Flet 桌面应用"
+  primary_language: "python"
+
+
+# ============================================================
+# 2. 知识库索引（核心）
+#    智能体在后续会话中按这些 location 加载上下文文件。
+# ============================================================
+knowledge_base:
+
+  # ---- 2.1 开发文档：架构、接口、部署等"是什么/怎么用" ----
+  docs:
+    design_doc:
+      path: "docs/current-system-design.md"
+      required: true                 # 系统设计文档，智能体必读
+    operations_manual:
+      path: "docs/backend-operations-manual.md"
+      required: false                # 构建与运维手册（桌面端打包等）
+    testing_guide:
+      path: "docs/local-testing-guide.md"
+      required: false                # 本地测试指南
+    book_source_testing:
+      path: "书源测试方法说明.md"
+      required: false                # 书源两层测试方法的业务说明（已存在）
+
+  # ---- 2.2 开发约束：编码规范、架构红线、提交规范等"不许做什么" ----
+  constraints:
+    coding_style:
+      path: "docs/coding-style.md"
+      required: true                 # 代码风格
+    architecture_rules:
+      path: "docs/architecture-rules.md"
+      required: false                # 架构约束（模块边界、依赖方向等）
+    git_workflow:
+      path: "docs/git-workflow.md"
+      required: false                # 分支/提交规范
+    secrets_policy:
+      path: "docs/secrets-policy.md"
+      required: true                 # 密钥管理策略（禁止入库等）
+      note: "严禁将令牌、密码、私钥、已填充的 .env 值写入仓库或本配置"
+
+  # ---- 2.3 开发日志：每次会话开始前的"续接点" ----
+  dev_logs:
+    root: "docs/dev-logs/"           # 日志目录（按日期命名，如 2026-09-01.md）
+    current: "docs/dev-logs/2026-09-01.md"  # 指向【最新】日志文件
+    required: true
+    note: >
+      智能体每次会话开始前必须读取 current 指向的日志，
+      了解上次进展、遗留问题与下一步计划；会话结束前更新该文件。
+
+  # ---- 2.4 问题记录：历史踩坑、已知缺陷、解决方案 ----
+  known_issues:
+    root: "docs/known-issues/"       # 问题记录目录
+    index: "docs/known-issues/README.md"  # 问题索引
+    required: false
+    note: >
+      遇到报错或异常行为时，智能体应先检索此目录是否已有同类记录，
+      避免重复踩坑；解决后补充条目。
+
+
+# ============================================================
+# 3. 运行时环境（按需启用，不涉及整块置 enabled: false，勿删除）
+# ============================================================
+
+python:
+  enabled: true
+  environment_manager: "conda"       # conda 安装于 D:\env_manger\minicaoda
+  environment_name: "legodo_booksource_check"
+  interpreter: "D:\\env_manger\\minicaoda\\envs\\legodo_booksource_check\\python.exe"
+  activate: "conda activate legodo_booksource_check"
+  version_requirement: ">=3.12"      # 当前环境 3.12.13
+  commands:
+    test: "python -m pytest -q"
+    lint: ""                         # 暂不配置（ruff 未安装）
+    syntax_check: "python -m compileall -q app main.py"
+
+frontend:
+  enabled: false                     # 本项目无独立前端（UI 为 Flet，随 Python 构建）
+  directory: "?"
+  package_manager: "?"
+  commands:
+    install: "?"
+    typecheck: "?"
+    build: "?"
+
+docker:
+  enabled: false                     # 本项目不容器化
+  compose_file: "compose.yml"
+  validate: "docker compose config --quiet"
+
+database:
+  enabled: false                     # 无独立数据库（本地文件缓存）
+  type: "?"
+  migrations_dir: "scripts/migrations"
+  migrate_command: "?"
+
+
+# ============================================================
+# 4. 工作流（智能体如何开始 / 结束一次会话）
+# ============================================================
+workflow:
+
+  # 会话开始时（续接上下文）
+  on_session_start:
+    - 读取 codeConfig.yaml，理解项目结构与约束
+    - 读取 knowledge_base.dev_logs.current，续接上次进度
+    - 读取 knowledge_base.constraints.*，明确红线
+    - 读取 knowledge_base.docs.design_doc，理解架构
+    - 检查 git status，保留开发者未提交的改动
+
+  # 改动完成后（验证）
+  on_change_verify:
+    - 按 python.commands.test 运行测试（enabled 时）
+    - 按 frontend.commands.typecheck + build（enabled 且改动前端时）
+    - 按 docker.validate 校验 compose（enabled 且改动部署时）
+
+  # 会话结束前（沉淀上下文）
+  on_session_end:
+    - 更新 knowledge_base.dev_logs.current（本次改动、遗留问题、下一步）
+    - 遇新问题时，在 knowledge_base.known_issues 追加记录
+    - 若约束/文档有变更，同步更新对应文件

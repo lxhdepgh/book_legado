@@ -34,3 +34,9 @@ edge-webview-profile/
 
 # Vendored reference sources downloaded for comparison
 other_history/
+
+# Recorded third-party page bodies used for offline engine replay
+# (real scraped content from book-source hosts; must not enter source control)
+tools/legado_diff/cases*.jsonl
+tools/legado_diff/legado_out*.jsonl
+tools/legado_diff/chunks/
