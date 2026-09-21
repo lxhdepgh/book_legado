@@ -43,6 +43,13 @@ def parse_json_smart(value: str):
     return json.loads(value, parse_int=int, parse_float=_json_smart_float)
 
 
+def is_json_text(value: Any) -> bool:
+    """Mirror String.isJson(): AnalyzeRule picks the JSON analyzer per content."""
+    text = str(value).strip() if value is not None else ""
+    return ((text.startswith("{") and text.endswith("}")) or
+            (text.startswith("[") and text.endswith("]")))
+
+
 class RuleParseError(RuntimeError):
     pass
 
@@ -1151,21 +1158,6 @@ def _jsoup_part(part: str) -> tuple[str, str, bool]:
     return selector, selection, exclude
 
 
-_VALUE_NAMES = {"text", "textnodes", "owntext", "html", "all"}
-# ElementsSingle treats these as selection steps, never as a trailing value.
-_STEP_NAMES = {"children"}
-_HTML_TAG_NAMES = {
-    "a", "abbr", "address", "article", "aside", "audio", "b", "blockquote",
-    "body", "br", "button", "canvas", "caption", "code", "col", "dd",
-    "details", "div", "dl", "dt", "em", "figcaption", "figure", "footer",
-    "form", "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hr",
-    "html", "i", "iframe", "img", "input", "label", "legend", "li", "link",
-    "main", "meta", "nav", "ol", "option", "p", "picture", "pre", "script",
-    "section", "select", "small", "source", "span", "strong", "style", "sub",
-    "summary", "sup", "table", "tbody", "td", "textarea", "tfoot", "th",
-    "thead", "time", "title", "tr", "track", "u", "ul", "video",
-}
-
 _BLOCK_TAGS = {
     "address", "article", "aside", "blockquote", "body", "caption", "center",
     "dd", "details", "dir", "div", "dl", "dt", "fieldset", "figcaption",
@@ -1487,8 +1479,10 @@ def jsoup_values(root: Any, rule: str, list_context: bool = False) -> list[Any]:
     """Resolve a Jsoup rule.
 
     list_context mirrors AnalyzeByJSoup.getElements, where every '@' segment is
-    a selector step; only the string path (getStringList -> getResultLast) reads
-    the trailing segment as text/html/attribute.
+    a selector step.  The string path (getStringList -> getResultList) selects
+    with every segment but the last and then reads the trailing segment through
+    getResultLast as text/textNodes/ownText/html/all, or as an attribute name for
+    anything else - so a trailing selector yields an empty attribute lookup.
     """
     if isinstance(root, ET.Element):
         root = BeautifulSoup(ET.tostring(root, encoding="unicode"), "html.parser")
@@ -1510,23 +1504,26 @@ def jsoup_values(root: Any, rule: str, list_context: bool = False) -> list[Any]:
                 extracted.append(match.group(1) if match.lastindex else match.group(0))
         return extracted
     force_css = rule.lower().startswith("@css:")
+    parts, attr = [], ""
     if force_css:
         rule = re.sub(r":contains\(([^)]*)\)", r":-soup-contains(\1)",
                       rule[5:].strip())
-    parts, _ = split_rule_expression(rule, ("@",), code=False)
-    attr = ""
-    terminal = parts[-1].lower() if parts else ""
-    if list_context:
-        pass
-    elif terminal in _VALUE_NAMES:
-        attr = parts.pop()
-    elif (terminal not in _STEP_NAMES and len(parts) > 1 and (
-            terminal.startswith("attr.") or
-            (terminal not in _HTML_TAG_NAMES and
-             re.fullmatch(r"[\w:-]+", parts[-1])))):
-        attr = parts.pop()
-    if force_css:
-        parts = ["@".join(parts)]
+        if not list_context:
+            # The css branch selects everything before the last '@' and hands
+            # the rest to getResultLast.
+            cut = rule.rfind("@")
+            parts, attr = (([rule[:cut]], rule[cut + 1:]) if cut >= 0
+                           else ([rule], ""))
+        else:
+            parts = [rule]
+    else:
+        parts, _ = split_rule_expression(rule, ("@",), code=False)
+        if parts and not list_context:
+            # getResultList selects with every segment but the last, then hands
+            # the trailing one to getResultLast, which reads it as
+            # text/textNodes/ownText/html/all or as an attribute name - never as
+            # a selector.  An '@'-less rule therefore selects nothing at all.
+            attr = parts.pop()
     # AnalyzeByJSoup accepts Jsoup Elements as content.  Its selectors run
     # against every element in that collection while preserving order.
     contexts = (list(root) if isinstance(root, (list, tuple)) and
@@ -1916,6 +1913,14 @@ def _jsonpath_is_definite(expression: str) -> bool:
 def json_values(root: Any, rule: str, _preserve_array: bool = False,
                 list_context: bool = False) -> list[Any]:
     if rule.lower().startswith("@json:"): rule = rule.split(":", 1)[1].strip()
+    if isinstance(root, str):
+        # AnalyzeByJSonPath.parse runs JsonPath.parse(String), which parses the
+        # JSON text first.  JS list rules therefore return per-item JSON strings
+        # that $.field rules read directly (BookList: setContent(item)).
+        try:
+            root = parse_json_smart(root)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
     expression = rule.strip()
     expression = re.sub(r"\](?=[A-Za-z_$])", "].", expression)
     # Jayway accepts JavaScript-style regex literals in predicates, whereas

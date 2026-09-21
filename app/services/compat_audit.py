@@ -296,7 +296,8 @@ def _script_blocks(value, source_index: int, path=""):
             yield from _script_blocks(child, source_index, f"{path}.{key}")
         login_ui = value.get("loginUi")
         login_url = value.get("loginUrl")
-        if (isinstance(login_ui, str) and login_ui.lstrip().startswith("[") and
+        if (isinstance(login_ui, str) and
+                login_ui.lstrip().startswith(("[", "@js:", "<js>")) and
                 isinstance(login_url, str) and
                 re.search(r"\b(?:function|var|let|const)\b|eval\s*\(", login_url)):
             yield f"{path}.loginUrl#library", login_url.strip()

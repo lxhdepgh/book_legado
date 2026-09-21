@@ -32,8 +32,8 @@ from app.services.legado_js import (JsBridgeError, JsContext, LegadoJsRuntime,
                                     split_js_rule)
 from app.services.legado_rule_parser import (JavaArrayNull, JavaKeySet,
                                              RuleParseError, evaluate,
-                                             parse_json_smart, parse_markup,
-                                             split_balanced)
+                                             is_json_text, parse_json_smart,
+                                             parse_markup, split_balanced)
 from app.services.java_regex import (search as java_regex_search,
                                      sub as java_regex_sub,
                                      translate_replacement)
@@ -1207,7 +1207,9 @@ class ReaderEngine:
                     get_string=lambda nested: extract_value(node, nested, kind, base_url),
                     get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
                     get_elements=lambda nested: [_legado_value_string(item)
-                                                  for item in evaluate(node, nested, kind)],
+                                                  for item in evaluate(
+                                                      node, nested, kind,
+                                                      list_context=True)],
                     book=book, chapter=chapter, title=title,
                     next_chapter_url=next_chapter_url,
                     result_html_nodes=(raw_result is None and kind == "html" and
@@ -1270,7 +1272,9 @@ class ReaderEngine:
                 get_string=lambda nested: extract_value(node, nested, kind, base_url),
                 get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
                 get_elements=lambda nested: [_legado_value_string(item)
-                                              for item in evaluate(node, nested, kind)],
+                                              for item in evaluate(
+                                                  node, nested, kind,
+                                                  list_context=True)],
                 book=book, chapter=chapter, title=title,
                 next_chapter_url=next_chapter_url,
                 result_html_nodes=(raw_result is None and kind == "html" and
@@ -1344,7 +1348,9 @@ class ReaderEngine:
                     get_string=lambda nested: extract_value(node, nested, kind, base_url),
                     get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
                     get_elements=lambda nested: [_legado_value_string(item)
-                                                  for item in evaluate(node, nested, kind)],
+                                                  for item in evaluate(
+                                                      node, nested, kind,
+                                                      list_context=True)],
                     book=book, chapter=chapter, title=title,
                     next_chapter_url=next_chapter_url,
                     result_html_nodes=(not selector and raw_result is None and kind == "html" and
@@ -1364,7 +1370,9 @@ class ReaderEngine:
                     get_string=lambda nested: extract_value(node, nested, kind, base_url),
                     get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
                     get_elements=lambda nested: [_legado_value_string(item)
-                                                  for item in evaluate(node, nested, kind)],
+                                                  for item in evaluate(
+                                                      node, nested, kind,
+                                                      list_context=True)],
                     book=book, chapter=chapter, title=title,
                     next_chapter_url=next_chapter_url,
                     src=(raw_result if isinstance(raw_result, str) else
@@ -1387,7 +1395,9 @@ class ReaderEngine:
                     get_string=lambda nested: extract_value(node, nested, kind, base_url),
                     get_string_list=lambda nested: extract_values(node, nested, kind, base_url),
                     get_elements=lambda nested: [_legado_value_string(item)
-                                                  for item in evaluate(node, nested, kind)],
+                                                  for item in evaluate(
+                                                      node, nested, kind,
+                                                      list_context=True)],
                     book=book, chapter=chapter, title=title,
                     next_chapter_url=next_chapter_url,
                     result_html_nodes=(not selector and raw_result is None and kind == "html" and
@@ -1569,8 +1579,9 @@ class ReaderEngine:
                         if "json" in (original_content_type or "").lower()
                         else parse_markup(original_text, original_content_type))
                 root_kind = "json" if isinstance(root, (dict, list)) else "html"
+                # java.getElement/getElements mirror AnalyzeRule.getElement(s).
                 return [_legado_value_string(item) for item in evaluate(
-                    root, str(rule_text), root_kind)]
+                    root, str(rule_text), root_kind, list_context=True)]
             except (json.JSONDecodeError, RuleParseError, TypeError, ValueError):
                 return []
 
@@ -1615,12 +1626,24 @@ class ReaderEngine:
                     nodes = [item for item in nodes if item is not None]
                     kind = "html"
                     break
+                if isinstance(transformed, list) and not transformed:
+                    nodes, kind = [], "html"
+                    break
                 if isinstance(transformed, dict) or (
                         isinstance(transformed, list) and
                         all(isinstance(item, dict) for item in transformed)):
                     nodes = (transformed if isinstance(transformed, list)
                              else [transformed])
                     kind = "json"
+                    break
+                if (isinstance(transformed, list) and transformed and
+                        all(isinstance(item, str) and is_json_text(item)
+                            for item in transformed)):
+                    # AnalyzeRule.getElements returns the JS list untouched and
+                    # BookList re-runs every field rule on setContent(item), so a
+                    # JSON-looking element keeps its string form and is read by
+                    # the JSONPath analyzer.
+                    nodes, kind = list(transformed), "json"
                     break
                 root, kind = ((parse_json_smart(text), "json") if "json" in content_type else
                               (parse_markup(text, content_type), "html"))

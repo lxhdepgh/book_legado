@@ -40,3 +40,6 @@ other_history/
 tools/legado_diff/cases*.jsonl
 tools/legado_diff/legado_out*.jsonl
 tools/legado_diff/chunks/
+
+# Gradle caches from the differential harness
+tools/legado_diff/harness/.gradle/

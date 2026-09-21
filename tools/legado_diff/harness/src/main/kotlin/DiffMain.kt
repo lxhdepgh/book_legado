@@ -33,6 +33,13 @@ fun main(args: Array<String>) {
                     // Legado's bookList path uses getElements (AnalyzeRule
                     // returns Elements for the list rule), not getStringList.
                     "jsoup" -> AnalyzeByJSoup(content).getElements(rule).map { it.text() }
+                    // AnalyzeRule.getString / getString(isUrl=true) delegate to
+                    // AnalyzeByJSoup.getString (join "\n") and getString0 (first
+                    // item only).  They are separate code paths from getElements.
+                    "jsoup_string" -> AnalyzeByJSoup(content).getString(rule) ?: ""
+                    "jsoup_string0" -> AnalyzeByJSoup(content).getString0(rule)
+                    "jsoup_string_list" ->
+                        AnalyzeByJSoup(content).getStringList(rule)
                     "json" -> AnalyzeByJSonPath(content).getList(rule)
                     "xpath" -> AnalyzeByXPath(content).getStringList(rule)
                     "regex" -> AnalyzeByRegex.getElements(

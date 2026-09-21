@@ -377,15 +377,15 @@ class RuleParserTests(unittest.TestCase):
             "<div id='a'>Alpha<span>Beta</span></div>"
             "<div id='b'><span>alpha</span></div>", "html.parser")
         self.assertEqual([node["id"] for node in evaluate(
-            root, "div:contains(ALPHABETA)", "html")], ["a"])
+            root, "div:contains(ALPHABETA)", "html", list_context=True)], ["a"])
         self.assertEqual([node["id"] for node in evaluate(
-            root, "div:containsOwn(ALPHA)", "html")], ["a"])
+            root, "div:containsOwn(ALPHA)", "html", list_context=True)], ["a"])
         self.assertEqual([node["id"] for node in evaluate(
-            root, r"div:matchesOwn(^Alpha$)", "html")], ["a"])
+            root, r"div:matchesOwn(^Alpha$)", "html", list_context=True)], ["a"])
         self.assertEqual([node["id"] for node in evaluate(
-            root, "div:not(:contains(BETA))", "html")], ["b"])
+            root, "div:not(:contains(BETA))", "html", list_context=True)], ["b"])
         self.assertEqual([node["id"] for node in evaluate(
-            root, "div:not(:containsOwn(ALPHA))", "html")], ["b"])
+            root, "div:not(:containsOwn(ALPHA))", "html", list_context=True)], ["b"])
 
     def test_jsoup_namespace_selectors_match_colon_named_tags(self):
         root = BeautifulSoup(
@@ -393,11 +393,13 @@ class RuleParserTests(unittest.TestCase):
             '<x:content id="b"></x:content><content id="c"></content></rss>',
             "html.parser")
         self.assertEqual(
-            [node["id"] for node in evaluate(root, "media|content", "html")],
+            [node["id"] for node in evaluate(
+                root, "media|content", "html", list_context=True)],
             ["a"],
         )
         self.assertEqual(
-            [node["id"] for node in evaluate(root, "*|content", "html")],
+            [node["id"] for node in evaluate(
+                root, "*|content", "html", list_context=True)],
             ["a", "b", "c"],
         )
 
@@ -490,14 +492,39 @@ class RuleParserTests(unittest.TestCase):
                               '<span>two</span></p>', "html.parser").p
         self.assertEqual(jsoup_values(plain, "text"), ["onetwo"])
 
-    def test_jsoup_at_chain_treats_terminal_html_tag_as_selector(self):
+    def test_jsoup_list_rule_treats_every_segment_as_selector(self):
+        # AnalyzeRule.getElements (book/chapter lists, bookInfo.init) runs every
+        # '@' segment through getElementsSingle, so the trailing one selects too.
         root = BeautifulSoup(
             '<ul><li><a href="/1">One</a></li><li>Two</li></ul>',
             "html.parser")
-        nodes = evaluate(root, "ul@li", "html")
+        nodes = evaluate(root, "ul@li", "html", list_context=True)
         self.assertEqual([node.get_text(strip=True) for node in nodes],
                          ["One", "Two"])
         self.assertEqual(evaluate(root, "ul@li@a@href", "html"), ["/1"])
+
+    def test_jsoup_accessor_tail_is_not_a_selector(self):
+        # The non-list path mirrors getResultList: rules[0..last-1] select,
+        # then getResultLast reads the trailing segment as text/textNodes/
+        # ownText/html/all or as an attribute name.  Selector-shaped tails
+        # therefore resolve to a blank attribute and drop out of the result,
+        # while "title"/"href" tails read the attribute like Legado does.
+        root = BeautifulSoup(
+            '<div class="book-list clearfix"><a href="/1" title="tip">'
+            'One</a></div>', "html.parser")
+        self.assertEqual(
+            evaluate(root, "class.book-list clearfix@tag.li", "html"), [])
+        self.assertEqual(
+            evaluate(root, "class.book-list clearfix@a@tag.li", "html"), [])
+        self.assertEqual(
+            evaluate(root, "class.book-list clearfix@a@title", "html"),
+            ["tip"])
+        self.assertEqual(evaluate(root, "class.book-list clearfix@a@href",
+                                  "html"), ["/1"])
+        # The same rule on the list path selects with every segment instead.
+        self.assertEqual(evaluate(
+            root, "class.book-list clearfix@a@href", "html",
+            list_context=True), [])
 
     def test_standalone_jsoup_value_rule_uses_current_element(self):
         node = BeautifulSoup(
@@ -507,6 +534,16 @@ class RuleParserTests(unittest.TestCase):
             evaluate(node, "html", "html"),
             ['<li><a href="/1">One</a></li>'],
         )
+
+    def test_standalone_bare_rule_reads_attribute_on_element_root(self):
+        # getResultList seeds its element list with the current element, so a
+        # single-segment rule never selects; getResultLast's else branch reads
+        # it as an attribute name.  ElementsSingle turns it into a CSS
+        # selector on the list path, where no element is named "href".
+        node = BeautifulSoup('<a href="/1" title="tip">One</a>',
+                             "html.parser").a
+        self.assertEqual(evaluate(node, "href", "html"), ["/1"])
+        self.assertEqual(evaluate(node, "href", "html", list_context=True), [])
 
     def test_js_failure_classification_separates_engine_source_and_network(self):
         self.assertEqual(classify_js_bridge_error(
@@ -4234,7 +4271,7 @@ class RuleParserTests(unittest.TestCase):
         kept = evaluate(
             search,
             '.results>.vrResult:has(h3 a):not(:has(:matches(^(广告|推广|手游)$)))',
-            "html")
+            "html", list_context=True)
         self.assertEqual([item.get_text(strip=True) for item in kept], ["正常书籍"])
 
     def test_legacy_class_spacing_exclusion_and_base_url_template(self):
@@ -5400,7 +5437,7 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
             '<li><a href="/2">Two</a><span>Bob</span></li>', "html.parser")
         selector, put_rule = engine._list_rule_parts(
             "li@put:{author:'span@text'}")
-        nodes = evaluate(soup, selector, "html")
+        nodes = evaluate(soup, selector, "html", list_context=True)
         books = engine._books_from_nodes(
             nodes, "html", {"name": "a@text", "bookUrl": "a@href",
                             "author": "@get:{author}"},
@@ -6482,8 +6519,12 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         engine = LegadoReadingEngine()
         source = SimpleNamespace(to_dict=lambda: {}, bookSourceUrl="https://x")
         root = BeautifulSoup("<div>x</div>", "html.parser")
+        # A lone "[invalid" never reaches the selector engine - getResultLast
+        # reads it as an attribute name - so it resolves to "" like Legado.
+        self.assertEqual(
+            engine._strict_value(root, "[invalid", "html", source, "https://x"), "")
         with self.assertRaises(Exception):
-            engine._strict_value(root, "[invalid", "html", source, "https://x")
+            engine._strict_value(root, "[invalid@text", "html", source, "https://x")
         with self.assertRaises(Exception):
             await engine._list_nodes(
                 "<div>x</div>", "text/html", "[invalid", source, "https://x")
@@ -7261,6 +7302,20 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
             '<js>result.replace("B","C")</js><js>##^A##X</js>',
             source, chapter)
         self.assertEqual(value, "X clean C")
+
+    async def test_replace_regex_expands_chapter_title_template(self):
+        # SourceRule.makeUpRule expands {{ }} before splitting on "##", and
+        # the JS body runs with the current content as `result`.  A source
+        # that writes ruleContent.replaceRegex = "##{{chapter.title}}" must
+        # therefore delete every copy of the chapter title.
+        engine = LegadoReadingEngine()
+        engine.current_book = BookItem("book", "https://x/book")
+        source = SimpleNamespace(to_dict=lambda: {}, ruleContent={})
+        chapter = ChapterItem("第1章 出海", "https://x/1")
+        value = await engine._replace_content_stages(
+            "第1章 出海\n正文\n第1章 出海", "##{{chapter.title}}",
+            source, chapter)
+        self.assertEqual(value, "正文")
 
 
 if __name__ == "__main__":

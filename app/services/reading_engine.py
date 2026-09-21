@@ -18,7 +18,8 @@ from bs4 import BeautifulSoup
 
 from test_book_sources_async import parse_request_config, parse_search_url
 from app.services.legado_js import JsContext, split_js_rule
-from app.services.legado_rule_parser import evaluate, parse_json_smart, parse_markup
+from app.services.legado_rule_parser import (evaluate, is_json_text,
+                                             parse_json_smart, parse_markup)
 from app.services.java_regex import search as java_regex_search, sub as java_regex_sub
 from app.services.source_rule import compile_rule_program
 from app.services.rule_engine import (BookItem, ChapterItem, ReaderEngine,
@@ -373,12 +374,39 @@ class LegadoReadingEngine(ReaderEngine):
             return False
         return True
 
+    async def _expand_rule_templates(self, value: str, source, chapter,
+                                     content: str, base_url: str) -> str:
+        """Expand ``{{ }}`` as SourceRule.makeUpRule does: the body is a JS
+        expression evaluated with the current content bound as ``result``, which
+        is how ``##{{chapter.title}}`` becomes a literal replacement pattern."""
+        rendered = str(value or "")
+        for _ in range(20):
+            match = re.search(r"\{\{([\s\S]*?)\}\}", rendered)
+            if not match:
+                break
+            try:
+                evaluated = await asyncio.to_thread(
+                    self.js.evaluate, f"@js:{match.group(1).strip()}",
+                    JsContext(source=source, result=content, base_url=base_url,
+                              variables=self.js_variables,
+                              book=getattr(self, "current_book", None),
+                              chapter=chapter))
+            except Exception:
+                break
+            rendered = (rendered[:match.start()] +
+                        self._template_result_text(evaluated) +
+                        rendered[match.end():])
+        return rendered
+
     async def _replace_content_stages(self, value: str, rule: str, source,
                                       chapter, context=None) -> str:
         """Apply every replaceRegex regex/JS stage to the previous result."""
         remaining = str(rule or "").strip()
         result = str(value)
         root, kind, final_url = context or (None, "html", chapter.url)
+        if "{{" in remaining:
+            remaining = await self._expand_rule_templates(
+                remaining, source, chapter, result, final_url)
         while remaining:
             if remaining.startswith("<js>") and "</js>" in remaining:
                 end = remaining.find("</js>") + 5
@@ -628,35 +656,65 @@ class LegadoReadingEngine(ReaderEngine):
             self._unbind_interaction()
         return result
 
-    async def login_schema(self, source) -> list[dict]:
-        """Parse Legado's JavaScript-object loginUi declaration."""
-        definition = str(getattr(source, "loginUi", "") or "").strip()
-        if not definition.startswith("["):
-            return []
-        script = (
-            "@js:(function(){var ui=eval('(' + source.loginUi + ')');"
-            "return JSON.stringify({ui:ui,values:source.getLoginInfoMap()});})()"
-        )
-        value = await asyncio.to_thread(
-            self.js.evaluate, script,
-            JsContext(source=source, base_url=getattr(source, "bookSourceUrl", ""),
-                      variables=self.js_variables),
-        )
+    async def _stored_login_values(self, source) -> dict:
+        raw = await asyncio.to_thread(
+            self.js.evaluate, "@js:JSON.stringify(source.getLoginInfoMap())",
+            JsContext(source=source, variables=self.js_variables))
+        if isinstance(raw, dict):
+            return dict(raw)
         try:
-            parsed = json.loads(value) if isinstance(value, str) else value
+            parsed = json.loads(raw) if isinstance(raw, str) else None
         except (TypeError, json.JSONDecodeError):
+            parsed = None
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _login_ui_items(value) -> list[dict]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, json.JSONDecodeError):
+                return []
+        if not isinstance(value, list):
             return []
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("ui"), list):
+        return [dict(item) for item in value if isinstance(item, dict)]
+
+    async def login_schema(self, source) -> list[dict]:
+        """Parse Legado's loginUi declaration: JSON text or @js:/<js> script."""
+        definition = str(getattr(source, "loginUi", "") or "").strip()
+        if not definition:
             return []
-        stored = parsed.get("values") if isinstance(parsed.get("values"), dict) else {}
+        stored = await self._stored_login_values(source)
+        ui: list[dict] = []
+        if definition.startswith("["):
+            ui = self._login_ui_items(definition)
+        if not ui:
+            code = definition
+            if definition.startswith("@js:"):
+                code = definition[4:]
+            elif definition.startswith("<js>"):
+                end = definition.rfind("<")
+                code = definition[4:end] if end >= 4 else definition[4:]
+            # SourceLoginDialog.evalUiJs pre-evaluates getLoginJs() and binds the
+            # dialog's current values as ``result``.  A URL loginUrl is data, not
+            # a script, so it is left alone.
+            login_js = self._login_script(source).strip()
+            prefix = ("" if not login_js or re.match(r"^https?://", login_js, flags=re.I)
+                      else login_js + "\n")
+            script = ("@js:" + prefix + "(function(){return eval(" +
+                      json.dumps(code, ensure_ascii=False) + ");})()")
+            value = await asyncio.to_thread(
+                self.js.evaluate, script,
+                JsContext(source=source, result=stored,
+                          base_url=getattr(source, "bookSourceUrl", ""),
+                          variables=self.js_variables))
+            ui = self._login_ui_items(value)
         result = []
-        for item in parsed["ui"]:
-            if isinstance(item, dict):
-                item = dict(item)
-                name = str(item.get("name", ""))
-                if name in stored:
-                    item["value"] = stored[name]
-                result.append(item)
+        for item in ui:
+            name = str(item.get("name", ""))
+            if name in stored:
+                item["value"] = stored[name]
+            result.append(item)
         return result
 
     @staticmethod
@@ -676,9 +734,8 @@ class LegadoReadingEngine(ReaderEngine):
 
     @classmethod
     def login_available(cls, source) -> bool:
-        ui = str(getattr(source, "loginUi", "") or "").lstrip()
-        login = str(getattr(source, "loginUrl", "") or "")
-        return (ui.startswith("[") and bool(login.strip())) or bool(cls.login_target(source))
+        """Legado shows the login menu whenever loginUrl is not blank."""
+        return bool(str(getattr(source, "loginUrl", "") or "").strip())
 
     @staticmethod
     def _login_script(source) -> str:
@@ -971,8 +1028,14 @@ class LegadoReadingEngine(ReaderEngine):
             else:
                 root, kind = self._root(text, content_type)
             selector, suffix = self._field_parts(value, kind)
-            nodes = evaluate(root, selector, kind) if selector else (
-                root if isinstance(root, list) else [root])
+            # Book list and chapter list mirror AnalyzeRule.getElements, where
+            # every '@' segment is a selector.  bookInfo.init mirrors
+            # getElement: Jsoup/XPath still return element lists, but the JSON
+            # stage reads one object through getObject instead of getList.
+            nodes = evaluate(
+                root, selector, kind,
+                list_context=not (preserve_element and kind == "json"),
+            ) if selector else (root if isinstance(root, list) else [root])
             if not suffix:
                 if preserve_element:
                     program = compile_rule_program(
@@ -1022,12 +1085,23 @@ class LegadoReadingEngine(ReaderEngine):
                 nodes = [item for item in nodes if item is not None]
                 kind = "html"
                 break
+            if isinstance(transformed, list) and not transformed:
+                nodes, kind = [], "html"
+                break
             if isinstance(transformed, dict) or (
                     isinstance(transformed, list) and
                     all(isinstance(item, dict) for item in transformed)):
                 nodes = (transformed if isinstance(transformed, list)
                          else [transformed])
                 kind = "json"
+                break
+            if (isinstance(transformed, list) and transformed and
+                    all(isinstance(item, str) and is_json_text(item)
+                        for item in transformed)):
+                # AnalyzeRule.getElements keeps a JS list as-is and every field
+                # rule re-reads setContent(item); JSON elements stay strings and
+                # are resolved by the JSONPath analyzer.
+                nodes, kind = list(transformed), "json"
                 break
             root, kind = self._root(text, content_type)
             nodes = root if isinstance(root, list) else [root]
