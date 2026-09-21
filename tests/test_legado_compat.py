@@ -11,6 +11,7 @@ import re
 import threading
 import time
 import zipfile
+import zlib
 from io import BytesIO
 from email.message import Message
 from urllib.error import HTTPError, URLError
@@ -1061,6 +1062,102 @@ class RuleParserTests(unittest.TestCase):
         for _ in range(2):
             self.assertEqual(runtime.evaluate(
                 "@js:let local=helper+1;local", JsContext(source=source)), 2)
+
+    def test_java_security_message_digest_signs_like_the_jdk(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source",
+            "jsLib": (
+                "var QM_KEY='d3dGiJc651gSQ8w1';"
+                "function qmMd5(s){"
+                "var b=Packages.java.security.MessageDigest.getInstance('MD5')"
+                ".digest(new Packages.java.lang.String(s).getBytes('UTF-8'));"
+                "var h='';"
+                "for(var i=0;i<b.length;i++){var x=(b[i]&0xff).toString(16);"
+                "h+=(x.length<2?'0':'')+x;}"
+                "return h;}"
+                "function qmSign(o){"
+                "return qmMd5(Object.keys(o).sort().map(function(k){"
+                "return k+'='+o[k];}).join('')+QM_KEY);}"
+            )})
+        context = JsContext(source=source)
+        self.assertEqual(runtime.evaluate("@js:qmMd5('中文')", context),
+                         hashlib.md5("中文".encode()).hexdigest())
+        expected = hashlib.md5(
+            ("gender=3imei_ip=2937357107page=1wd=斗破" + "d3dGiJc651gSQ8w1")
+            .encode()).hexdigest()
+        self.assertEqual(runtime.evaluate(
+            "@js:qmSign({gender:'3',imei_ip:'2937357107',page:1,wd:'斗破'})",
+            context), expected)
+
+    def test_java_security_message_digest_accumulates_updates(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var md=java.security.MessageDigest.getInstance('MD5');"
+            "md.update(new java.lang.String('ab').getBytes('UTF-8'));"
+            "md.update(new java.lang.String('c').getBytes('UTF-8'));"
+            "var bytes=md.digest();var out='';"
+            "for(var i=0;i<bytes.length;i++)"
+            "out+=(bytes[i]&0xff).toString(16).padStart(2,'0');"
+            "return out+'/'+md.getAlgorithm()+'/'+md.getDigestLength()})()",
+            JsContext(source=source)), hashlib.md5(b"abc").hexdigest() + "/MD5/16")
+
+    def test_hutool_digest_util_hex_helpers_match_hashlib(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        context = JsContext(source=source)
+        for expression, expected in (
+                ("Packages.cn.hutool.crypto.digest.DigestUtil.md5Hex('abc')",
+                 hashlib.md5(b"abc").hexdigest()),
+                ("Packages.cn.hutool.crypto.digest.DigestUtil.sha256Hex('abc')",
+                 hashlib.sha256(b"abc").hexdigest())):
+            self.assertEqual(runtime.evaluate("@js:" + expression, context), expected)
+
+    def test_java_lang_string_constructor_returns_java_byte_array_and_text(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        context = JsContext(source=source)
+        self.assertEqual(runtime.evaluate(
+            "@js:JSON.stringify(Array.from(new Packages.java.lang.String('中文')"
+            ".getBytes('UTF-8')))", context),
+            json.dumps([value - 256 if value > 127 else value
+                        for value in "中文".encode()], separators=(",", ":")))
+        self.assertEqual(runtime.evaluate(
+            "@js:String(new Packages.java.lang.String("
+            "new Packages.java.lang.String('中文').getBytes('UTF-8'),'UTF-8'))",
+            context), "中文")
+        self.assertEqual(runtime.evaluate(
+            "@js:String(new Packages.java.lang.String("
+            "new Packages.java.lang.String('0123456789').getBytes('UTF-8'),2,3,'UTF-8'))",
+            context), "234")
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var s=new Packages.java.lang.String('abcd');"
+            "return s.length()+'/'+s.length+'/'+(s+'!')+'/'+s.match(/b/)[0]})()",
+            context), "4/4/abcd!/b")
+
+    def test_java_util_arrays_copy_of_pads_and_truncates_like_java(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var A=Packages.java.util.Arrays;"
+            "return JSON.stringify([Array.from(A.copyOf([1,2,3,4],2)),"
+            "Array.from(A.copyOf([1],4))])})()", JsContext(source=source)),
+            "[[1,2],[1,0,0,0]]")
+
+    def test_java_util_zip_inflater_writes_into_the_caller_buffer(self):
+        raw = b"chapter text " * 20
+        compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
+        payload = compressor.compress(raw) + compressor.flush()
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var b=" + json.dumps(list(payload)) + ";"
+            "var out=Packages.java.util.Arrays.copyOf([]," + str(len(raw)) + ");"
+            "var inf=new Packages.java.util.zip.Inflater(true);"
+            "inf.setInput(b,0,b.length);var count=inf.inflate(out);inf.end();"
+            "return count+':'+String(new Packages.java.lang.String(out,'UTF-8'))})()",
+            JsContext(source=source)), f"{len(raw)}:" + raw.decode())
 
     def test_empty_login_maps_are_null_like_fixed_base_source(self):
         runtime = LegadoJsRuntime()

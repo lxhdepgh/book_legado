@@ -18,6 +18,7 @@ import time
 import threading
 import uuid
 import zipfile
+import zlib
 import tempfile
 import sys
 import traceback
@@ -488,6 +489,7 @@ class LegadoJsRuntime:
         ctx.add_callable("__md5", lambda value: hashlib.md5(str(value).encode()).hexdigest())
         ctx.add_callable("__digest", self._digest)
         ctx.add_callable("__digest_base64", self._digest_base64)
+        ctx.add_callable("__digest_bytes", self._digest_bytes)
         ctx.add_callable("__hmac", lambda value, algorithm, secret, as_base64=False:
                          self._bridge_call(self._hmac, value, algorithm, secret,
                                            as_base64))
@@ -600,6 +602,7 @@ class LegadoJsRuntime:
         ctx.add_callable("__font_replace", self._replace_font)
         ctx.add_callable("__font_op", self._font_operation)
         ctx.add_callable("__gzip", self._gzip)
+        ctx.add_callable("__inflate", self._inflate)
         ctx.add_callable("__md5bytes", lambda value: json.dumps(list(
             hashlib.md5(str(value).encode()).digest())))
         ctx.add_callable("__b64encode_bytes", self._base64_encode_bytes)
@@ -1831,9 +1834,94 @@ class LegadoJsRuntime:
           }},enumerable:false}},
           clear: {{value:function(){{this.splice(0)}},enumerable:false}}
         }});
-        function __JavaString(value) {{
+        function __javaStringText(value, count, offset, length, charset) {{
+          if (count === 0) return '';
+          if (!Array.isArray(value)) return String(value);
+          const bytes = Array.from(value);
+          if (count >= 4) return __bytesstr(JSON.stringify(bytes.slice(
+            Number(offset), Number(offset) + Number(length))), String(charset));
+          if (count === 3) return __bytesstr(JSON.stringify(bytes.slice(
+            Number(offset), Number(offset) + Number(length))), 'utf-8');
+          if (count === 2) return __bytesstr(JSON.stringify(bytes), String(offset));
+          return __bytesstr(JSON.stringify(bytes), 'utf-8');
+        }}
+        function __javaStringObject(value, count, offset, length, charset) {{
+          const text = __javaStringText(value, count, offset, length, charset);
+          const size = () => text.length;
+          size.valueOf = size; size.toString = () => String(text.length);
+          const wrap = string => __javaStringObject(string, 1);
+          const api = {{
+            toString: () => text, valueOf: () => text, toJSON: () => text,
+            // Java exposes length() while scripts keep writing myStr.length.
+            length: size,
+            getBytes: charset_ => __byteArray(JSON.parse(__strbytes(
+              text, String(charset_ === undefined ? 'utf-8' : charset_)))),
+            isEmpty: () => text.length === 0,
+            charAt: index => text.charAt(Number(index)),
+            charCodeAt: index => text.charCodeAt(Number(index)),
+            codePointAt: index => text.codePointAt(Number(index)),
+            toCharArray: () => Array.from(text),
+            substring: (start, end) => wrap(text.substring(
+              Number(start), end === undefined ? undefined : Number(end))),
+            contains: value => text.includes(String(value)),
+            startsWith: (value, position) => text.startsWith(
+              String(value), Number(position === undefined ? 0 : position)),
+            endsWith: value => text.endsWith(String(value)),
+            equals: value => text === String(value),
+            equalsIgnoreCase: value => text.toLowerCase() === String(value).toLowerCase(),
+            compareTo: value => {{
+              const other = String(value);
+              return text < other ? -1 : text > other ? 1 : 0;
+            }},
+            concat: value => wrap(text + String(value)),
+            trim: () => wrap(text.trim()),
+            toUpperCase: () => wrap(text.toUpperCase()),
+            toLowerCase: () => wrap(text.toLowerCase()),
+            indexOf: (value, from) => text.indexOf(
+              String(value), Number(from === undefined ? 0 : from)),
+            lastIndexOf: (value, from) => from === undefined
+              ? text.lastIndexOf(String(value))
+              : text.lastIndexOf(String(value), Number(from)),
+            replace: (search, replacement) => search instanceof RegExp
+              ? wrap(text.replace(search, replacement))
+              // java.lang.String.replace swaps every literal occurrence.
+              : wrap(text.split(String(search)).join(String(replacement))),
+            replaceAll: (pattern, replacement) => wrap(
+              text.replace(new RegExp(String(pattern), 'g'), String(replacement))),
+            split: (pattern, limit) => {{
+              const parts = text.split(new RegExp(String(pattern)));
+              if (limit === undefined) {{
+                while (parts.length && parts[parts.length - 1] === '') parts.pop();
+              }} else if (Number(limit) > 0 && parts.length > Number(limit)) {{
+                parts.length = Number(limit);
+              }}
+              return parts;
+            }},
+            matches: pattern => new RegExp('^(?:' + String(pattern) + ')$').test(text),
+            hashCode: () => {{
+              let hash = 0;
+              for (let index = 0; index < text.length; index += 1)
+                hash = (Math.imul(31, hash) + text.charCodeAt(index)) | 0;
+              return hash;
+            }},
+            getClass: () => null
+          }};
+          api[Symbol.toPrimitive] = hint => hint === 'number' ? Number(text) : text;
+          return new Proxy(api, {{
+            get: (target, name) => {{
+              if (Reflect.has(target, name)) return Reflect.get(target, name);
+              if (typeof name !== 'string') return undefined;
+              const member = text[name];
+              return typeof member === 'function' ? member.bind(text) : member;
+            }}
+          }});
+        }}
+        function __JavaString(value, offset, length, charset) {{
+          if (new.target) return __javaStringObject(
+            value, arguments.length, offset, length, charset);
           return Array.isArray(value) ? __bytesstr(JSON.stringify(value), 'utf-8') : String(value);
         }}
+        __JavaString.valueOf = value => value == null ? 'null' : String(value);
         function __javaException(name) {{
           function JavaException(message) {{
             const error=new Error(String(message == null ? '' : message));
@@ -2062,6 +2150,11 @@ class LegadoJsRuntime:
           HashSet:function(value){{return __HashSet(value)}},
           Arrays:{{
             copyOfRange:(value,start,end)=>Array.from(value || []).slice(Number(start),Number(end)),
+            copyOf:(value,newLength)=>{{
+              const copied=Array.from(value || []).slice(0, Number(newLength));
+              while (copied.length < Number(newLength)) copied.push(0);
+              return __byteArray(copied);
+            }},
             asList:(...values)=>values.length===1&&Array.isArray(values[0])?values[0]:values
           }},
           Base64:__Base64,
@@ -2075,6 +2168,62 @@ class LegadoJsRuntime:
           ByteArrayOutputStream:function(){{
           this._bytes=[]; this.toByteArray=()=>__byteArray(this._bytes); this.close=()=>undefined;
         }}}};
+        const __MessageDigest = {{
+          getInstance: algorithm => {{
+            const name = String(algorithm);
+            const pending = [];
+            const append = values => {{ for (const item of values) pending.push(item); }};
+            return {{
+              getAlgorithm: () => name,
+              getDigestLength: () => JSON.parse(__digest_bytes(name, '[]')).length,
+              update: (value, offset, length) => {{
+                const bytes = Array.from(value || []);
+                if (offset === undefined || offset === null) append(bytes);
+                else append(bytes.slice(Number(offset), Number(offset) + Number(length)));
+              }},
+              reset: () => {{ pending.length = 0; }},
+              digest: value => {{
+                const bytes = value === undefined || value === null
+                  ? pending.slice() : pending.concat(Array.from(value));
+                pending.length = 0;
+                return __byteArray(JSON.parse(__digest_bytes(name, JSON.stringify(bytes))));
+              }}
+            }};
+          }},
+          isEqual: (left, right) => {{
+            const a = Array.from(left || []), b = Array.from(right || []);
+            if (a.length !== b.length) return false;
+            let difference = 0;
+            for (let index = 0; index < a.length; index += 1)
+              difference |= Number(a[index]) ^ Number(b[index]);
+            return difference === 0;
+          }}
+        }};
+        function __Inflater(nowrap) {{
+          const state = {{input: [], nowrap: Boolean(nowrap)}};
+          this.setInput = (value, offset, length) => {{
+            const bytes = Array.from(value || []);
+            const slice = offset === undefined ? bytes
+              : bytes.slice(Number(offset), Number(offset) + Number(length));
+            for (const item of slice) state.input.push(item);
+          }};
+          this.inflate = out => {{
+            const raw = JSON.parse(__inflate(
+              JSON.stringify(state.input), state.nowrap, out ? out.length : 0));
+            if (!out) return __byteArray(raw);
+            const count = Math.min(raw.length, out.length);
+            for (let index = 0; index < count; index += 1)
+              out[index] = raw[index] > 127 ? raw[index] - 256 : raw[index];
+            return count;
+          }};
+          this.finished = () => true;
+          this.needsInput = () => false;
+          this.getRemaining = () => 0;
+          this.reset = () => {{ state.input.length = 0; }};
+          this.end = () => {{ state.input.length = 0; }};
+        }}
+        Packages.java.security = {{MessageDigest:__MessageDigest}};
+        Packages.java.util.zip = {{Inflater:__Inflater}};
         Packages.javax.crypto = {{Cipher:__Cipher,Mac:__Mac}};
         Packages.javax.crypto.SecretKeyFactory = {{getInstance:algorithm=>({{
           generateSecret:spec=>({{bytes:spec.bytes,algorithm:String(algorithm)}})
@@ -2106,7 +2255,16 @@ class LegadoJsRuntime:
           return charset ? raw : __byteArray(JSON.parse(raw));
         }}}};
         Packages.cn.hutool.crypto.digest.DigestUtil = {{
-          md5:value=>__byteArray(JSON.parse(__md5bytes(String(value))))
+          md5:value=>__byteArray(JSON.parse(__md5bytes(String(value)))),
+          md5Hex:value=>__digest(String(value), 'MD5'),
+          digestHex:value=>__digest(String(value), 'MD5'),
+          sha1:value=>__byteArray(JSON.parse(__digest_bytes(
+            'SHA-1', JSON.stringify(String(value))))),
+          sha1Hex:value=>__digest(String(value), 'SHA-1'),
+          sha256:value=>__byteArray(JSON.parse(__digest_bytes(
+            'SHA-256', JSON.stringify(String(value))))),
+          sha256Hex:value=>__digest(String(value), 'SHA-256'),
+          sha512Hex:value=>__digest(String(value), 'SHA-512')
         }};
         Packages.okhttp3 = (() => {{
           function RequestBuilder() {{
@@ -2142,6 +2300,7 @@ class LegadoJsRuntime:
           const known=[[__JavaString,'String'],[__Cipher,'Cipher'],[__Mac,'Mac'],
             [__SecretKeySpec,'SecretKeySpec'],[__IvParameterSpec,'IvParameterSpec'],
             [__DESKeySpec,'DESKeySpec'],[__Base64,'Base64'],
+            [__MessageDigest,'MessageDigest'],[__Inflater,'Inflater'],
             [__URLEncoder,'URLEncoder'],[__DatatypeConverter,'DatatypeConverter']];
           const match=known.find(item=>item[0]===value);
           if(match) {{target[match[1]]=value;return;}}
@@ -2768,6 +2927,17 @@ class LegadoJsRuntime:
             ? target[name]
             : undefined
         }});
+        // Rhino exposes every package at top level, so `java.util.Base64` and
+        // `javax.crypto.Cipher` resolve without the Packages prefix.
+        var javax = {{}}, android = {{}};
+        java.lang = Packages.java.lang;
+        java.util = Packages.java.util;
+        java.io = Packages.java.io;
+        java.net = Packages.java.net;
+        java.security = Packages.java.security;
+        javax.crypto = Packages.javax.crypto;
+        javax.xml = Packages.javax.xml;
+        android.util = Packages.android.util;
         function replace(pattern, replacement) {{
           result = String(result == null ? '' : result).replace(pattern, replacement);
           return result;
@@ -3614,6 +3784,16 @@ class LegadoJsRuntime:
             return raw.decode(encoding, errors="replace")
         return json.dumps(list(raw))
 
+    @classmethod
+    def _inflate(cls, value, nowrap=False, limit=0) -> str:
+        window = -zlib.MAX_WBITS if nowrap else zlib.MAX_WBITS
+        try:
+            raw = zlib.decompressobj(window).decompress(
+                cls._byte_values(value), int(limit or 0))
+        except zlib.error as exc:
+            raise JsBridgeError(f"java.util.zip.DataFormatException: {exc}") from exc
+        return json.dumps(list(raw))
+
     @staticmethod
     def _hex_bytes(value) -> str:
         text = re.sub(r"\s+", "", str(value))
@@ -3650,6 +3830,19 @@ class LegadoJsRuntime:
     def _digest(cls, value, algorithm="MD5") -> str:
         name = cls._hash_name(str(algorithm))
         return hashlib.new(name, str(value).encode()).hexdigest()
+
+    @classmethod
+    def _digest_bytes(cls, algorithm, value) -> str:
+        name = cls._hash_name(str(algorithm))
+        # java.security.MessageDigest calls "SHA" what hashlib names sha1.
+        if name in ("sha", ""):
+            name = "sha1"
+        try:
+            digest = hashlib.new(name, cls._byte_values(value)).digest()
+        except ValueError as exc:
+            raise JsBridgeError(
+                f"java.security.NoSuchAlgorithmException: {algorithm}") from exc
+        return json.dumps(list(digest))
 
     @classmethod
     def _digest_base64(cls, value, algorithm="MD5") -> str:
