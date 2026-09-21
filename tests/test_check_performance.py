@@ -448,6 +448,36 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
                          check_service.READING_CHAIN_CANDIDATES)
         self.assertEqual(result["reading_status"], "rule_error")
 
+    async def test_browser_only_content_is_reported_as_unverified(self):
+        # 霹雳书屋 renders its chapter body from script, so the empty document a
+        # plain HTTP check sees says nothing about the source.
+        books = [SimpleNamespace(name="b0", url="https://example/b0")]
+        engine = self._multi_book_engine(["empty"])
+        engine.webview_fetcher = None
+        source = _source(ruleContent={
+            "content": "#chapterContent .jsChapterWrapper p@html",
+            "webJs": "(()=>{return document.title})()"})
+
+        result = await check_service._reading_chain_check(
+            source, engine, books, timeout=5)
+
+        self.assertEqual(result["reading_status"], "needs_browser")
+        self.assertEqual(result["reading_stage"], "content")
+        self.assertEqual("search_only", check_service._classify_result({
+            "search_status": "ok", "tag_valid": 0, **result}))
+
+    async def test_browser_backed_check_still_fails_a_broken_content_rule(self):
+        books = [SimpleNamespace(name="b0", url="https://example/b0")]
+        engine = self._multi_book_engine(["empty"])
+        engine.webview_fetcher = AsyncMock()
+        source = _source(ruleContent={"content": "#body p@html",
+                                      "webJs": "(()=>{return 1})()"})
+
+        result = await check_service._reading_chain_check(
+            source, engine, books, timeout=5)
+
+        self.assertEqual(result["reading_status"], "rule_error")
+
     def test_locally_blocked_host_is_not_counted_as_source_failure(self):
         block_page = ("<html><body><h1>拦截提示</h1>"
                       "<p>火绒安全软件已阻止你访问该网站</p></body></html>")

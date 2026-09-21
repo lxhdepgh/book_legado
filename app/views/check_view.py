@@ -35,6 +35,8 @@ READING_STAGE_LABELS = {
     "content": "正文",
     "complete": "正文",
 }
+# 其余阅读状态沿用英文枚举，只有需要解释的一项换成中文。
+READING_STATUS_LABELS = {"needs_browser": "需浏览器未抽检"}
 
 
 class CheckView(ft.Column):
@@ -389,6 +391,9 @@ class CheckView(ft.Column):
             detail += (f" · 阅读抽检通过{sample_note}"
                        f"（{result.get('chapter_count', 0)} 章"
                        f"{'，试 ' + str(tried) + ' 本' if tried > 1 else ''}）")
+        elif result.get("reading_status") == "needs_browser":
+            stage_label = READING_STAGE_LABELS.get(reading_stage, reading_stage)
+            detail += (f" · {stage_label}需内置浏览器渲染，未抽检{sample_note}")
         elif reading_stage not in {None, "none"}:
             stage_label = READING_STAGE_LABELS.get(reading_stage, reading_stage)
             detail += (f" · {stage_label}失败{sample_note}："
@@ -440,7 +445,9 @@ class CheckView(ft.Column):
                 else round(result["response_time_ms"]),
                 "" if not tag_total else
                 f"{result.get('tag_valid', 0)}/{tag_total}",
-                result.get("reading_status", ""),
+                READING_STATUS_LABELS.get(
+                    result.get("reading_status", ""),
+                    result.get("reading_status", "")),
                 self.detail_text(result),
                 "是" if result.get("auto_disabled") else "",
             ])

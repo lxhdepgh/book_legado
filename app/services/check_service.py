@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 
@@ -241,6 +242,36 @@ async def check_categories(source, session=None, sem=None, timeout=10,
             engine.js.close()
 
 
+def _stage_needs_browser(value) -> bool:
+    """True when a stage can only be read through Legado's backstage WebView.
+
+    Two shapes mean the same thing: a ``{"webView":true}`` suffix on the URL a
+    rule produces, and the ``webJs`` field of ``ruleContent``, which Legado
+    hands to BackstageWebView as the wait script.  Neither is meaningful over
+    plain HTTP, so a headless check cannot judge such a stage.
+    """
+    if value in (None, "", {}, []):
+        return False
+    if isinstance(value, (dict, list)):
+        # json.dumps escapes the inner quotes of a URL-option suffix.
+        text = json.dumps(value, ensure_ascii=False).replace('\\"', '"')
+    else:
+        text = str(value)
+    return bool(re.search(r'"\s*web_?view\s*"\s*:\s*true', text, re.I) or
+                re.search(r'"\s*webJs\s*"\s*:\s*"[^"]', text))
+
+
+def _browser_only_stages(source) -> set:
+    """Reading-chain stages whose rules require the built-in browser."""
+    stages = set()
+    toc = getattr(source, "ruleToc", {}) or {}
+    if isinstance(toc, dict) and _stage_needs_browser(toc):
+        stages.add("catalog")
+    if _stage_needs_browser(getattr(source, "ruleContent", {}) or {}):
+        stages.add("content")
+    return stages
+
+
 async def _reading_chain_check(source, engine, candidates, timeout,
                                budget=READING_CHAIN_BUDGET) -> dict:
     result = {"reading_status": "skip", "reading_stage": "none",
@@ -250,6 +281,8 @@ async def _reading_chain_check(source, engine, candidates, timeout,
     books = [item for item in candidates if getattr(item, "url", "")]
     if not books:
         return result
+    browser_stages = _browser_only_stages(source)
+    has_browser = getattr(engine, "webview_fetcher", None) is not None
     books = books[:READING_CHAIN_CANDIDATES]
     result["sample_book"] = str(getattr(books[0], "name", "") or "")
     deadline = (time.perf_counter()
@@ -288,6 +321,14 @@ async def _reading_chain_check(source, engine, candidates, timeout,
             return result
         except Exception as exc:
             kind = _error_kind(exc)
+            # 这一阶段在无浏览器环境下按 HTTP 结果判断，正文由脚本渲染时必然为
+            # 空。判成"正文不可用"会把一条本机验证不了的链路报成书源失效。
+            if (kind == "rule_error" and result["reading_stage"] in browser_stages
+                    and not has_browser):
+                result["reading_status"] = "needs_browser"
+                result["reading_error"] = ("该阶段需要内置浏览器渲染，"
+                                           "本次检测未启用浏览器")
+                break
             result["reading_status"] = kind
             result["reading_error"] = _error_text(exc)
             if (kind == "rule_error" and
@@ -305,6 +346,10 @@ def _classify_result(result: dict) -> str:
     reading = result.get("reading_status")
     uncertain = {"timeout", "rate_limited", "network_error", "js_error",
                  "unsupported"}
+    if reading == "needs_browser":
+        # 正文链路要渲染后才拿得到，本次检测没开浏览器，等于没验证过这一段；
+        # 结论只能停在列表链路已经证明的那一级。
+        reading = "skip"
     if reading == "ok":
         return "fully_usable"
     if reading in uncertain:
