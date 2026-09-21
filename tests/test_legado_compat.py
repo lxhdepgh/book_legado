@@ -1861,6 +1861,24 @@ class RuleParserTests(unittest.TestCase):
         self.assertEqual(value[1], "text/html")
         self.assertTrue(value[0].startswith("Mozilla/5.0"), value[0])
 
+    def test_url_context_resolves_a_header_script_that_calls_the_js_lib(self):
+        # SharedJsScope evaluates the jsLib before the rule scope, so a header
+        # may call library helpers.  点众阅读's header reads a constant the
+        # jsLib declares; resolving it inside the bootstrap failed with
+        # "ReferenceError: 'AES_KEY' is not defined".
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source.example",
+            "jsLib": 'const AES_KEY = "lib-secret";\n'
+                     'function libToken() { return AES_KEY + "-token"; }',
+            "header": '@js:\nJSON.stringify({"X-Token": libToken()})',
+        })
+        value = runtime.evaluate(
+            "@js:String(java.headerMap.get('X-Token'))",
+            JsContext(source=source, host_kind="url", key="key", page=1,
+                      base_url="https://source.example"))
+        self.assertEqual(value, "lib-secret-token")
+
     def test_documented_chapter_and_tts_script_globals(self):
         source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
         chapter = SimpleNamespace(name="Chapter One")

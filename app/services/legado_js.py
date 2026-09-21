@@ -3058,12 +3058,14 @@ class LegadoJsRuntime:
           cookie=undefined;cache=undefined;infoMap=undefined;
         }}
         // AnalyzeUrl resolves the source header while it is constructed.  The
-        // resolution waits until here because a @js: header may call any of the
-        // JsExtensions the context defines further down (java.getWebViewUA,
-        // java.androidId, the Packages aliases, cookie...); running it in place
-        // would call them while java still lacks them and fail with
-        // "TypeError: not a function".
-        if (__hostKind === 'url') {{
+        // resolution is deferred to __initUrlHeaderMap() because a @js: header
+        // may call any of the JsExtensions the context defines further down
+        // (java.getWebViewUA, java.androidId, the Packages aliases, cookie...),
+        // and it may also call jsLib functions, so the call site sits after the
+        // library program rather than here.  Evaluating it in place would reach
+        // java before it is complete and fail with "TypeError: not a function".
+        function __initUrlHeaderMap() {{
+          if (__hostKind !== 'url') return;
           java.headerMap=__map(Object.assign({{}},source.getHeaderMap(true),
             __requestHeaderData));
         }}
@@ -3127,7 +3129,8 @@ class LegadoJsRuntime:
                 library_program = js_lib if is_new_shared_context else ""
                 value = ctx.eval(
                     bootstrap + "\n;delete __global.globalThis;\n" +
-                    library_program + "\n" + rule_program)
+                    library_program + "\n;__initUrlHeaderMap();\n" +
+                    rule_program)
             else:
                 declaration_only = bool(re.fullmatch(
                     r"\s*(?:(?:var|let|const)\s+[^;]+;|"
@@ -3140,7 +3143,7 @@ class LegadoJsRuntime:
                     rule_program = (";eval(" + json.dumps(clean, ensure_ascii=False) + ")"
                                     if declaration_only else clean)
                 value = ctx.eval(bootstrap + "\n;delete __global.globalThis;\n" +
-                                 rule_program)
+                                 ";__initUrlHeaderMap();\n" + rule_program)
             self._sync_context_objects(ctx, context)
             self._sync_rule_variables(context)
             if hasattr(value, "json"):
@@ -3153,7 +3156,7 @@ class LegadoJsRuntime:
             if location:
                 rule_line = int(location.group(1)) - (
                     bootstrap.count("\n") + js_lib.count("\n") +
-                    4)
+                    5)
                 if rule_line > 0:
                     detail = f"{detail.rstrip()}\nRule line: {rule_line}"
             if bridge_error and bridge_error not in detail:
