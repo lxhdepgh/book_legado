@@ -24,6 +24,9 @@ class _Engine:
         self.attempts = {}
         self.media_calls = []
 
+    async def aclose(self):
+        self.js.close()
+
     async def chapters(self, _source, _book):
         return [ChapterItem("One", "https://book/1", index=0),
                 ChapterItem("Volume", "", index=1, is_volume=True),

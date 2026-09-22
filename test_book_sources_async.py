@@ -283,7 +283,7 @@ async def test_one(source: dict, idx: int, session: aiohttp.ClientSession,
         result["book_count"] = -1
         result["error"] = f"Engine search: {type(exc).__name__}: {str(exc)[:160]}"
     finally:
-        engine.js.close()
+        await engine.aclose()
     return result
 
     # 解析 searchUrl
@@ -298,7 +298,7 @@ async def test_one(source: dict, idx: int, session: aiohttp.ClientSession,
                     js_value = await engine._resolve_rule_url(
                         search_url_raw, BookSource.from_dict(source), keyword, 1)
                 finally:
-                    engine.js.close()
+                    await engine.aclose()
                 if isinstance(js_value, str):
                     parsed = parse_search_url(js_value, url, keyword)
                 if parsed:

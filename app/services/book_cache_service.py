@@ -68,11 +68,8 @@ class WholeBookCacheService:
             await self._notify(on_progress, progress)
             return progress
         finally:
-            closed = set()
             for engine in engines:
-                if id(engine.js) not in closed:
-                    engine.js.close()
-                    closed.add(id(engine.js))
+                await engine.aclose()
 
     @staticmethod
     def _prepare_engine(engine, book) -> None:

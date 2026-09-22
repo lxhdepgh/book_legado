@@ -45,7 +45,7 @@ async def check_source(index: int, source: BookSource, timeout: float) -> dict:
     if not str(source.searchUrl or "").strip():
         result["status"] = "source_config"
         result["error"] = "missing searchUrl"
-        engine.js.close()
+        await engine.aclose()
         return result
     try:
         books = await asyncio.wait_for(engine.search(source, keyword), timeout)
@@ -96,7 +96,7 @@ async def check_source(index: int, source: BookSource, timeout: float) -> dict:
         result["status"] = status
         result["error"] = f"{type(exc).__name__}: {exc}"[:500]
     finally:
-        engine.js.close()
+        await engine.aclose()
     return result
 
 

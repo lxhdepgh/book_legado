@@ -5120,10 +5120,14 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         captured = []
 
         class Session:
-            def __init__(self, *_args, **kwargs): captured.append(kwargs["headers"])
+            closed = False
+            def __init__(self, *_args, **_kwargs): pass
             async def __aenter__(self): return self
             async def __aexit__(self, *_args): return False
-            def request(self, *_args, **_kwargs): return Response()
+            def request(self, *_args, **kwargs):
+                # Wire headers now travel with the request, not the session.
+                captured.append(kwargs["headers"])
+                return Response()
 
         source = SimpleNamespace(
             bookSourceUrl="https://source", concurrentRate="",
@@ -5162,6 +5166,7 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         sessions, requests = [], []
 
         class Session:
+            closed = False
             def __init__(self, *_args, **kwargs): sessions.append(kwargs)
             async def __aenter__(self): return self
             async def __aexit__(self, *_args): return False
@@ -5186,9 +5191,95 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.last_response["headers"]["content-encoding"],
                          "gzip")
         self.assertFalse(sessions[0]["auto_decompress"])
-        self.assertEqual(sessions[0]["headers"]["Accept-Encoding"], "gzip")
-        self.assertEqual(sessions[1]["headers"].getall("Accept-Encoding"),
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(requests[0]["headers"]["Accept-Encoding"], "gzip")
+        self.assertEqual(requests[1]["headers"].getall("Accept-Encoding"),
                          ["gzip"])
+
+    async def test_a_source_reuses_one_connection_across_requests(self):
+        peers = set()
+
+        async def handler(request):
+            peers.add(request.transport.get_extra_info("peername")[:2])
+            return web.Response(text="ok")
+
+        app = web.Application()
+        app.router.add_get("/page", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        base = f"http://127.0.0.1:{port}"
+        source = SimpleNamespace(bookSourceUrl=base, enabledCookieJar=True,
+                                 header="", concurrentRate="")
+        engine = ReaderEngine()
+        try:
+            await engine._request({"url": base + "/page"}, source)
+            await engine._request({"url": base + "/page"}, source)
+        finally:
+            await engine.aclose()
+            await runner.cleanup()
+        # Both calls came out of the same pooled socket, as OkHttp would.
+        self.assertEqual(len(peers), 1)
+        self.assertEqual(engine._sessions, {})
+
+    async def test_a_dead_pooled_connection_gets_one_extra_attempt(self):
+        class Response:
+            status, charset, content_type = 200, "utf-8", "text/plain"
+            headers, url = {}, "https://host/page"
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return False
+            async def read(self): return b"ok"
+
+        calls = []
+
+        class Session:
+            closed = False
+            def __init__(self, *_args, **_kwargs): pass
+            def request(self, *_args, **_kwargs):
+                calls.append(1)
+                if len(calls) == 1:
+                    raise aiohttp.ServerDisconnectedError("keep-alive 已断开")
+                return Response()
+
+        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.rule_engine.aiohttp.TCPConnector",
+                      lambda **_kwargs: object()):
+            result = await ReaderEngine()._request({"url": "https://host/page"})
+        self.assertEqual(result[0], "ok")
+        self.assertEqual(len(calls), 2)
+
+        class AlwaysDead(Session):
+            def request(self, *_args, **_kwargs):
+                calls.append(1)
+                raise aiohttp.ServerDisconnectedError("keep-alive 已断开")
+
+        calls.clear()
+        with patch("app.services.rule_engine.aiohttp.ClientSession", AlwaysDead), \
+                patch("app.services.rule_engine.aiohttp.TCPConnector",
+                      lambda **_kwargs: object()):
+            with self.assertRaises(RuntimeError):
+                await ReaderEngine()._request({"url": "https://host/page"})
+        # 只补一次：第二条连接同样断开就说明站点真的不可用。
+        self.assertEqual(len(calls), 2)
+
+    async def test_engine_pools_one_session_per_cookie_jar_and_proxy(self):
+        engine = ReaderEngine()
+        first = SimpleNamespace(bookSourceUrl="https://pooled.example")
+        second = SimpleNamespace(bookSourceUrl="https://other.example")
+        cookie_off = SimpleNamespace(bookSourceUrl="https://pooled.example",
+                                     enabledCookieJar=False)
+        plain = engine._session_for(first, "", False)
+        self.assertIs(plain, engine._session_for(first, "", False))
+        self.assertIsNot(plain, engine._session_for(second, "", False))
+        self.assertIsNot(plain, engine._session_for(first, "http://1.2.3.4:8080", False))
+        # 关掉 cookie 罐的书源共用无状态的那个会话。
+        self.assertIs(engine._session_for(cookie_off, "", False),
+                      engine._session_for(None, "", False))
+        await engine.aclose()
+        self.assertTrue(plain.closed)
+        self.assertEqual(engine._sessions, {})
 
     async def test_redirect_method_body_and_cross_origin_authorization(self):
         observed = {}
@@ -5322,6 +5413,7 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         responses = [Response(503, b"retry"), Response(200, b"ok")]
 
         class Session:
+            closed = False
             def __init__(self, *_args, **_kwargs):
                 pass
 
@@ -5356,10 +5448,11 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
                 calls.append(1)
                 return Failure()
 
+        # A pooled engine would keep reusing the session patched above.
         with patch("app.services.rule_engine.aiohttp.ClientSession", FailedSession), \
                 patch("app.services.rule_engine.aiohttp.TCPConnector", lambda **_kwargs: object()):
             with self.assertRaises(RuntimeError):
-                await engine._request({"url": "https://host/page", "retry": 3})
+                await ReaderEngine()._request({"url": "https://host/page", "retry": 3})
         self.assertEqual(len(calls), 1)
 
     def test_url_option_charset_does_not_override_response_decoding(self):
@@ -5603,6 +5696,7 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         sessions, requests = [], []
 
         class Session:
+            closed = False
             def __init__(self, *_args, **kwargs): sessions.append(kwargs)
             async def __aenter__(self): return self
             async def __aexit__(self, *_args): return False
@@ -5658,6 +5752,7 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
                 return b"ok"
 
         class Session:
+            closed = False
             def __init__(self, *_args, **_kwargs): pass
             async def __aenter__(self): return self
             async def __aexit__(self, *_args): return False
@@ -5736,11 +5831,13 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
             async def read(self): return b"ok"
 
         class Session:
-            def __init__(self, *args, **kwargs):
-                captured["headers"] = kwargs.get("headers", {})
+            closed = False
+            def __init__(self, *args, **kwargs): pass
             async def __aenter__(self): return self
             async def __aexit__(self, *_args): return False
-            def request(self, *_args, **_kwargs): return Response()
+            def request(self, *_args, **kwargs):
+                captured["headers"] = kwargs.get("headers", {})
+                return Response()
 
         source = SimpleNamespace(
             bookSourceUrl="https://source.example", enabledCookieJar=True,
@@ -6276,7 +6373,7 @@ class ExploreCategoryTests(unittest.IsolatedAsyncioTestCase):
             compact_books = await engine.explore(source, categories[0], 1)
             table_books = await engine.explore(source, categories[0], 1)
         finally:
-            engine.js.close()
+            await engine.aclose()
 
         self.assertEqual([book.name for book in compact_books], ["第一部", "第二部"])
         self.assertEqual(compact_books[0].url, source.bookSourceUrl + "novel/1.html")
@@ -6449,7 +6546,7 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body, "3132333435")
         self.assertEqual(content_type, "text/plain; charset=utf-8")
         self.assertEqual(final_url, value)
-        engine.js.close()
+        await engine.aclose()
 
     async def test_strict_json_detail_field_runs_inline_templates(self):
         engine = LegadoReadingEngine()
@@ -7631,6 +7728,7 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
             async def read(self): return b"encrypted"
 
         class Session:
+            closed = False
             def __init__(self, *_args, **_kwargs): pass
             async def __aenter__(self): return self
             async def __aexit__(self, *_args): return False

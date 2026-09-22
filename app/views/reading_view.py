@@ -1460,7 +1460,7 @@ class ReadingView(ft.Column):
                         (source, book) for book in books
                         if keyword.casefold() in str(book.name or "").casefold())
                 finally:
-                    engine.js.close()
+                    await engine.aclose()
                     completed += 1
                     # 全量书源可能有上千个，逐条重绘结果列表会把界面拖住。
                     now = time.monotonic()
@@ -1728,7 +1728,7 @@ class ReadingView(ft.Column):
                     exc, retry=lambda: self.page.run_task(
                         self._refresh_shelf_item, item, show_result))
         finally:
-            update_engine.js.close()
+            await update_engine.aclose()
             if show_result:
                 self._render_bookshelf()
                 self.update()
@@ -2310,7 +2310,7 @@ class ReadingView(ft.Column):
             # 预加载失败不能影响当前章节阅读，实际翻页时仍会正常请求。
             return
         finally:
-            prefetch_engine.js.close()
+            await prefetch_engine.aclose()
 
     def _adjacent_chapter(self, direction):
         if not self._current_chapter or not self.chapters:

@@ -279,7 +279,7 @@ async def main():
         for task in asyncio.as_completed(tasks):
             summary_rows.append(await task)
     finally:
-        engine.js.close()
+        await engine.aclose()
 
     summary_rows.sort(key=lambda row: row["index"])
     for row in summary_rows:

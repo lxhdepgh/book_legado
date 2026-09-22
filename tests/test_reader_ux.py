@@ -31,7 +31,7 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.view = ReadingView(service)
 
     async def asyncTearDown(self):
-        self.view.engine.js.close()
+        await self.view.engine.aclose()
         self.directory.cleanup()
 
     async def test_reader_toolbar_is_immersive_and_keeps_core_actions(self):
@@ -126,7 +126,7 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reopened._reader_preferences["line_height"], 2.0)
             self.assertEqual(reopened._reader_document.width, 620.0)
         finally:
-            reopened.engine.js.close()
+            await reopened.engine.aclose()
 
     async def test_invalid_reader_preferences_fall_back_safely(self):
         self.view._reader_preferences_path.write_text(
@@ -138,7 +138,7 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reopened._reader_preferences["line_height"], 1.7)
             self.assertEqual(reopened._reader_document.width, 760)
         finally:
-            reopened.engine.js.close()
+            await reopened.engine.aclose()
 
     async def test_reader_tap_zones_keep_middle_for_chrome(self):
         page = SimpleNamespace(width=1000, platform=ft.PagePlatform.ANDROID)
@@ -309,7 +309,7 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 reopened._reader_preferences["shortcuts"], shortcuts)
         finally:
-            reopened.engine.js.close()
+            await reopened.engine.aclose()
 
     async def test_reader_key_handler_uses_custom_binding(self):
         self.view._reader_preferences["shortcuts"]["previous"] = "home"
@@ -808,6 +808,9 @@ class _SwitchEngineStub:
         self.search = search
         self.js = SimpleNamespace(close=lambda: None)
 
+    async def aclose(self):
+        self.js.close()
+
 
 class _SwitchSearchStub:
     """Canned results per source URL; a gate parks workers for stop tests."""
@@ -861,7 +864,7 @@ class SourceSwitchTests(unittest.IsolatedAsyncioTestCase):
                                return_value=self.page)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.addCleanup(self.view.engine.js.close)
+        self.addAsyncCleanup(self.view.engine.aclose)
         self.addCleanup(self.directory.cleanup)
 
     def _shelve(self, *, origin="https://dead.example",

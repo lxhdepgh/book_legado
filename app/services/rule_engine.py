@@ -687,6 +687,7 @@ class ReaderEngine:
                 "Chrome/119.0.0.0 Safari/537.36")}
         self.cookie_jar = aiohttp.CookieJar(unsafe=True)
         self._source_cookie_jars = {}
+        self._sessions = {}
         self.last_response = None
 
     def create_search_model(self, *, thread_count: int = 16,
@@ -720,6 +721,38 @@ class ReaderEngine:
                     pass
             self._source_cookie_jars[key] = jar
         return jar
+
+    def _session_for(self, source, normalized_proxy: str, socks_proxy: bool):
+        """Reuse one session per cookie jar and proxy, like OkHttp's client.
+
+        One session per request re-resolved DNS and re-dialled TCP/TLS every
+        time; the wire headers still carry the same keep-alive defaults, but
+        they now describe a socket that actually survives between requests.
+        """
+        if (source is None or
+                getattr(source, "enabledCookieJar", True) is not True):
+            jar_key = ""
+        else:
+            jar_key = str(getattr(source, "bookSourceUrl", "") or id(source))
+        key = (jar_key, normalized_proxy)
+        session = self._sessions.get(key)
+        if session is None or session.closed:
+            connector = (ProxyConnector.from_url(normalized_proxy, ssl=False)
+                         if socks_proxy else aiohttp.TCPConnector(ssl=False))
+            session = aiohttp.ClientSession(
+                connector=connector,
+                cookie_jar=self._cookie_jar_for_source(source),
+                auto_decompress=False)
+            self._sessions[key] = session
+        return session
+
+    async def aclose(self) -> None:
+        """Release pooled HTTP sessions and the JS runtime."""
+        for session in list(self._sessions.values()):
+            if not session.closed:
+                await session.close()
+        self._sessions.clear()
+        self.js.close()
 
     @staticmethod
     def _merge_cookie_header(stored: str, request_cookie: str | None) -> str:
@@ -927,7 +960,11 @@ class ReaderEngine:
             return text, content_type, request_url
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         retry_count = self._request_retry_count(request)
-        for attempt in range(retry_count + 1):
+        attempts = retry_count + 1
+        attempt = 0
+        stale_retried = False
+        while attempt < attempts:
+            attempt += 1
             try:
                 headers = dict(self.headers)
                 proxy = None
@@ -940,8 +977,7 @@ class ReaderEngine:
                     headers.update(source_headers)
                 normalized_proxy = self._normalize_proxy(proxy) if proxy else ""
                 socks_proxy = normalized_proxy.startswith(("socks4://", "socks5://"))
-                connector = (ProxyConnector.from_url(normalized_proxy, ssl=False)
-                             if socks_proxy else aiohttp.TCPConnector(ssl=False))
+                session = self._session_for(source, normalized_proxy, socks_proxy)
                 request_headers = request.get("headers") or {}
                 if isinstance(request_headers, str):
                     try: request_headers = json.loads(request_headers)
@@ -978,66 +1014,71 @@ class ReaderEngine:
                 else:
                     request_url = encode_url_query_fields(
                         request_url, str(request.get("charset") or "utf-8"))
-                async with aiohttp.ClientSession(
-                        headers=wire_headers, connector=connector,
-                        cookie_jar=self._cookie_jar_for_source(source),
-                        auto_decompress=False) as session:
-                    kwargs = {"timeout": timeout, "ssl": False, "allow_redirects": True}
-                    # aiohttp natively handles HTTP proxying, including CONNECT
-                    # tunnels for HTTPS. SOCKS must be installed as the session
-                    # connector and must not also be passed as request.proxy.
-                    if normalized_proxy and not socks_proxy:
-                        kwargs["proxy"] = normalized_proxy
-                    if method == "POST":
-                        body = request.get("body") or ""
-                        kwargs["data"] = self._encode_request_body(
-                            body, request.get("charset") or "utf-8",
-                            headers.get("Content-Type", ""))
-                    async with session.request(method, encode_url(request_url), **kwargs) as resp:
-                        raw = await resp.read()
-                        response_headers = {
-                            str(k).lower(): str(v) for k, v in resp.headers.items()}
-                        response_headers_multi = {
-                            str(name).lower(): [str(item) for item in (
-                                resp.headers.getall(name, [])
-                                if hasattr(resp.headers, "getall") else
-                                [resp.headers[name]])]
-                            for name in dict(resp.headers.items())
-                        }
-                        if (transparent_gzip and
-                                response_headers.get("content-encoding", "").lower() == "gzip"):
-                            raw = gzip.decompress(raw)
-                            response_headers.pop("content-encoding", None)
-                            response_headers.pop("content-length", None)
-                            response_headers_multi.pop("content-encoding", None)
-                            response_headers_multi.pop("content-length", None)
-                        if cookie_enabled:
-                            self.js.save_response_cookies(str(resp.url), resp.headers)
-                        self._persist_source_cookie_jar(source)
-                        if request.get("type") is not None:
-                            text = raw.hex()
-                        else:
-                            decoded_raw = self._uncompress_response_body(
-                                raw, resp.headers.get("Content-Type", ""))
-                            text = self._decode_response_body(decoded_raw, resp.charset)
-                            text = self._normalize_response_text(
-                                text, resp.headers.get("Content-Type", ""))
-                        self.last_response = {
-                            "body": text,
-                            "bodyBytes": list(raw),
-                            "headers": response_headers,
-                            "headersMulti": response_headers_multi,
-                            "status": int(resp.status),
-                            "message": str(getattr(resp, "reason", "") or ""),
-                            "protocol": (f"http/{resp.version.major}.{resp.version.minor}"
-                                         if getattr(resp, "version", None) else "http/1.1"),
-                            "responseKind": "str",
-                            "url": str(resp.url),
-                        }
-                        if 200 <= int(resp.status) < 300 or attempt >= retry_count:
-                            return text, resp.content_type or "", str(resp.url)
-            except (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError,
-                    asyncio.TimeoutError) as exc:
+                kwargs = {"timeout": timeout, "ssl": False, "allow_redirects": True}
+                # aiohttp natively handles HTTP proxying, including CONNECT
+                # tunnels for HTTPS. SOCKS must be installed as the session
+                # connector and must not also be passed as request.proxy.
+                if normalized_proxy and not socks_proxy:
+                    kwargs["proxy"] = normalized_proxy
+                if method == "POST":
+                    body = request.get("body") or ""
+                    kwargs["data"] = self._encode_request_body(
+                        body, request.get("charset") or "utf-8",
+                        headers.get("Content-Type", ""))
+                async with session.request(
+                        method, encode_url(request_url),
+                        headers=wire_headers, **kwargs) as resp:
+                    raw = await resp.read()
+                    response_headers = {
+                        str(k).lower(): str(v) for k, v in resp.headers.items()}
+                    response_headers_multi = {
+                        str(name).lower(): [str(item) for item in (
+                            resp.headers.getall(name, [])
+                            if hasattr(resp.headers, "getall") else
+                            [resp.headers[name]])]
+                        for name in dict(resp.headers.items())
+                    }
+                    if (transparent_gzip and
+                            response_headers.get("content-encoding", "").lower() == "gzip"):
+                        raw = gzip.decompress(raw)
+                        response_headers.pop("content-encoding", None)
+                        response_headers.pop("content-length", None)
+                        response_headers_multi.pop("content-encoding", None)
+                        response_headers_multi.pop("content-length", None)
+                    if cookie_enabled:
+                        self.js.save_response_cookies(str(resp.url), resp.headers)
+                    self._persist_source_cookie_jar(source)
+                    if request.get("type") is not None:
+                        text = raw.hex()
+                    else:
+                        decoded_raw = self._uncompress_response_body(
+                            raw, resp.headers.get("Content-Type", ""))
+                        text = self._decode_response_body(decoded_raw, resp.charset)
+                        text = self._normalize_response_text(
+                            text, resp.headers.get("Content-Type", ""))
+                    self.last_response = {
+                        "body": text,
+                        "bodyBytes": list(raw),
+                        "headers": response_headers,
+                        "headersMulti": response_headers_multi,
+                        "status": int(resp.status),
+                        "message": str(getattr(resp, "reason", "") or ""),
+                        "protocol": (f"http/{resp.version.major}.{resp.version.minor}"
+                                     if getattr(resp, "version", None) else "http/1.1"),
+                        "responseKind": "str",
+                        "url": str(resp.url),
+                    }
+                    if 200 <= int(resp.status) < 300 or attempt >= attempts:
+                        return text, resp.content_type or "", str(resp.url)
+            except aiohttp.ServerDisconnectedError as exc:
+                # OkHttp re-dials and replays the call when a pooled keep-alive
+                # connection turns out to be closed already; without the extra
+                # attempt a healthy site would look broken once we reuse sockets.
+                if stale_retried:
+                    raise RuntimeError(f"连接失败：{exc}") from exc
+                stale_retried = True
+                attempts += 1
+            except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as exc:
                 raise RuntimeError(f"连接失败：{exc}") from exc
         raise RuntimeError("request loop ended without a response")
 

@@ -247,7 +247,7 @@ async def check_categories(source, session=None, sem=None, timeout=10,
         return output
     finally:
         if own_engine:
-            engine.js.close()
+            await engine.aclose()
 
 
 def _stage_needs_browser(value) -> bool:
@@ -466,7 +466,7 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
             finally:
                 if not probe_task.done():
                     probe_task.cancel()
-                engine.js.close()
+                await engine.aclose()
             result["tag_total"] = len(result["category_results"])
             result["tag_valid"] = sum(
                 1 for item in result["category_results"] if item["valid"])

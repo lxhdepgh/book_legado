@@ -23,6 +23,11 @@ def _source(**overrides):
     return SimpleNamespace(**values)
 
 
+async def _noop_aclose():
+    """检测/缓存用的引擎替身没有连接池要释放。"""
+    pass
+
+
 class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
     async def test_sources_use_independent_engines_concurrently(self):
         active = 0
@@ -45,6 +50,7 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
         class FakeEngine:
             def __init__(self, **kwargs):
                 self.js = SimpleNamespace(close=lambda: None)
+                self.aclose = _noop_aclose
 
         started = time.perf_counter()
         with patch.object(check_service, "_engine_search_check", fake_search), \
@@ -152,6 +158,7 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
         class FakeEngine:
             def __init__(self, **kwargs):
                 self.js = SimpleNamespace(close=lambda: None)
+                self.aclose = _noop_aclose
 
         with patch.object(check_service, "_engine_search_check", fake_search), \
                 patch.object(check_service, "check_categories", fake_categories), \
@@ -183,6 +190,7 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
         class FakeEngine:
             def __init__(self, **kwargs):
                 self.js = SimpleNamespace(close=lambda: None)
+                self.aclose = _noop_aclose
 
         with patch.object(check_service, "_engine_search_check", fake_search), \
                 patch.object(check_service, "check_categories", fake_categories), \
@@ -211,6 +219,7 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
         class FakeEngine:
             def __init__(self, **kwargs):
                 self.js = SimpleNamespace(close=lambda: None)
+                self.aclose = _noop_aclose
 
         with patch.object(check_service, "_engine_search_check", fake_search), \
                 patch.object(check_service, "_probe_source", fake_probe), \
@@ -244,6 +253,7 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
         class SlowEngine:
             def __init__(self, **kwargs):
                 self.js = SimpleNamespace(close=lambda: None)
+                self.aclose = _noop_aclose
 
             async def book_info(self, source, book):
                 await asyncio.sleep(30)
@@ -275,6 +285,9 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
 
         class HangingEngine:
             js = SimpleNamespace(close=lambda: None)
+
+            async def aclose(self):
+                pass
 
             async def book_info(self, source, book):
                 await asyncio.sleep(30)
@@ -325,6 +338,7 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
         class FakeEngine:
             def __init__(self, **kwargs):
                 self.js = SimpleNamespace(close=lambda: None)
+                self.aclose = _noop_aclose
 
         sources = [_source() for _ in range(8)]
         with patch.object(check_service, "_engine_search_check", fake_search), \
@@ -359,6 +373,7 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
         class FakeEngine:
             def __init__(self, **kwargs):
                 self.js = SimpleNamespace(close=lambda: None)
+                self.aclose = _noop_aclose
 
         with patch.object(check_service, "_engine_search_check", fake_search), \
                 patch.object(check_service, "check_categories", fake_categories), \
@@ -487,6 +502,7 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, **kwargs):
                 seen.update(kwargs)
                 self.js = SimpleNamespace(close=lambda: None)
+                self.aclose = _noop_aclose
 
         async def fake_search(source, engine, timeout):
             return ({"search_status": "no_results", "book_count": 0,
@@ -602,7 +618,7 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
         try:
             await engine.explore(source, ExploreCategory("分类", "/list"))
         finally:
-            engine.js.close()
+            await engine.aclose()
 
         engine._request.assert_awaited_once()
         engine.explore_document.assert_awaited_once_with(

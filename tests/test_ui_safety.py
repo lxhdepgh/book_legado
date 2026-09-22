@@ -132,6 +132,9 @@ class CheckSafetyTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self, **kwargs):
                 self.js = SimpleNamespace(close=lambda: None)
 
+            async def aclose(self):
+                pass
+
         return (patch.object(check_service, "_probe_source", probe),
                 patch.object(check_service, "_engine_search_check", search),
                 patch.object(check_service, "LegadoReadingEngine", Engine))
