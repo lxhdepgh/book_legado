@@ -3,17 +3,17 @@
 A rule carrying a ``webView`` URL option or a ``webJs`` script cannot be
 answered by plain HTTP: the page builds its content with JavaScript, or it is
 behind a challenge.  Legado hands those to a real WebView.  This module is the
-desktop equivalent and owns every stateful part of that conversation — the
-silent built-in browser attempt, the in-app WebView (Android/iOS/macOS), the
-controlled Edge window (Windows), the wait loop for ``webJs`` rules, the
-``sourceRegex``/``overrideUrlRegex`` sniffer modes, and the captcha dialog.
+equivalent and owns every stateful part of that conversation — the silent
+built-in browser attempt, the in-app WebView (Android/iOS/macOS), the screen
+cast of a real browser on the platforms that have no WebView control, the wait
+loop for ``webJs`` rules, the ``sourceRegex``/``overrideUrlRegex`` sniffer
+modes, and the captcha dialog.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import json
-from pathlib import Path
 import re
 import uuid
 
@@ -21,8 +21,8 @@ import flet as ft
 
 from app import platform_support
 from app.services.block_pages import block_reason
-from app.services.desktop_browser import EdgeCdpSession
-from app.services.headless_browser import available_fetcher
+from app.services.headless_browser import BROWSER, available_fetcher
+from app.services.interactive_browser import VIEWPORT, InteractiveBrowser
 
 
 def looks_like_gate(html: str) -> bool:
@@ -41,12 +41,12 @@ def looks_like_gate(html: str) -> bool:
 class WebPageRenderer:
     """Fetch a page through a browser; fall back to asking the user to clear a gate."""
 
-    def __init__(self, page_provider, cache_dir: str | Path | None = None,
-                 set_status=None):
+    def __init__(self, page_provider, set_status=None):
         self._page_provider = page_provider
-        self._cache_dir = Path(cache_dir) if cache_dir is not None else None
         self._set_status = set_status or (lambda _text: None)
         self._view = None
+        self._stream_view = None
+        self._typed_text = None
         self._desktop = None
         self._future = None
         self._marker = ""
@@ -85,17 +85,7 @@ class WebPageRenderer:
         self._override_regex = str(options.get("overrideUrlRegex") or "")
         self._html = str(options.get("html") or "")
         self._initial_url = str(url)
-        if platform_support.is_windows_page(page):
-            self._desktop = EdgeCdpSession(
-                (self._cache_dir or Path.cwd()) / "edge-webview-profile")
-            await self._desktop.start(url)
-            dialog_content = ft.Container(
-                width=400, height=150,
-                content=ft.Column([
-                    ft.Icon(ft.Icons.OPEN_IN_NEW, size=42),
-                    ft.Text("验证页面已在 Microsoft Edge 中打开。完成登录或人机验证后，返回此处读取页面。"),
-                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER))
-        elif platform_support.supports_in_app_webview(page):
+        if platform_support.supports_in_app_webview(page):
             import flet_webview as ftw
             self._view = ftw.WebView(
                 url=url, expand=True,
@@ -103,6 +93,8 @@ class WebPageRenderer:
                 on_console_message=self._on_console_message,
                 on_web_resource_error=self._on_resource_error)
             dialog_content = ft.Container(width=400, height=620, content=self._view)
+        elif platform_support.is_desktop_page(page):
+            dialog_content = await self._start_stream(url, options)
         else:
             raise RuntimeError("当前平台没有可用的网页验证组件")
         dialog = ft.AlertDialog(
@@ -126,6 +118,8 @@ class WebPageRenderer:
                 self._desktop = None
             self._future = None
             self._view = None
+            self._stream_view = None
+            self._typed_text = None
             self._capture_pending = False
             self._rule_mode = False
             self._script = ""
@@ -167,6 +161,106 @@ class WebPageRenderer:
             self._verification_future = None
             self._verification_input = None
             self._verification_dialog = None
+
+    # ── desktop: a live cast instead of an in-app WebView control ────────
+
+    async def _start_stream(self, url, options):
+        """Show the page as a live cast and forward the reader's input to it."""
+        if available_fetcher() is None:
+            raise RuntimeError("内置 Chromium 内核不可用，无法在应用内打开验证页"
+                               "（python -m playwright install chromium）")
+        self._stream_view = ft.Image(
+            src="", width=VIEWPORT["width"], height=VIEWPORT["height"],
+            fit=ft.BoxFit.FILL)
+        self._typed_text = ft.TextField(
+            label="输入到网页的文字", width=250, dense=True,
+            on_submit=self._submit_typed_text)
+        self._desktop = InteractiveBrowser(on_frame=self._push_frame)
+        await self._desktop.start(url, options)
+        return ft.Container(width=VIEWPORT["width"], content=ft.Column([
+            ft.GestureDetector(
+                content=self._stream_view,
+                on_tap_down=self._on_stream_tap,
+                on_secondary_tap_down=self._on_stream_secondary_tap,
+                on_scroll=self._on_stream_scroll,
+                on_pan_start=self._on_stream_pan_start,
+                on_pan_update=self._on_stream_pan_update,
+                on_pan_end=self._on_stream_pan_end,
+                on_pan_cancel=self._on_stream_pan_end),
+            ft.Text("点击网页输入框后，在这里输入并回车；拖动可操作滑块",
+                    size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+            ft.Row([self._typed_text,
+                    ft.Button("输入", on_click=self._submit_typed_text)],
+                   alignment=ft.MainAxisAlignment.CENTER),
+        ], tight=True))
+
+    def _push_frame(self, data: bytes) -> None:
+        view = self._stream_view
+        if view is None or not data:
+            return
+        view.src = "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+        page = self._page_provider()
+        if page is not None:
+            try:
+                page.update()
+            except Exception:
+                pass
+
+    def _stream_point(self, event):
+        """A cast coordinate from a Flet gesture position, or None."""
+        view, browser = self._stream_view, self._desktop
+        position = getattr(event, "local_position", None)
+        if view is None or browser is None or position is None:
+            return None
+        width, height = browser.cast_viewport()
+        return (position.x * width / float(view.width),
+                position.y * height / float(view.height))
+
+    def _run_on_stream(self, action, *args) -> None:
+        page = self._page_provider()
+        if self._desktop is None or page is None:
+            return
+        page.run_task(action, *args)
+
+    def _on_stream_tap(self, event):
+        self._tap_stream(event, "left")
+
+    def _on_stream_secondary_tap(self, event):
+        self._tap_stream(event, "right")
+
+    def _tap_stream(self, event, button: str) -> None:
+        point = self._stream_point(event)
+        if point is not None:
+            self._run_on_stream(self._desktop.tap, point[0], point[1], button)
+
+    def _on_stream_scroll(self, event):
+        delta = getattr(event, "scroll_delta", None)
+        point = self._stream_point(event)
+        if delta is not None and point is not None:
+            self._run_on_stream(self._desktop.scroll, point[0], point[1],
+                                delta.x, delta.y)
+
+    def _on_stream_pan_start(self, event):
+        point = self._stream_point(event)
+        if point is not None:
+            self._run_on_stream(self._desktop.press, point[0], point[1])
+
+    def _on_stream_pan_update(self, event):
+        point = self._stream_point(event)
+        if point is not None:
+            self._run_on_stream(self._desktop.move_to, point[0], point[1])
+
+    def _on_stream_pan_end(self, _event):
+        self._run_on_stream(self._desktop.release)
+
+    def _submit_typed_text(self, _):
+        field, page = self._typed_text, self._page_provider()
+        text = str(getattr(field, "value", "") or "")
+        if not text or self._desktop is None or page is None:
+            return
+        field.value = ""
+        page.update()
+        page.run_task(self._desktop.type_text, text)
 
     async def _render_silently(self, url, options):
         """Render through the built-in browser first: that needs no human.
@@ -234,6 +328,7 @@ class WebPageRenderer:
                 if js_result is None:
                     return
                 if not self._future.done():
+                    await self._hand_over_cookies(response)
                     self._future.set_result(response)
                 self._page_provider().pop_dialog()
                 return
@@ -244,10 +339,21 @@ class WebPageRenderer:
                 self._set_status("网页验证尚未完成，请完成验证后再次读取页面")
                 return
             if not self._future.done():
+                await self._hand_over_cookies(response)
                 self._future.set_result(response)
             self._page_provider().pop_dialog()
         except Exception as exc:
-            self._set_status(f"读取 Edge 页面失败：{exc}")
+            self._set_status(f"读取内置浏览器页面失败：{exc}")
+
+    @staticmethod
+    async def _hand_over_cookies(response) -> None:
+        """Let the silent profile reuse the clearance this window just earned.
+
+        The two browsers cannot share a profile — Chromium locks it to the
+        process holding it — so a gate solved here would otherwise be asked
+        again on the next silent render.
+        """
+        await BROWSER.adopt_cookies(response.get("cookies") or [])
 
     async def _capture_dom(self):
         if not self._view or not self._future:

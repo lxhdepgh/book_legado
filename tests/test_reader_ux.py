@@ -1,5 +1,6 @@
 import json
 import asyncio
+import base64
 import unittest
 import flet as ft
 from pathlib import Path
@@ -14,6 +15,7 @@ from app.services.reading_engine import (ChapterContent, ContentBlock,
                                          parse_content_blocks)
 from app.services.rule_engine import (BookItem, ChapterItem, UnsupportedRule)
 from app.services.source_service import SourceService
+from app.services.interactive_browser import VIEWPORT
 from app.views.reading_view import ReadingView
 from app.services.web_page_renderer import WebPageRenderer, looks_like_gate
 from app.app import BookSourceApp
@@ -1150,6 +1152,210 @@ class BuiltinBrowserFallbackTests(unittest.IsolatedAsyncioTestCase):
         article = ("<html><body><p>" + "正文。" * 2000
                    + "</p><a href='/login'>登录</a></body></html>")
         self.assertFalse(looks_like_gate(article))
+
+
+class _FakeCastBrowser:
+    """Records what the dialog asked the screen cast to do."""
+
+    def __init__(self):
+        self.started = []
+        self.input = []
+        self.viewport = (400, 480)
+        self.closed = False
+        self.response = {"body": "<p>chapter</p>", "cookies": [{"name": "cf",
+                                                                "value": "1"}]}
+
+    async def start(self, url, options=None):
+        self.started.append((url, options))
+
+    def cast_viewport(self):
+        return self.viewport
+
+    async def tap(self, x, y, button="left"):
+        self.input.append(("tap", x, y, button))
+
+    async def press(self, x, y):
+        self.input.append(("press", x, y))
+
+    async def move_to(self, x, y):
+        self.input.append(("move", x, y))
+
+    async def release(self):
+        self.input.append(("release",))
+
+    async def scroll(self, x, y, delta_x, delta_y):
+        self.input.append(("scroll", x, y, delta_x, delta_y))
+
+    async def type_text(self, text):
+        self.input.append(("type", text))
+
+    async def capture(self, *_args):
+        return self.response
+
+    async def close(self):
+        self.closed = True
+
+
+class ScreencastDialogTests(unittest.IsolatedAsyncioTestCase):
+    """The desktop fallback: a cast page inside the dialog, driven by gestures."""
+
+    def setUp(self):
+        self.browser = _FakeCastBrowser()
+        self.statuses = []
+        self.dialogs = []
+        self.tasks = []
+
+        def run_task(function, *args):
+            task = asyncio.ensure_future(function(*args))
+            self.tasks.append(task)
+            return task
+
+        self.page = SimpleNamespace(
+            platform=ft.PagePlatform.WINDOWS,
+            show_dialog=self.dialogs.append,
+            pop_dialog=lambda: self.dialogs.pop(),
+            run_task=run_task,
+            update=lambda: None)
+        self.renderer = WebPageRenderer(lambda: self.page, self.statuses.append)
+
+    def _patches(self, fetcher=object()):
+        return [
+            patch("app.services.web_page_renderer.available_fetcher",
+                  return_value=fetcher),
+            patch("app.services.web_page_renderer.InteractiveBrowser",
+                  lambda **_kwargs: self.browser),
+        ]
+
+    async def _start_stream(self, url="https://host/gate", options=None):
+        with self._patches()[0], self._patches()[1]:
+            return await self.renderer._start_stream(url, options or {})
+
+    async def test_the_dialog_carries_a_live_cast_an_input_row_and_a_hint(self):
+        content = await self._start_stream(
+            options={"headerMap": {"Referer": "https://host/"}})
+        self.assertEqual(self.browser.started,
+                         [("https://host/gate",
+                           {"headerMap": {"Referer": "https://host/"}})])
+        self.assertEqual(content.width, VIEWPORT["width"])
+        detector = content.content.controls[0]
+        self.assertIsInstance(detector, ft.GestureDetector)
+        self.assertIsInstance(detector.content, ft.Image)
+        self.assertEqual(detector.on_tap_down, self.renderer._on_stream_tap)
+        self.assertEqual(detector.on_secondary_tap_down,
+                         self.renderer._on_stream_secondary_tap)
+        self.assertEqual(detector.on_scroll, self.renderer._on_stream_scroll)
+        self.assertEqual(detector.on_pan_start,
+                         self.renderer._on_stream_pan_start)
+        self.assertEqual(detector.on_pan_update,
+                         self.renderer._on_stream_pan_update)
+        self.assertEqual(detector.on_pan_end, self.renderer._on_stream_pan_end)
+        row = content.content.controls[2]
+        self.assertEqual(row.controls[0], self.renderer._typed_text)
+        self.assertEqual(row.controls[1].content, "输入")
+
+    async def test_a_cast_frame_becomes_a_jpeg_data_uri(self):
+        await self._start_stream()
+        self.renderer._push_frame(b"\xff\xd8jpeg")
+        self.assertEqual(
+            self.renderer._stream_view.src,
+            "data:image/jpeg;base64," + base64.b64encode(b"\xff\xd8jpeg").decode())
+
+    async def test_gestures_are_scaled_from_the_control_onto_the_cast(self):
+        await self._start_stream()
+        # The control is half the cast, so a gesture arrives at twice the point.
+        view = self.renderer._stream_view
+        view.width, view.height = 200, 240
+        event = SimpleNamespace(local_position=ft.Offset(10, 20))
+        self.renderer._on_stream_tap(event)
+        self.renderer._on_stream_scroll(
+            SimpleNamespace(local_position=ft.Offset(10, 20),
+                            scroll_delta=ft.Offset(0, 40)))
+        self.renderer._on_stream_pan_start(event)
+        self.renderer._on_stream_pan_update(event)
+        self.renderer._on_stream_pan_end(event)
+        await asyncio.sleep(0)
+        self.assertEqual(self.browser.input, [
+            ("tap", 20.0, 40.0, "left"),
+            ("scroll", 20.0, 40.0, 0.0, 40.0),
+            ("press", 20.0, 40.0),
+            ("move", 20.0, 40.0),
+            ("release",)])
+
+    async def test_a_secondary_tap_reaches_the_page_as_a_right_click(self):
+        await self._start_stream()
+        self.renderer._on_stream_secondary_tap(
+            SimpleNamespace(local_position=ft.Offset(5, 6)))
+        await asyncio.sleep(0)
+        self.assertEqual(self.browser.input, [("tap", 5.0, 6.0, "right")])
+
+    async def test_typed_text_is_sent_and_the_field_is_cleared(self):
+        await self._start_stream()
+        self.renderer._typed_text.value = "1234"
+        self.renderer._submit_typed_text(None)
+        await asyncio.sleep(0)
+        self.assertEqual(self.renderer._typed_text.value, "")
+        self.assertEqual(self.browser.input, [("type", "1234")])
+
+    async def test_an_empty_submission_is_not_sent(self):
+        await self._start_stream()
+        self.renderer._typed_text.value = ""
+        self.renderer._submit_typed_text(None)
+        await asyncio.sleep(0)
+        self.assertEqual(self.browser.input, [])
+
+    async def test_a_read_page_hands_its_cookies_to_the_silent_browser(self):
+        await self._start_stream()
+        self.renderer._future = asyncio.get_running_loop().create_future()
+        adopt = AsyncMock()
+        with patch("app.services.web_page_renderer.BROWSER",
+                   SimpleNamespace(adopt_cookies=adopt)):
+            await self.renderer._capture_desktop()
+        adopt.assert_awaited_once_with([{"name": "cf", "value": "1"}])
+        self.assertEqual(self.renderer._future.result()["body"], "<p>chapter</p>")
+        self.assertEqual(self.dialogs, [])
+
+    async def test_an_unsolved_gate_keeps_the_dialog_open(self):
+        await self._start_stream()
+        self.renderer._future = asyncio.get_running_loop().create_future()
+        self.browser.response = {"body": "<html><title>Just a moment</title>",
+                                 "cookies": []}
+        adopt = AsyncMock()
+        with patch("app.services.web_page_renderer.BROWSER",
+                   SimpleNamespace(adopt_cookies=adopt)):
+            await self.renderer._capture_desktop()
+        self.assertFalse(self.renderer._future.done())
+        adopt.assert_not_awaited()
+        self.assertIn("尚未完成", self.statuses[-1])
+
+    async def test_a_failed_read_is_reported_instead_of_crashing_the_dialog(self):
+        await self._start_stream()
+        self.renderer._future = asyncio.get_running_loop().create_future()
+        self.browser.capture = AsyncMock(side_effect=RuntimeError("page gone"))
+        await self.renderer._capture_desktop()
+        self.assertFalse(self.renderer._future.done())
+        self.assertEqual(self.statuses[-1], "读取内置浏览器页面失败：page gone")
+
+    async def test_the_cast_is_closed_once_the_page_has_been_read(self):
+        with self._patches()[0], self._patches()[1], \
+                patch.object(WebPageRenderer, "_render_silently",
+                             AsyncMock(return_value=None)):
+            task = asyncio.create_task(self.renderer.render(
+                "https://host/gate", SimpleNamespace(bookSourceName="Test"), {}))
+            for _ in range(10):
+                if self.dialogs:
+                    break
+                await asyncio.sleep(0)
+            await self.renderer._capture_desktop()
+            result = await task
+        self.assertEqual(result["body"], "<p>chapter</p>")
+        self.assertTrue(self.browser.closed)
+        self.assertIsNone(self.renderer._desktop)
+
+    async def test_a_missing_kernel_says_how_to_install_it(self):
+        with self._patches(fetcher=None)[0]:
+            with self.assertRaises(RuntimeError) as caught:
+                await self.renderer._start_stream("https://host/gate", {})
+        self.assertIn("playwright install chromium", str(caught.exception))
 
 
 if __name__ == "__main__":

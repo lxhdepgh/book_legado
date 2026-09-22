@@ -43,10 +43,6 @@ def is_desktop_page(page) -> bool:
     return page_platform(page) in _DESKTOP_PAGES
 
 
-def is_windows_page(page) -> bool:
-    return page_platform(page) == ft.PagePlatform.WINDOWS
-
-
 def supports_in_app_webview(page) -> bool:
     """True when ``flet_webview`` can render a page inside the app window."""
     return page_platform(page) in _IN_APP_WEBVIEW_PAGES

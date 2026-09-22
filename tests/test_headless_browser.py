@@ -17,8 +17,8 @@ from app.models.book_source import BookSource
 from app.services import check_service
 from app.services import headless_browser
 from app.services.headless_browser import (
-    DEFAULT_SCRIPT, HeadlessBrowser, _with_base, cookie_header,
-    default_user_agent, headless_fetch)
+    DEFAULT_SCRIPT, HeadlessBrowser, cookie_header, default_user_agent,
+    headless_fetch, with_base_url)
 
 
 class _FakeRequest:
@@ -251,6 +251,32 @@ class _BrowserTestCase(unittest.IsolatedAsyncioTestCase):
         await self.browser._route_handler(route)
         self.assertTrue(route.continued)
 
+    async def test_cookies_from_the_visible_window_reach_the_silent_profile(self):
+        context = _FakeContext(_FakePage())
+        context.cookies_added = []
+
+        async def add_cookies(entries):
+            context.cookies_added.append(entries)
+
+        context.add_cookies = add_cookies
+        with patch.object(self.browser, "_ensure_browser",
+                          AsyncMock(return_value=context)):
+            await self.browser.adopt_cookies([
+                {"name": "cf", "value": "1", "domain": ".site.example",
+                 "path": "/", "httpOnly": True, "unrelated": "dropped"},
+                {"name": "hostonly", "value": "2"},
+                {"value": "nameless"},
+            ])
+        self.assertEqual(context.cookies_added, [[
+            {"name": "cf", "value": "1", "domain": ".site.example",
+             "path": "/", "httpOnly": True}]])
+
+    async def test_an_empty_cookie_list_never_starts_the_browser(self):
+        with patch.object(self.browser, "_ensure_browser", AsyncMock()) as ensure:
+            await self.browser.adopt_cookies([])
+            await self.browser.adopt_cookies(None)
+        ensure.assert_not_awaited()
+
 
 class _HelperTests(unittest.TestCase):
     def test_cookie_header_covers_the_host_and_its_subdomains(self):
@@ -262,16 +288,16 @@ class _HelperTests(unittest.TestCase):
         self.assertEqual(cookie_header(cookies, "https://other.example/x"), "c=3")
 
     def test_a_base_tag_is_injected_only_once(self):
-        self.assertEqual(_with_base('<html><head></head><body></body></html>',
+        self.assertEqual(with_base_url('<html><head></head><body></body></html>',
                                     "https://site.example/x"),
                          '<html><head><base href="https://site.example/x">'
                          '</head><body></body></html>')
-        self.assertEqual(_with_base('<html><head><base href="/y"></head></html>',
+        self.assertEqual(with_base_url('<html><head><base href="/y"></head></html>',
                                     "https://site.example/x"),
                          '<html><head><base href="/y"></head></html>')
-        self.assertEqual(_with_base("<p>bare</p>", "https://site.example/x"),
+        self.assertEqual(with_base_url("<p>bare</p>", "https://site.example/x"),
                          '<base href="https://site.example/x"><p>bare</p>')
-        self.assertEqual(_with_base("<p>bare</p>", ""), "<p>bare</p>")
+        self.assertEqual(with_base_url("<p>bare</p>", ""), "<p>bare</p>")
 
     def test_the_user_agent_does_not_advertise_headless_chrome(self):
         self.assertNotIn("Headless", default_user_agent())

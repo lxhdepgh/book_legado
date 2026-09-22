@@ -44,14 +44,13 @@ class SourceService:
 
     def _migrate_legacy_cache_dirs(self) -> None:
         """Copy caches created by older versions under data_dir."""
-        for name in ("reader-cache", "edge-webview-profile"):
-            old = self.data_dir / name
-            new = self.cache_dir / name
-            if old.exists() and not new.exists():
-                try:
-                    shutil.copytree(old, new)
-                except OSError:
-                    pass
+        old = self.data_dir / "reader-cache"
+        new = self.cache_dir / "reader-cache"
+        if old.exists() and not new.exists():
+            try:
+                shutil.copytree(old, new)
+            except OSError:
+                pass
 
     def _migrate_legacy_data_dir(self) -> None:
         legacy = Path.home() / ".legado_booksource_check"

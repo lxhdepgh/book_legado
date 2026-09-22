@@ -86,7 +86,7 @@ def cookie_header(cookies: list[dict], url: str) -> str:
     return "; ".join(values)
 
 
-def _with_base(html: str, base_url: str) -> str:
+def with_base_url(html: str, base_url: str) -> str:
     """Mirror ``WebView.loadDataWithBaseURL``: the markup keeps its origin."""
     if not base_url or re.search(r"(?i)<base\b", html[:4096]):
         return html
@@ -181,6 +181,41 @@ class HeadlessBrowser:
             except Exception:
                 pass
 
+    async def adopt_cookies(self, cookies) -> None:
+        """Take over cookies a challenge in the interactive window produced.
+
+        The interactive browser cannot share this profile — a Chromium profile
+        is locked by the process holding it — so a gate the reader passed there
+        would otherwise be asked again on the next silent render.
+        """
+        if not cookies:
+            return
+        self._ensure_thread()
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        try:
+            await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(
+                self._adopt_cookies(cookies), loop))
+        except Exception:
+            pass
+
+    async def _adopt_cookies(self, cookies) -> None:
+        context = await self._ensure_browser()
+        entries = []
+        for item in cookies or []:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            # Playwright wants a domain and a path; a host-only cookie still
+            # carries its host there, and one without it would fail the batch.
+            if not item.get("domain"):
+                continue
+            entries.append({key: item[key] for key in (
+                "name", "value", "domain", "path", "expires", "httpOnly",
+                "secure", "sameSite") if key in item})
+        if entries:
+            await context.add_cookies(entries)
+
     async def fetch(self, url, options=None) -> dict:
         """Render one URL and return a browser-response mapping."""
         self._ensure_thread()
@@ -223,7 +258,7 @@ class HeadlessBrowser:
                 base_url = str(options.get("initialUrl") or url or "")
                 document_url = base_url if html else ""
                 if html:
-                    await page.set_content(_with_base(html, base_url),
+                    await page.set_content(with_base_url(html, base_url),
                                            wait_until="domcontentloaded")
                 elif url:
                     await page.goto(url, wait_until="domcontentloaded")

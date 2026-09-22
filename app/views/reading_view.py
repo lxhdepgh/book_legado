@@ -41,7 +41,6 @@ class ReadingView(ft.Column):
         self.discovery_only = discovery_only
         self.renderer = WebPageRenderer(
             lambda: platform_support.attached_page(self),
-            getattr(service, "cache_dir", service.data_dir),
             self._set_webview_hint)
         self.engine = LegadoReadingEngine(
             webview_fetcher=self.renderer.render,

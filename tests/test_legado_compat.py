@@ -36,7 +36,6 @@ from app.services.legado_rule_parser import (JavaDateValue, _jsoup_html_markup,
                                               select_jsoup,
                                               split_rule_expression)
 from app.services.compat_audit import SUPPORTED_JAVA_APIS, SUPPORTED_OBJECT_APIS
-from app.services.desktop_browser import EdgeCdpSession
 from app.services.icu_charset import detect_charset
 from app.services.legado_js import (JsBridgeError, JsContext, LegadoJsRuntime,
                                     classify_js_bridge_error)
@@ -6984,14 +6983,6 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
             ("browser", "https://source/redirect", "posted")])
         self.assertEqual(value, ("rendered", "text/html",
                                  "https://source/redirect/web"))
-
-    async def test_edge_cookie_header_only_includes_matching_domain(self):
-        cookies = [
-            {"name": "a", "value": "1", "domain": ".example.com"},
-            {"name": "b", "value": "2", "domain": "other.test"},
-        ]
-        self.assertEqual(EdgeCdpSession.cookie_header(
-            cookies, "https://www.example.com/book"), "a=1")
 
     async def test_login_ui_schema_and_action_share_login_url_scope(self):
         engine = LegadoReadingEngine()

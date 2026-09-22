@@ -20,7 +20,7 @@ python -m pytest tests/test_legado_compat.py -q   # 单文件
 |---|---|---|
 | 无人值守渲染 | 内置无头 Chromium（Playwright） | Windows / Linux / macOS |
 | 需要人处理（登录、验证码、质询页） | 应用窗口内的 `ftw.WebView` | Android / iOS / macOS |
-| 需要人处理（同上） | 弹出 Microsoft Edge 窗口并读取当前页 | Windows |
+| 需要人处理（同上） | 投屏进应用窗口的内置 Chromium（CDP screencast） | Windows / Linux |
 
 ```powershell
 conda activate legodo_booksource_check
@@ -32,7 +32,10 @@ python -m playwright install chromium     # 内核不入库，须单独下载
 - 内核位置：`%LOCALAPPDATA%\ms-playwright`（可用 `PLAYWRIGHT_BROWSERS_PATH` 覆盖）。
 - 用户配置目录：缓存目录下的 `chromium-profile/`，登录态和验证结果跨启动保留。
 - 内核缺失时 `available_fetcher()` 返回 `None`，检测与阅读都退回到原有行为（网页阶段记为"需浏览器未抽检"），不会报错。
+- 投屏窗口用独立配置目录 `chromium-interactive-profile/`（Chromium 的 profile 被持有它的进程锁定，不能与无头共用）。人在投屏里通过验证后，Cookie 会转交无头配置，之后的静默渲染不再重复要验证。
+- 投屏只支持点击、右键、滚轮、拖拽和键盘输入这几种操作，滑块类验证码靠拖拽完成；窗口本身停在桌面可视区域外，不会抢占前台。
 - `tests/test_headless_browser.py` 的 `_RealRenderTests` 与 `_PipelineWiringTests` 需要内核，未安装时自动跳过；其余用例用假页面驱动，不联网、不启动浏览器。
+- `tests/test_interactive_browser.py` 的 `_RealCastTests` 同样需要内核：它用 `data:` 页面验证投屏能出帧、点击能落到页面上。
 
 ## 2. 测试目录说明（待补充各文件覆盖范围）
 

@@ -27,8 +27,8 @@ Thumbs.db
 # Runtime/user data must stay outside source control
 bookshelf.json
 reader-cache/
-edge-webview-profile/
 chromium-profile/
+chromium-interactive-profile/
 
 # Local book-source corpora under resource/ are user data, not source
 resource/*.json
