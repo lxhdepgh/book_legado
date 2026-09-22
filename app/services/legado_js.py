@@ -515,6 +515,8 @@ class LegadoJsRuntime:
         ctx.add_callable("__bytesstr", self._bytes_to_string)
         ctx.add_callable("__strbytes", self._string_to_bytes)
         ctx.add_callable("__uuid", lambda: str(uuid.uuid4()))
+        ctx.add_callable("__random_bytes", lambda count: json.dumps(
+            list(os.urandom(max(0, int(count))))))
         ctx.add_callable("__time_format", lambda value, pattern, utc=False:
                          self._bridge_call(self._time_format, value, pattern, utc))
         ctx.add_callable("__tz_offset", self._timezone_offset_minutes)
@@ -621,6 +623,7 @@ class LegadoJsRuntime:
         ctx.add_callable("__b64encode_bytes", self._base64_encode_bytes)
         ctx.add_callable("__bitmap_decode", self._bitmap_decode)
         ctx.add_callable("__bitmap_info", self._bitmap_info)
+        ctx.add_callable("__bitmap_pixel", self._bitmap_pixel)
         ctx.add_callable("__bitmap_crop", self._bitmap_crop)
         ctx.add_callable("__bitmap_create", self._bitmap_create)
         ctx.add_callable("__bitmap_draw", self._bitmap_draw)
@@ -1761,17 +1764,25 @@ class LegadoJsRuntime:
           }};
           return api;
         }}
+        // Jsoup 在 Java 里是类，做成函数才能让 importClass(Jsoup) 的引用比较成立。
+        function __Jsoup() {{}}
+        __Jsoup.parse=(html,location)=>__document(html,location);
+        __Jsoup.connect=url=>__jsoupConnect(url);
         var org = {{jsoup: {{
-          Jsoup: {{
-            parse: (html,location) => __document(html,location),
-            connect: url => __jsoupConnect(url)
-          }},
+          Jsoup: __Jsoup,
           nodes: {{Document:function(){{}},Element:function(){{}}}}
         }}}};
         org.jsoup.nodes.Document.OutputSettings={{Syntax:{{html:'html',xml:'xml'}}}};
         org.jsoup.nodes.Document.QuirksMode={{noQuirks:'noQuirks',quirks:'quirks',
           limitedQuirks:'limitedQuirks'}};
         org.jsoup.nodes.Range={{Untracked:__untrackedRange}};
+        // Jsoup.parse 的第三个参数只用来切换解析器对象，文档树仍由本运行时的
+        // HTML 解析器构建（见 __document）。
+        const __jsoupParser=name=>({{getName:()=>name,toString:()=>'org.jsoup.parser.Parser@'+name}});
+        org.jsoup.parser={{Parser:{{
+          htmlParser:()=>__jsoupParser('html'),
+          xmlParser:()=>__jsoupParser('xml')
+        }}}};
         org.jsoup.nodes.Entities={{EscapeMode:{{xhtml:'xhtml',base:'base',extended:'extended'}}}};
         org.jsoup.select={{NodeFilter:{{FilterResult:{{CONTINUE:'CONTINUE',SKIP_CHILDREN:'SKIP_CHILDREN',
           SKIP_ENTIRELY:'SKIP_ENTIRELY',REMOVE:'REMOVE',STOP:'STOP'}}}},NodeVisitor:function(){{}}}};
@@ -1962,6 +1973,7 @@ class LegadoJsRuntime:
           const api = {{__bitmap:String(handle)}};
           api.getWidth = () => JSON.parse(__bitmap_info(api.__bitmap))[0];
           api.getHeight = () => JSON.parse(__bitmap_info(api.__bitmap))[1];
+          api.getPixel = (x,y) => __bitmap_pixel(api.__bitmap,Number(x),Number(y));
           api.compress = (format,quality,stream) => {{
             stream._bytes = JSON.parse(__bitmap_encode(api.__bitmap,String(format),Number(quality)));
             return true;
@@ -2020,7 +2032,9 @@ class LegadoJsRuntime:
             .toString(16).padStart(2,'0')).join('').toUpperCase(),
           parseHexBinary:value=>__byteArray(JSON.parse(__hexbytes(String(value))))
         }};
-        const Packages = {{java:{{}},javax:{{}},android:{{}},cn:{{}},org:org,io:{{}}}};
+        const __javaNamespaceOriginals=new WeakMap();
+        const Packages = __javaNamespace('', {{java:{{}},javax:{{}},android:{{}},cn:{{}},
+          org:org,io:{{}}}});
         const __Throwable=__javaException('java.lang.Throwable');
         const __Exception=__javaException('java.lang.Exception');
         __Exception.prototype=Object.create(__Throwable.prototype);
@@ -2055,14 +2069,63 @@ class LegadoJsRuntime:
           error.toString=function(){{return 'JavaException: '+String(javaException)}};
           return error;
         }}
-        function __javaPackage(name) {{
-          const target={{toString:()=> '[JavaPackage '+name+']'}};
-          return new Proxy(target,{{get:(object,key)=>{{
-            if(key==='toString'||key==='valueOf')return object.toString;
-            if(key===Symbol.toPrimitive)return object.toString;
-            return __javaPackage(name+'.'+String(key));
-          }}}});
+        function __unsupportedJavaApi(path) {{
+          const error=new Error('未实现的 Java API：Packages.'+path
+            +'，本运行时未模拟该接口');
+          error.name='UnsupportedJavaApiError';
+          error.javaApi='Packages.'+path;
+          return error;
         }}
+        function __javaInterface(name) {{
+          const target=function(){{throw __unsupportedJavaApi(name);}};
+          target.toString=()=>'[JavaInterface '+name+']';
+          Object.defineProperty(target,'name',{{value:String(name).split('.').pop()}});
+          return target;
+        }}
+        function __javaMember(path) {{
+          // 未模拟的成员必须保持「可探测」——typeof 仍是 function、取值仍为真——
+          // 只在真正调用或实例化的那一刻抛错，并且报错里带上完整路径。
+          const callable=function(){{throw __unsupportedJavaApi(path);}};
+          Object.defineProperty(callable,'name',{{value:String(path).split('.').pop()}});
+          callable.toString=()=>'[JavaPackage '+path+']';
+          return new Proxy(callable,{{get:(target,key)=>{{
+            if(key===Symbol.toPrimitive||key==='toString'||key==='valueOf')
+              return target.toString;
+            if(key==='then'||key===Symbol.iterator||key===Symbol.toStringTag)
+              return undefined;
+            if(key==='name'||key==='length')return target[key];
+            return __javaMember(path+'.'+String(key));
+          }},apply:()=>{{throw __unsupportedJavaApi(path)}},
+             construct:()=>{{throw __unsupportedJavaApi(path)}}}});
+        }}
+        function __javaNamespace(name,members) {{
+          // 直接代理真实成员表而不是复制，importPackage/importClass 才能靠
+          // 引用相等认出 __Cipher、__MessageDigest 这些类对象。
+          const wrapped=new Map();
+          const path=key=>name?name+'.'+key:String(key);
+          const proxy=new Proxy(members,{{get:(object,key)=>{{
+            if(Object.prototype.hasOwnProperty.call(object,key)){{
+              const value=object[key];
+              if(value===null||typeof value!=='object'||
+                 Object.getPrototypeOf(value)!==Object.prototype||
+                 __javaNamespaceOriginals.has(value))return value;
+              if(!wrapped.has(key))wrapped.set(key,__javaNamespace(path(key),value));
+              return wrapped.get(key);
+            }}
+            if(key==='then'||key===Symbol.iterator||key===Symbol.toStringTag)
+              return undefined;
+            if(key==='toString'||key==='valueOf'||key===Symbol.toPrimitive)
+              return object.toString;
+            return __javaMember(path(String(key)));
+          }}}});
+          __javaNamespaceOriginals.set(proxy,members);
+          return proxy;
+        }}
+        function __unwrapJava(value) {{
+          return value&&typeof value==='object'&&__javaNamespaceOriginals.has(value)
+            ? __javaNamespaceOriginals.get(value) : value;
+        }}
+        function __javaPackage(name) {{ return __javaMember(name); }}
         function __parseJavaInteger(value,radix,min,max) {{
           const text=String(value),base=radix===undefined?10:Number(radix);
           if(!Number.isInteger(base)||base<2||base>36||!text.length)
@@ -2151,7 +2214,30 @@ class LegadoJsRuntime:
         __BooleanBox.prototype.toString=function(){{return this.__value?'true':'false'}};
         __BooleanBox.prototype.equals=function(other){{return other instanceof __BooleanBox&&this.__value===other.__value}};
         __BooleanBox.prototype.getClass=()=>null;__BooleanBox.prototype.toJSON=__BooleanBox.prototype.booleanValue;
-        Packages.java.lang = {{String:__JavaString,Thread:{{sleep:value=>__sleep(Number(value))}},
+        Packages.java.lang = __javaNamespace('java.lang', {{
+          String:__JavaString,Thread:{{sleep:value=>__sleep(Number(value))}},
+          System:{{
+            currentTimeMillis:()=>Date.now(),
+            nanoTime:()=>Math.round(Date.now()*1e6),
+            lineSeparator:()=>'\\n',
+            getProperty:key=>key==='line.separator'?'\\n'
+              :key==='os.name'?'Linux'
+              :key==='file.separator'?'/'
+              :key==='java.version'?'0'
+              :key==='user.dir'?'/'
+              :key==='file.encoding'?'UTF-8':null,
+            arraycopy:(source,sourceIndex,target,targetIndex,length)=>{{
+              const values=Array.from(source||[]),start=Number(sourceIndex),
+                offset=Number(targetIndex),count=Number(length);
+              if(count<0||start<0||offset<0||start+count>values.length||
+                 offset+count>Number(target.length||0))
+                throw __wrappedJavaException(new __IndexOutOfBoundsException(
+                  'arraycopy: length '+count+' is negative'));
+              for(let index=0;index<count;index++)
+                target[offset+index]=values[start+index];
+            }},
+            gc:()=>undefined
+          }},
           Throwable:__Throwable,Exception:__Exception,RuntimeException:__RuntimeException,
           NullPointerException:__NullPointerException,
           IllegalArgumentException:__IllegalArgumentException,
@@ -2159,12 +2245,12 @@ class LegadoJsRuntime:
           NumberFormatException:__NumberFormatException,
           Byte:__Byte,Short:__Short,Integer:__Integer,Long:__Long,
           Float:__Float,Double:__Double,Boolean:__BooleanBox,Character:__Character,
-          Class:__javaPackage('java.lang.Class'),
-          ClassLoader:__javaPackage('java.lang.ClassLoader'),
-          Runtime:__javaPackage('java.lang.Runtime')
-        }};
-        Packages.java.net = {{URLEncoder:__URLEncoder}};
-        Packages.java.util = {{
+          Class:__javaMember('java.lang.Class'),
+          ClassLoader:__javaMember('java.lang.ClassLoader'),
+          Runtime:__javaMember('java.lang.Runtime')
+        }});
+        Packages.java.net = __javaNamespace('java.net', {{URLEncoder:__URLEncoder}});
+        Packages.java.util = __javaNamespace('java.util', {{
           ArrayList:__ArrayList,
           HashMap:function(value){{return __map(Object.assign({{}},value||{{}}))}},
           HashSet:function(value){{return __HashSet(value)}},
@@ -2182,9 +2268,53 @@ class LegadoJsRuntime:
           stream:{{Collectors:{{
             toList:()=>({{__collector:'list'}}),toSet:()=>({{__collector:'set'}})
           }}}}
+        }});
+        function __streamBytes(value) {{
+          if(value===null||value===undefined)return [];
+          if(Array.isArray(value)||ArrayBuffer.isView(value))return __byteArray(value);
+          if(typeof value.toByteArray==='function')return __byteArray(value.toByteArray());
+          if(typeof value.__drain==='function')return value.__drain();
+          return [];
+        }}
+        function __ByteArrayInputStream(value) {{
+          this._bytes=__streamBytes(value);
+          this._position=0;
+          this._mark=0;
+        }}
+        __ByteArrayInputStream.prototype.__drain=function() {{
+          const rest=this._bytes.slice(this._position);
+          this._position=this._bytes.length;
+          return rest;
         }};
-        Packages.java.io = {{IOException:__IOException,EOFException:__EOFException,
-          File:__javaPackage('java.io.File'),
+        __ByteArrayInputStream.prototype.read=function(target,offset,length) {{
+          if(target===undefined||target===null)
+            return this._position<this._bytes.length
+              ? this._bytes[this._position++] : -1;
+          const start=Number(offset||0);
+          const count=length===undefined?Number(target.length||0)-start:Number(length);
+          if(count<=0)return 0;
+          let written=0;
+          while(written<count&&this._position<this._bytes.length)
+            target[start+written++]=this._bytes[this._position++];
+          return written===0?-1:written;
+        }};
+        __ByteArrayInputStream.prototype.available=function() {{
+          return this._bytes.length-this._position;
+        }};
+        __ByteArrayInputStream.prototype.skip=function(count) {{
+          const step=Math.max(0,Math.min(Number(count)||0,this.available()));
+          this._position+=step;return step;
+        }};
+        __ByteArrayInputStream.prototype.mark=function(value) {{
+          this._mark=this._position;
+        }};
+        __ByteArrayInputStream.prototype.reset=function() {{this._position=this._mark;}};
+        __ByteArrayInputStream.prototype.markSupported=()=>true;
+        __ByteArrayInputStream.prototype.close=()=>undefined;
+        __ByteArrayInputStream.prototype.toString=()=>'java.io.ByteArrayInputStream';
+        Packages.java.io = __javaNamespace('java.io', {{IOException:__IOException,EOFException:__EOFException,
+          File:__javaMember('java.io.File'),
+          ByteArrayInputStream:__ByteArrayInputStream,
           ByteArrayOutputStream:function(){{
           this._bytes=[];
           this.write=function(value,offset,length){{
@@ -2204,7 +2334,193 @@ class LegadoJsRuntime:
           this.toString=charset=>__bytesstr(JSON.stringify(this._bytes),
             String(charset||'utf-8'));
           this.close=()=>undefined;
-        }}}};
+        }}}});
+        function __ByteBuffer(bytes) {{
+          const state={{bytes:__byteArray(bytes||[]),position:0,limit:0,mark:-1,
+                      order:'BIG_ENDIAN'}};
+          state.limit=state.bytes.length;
+          const api={{}};
+          const readNumber=size=>{{
+            if(state.position+size>state.limit)
+              throw __wrappedJavaException(new __IndexOutOfBoundsException(
+                'ByteBuffer underflow at position '+state.position));
+            const raw=state.bytes.slice(state.position,state.position+size);
+            state.position+=size;
+            const ordered=state.order==='LITTLE_ENDIAN'?raw.slice().reverse():raw;
+            return ordered.reduce((total,item)=>total*256+(item<0?item+256:item),0);
+          }};
+          const writeNumber=(size,value)=>{{
+            if(state.position+size>state.limit)
+              throw __wrappedJavaException(new __IndexOutOfBoundsException(
+                'ByteBuffer overflow at position '+state.position));
+            const raw=[];
+            let rest=Math.trunc(Number(value));
+            for(let index=0;index<size;index++){{
+              raw.push(__signedByte(((rest%256)+256)%256));
+              rest=Math.floor(rest/256);
+            }}
+            const ordered=state.order==='LITTLE_ENDIAN'?raw:raw.reverse();
+            for(let index=0;index<size;index++)state.bytes[state.position++]=ordered[index];
+          }};
+          api.array=()=>state.bytes;
+          api.arrayOffset=()=>0;
+          api.hasArray=()=>true;
+          api.isDirect=()=>false;
+          api.isReadOnly=()=>false;
+          api.capacity=()=>state.bytes.length;
+          api.limit=value=>{{if(value===undefined)return state.limit;
+            state.limit=Math.max(0,Math.min(Number(value),state.bytes.length));return api;}};
+          api.position=value=>{{if(value===undefined)return state.position;
+            state.position=Number(value);return api;}};
+          api.remaining=()=>Math.max(0,state.limit-state.position);
+          api.hasRemaining=()=>state.limit>state.position;
+          api.flip=()=>{{state.limit=state.position;state.position=0;state.mark=-1;return api;}};
+          api.rewind=()=>{{state.position=0;state.mark=-1;return api;}};
+          api.clear=()=>{{state.position=0;state.limit=state.bytes.length;state.mark=-1;return api;}};
+          api.mark=()=>{{state.mark=state.position;return api;}};
+          api.reset=()=>{{state.position=state.mark<0?0:state.mark;return api;}};
+          api.order=value=>{{if(value===undefined)return state.order;
+            state.order=String(value);return api;}};
+          api.put=(value,offset,length)=>{{
+            if(value===undefined)return api;
+            if(typeof value==='number'){{writeNumber(1,value);return api;}}
+            const values=__byteArray(value);
+            const start=Number(offset||0);
+            const count=length===undefined?values.length-start:Number(length);
+            for(let index=0;index<count;index++)api.put(values[start+index]);
+            return api;
+          }};
+          api.get=(target,offset,length)=>{{
+            if(target===undefined)return readNumber(1);
+            const start=Number(offset||0);
+            const count=length===undefined?Number(target.length||0)-start:Number(length);
+            for(let index=0;index<count;index++)target[start+index]=readNumber(1);
+            return api;
+          }};
+          ['Int','Short','Long','Float','Double'].forEach(name=>{{
+            const size=name==='Short'?2:name==='Int'||name==='Float'?4:8;
+            const isFloat=name==='Float';
+            api['put'+name]=value=>{{
+              writeNumber(size,isFloat?Math.fround(Number(value)):value);
+              return api;
+            }};
+            api['get'+name]=()=>{{
+              const value=readNumber(size);
+              return isFloat?Math.fround(value):value;
+            }};
+          }});
+          api.putChar=value=>{{writeNumber(2,String(value).charCodeAt(0));return api;}};
+          api.getChar=()=>String.fromCharCode(api.getShort());
+          api.slice=()=>__ByteBuffer(state.bytes.slice(state.position,state.limit));
+          api.duplicate=()=>{{const copy=__ByteBuffer(state.bytes.slice(0));
+            copy.position(state.position).limit(state.limit).order(state.order);return copy;}};
+          api.asReadOnlyBuffer=()=>api.duplicate();
+          api.toString=()=>'java.nio.HeapByteBuffer[pos='+state.position
+            +' lim='+state.limit+' cap='+state.bytes.length+']';
+          return api;
+        }}
+        const __ByteBufferClass={{allocate:capacity=>
+          __ByteBuffer(Array(Math.max(0,Math.trunc(Number(capacity)||0))).fill(0)),
+          wrap:value=>__ByteBuffer(value),
+          allocateDirect:capacity=>__ByteBufferClass.allocate(capacity)}};
+        function __InflaterInputStream(stream,inflater) {{
+          this._stream=stream;
+          this._inflater=inflater||null;
+          this._output=null;
+          this._position=0;
+        }}
+        __InflaterInputStream.prototype.__inflated=function() {{
+          if(this._output===null){{
+            const raw=JSON.parse(__inflate(JSON.stringify(__streamBytes(this._stream)),
+              Boolean(this._inflater&&this._inflater.__nowrap()),0));
+            this._output=__byteArray(raw);
+            this._position=0;
+          }}
+          return this._output;
+        }};
+        __InflaterInputStream.prototype.read=function(target,offset,length) {{
+          const values=this.__inflated();
+          if(target===undefined||target===null)
+            return this._position<values.length?values[this._position++]:-1;
+          const start=Number(offset||0);
+          const count=length===undefined?Number(target.length||0)-start:Number(length);
+          if(count<=0)return 0;
+          let written=0;
+          while(written<count&&this._position<values.length)
+            target[start+written++]=values[this._position++];
+          return written===0?-1:written;
+        }};
+        __InflaterInputStream.prototype.available=function() {{
+          return Math.max(0,this.__inflated().length-this._position);
+        }};
+        __InflaterInputStream.prototype.skip=function(count) {{
+          const step=Math.max(0,Math.min(Number(count)||0,this.available()));
+          this._position+=step;return step;
+        }};
+        __InflaterInputStream.prototype.close=function() {{
+          if(this._stream&&typeof this._stream.close==='function')this._stream.close();
+          this._stream=null;
+        }};
+        __InflaterInputStream.prototype.markSupported=()=>false;
+        function __randomUint32() {{
+          const raw=JSON.parse(__random_bytes(4));
+          return ((Number(raw[0])&255)|((Number(raw[1])&255)<<8)|
+                  ((Number(raw[2])&255)<<16)|((Number(raw[3])&255)<<24))>>>0;
+        }}
+        function __SecureRandom(seed) {{
+          let spare=null;
+          this.nextInt=bound=>{{
+            if(bound===undefined||bound===null)return __randomUint32()|0;
+            const maximum=Math.trunc(Number(bound));
+            if(maximum<=0)throw __wrappedJavaException(new __IllegalArgumentException(
+              'bound must be positive'));
+            if(maximum===1)return 0;
+            if((maximum&(maximum-1))===0)
+              return Number(BigInt(__randomUint32())%BigInt(maximum));
+            for(;;){{
+              const candidate=Number(BigInt(__randomUint32())%BigInt(maximum));
+              if(candidate<maximum)return candidate;
+            }}
+          }};
+          this.nextLong=()=>{{
+            const raw=JSON.parse(__random_bytes(8));
+            return Number(raw.reduce((total,item)=>
+              total*256n+BigInt(Number(item)&255),0n)%(1n<<63n));
+          }};
+          this.nextDouble=()=>{{
+            const high=Number(BigInt(__randomUint32())>>11);
+            const low=Number(BigInt(__randomUint32())>>11);
+            return (high*67108864+low)/9007199254740992;
+          }};
+          this.nextFloat=()=>Math.fround(this.nextDouble());
+          this.nextBoolean=()=>(__randomUint32()&1)===1;
+          this.nextBytes=value=>{{
+            const raw=JSON.parse(__random_bytes(value?value.length:0));
+            for(let index=0;index<raw.length;index++)
+              value[index]=Number(raw[index])>127?Number(raw[index])-256:Number(raw[index]);
+          }};
+          this.nextGaussian=()=>{{
+            if(spare!==null){{const value=spare;spare=null;return value;}}
+            let first=0,second=0,square=0;
+            do{{first=this.nextDouble()*2-1;second=this.nextDouble()*2-1;
+                square=first*first+second*second;}}while(square>=1||square===0);
+            const scale=Math.sqrt(-2*Math.log(square)/square);
+            spare=second*scale;return first*scale;
+          }};
+          this.setSeed=()=>undefined;
+          this.generateSeed=count=>__byteArray(JSON.parse(__random_bytes(Number(count)||0)));
+          this.getAlgorithm=()=>'NativePRNG';
+          this.toString=()=>'java.security.SecureRandom';
+        }}
+        function __encodedKeySpec(name,format) {{
+          return function(value){{
+            const bytes=__byteArray(value||[]);
+            this.encoded=bytes;
+            this.getEncoded=()=>bytes;
+            this.getFormat=()=>format;
+            this.toString=()=>name;
+          }};
+        }}
         const __MessageDigest = {{
           getInstance: algorithm => {{
             const name = String(algorithm);
@@ -2256,25 +2572,93 @@ class LegadoJsRuntime:
           this.finished = () => true;
           this.needsInput = () => false;
           this.getRemaining = () => 0;
+          this.__nowrap = () => state.nowrap;
           this.reset = () => {{ state.input.length = 0; }};
           this.end = () => {{ state.input.length = 0; }};
         }}
-        Packages.java.security = {{MessageDigest:__MessageDigest}};
-        Packages.java.util.zip = {{Inflater:__Inflater}};
-        Packages.javax.crypto = {{Cipher:__Cipher,Mac:__Mac}};
+        Packages.java.security = __javaNamespace('java.security', {{
+          MessageDigest:__MessageDigest,
+          SecureRandom:__SecureRandom,
+          KeyFactory:{{getInstance:algorithm=>({{
+            generatePublic:spec=>({{algorithm:String(algorithm),encoded:spec.encoded,
+              getAlgorithm:()=>String(algorithm),getEncoded:()=>spec.encoded}}),
+            generatePrivate:spec=>({{algorithm:String(algorithm),encoded:spec.encoded,
+              getAlgorithm:()=>String(algorithm),getEncoded:()=>spec.encoded}})
+          }})}},
+          spec:__javaNamespace('java.security.spec', {{
+            X509EncodedKeySpec:__encodedKeySpec('X509EncodedKeySpec','X.509'),
+            PKCS8EncodedKeySpec:__encodedKeySpec('PKCS8EncodedKeySpec','PKCS#8'),
+            RSAPublicKeySpec:function(modulus,exponent){{
+              this.getModulus=()=>modulus;this.getPublicExponent=()=>exponent;
+              this.toString=()=>'RSAPublicKeySpec';
+            }},
+            RSAPrivateKeySpec:function(modulus,exponent){{
+              this.getModulus=()=>modulus;this.getPrivateExponent=()=>exponent;
+              this.toString=()=>'RSAPrivateKeySpec';
+            }},
+            ECGenParameterSpec:function(name){{
+              this.getName=()=>String(name);this.toString=()=>'ECGenParameterSpec';
+            }},
+            KeySpec:__javaInterface('java.security.spec.KeySpec')
+          }}),
+          interfaces:__javaNamespace('java.security.interfaces', {{
+            RSAKey:__javaInterface('java.security.interfaces.RSAKey'),
+            RSAPublicKey:__javaInterface('java.security.interfaces.RSAPublicKey'),
+            RSAPrivateKey:__javaInterface('java.security.interfaces.RSAPrivateKey'),
+            RSAPrivateCrtKey:__javaInterface('java.security.interfaces.RSAPrivateCrtKey'),
+            ECKey:__javaInterface('java.security.interfaces.ECKey'),
+            ECPublicKey:__javaInterface('java.security.interfaces.ECPublicKey'),
+            ECPrivateKey:__javaInterface('java.security.interfaces.ECPrivateKey'),
+            DSAKey:__javaInterface('java.security.interfaces.DSAKey')
+          }})
+        }});
+        Packages.java.util.zip = __javaNamespace('java.util.zip', {{
+          Inflater:__Inflater,InflaterInputStream:__InflaterInputStream
+        }});
+        Packages.java.nio = __javaNamespace('java.nio', {{ByteBuffer:__ByteBufferClass}});
+        Packages.javax.crypto = __javaNamespace('javax.crypto', {{Cipher:__Cipher,Mac:__Mac}});
         Packages.javax.crypto.SecretKeyFactory = {{getInstance:algorithm=>({{
           generateSecret:spec=>({{bytes:spec.bytes,algorithm:String(algorithm)}})
         }})}};
-        Packages.javax.crypto.spec = {{
+        Packages.javax.crypto.spec = __javaNamespace('javax.crypto.spec', {{
           SecretKeySpec:__SecretKeySpec,IvParameterSpec:__IvParameterSpec,
           DESKeySpec:__DESKeySpec,GCMParameterSpec:__GCMParameterSpec
+        }});
+        Packages.javax.xml = __javaNamespace('javax.xml', {{
+          bind:{{DatatypeConverter:__DatatypeConverter}}
+        }});
+        Packages.android.util = __javaNamespace('android.util', {{Base64:__Base64}});
+        Packages.android.text = __javaNamespace('android.text', {{
+          TextUtils:{{isEmpty:value=>value == null || String(value).length === 0}}
+        }});
+        const __CookieManager = {{
+          getInstance:()=>({{
+            getCookie:url=>{{const value=__cookie_get(String(url||''));return value?value:null;}},
+            setCookie:(url,value)=>{{__cookie_set(String(url||''),String(value||''));}},
+            removeAllCookies:()=>{{__cookie_clear();}},
+            removeSessionCookies:()=>undefined,
+            setAcceptCookie:()=>undefined,
+            setAcceptThirdPartyCookies:()=>undefined,
+            acceptCookie:()=>true,
+            hasCookies:()=>Boolean(__cookie_get(String(baseUrl||''))),
+            flush:()=>undefined
+          }})
         }};
-        Packages.javax.xml = {{bind:{{DatatypeConverter:__DatatypeConverter}}}};
-        Packages.android.util = {{Base64:__Base64}};
-        Packages.android.text = {{TextUtils:{{isEmpty:value=>value == null || String(value).length === 0}}}};
-        Packages.android.graphics = {{
-          BitmapFactory:{{decodeByteArray:(value,start,length)=>__bitmap(__bitmap_decode(
-            JSON.stringify(Array.from(value || []).slice(Number(start),Number(start)+Number(length)))))}},
+        Packages.android.webkit = __javaNamespace('android.webkit', {{
+          CookieManager:__CookieManager
+        }});
+        Packages.android.graphics = __javaNamespace('android.graphics', {{
+          BitmapFactory:{{
+            decodeByteArray:(value,start,length)=>__bitmap(__bitmap_decode(
+              JSON.stringify(Array.from(value || []).slice(Number(start),Number(start)+Number(length))))),
+            decodeStream:stream=>{{
+              // Android 的 decodeStream 对不可解码的输入返回 null，而不是抛异常。
+              const bytes=__streamBytes(stream);
+              if(!bytes.length)return null;
+              try {{ return __bitmap(__bitmap_decode(JSON.stringify(bytes))); }}
+              catch(ignoreBrokenImage) {{ return null; }}
+            }}
+          }},
           Bitmap:{{
             CompressFormat:{{JPEG:'JPEG',PNG:'PNG',WEBP:'WEBP'}},
             Config:{{ARGB_8888:'ARGB_8888'}},
@@ -2286,8 +2670,10 @@ class LegadoJsRuntime:
             this.drawBitmap=(source,x,y,paint)=>__bitmap_draw(
               bitmap.__bitmap,source.__bitmap,Number(x),Number(y));
           }}
-        }};
-        Packages.cn.hutool = {{core:{{codec:{{Base64:__Base64}},util:{{}}}},crypto:{{digest:{{}}}}}};
+        }});
+        Packages.cn.hutool = __javaNamespace('cn.hutool', {{
+          core:{{codec:{{Base64:__Base64}},util:{{}}}},crypto:{{digest:{{}}}}
+        }});
         Packages.cn.hutool.core.util.ZipUtil = {{unGzip:(value,charset)=>{{
           const raw=__gzip(JSON.stringify(Array.from(value || [])), String(charset || ''));
           return charset ? raw : __byteArray(JSON.parse(raw));
@@ -2304,7 +2690,7 @@ class LegadoJsRuntime:
           sha256Hex:value=>__digest(String(value), 'SHA-256'),
           sha512Hex:value=>__digest(String(value), 'SHA-512')
         }};
-        Packages.okhttp3 = (() => {{
+        Packages.okhttp3 = __javaNamespace('okhttp3', (() => {{
           function RequestBuilder() {{
             this._url=''; this._headers={{}};
             this.url=value=>{{this._url=String(value);return this}};
@@ -2324,8 +2710,18 @@ class LegadoJsRuntime:
             }}}});
           }}
           return {{OkHttpClient:OkHttpClient,Request:{{Builder:RequestBuilder}}}};
-        }})();
-        Packages.io.legado = {{app:{{help:{{http:{{}}}},model:{{analyzeRule:{{}}}}}}}};
+        }})());
+        Packages.io.legado = __javaNamespace('io.legado', {{
+          app: {{help: {{http: {{}}}}, model: {{analyzeRule: {{}}}}}}
+        }});
+        Packages.io.legado.app.help.http.CookieStore = {{
+          setCookie:(url,value)=>__cookie_set(String(url||''),String(value||'')),
+          getCookie:url=>__cookie_get(String(url||''))||'',
+          replaceCookie:(url,value)=>__cookie_replace(
+            String(url||''),String(value||'')),
+          removeCookie:url=>__cookie_remove(String(url||'')),
+          clear:()=>{{__cookie_clear();}}
+        }};
         Packages.io.legado.app.help.http.StrResponse = (url,body)=>__response(JSON.stringify({{
           body:String(body == null ? '' : body),headers:{{}},status:200,url:String(url || baseUrl)
         }}));
@@ -2334,6 +2730,7 @@ class LegadoJsRuntime:
         }});
         __global.Packages = Packages;
         function __importValue(target,value) {{
+          value=__unwrapJava(value);
           if (!value) return;
           const known=[[__JavaString,'String'],[__Cipher,'Cipher'],[__Mac,'Mac'],
             [__SecretKeySpec,'SecretKeySpec'],[__IvParameterSpec,'IvParameterSpec'],
@@ -2360,6 +2757,7 @@ class LegadoJsRuntime:
         }}
         function importClass(...classes) {{
           classes.forEach(value => {{
+            value=__unwrapJava(value);
             if (value === org.jsoup.Jsoup) __global.Jsoup = value;
             else __importValue(__global,value);
           }});
@@ -5118,6 +5516,16 @@ class LegadoJsRuntime:
         else:
             target.paste(source, position)
         return True
+
+    def _bitmap_pixel(self, handle: str, x, y) -> int:
+        """Bitmap.getPixel: ARGB_8888 packed as a signed Java int."""
+        image = self.bitmap_store.get(str(handle))
+        if image is None:
+            raise JsBridgeError("bitmap handle is no longer available")
+        red, green, blue, alpha = image.convert("RGBA").getpixel((int(x), int(y)))
+        packed = ((alpha & 255) << 24) | ((red & 255) << 16) | (
+            (green & 255) << 8) | (blue & 255)
+        return packed - 0x100000000 if packed >= 0x80000000 else packed
 
     def _bitmap_encode(self, handle: str, image_format="JPEG", quality=100) -> str:
         image = self.bitmap_store.get(str(handle))

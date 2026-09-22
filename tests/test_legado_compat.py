@@ -1316,6 +1316,181 @@ class RuleParserTests(unittest.TestCase):
             "return count+':'+String(new Packages.java.lang.String(out,'UTF-8'))})()",
             JsContext(source=source)), f"{len(raw)}:" + raw.decode())
 
+    def test_java_lang_system_reports_wall_clock_millis(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        before = int(time.time() * 1000)
+        value = runtime.evaluate(
+            "@js:Packages.java.lang.System.currentTimeMillis()",
+            JsContext(source=source))
+        after = int(time.time() * 1000)
+        self.assertTrue(before <= value <= after, value)
+        self.assertEqual(runtime.evaluate(
+            "@js:Packages.java.lang.System.getProperty('line.separator')",
+            JsContext(source=source)), "\n")
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var a=[0,0,0];"
+            "Packages.java.lang.System.arraycopy([7,8],0,a,1,2);"
+            "return a.join(',')})()", JsContext(source=source)), "0,7,8")
+
+    def test_java_nio_byte_buffer_backs_the_key_schedules(self):
+        """weiRead derives key/iv from ByteBuffer.allocate(n).array()."""
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var keyIv=Packages.java.nio.ByteBuffer.allocate(32).array();"
+            "for(var i=0;i<32;i++){var mapped=(i*7)&0xff;"
+            "keyIv[i]=mapped>127?mapped-256:mapped;}"
+            "return keyIv.length+':'+keyIv[0]+','+keyIv[31]})()",
+            JsContext(source=source)), "32:0,-39")
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var b=Packages.java.nio.ByteBuffer.wrap([0,0,1,2]);"
+            "return b.getInt()+'|'+b.remaining()})()", JsContext(source=source)),
+            "258|0")
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var b=Packages.java.nio.ByteBuffer.allocate(4);"
+            "b.put([1,2]);b.flip();var out=[];var one=new Array(1);"
+            "while(b.hasRemaining()){b.get(one);out.push(one[0]);}"
+            "return out.join(',')+'|'+b.array().join(',')})()",
+            JsContext(source=source)), "1,2|1,2,0,0")
+
+    def test_java_zip_inflater_input_stream_drains_raw_deflate(self):
+        raw = b"decoded chapter " * 12
+        compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+        payload = compressor.compress(raw) + compressor.flush()
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var input=" + json.dumps(list(payload)) + ";"
+            "var stream=new Packages.java.util.zip.InflaterInputStream("
+            "new Packages.java.io.ByteArrayInputStream(input),"
+            "new Packages.java.util.zip.Inflater(true));"
+            "var out=new Packages.java.io.ByteArrayOutputStream();"
+            "var buffer=Packages.java.nio.ByteBuffer.allocate(64).array();"
+            "var count;"
+            "while((count=stream.read(buffer))!=-1)out.write(buffer,0,count);"
+            "stream.close();"
+            "return String(new Packages.java.lang.String(out.toByteArray(),'UTF-8'))})()",
+            JsContext(source=source)), raw.decode())
+
+    def test_java_byte_array_input_stream_reads_like_the_jdk(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var s=new Packages.java.io.ByteArrayInputStream([65,66,67,68]);"
+            "var head=s.read();var buffer=new Array(2);var count=s.read(buffer);"
+            "var skipped=s.skip(1);var tail=s.read();"
+            "return [head,String.fromCharCode(count?buffer[0]:0),"
+            "String.fromCharCode(buffer[1]),skipped,s.available(),tail].join('|')})()",
+            JsContext(source=source)), "65|B|C|1|0|-1")
+
+    def test_java_security_secure_random_stays_in_range(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var random=new Packages.java.security.SecureRandom();"
+            "var bytes=new Array(16);random.nextBytes(bytes);"
+            "var ok=true;for(var i=0;i<16;i++)"
+            "if(typeof bytes[i]!=='number'||bytes[i]<-128||bytes[i]>127)ok=false;"
+            "var tries=[];for(var n=0;n<200;n++){var v=random.nextInt(9);"
+            "if(v<0||v>8)ok=false;tries.push(v);}"
+            "return ok+'|'+new Packages.java.util.HashSet(tries).length})()",
+            JsContext(source=source)), "true|9")
+
+    def test_java_security_spec_and_interfaces_are_importable(self):
+        """A 台湾小说网-style jsLib imports java.security.spec by package."""
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        self.assertEqual(runtime.evaluate(
+            "@js:var imports=new JavaImporter();"
+            "imports.importPackage(Packages.java.security,"
+            "Packages.java.security.interfaces,Packages.java.security.spec);"
+            "(function(){with(imports){"
+            "var spec=new X509EncodedKeySpec([1,2,3]);"
+            "return typeof RSAPublicKey+'|'+spec.getFormat()+'|'"
+            "+spec.getEncoded().join(',')+'|'+new SecureRandom().getAlgorithm()}})()",
+            JsContext(source=source)), "function|X.509|1,2,3|NativePRNG")
+
+    def test_java_jsoup_parser_selects_the_dialect(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var Parser=Packages.org.jsoup.parser.Parser;"
+            "var doc=Packages.org.jsoup.Jsoup.parse("
+            "'<div id=\"a\">hi</div>','',Parser.xmlParser());"
+            "return Parser.htmlParser().getName()+':'+doc.select('div#a').text()})()",
+            JsContext(source=source)), "html:hi")
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){importClass(Packages.org.jsoup.Jsoup);"
+            "return typeof Jsoup.parse})()", JsContext(source=source)), "function")
+
+    def test_android_cookie_managers_share_the_cookie_store(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var manager=Packages.android.webkit.CookieManager"
+            ".getInstance();"
+            "Packages.io.legado.app.help.http.CookieStore.setCookie("
+            "'https://example.com/','sid=1; token=2');"
+            "return manager.getCookie('https://example.com/')"
+            "+'|'+Packages.io.legado.app.help.http.CookieStore.getCookie("
+            "'https://example.com/')})()",
+            JsContext(source=source)), "sid=1; token=2|sid=1; token=2")
+
+    def test_bitmap_factory_decode_stream_reads_pixels(self):
+        from PIL import Image
+        image = Image.new("RGB", (8, 5), (0xAB, 0x11, 0x22))
+        image.putpixel((1, 0), (0xCD, 0x33, 0x44))
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var bytes=" + json.dumps(list(buffer.getvalue())) + ";"
+            "var bitmap=Packages.android.graphics.BitmapFactory.decodeStream("
+            "new Packages.java.io.ByteArrayInputStream(bytes));"
+            "if(bitmap===null)return 'null';"
+            "return [bitmap.getWidth(),bitmap.getHeight(),"
+            "(bitmap.getPixel(0,0)>>16)&255,(bitmap.getPixel(1,0)>>16)&255].join(',')})()",
+            JsContext(source=source)), "8,5,171,205")
+        self.assertEqual(runtime.evaluate(
+            "@js:String(Packages.android.graphics.BitmapFactory.decodeStream("
+            "new Packages.java.io.ByteArrayInputStream([])))",
+            JsContext(source=source)), "null")
+
+    def test_unimplemented_java_api_fails_loudly_with_its_path(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        for expression, path in (
+                ("Packages.java.util.Objects.requireNonNull(1)",
+                 "Packages.java.util.Objects.requireNonNull"),
+                ("new Packages.java.nio.charset.Charset('x')",
+                 "Packages.java.nio.charset.Charset"),
+                ("Packages.com.example.Widget.missing()",
+                 "Packages.com.example.Widget.missing"),
+                ("Packages.java.lang.Class.forName('x')",
+                 "Packages.java.lang.Class.forName")):
+            value = runtime.evaluate(
+                "@js:(function(){try{" + expression +
+                ";return 'no-throw'}catch(e){return e.name+'|'+e.javaApi}})()",
+                JsContext(source=source))
+            self.assertEqual(value, f"UnsupportedJavaApiError|{path}", expression)
+
+    def test_unimplemented_java_api_stays_probeable(self):
+        """Feature detection reads typeof/truthiness; only the call throws."""
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        self.assertEqual(runtime.evaluate(
+            "@js:[typeof Packages.java.util.Objects,"
+            "Boolean(Packages.java.util.Objects),"
+            "typeof Packages,"
+            "Object.keys(Packages.java.util).indexOf('ArrayList')>=0].join('|')",
+            JsContext(source=source)), "function|true|object|true")
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var out=typeof Packages!='undefined'"
+            "?new Packages.java.util.ArrayList():[];out.add(1);return out.size()})()",
+            JsContext(source=source)), 1)
+
     def test_empty_login_maps_are_null_like_fixed_base_source(self):
         runtime = LegadoJsRuntime()
         source = SimpleNamespace(
