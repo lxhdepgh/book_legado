@@ -1,0 +1,7 @@
+# Desktop targets (Windows / Linux / macOS). This is the file a desktop
+# checkout and the PyInstaller build install, because the built-in headless
+# browser is desktop-only: Playwright's wheel carries a per-platform Node
+# driver (about 100 MB on Windows) and its Chromium is a desktop binary, so it
+# cannot run inside an Android/iOS bundle.
+-r requirements.txt
+playwright>=1.49,<2

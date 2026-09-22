@@ -12,20 +12,27 @@ python -m pytest tests/test_legado_compat.py -q   # 单文件
 
 - `pytest.ini` 已配置 `norecursedirs = base_history`，参考源码目录不参与收集。
 
-## 1.1 内置无头浏览器（Playwright）
+## 1.1 内置无头浏览器（Playwright，仅桌面）
 
-`{"webView":true}` 与 `ruleContent.webJs` 只能由真实浏览器渲染，桌面端用内置 Chromium 承担：
+`{"webView":true}` 与 `ruleContent.webJs` 只能由真实浏览器渲染。桌面端两种情形分开走：
+
+| 情形 | 机制 | 平台 |
+|---|---|---|
+| 无人值守渲染 | 内置无头 Chromium（Playwright） | Windows / Linux / macOS |
+| 需要人处理（登录、验证码、质询页） | 应用窗口内的 `ftw.WebView` | Android / iOS / macOS |
+| 需要人处理（同上） | 弹出 Microsoft Edge 窗口并读取当前页 | Windows |
 
 ```powershell
 conda activate legodo_booksource_check
-pip install -r requirements.txt
-python -m playwright install chromium    # 内核不入库，须单独下载
+pip install -r requirements-desktop.txt   # 桌面端；只装 requirements.txt 会没有内置浏览器
+python -m playwright install chromium     # 内核不入库，须单独下载
 ```
 
+- 依赖分两份：`requirements.txt` 全平台通用（Android/iOS 打包只装这份），`requirements-desktop.txt` 在其上追加 `playwright`。Android 上用系统 WebView，不需要也不支持 Playwright。
 - 内核位置：`%LOCALAPPDATA%\ms-playwright`（可用 `PLAYWRIGHT_BROWSERS_PATH` 覆盖）。
 - 用户配置目录：缓存目录下的 `chromium-profile/`，登录态和验证结果跨启动保留。
 - 内核缺失时 `available_fetcher()` 返回 `None`，检测与阅读都退回到原有行为（网页阶段记为"需浏览器未抽检"），不会报错。
-- `tests/test_headless_browser.py` 的 `_RealRenderTests` 需要内核，未安装时自动跳过；其余用例用假页面驱动，不联网、不启动浏览器。
+- `tests/test_headless_browser.py` 的 `_RealRenderTests` 与 `_PipelineWiringTests` 需要内核，未安装时自动跳过；其余用例用假页面驱动，不联网、不启动浏览器。
 
 ## 2. 测试目录说明（待补充各文件覆盖范围）
 
