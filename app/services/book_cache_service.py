@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.services.reading_cache import ReadingCache
-from app.services.reading_engine import LegadoReadingEngine, _media_request
+from app.services.reading_engine import LegadoReadingEngine
 
 
 @dataclass
@@ -119,14 +119,10 @@ class WholeBookCacheService:
             raw_value = block.value.strip()
             if not raw_value or raw_value.startswith("data:"):
                 continue
-            url, option_headers = _media_request(raw_value, raw_value)
-            headers = dict(option_headers)
-            headers.update(block.headers or {})
-            await engine._request(
-                {"url": url, "method": "GET", "headers": headers}, source)
-            payload = bytes((engine.last_response or {}).get("bodyBytes") or [])
+            payload = await engine.fetch_media(raw_value, source,
+                                               extra_headers=block.headers)
             if not payload:
-                raise RuntimeError(f"图片缓存为空: {url}")
+                raise RuntimeError(f"图片缓存为空: {raw_value}")
             block.value = payload
 
     @staticmethod

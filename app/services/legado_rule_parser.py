@@ -19,9 +19,157 @@ from bs4 import (BeautifulSoup, CData, Comment, Doctype, NavigableString,
 from soupsieve.util import SelectorSyntaxError
 import soupsieve
 
-from test_book_sources_async import jsonpath_get
 from app.services.java_regex import (compile_pattern, finditer as java_finditer,
                                      search as java_search)
+
+
+def usable_non_js_rule(rule: str) -> str:
+    """从“JS预处理 + 普通规则”组合中提取仍可尝试的普通规则。"""
+    text = (rule or "").strip()
+    if not text:
+        return text
+    # <js>...</js> 后常跟 CSS/JSONPath，先用原始响应尝试该规则。
+    match = re.match(r"<js>[\s\S]*?</js>\s*([\s\S]+)$", text, flags=re.I)
+    if match and match.group(1).strip():
+        return match.group(1).strip()
+    # 普通 JSONPath 后附加 JS 增强时，先执行前置 JSONPath。
+    match = re.match(r"([^\n]+)\s*<js>[\s\S]*?</js>", text, flags=re.I)
+    if match and match.group(1).strip():
+        return match.group(1).strip()
+    return text
+
+
+def simplify_legado_selector(rule: str) -> str | None:
+    """
+    简化 Legado 混合选择器为基本 CSS 选择器。
+    例如:
+      class.col-6.col-md-4...@tag.a!0  → .col-6.col-md-4...
+      .content@p@text                    → .content
+      id.book-list@tag.li!-1             → #book-list
+      class.ser-ret@li||class.j_bookList@li → .ser-ret (第一个)
+    """
+    # 如果有 || 取第一个
+    if "||" in rule:
+        rule = rule.split("||")[0].strip()
+
+    # 去掉 @ 后面的部分
+    if "@" in rule:
+        rule = rule.split("@")[0].strip()
+
+    # 处理 class.xxx / id.xxx 格式
+    if rule.startswith("class."):
+        rule = "." + rule[6:]
+    elif rule.startswith("id."):
+        rule = "#" + rule[3:]
+    elif rule.startswith("tag."):
+        rule = rule[4:]
+
+    # 清理末尾的 !0, !-1 等
+    rule = re.sub(r"!\s*-?\d+\s*$", "", rule).strip()
+
+    if not rule:
+        return None
+
+    # 验证是否像 CSS 选择器
+    if rule.startswith((".", "#", "[", "a", "div", "li", "ul", "p", "span",
+                        "table", "tr", "td", "th", "h1", "h2", "h3", "h4",
+                        "body", "head", "html", "meta", "img", "input",
+                        "form", "button", "select", "option", "nav",
+                        "section", "article", "header", "footer", "main")):
+        return rule
+
+    # 如果是纯 JSONPath (如 data.books), 不是 CSS, 返回 None
+    if "." in rule and not rule.startswith("."):
+        return None
+
+    return rule if rule.startswith((".", "#", "[")) else None
+
+
+def jsonpath_get(data, path: str) -> list:
+    """
+    简单的 JSONPath 实现。
+    支持: $.a.b.c, $.a[*].b, data.books, $..key (递归)
+    返回匹配值列表。
+    """
+    # 去掉 $.
+    if path.startswith("$."):
+        path = path[2:]
+    elif path.startswith("$.."):
+        path = path[1:]  # 保留一个 .
+
+    # 处理 $..xxx (递归)
+    if path.startswith(".."):
+        results = []
+        _recursive_find(data, path[2:], results)
+        return results
+
+    current = [data]
+    # 按 . 分割路径
+    parts = path.split(".")
+    for part in parts:
+        if not part:
+            continue
+        next_current = []
+        # 处理 [*]、[0]、[:10] 等数组访问
+        array_match = re.match(r"^(.*)\[([^]]+)\]$", part)
+        if array_match:
+            key, expression = array_match.groups()
+            for item in current:
+                if key and isinstance(item, dict):
+                    val = item.get(key, [])
+                elif not key:
+                    val = item
+                else:
+                    val = []
+                if not isinstance(val, list):
+                    continue
+                if expression == "*":
+                    next_current.extend(val)
+                elif expression.startswith(":"):
+                    try:
+                        next_current.extend(val[:int(expression[1:])])
+                    except ValueError:
+                        pass
+                else:
+                    try:
+                        next_current.append(val[int(expression)])
+                    except (ValueError, IndexError):
+                        pass
+        else:
+            for item in current:
+                if isinstance(item, dict):
+                    val = item.get(part)
+                    if val is not None:
+                        if isinstance(val, list):
+                            next_current.extend(val)
+                        else:
+                            next_current.append(val)
+                elif isinstance(item, list):
+                    for sub in item:
+                        if isinstance(sub, dict):
+                            val = sub.get(part)
+                            if val is not None:
+                                if isinstance(val, list):
+                                    next_current.extend(val)
+                                else:
+                                    next_current.append(val)
+        current = next_current
+        if not current:
+            break
+    return current
+
+
+def _recursive_find(data, key: str, results: list):
+    """递归查找所有 key"""
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if k == key:
+                results.append(v)
+            else:
+                _recursive_find(v, key, results)
+    elif isinstance(data, list):
+        for item in data:
+            _recursive_find(item, key, results)
 
 
 class JavaKeySet(list):

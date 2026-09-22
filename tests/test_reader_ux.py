@@ -14,7 +14,8 @@ from app.services.reading_engine import (ChapterContent, ContentBlock,
                                          parse_content_blocks)
 from app.services.rule_engine import (BookItem, ChapterItem, UnsupportedRule)
 from app.services.source_service import SourceService
-from app.views.reading_view import ReadingView, _looks_like_gate
+from app.views.reading_view import ReadingView
+from app.services.web_page_renderer import WebPageRenderer, looks_like_gate
 from app.app import BookSourceApp
 from app.views.settings_view import SettingsView
 
@@ -392,7 +393,7 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.view._prefetch_task = prefetch_task
         self.view._chapter_cache["chapter"] = "cached"
         webview = asyncio.get_running_loop().create_future()
-        self.view._webview_future = webview
+        self.view.renderer._future = webview
 
         self.view.will_unmount()
 
@@ -553,19 +554,19 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(document.blocks[0].headers, {"Referer": "https://source/"})
 
     async def test_webview_sniffer_matches_full_resource_and_override_urls(self):
-        self.view._webview_initial_url = "https://host/start"
-        self.view._webview_source_regex = r"https://cdn/.+\.m3u8"
-        self.view._webview_override_regex = ""
-        result = self.view._select_webview_payload({
+        renderer = WebPageRenderer(lambda: None)
+        renderer._initial_url = "https://host/start"
+        renderer._source_regex = r"https://cdn/.+\.m3u8"
+        result = renderer._select_payload({
             "html": "<main>page</main>", "url": "https://host/page",
             "resources": ["https://cdn/video.m3u8"]})
         self.assertEqual(result["source"], "https://cdn/video.m3u8")
         self.assertEqual(result["body"], "https://cdn/video.m3u8")
         self.assertEqual(result["url"], "https://host/start")
 
-        self.view._webview_source_regex = ""
-        self.view._webview_override_regex = r"https://host/final/\d+"
-        result = self.view._select_webview_payload({
+        renderer._source_regex = ""
+        renderer._override_regex = r"https://host/final/\d+"
+        result = renderer._select_payload({
             "html": "", "url": "https://host/final/42", "resources": []})
         self.assertEqual(result["overrideUrl"], "https://host/final/42")
 
@@ -1118,10 +1119,10 @@ class BuiltinBrowserFallbackTests(unittest.IsolatedAsyncioTestCase):
     """The rendering step that runs before the visible window is offered."""
 
     async def _render(self, fetcher, options=None):
-        with patch("app.views.reading_view.available_fetcher",
+        with patch("app.services.web_page_renderer.available_fetcher",
                    return_value=fetcher):
-            return await ReadingView._render_with_builtin_browser(
-                SimpleNamespace(), "https://site.example/c", options or {})
+            return await WebPageRenderer(lambda: None)._render_silently(
+                "https://site.example/c", options or {})
 
     async def test_a_rendered_chapter_is_used_without_asking_the_user(self):
         fetcher = AsyncMock(return_value={"body": "<p>chapter</p>"})
@@ -1148,7 +1149,7 @@ class BuiltinBrowserFallbackTests(unittest.IsolatedAsyncioTestCase):
     def test_a_rendered_article_is_not_mistaken_for_a_login_form(self):
         article = ("<html><body><p>" + "正文。" * 2000
                    + "</p><a href='/login'>登录</a></body></html>")
-        self.assertFalse(_looks_like_gate(article))
+        self.assertFalse(looks_like_gate(article))
 
 
 if __name__ == "__main__":

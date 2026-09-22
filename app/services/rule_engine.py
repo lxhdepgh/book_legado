@@ -26,15 +26,16 @@ from aiohttp_socks import ProxyConnector
 from bs4 import BeautifulSoup, UnicodeDammit
 from multidict import CIMultiDict
 
-from test_book_sources_async import (encode_url, jsonpath_get, parse_search_url,
-                                     simplify_legado_selector, usable_non_js_rule)
 from app.services.block_pages import SiteBlockedError, block_reason
 from app.services.legado_js import (JsBridgeError, JsContext, LegadoJsRuntime,
                                     split_js_rule)
 from app.services.legado_rule_parser import (JavaArrayNull, JavaKeySet,
                                              RuleParseError, evaluate,
                                              is_json_text, parse_json_smart,
-                                             parse_markup, split_balanced)
+                                             parse_markup,
+                                             simplify_legado_selector,
+                                             split_balanced, usable_non_js_rule)
+from app.services.legado_url import encode_url, parse_search_url
 from app.services.java_regex import (search as java_regex_search,
                                      sub as java_regex_sub,
                                      translate_replacement)

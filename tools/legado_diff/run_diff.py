@@ -30,7 +30,7 @@ from app.services.source_service import SourceService
 from app.services.rule_engine import ReaderEngine, _legado_value_string
 from app.services.legado_rule_parser import (evaluate, parse_json_smart,
                                              parse_markup)
-from test_book_sources_async import parse_search_url
+from app.services.legado_url import parse_search_url
 
 HARNESS = (ROOT / "tools/legado_diff/harness/build/install/"
            "legado-engine-harness/bin/legado-engine-harness.bat")

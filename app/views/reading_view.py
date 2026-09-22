@@ -2,41 +2,23 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import json
 import re
 import time
-import uuid
 
 import flet as ft
-import flet_audio as fta
-import flet_video as ftv
-import flet_webview as ftw
 
+from app import platform_support
 from app.services.rule_engine import (UnsupportedRule, parse_explore_categories,
                                       resolve_explore_categories, BookItem)
 from app.services.reading_engine import LegadoReadingEngine
 from app.services.reading_cache import ReadingCache
-from app.services.desktop_browser import EdgeCdpSession
-from app.services.block_pages import block_reason
 from app.services.headless_browser import available_fetcher
 from app.services.book_cache_service import WholeBookCacheService
 from app.services.reading_progress import ReadingProgressStore, ReadingSession
+from app.services.web_page_renderer import WebPageRenderer
 from app.ui_feedback import show_snack_bar
-
-
-def _looks_like_gate(html: str) -> bool:
-    """True when a rendered page is still a wall instead of the article.
-
-    A login form is the one gate a page keeps after rendering: the challenge
-    interstitials are already recognised by the shared block-page detector.
-    """
-    if not html.strip():
-        return True
-    if block_reason(html):
-        return True
-    return bool(re.search(r"""(?i)<input[^>]+type\s*=\s*["']?password""", html))
 
 
 class ReadingView(ft.Column):
@@ -57,26 +39,15 @@ class ReadingView(ft.Column):
         self.reading_session = ReadingSession()
         self._whole_book_tasks = {}
         self.discovery_only = discovery_only
+        self.renderer = WebPageRenderer(
+            lambda: platform_support.attached_page(self),
+            getattr(service, "cache_dir", service.data_dir),
+            self._set_webview_hint)
         self.engine = LegadoReadingEngine(
-            webview_fetcher=self._fetch_with_webview,
-            verification_fetcher=self._get_verification_code,
+            webview_fetcher=self.renderer.render,
+            verification_fetcher=self.renderer.verification_code,
             state_dir=service.data_dir,
         )
-        self._webview = None
-        self._desktop_webview = None
-        self._webview_future = None
-        self._verification_future = None
-        self._verification_input = None
-        self._verification_dialog = None
-        self._webview_marker = ""
-        self._webview_capture_pending = False
-        self._webview_rule_mode = False
-        self._webview_script = ""
-        self._webview_delay = 0
-        self._webview_source_regex = ""
-        self._webview_override_regex = ""
-        self._webview_html = ""
-        self._webview_initial_url = ""
         self._current_chapter = None
         self._current_book = None
         self._pending_scroll_offset = 0.0
@@ -514,294 +485,9 @@ class ReadingView(ft.Column):
         # alive and swaps it back in.  Only work that depends on a control in
         # this subtree may be cancelled, otherwise a tab switch would kill
         # whole-book caching, catalog loading and chapter prefetch.
-        if self._webview_future and not self._webview_future.done():
-            self._webview_future.cancel()
+        self.renderer.cancel()
         self._persist_scroll_position()
 
-    async def _get_verification_code(self, image, source):
-        """Display the image captcha requested by java.getVerificationCode()."""
-        if self._verification_future and not self._verification_future.done():
-            raise RuntimeError("已有验证码输入任务正在进行")
-        loop = asyncio.get_running_loop()
-        self._verification_future = loop.create_future()
-        image_src = str(image or "")
-        if (image_src and "://" not in image_src and
-                not image_src.startswith(("data:", "/"))):
-            image_src = "data:image/png;base64," + image_src
-        self._verification_input = ft.TextField(
-            label="验证码", autofocus=True, on_submit=self._submit_verification)
-        controls = []
-        if image_src:
-            controls.append(ft.Image(src=image_src, height=160, fit=ft.BoxFit.CONTAIN))
-        controls.append(self._verification_input)
-        self._verification_dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text(f"输入验证码 · {getattr(source, 'bookSourceName', '')}"),
-            content=ft.Container(width=360, content=ft.Column(controls, tight=True)),
-            actions=[
-                ft.TextButton("取消", on_click=self._cancel_verification),
-                ft.Button("确定", on_click=self._submit_verification),
-            ],
-        )
-        self.page.show_dialog(self._verification_dialog)
-        try:
-            return await self._verification_future
-        finally:
-            self._verification_future = None
-            self._verification_input = None
-            self._verification_dialog = None
-
-    def _submit_verification(self, _):
-        if self._verification_future and not self._verification_future.done():
-            value = self._verification_input.value if self._verification_input else ""
-            self._verification_future.set_result(str(value or "").strip())
-        if self._verification_dialog:
-            self.page.pop_dialog()
-
-    def _cancel_verification(self, _):
-        if self._verification_future and not self._verification_future.done():
-            self._verification_future.set_exception(RuntimeError("验证码输入已取消"))
-        if self._verification_dialog:
-            self.page.pop_dialog()
-
-    def _supports_webview(self):
-        return self.page.platform in {
-            ft.PagePlatform.ANDROID, ft.PagePlatform.ANDROID_TV,
-            ft.PagePlatform.IOS, ft.PagePlatform.MACOS,
-        }
-
-    async def _render_with_builtin_browser(self, url, options):
-        """Silently render through the built-in browser before asking the user.
-
-        Rendering script-built pages needs no human, so the visible window is
-        reserved for what genuinely needs one: a challenge page or a login form
-        still comes back as a gate and falls through to it.
-        """
-        fetcher = available_fetcher()
-        if fetcher is None:
-            return None
-        try:
-            rendered = await fetcher(url, None, options)
-        except Exception:
-            return None
-        if _looks_like_gate(str(rendered.get("body") or "")):
-            return None
-        return rendered
-
-    async def _fetch_with_webview(self, url, source, options=None):
-        """Legado-style WebView fallback: render JS, then return final DOM HTML."""
-        options = options or {}
-        rendered = await self._render_with_builtin_browser(url, options)
-        if rendered is not None:
-            return rendered
-        if self._webview_future and not self._webview_future.done():
-            raise RuntimeError("已有一个网页验证任务正在进行")
-        loop = asyncio.get_running_loop()
-        self._webview_future = loop.create_future()
-        self._webview_marker = f"__LEGADO_HTML_{uuid.uuid4().hex}__"
-        options = options or {}
-        self._webview_rule_mode = str(options.get("mode") or "") == "webJs"
-        self._webview_script = str(options.get("webJs") or
-                                   options.get("javaScript") or "")
-        self._webview_delay = int(options.get("webViewDelayTime") or 0)
-        self._webview_source_regex = str(options.get("sourceRegex") or "")
-        self._webview_override_regex = str(options.get("overrideUrlRegex") or "")
-        self._webview_html = str(options.get("html") or "")
-        self._webview_initial_url = str(url)
-        if self.page.platform == ft.PagePlatform.WINDOWS:
-            self._desktop_webview = EdgeCdpSession(
-                getattr(self.service, "cache_dir", self.service.data_dir) /
-                "edge-webview-profile")
-            await self._desktop_webview.start(url)
-            dialog_content = ft.Container(
-                width=400, height=150,
-                content=ft.Column([
-                    ft.Icon(ft.Icons.OPEN_IN_NEW, size=42),
-                    ft.Text("验证页面已在 Microsoft Edge 中打开。完成登录或人机验证后，返回此处读取页面。"),
-                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER))
-        elif self._supports_webview():
-            self._webview = ftw.WebView(
-                url=url, expand=True,
-                on_page_ended=self._webview_page_ended,
-                on_console_message=self._webview_console_message,
-                on_web_resource_error=self._webview_resource_error)
-            dialog_content = ft.Container(width=400, height=620, content=self._webview)
-        else:
-            raise RuntimeError("当前平台没有可用的网页验证组件")
-        dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text(f"网页验证 · {getattr(source, 'bookSourceName', '')}"),
-            content=dialog_content,
-            actions=[
-                ft.TextButton("读取当前页面", on_click=self._capture_webview_now),
-                ft.TextButton("取消", on_click=self._cancel_webview),
-            ],
-        )
-        self.page.show_dialog(dialog)
-        self._status.value = "请在网页中完成验证；通过后会自动继续解析"
-        self.update()
-        try:
-            if self._webview_rule_mode:
-                return await self._await_rule_webview_result()
-            return await self._webview_future
-        finally:
-            if self._desktop_webview:
-                await self._desktop_webview.close()
-                self._desktop_webview = None
-            self._webview_future = None
-            self._webview = None
-            self._webview_capture_pending = False
-            self._webview_rule_mode = False
-            self._webview_script = ""
-            self._webview_delay = 0
-            self._webview_source_regex = ""
-            self._webview_override_regex = ""
-            self._webview_html = ""
-            self._webview_initial_url = ""
-
-    async def _await_rule_webview_result(self):
-        """BackstageWebView-style auto evaluation loop for @webjs: rules."""
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + 15
-        while loop.time() < deadline:
-            if self._webview_future and self._webview_future.done():
-                break
-            if self._desktop_webview:
-                await self._capture_desktop_webview()
-            elif self._webview and not self._webview_capture_pending:
-                await self._capture_webview_dom()
-            await asyncio.sleep(0.6)
-        if self._webview_future and self._webview_future.done():
-            return await self._webview_future
-        raise RuntimeError("webjs 脚本执行超时，页面可能需要人工验证")
-
-    def _webview_page_ended(self, _):
-        if self._webview and not self._webview_capture_pending:
-            self._webview_capture_pending = True
-            self.page.run_task(self._capture_webview_dom)
-
-    def _capture_webview_now(self, _):
-        if self._desktop_webview:
-            self.page.run_task(self._capture_desktop_webview)
-        elif self._webview:
-            self.page.run_task(self._capture_webview_dom)
-
-    async def _capture_desktop_webview(self):
-        if not self._desktop_webview or not self._webview_future:
-            return
-        try:
-            response = await self._desktop_webview.capture(
-                self._webview_script, self._webview_delay,
-                self._webview_html, self._webview_source_regex,
-                self._webview_override_regex)
-            html = response.get("body", "")
-            if self._webview_rule_mode:
-                js_result = response.get("jsResult")
-                if isinstance(js_result, str) and \
-                        js_result.startswith("__LEGADO_JS_ERROR__:"):
-                    if not self._webview_future.done():
-                        self._webview_future.set_exception(RuntimeError(
-                            js_result[len("__LEGADO_JS_ERROR__:")]))
-                    self.page.pop_dialog()
-                    return
-                if js_result is None:
-                    return
-                if not self._webview_future.done():
-                    self._webview_future.set_result(response)
-                self.page.pop_dialog()
-                return
-            waiting_for_source = bool(self._webview_source_regex and
-                                      not response.get("source"))
-            if ("Just a moment" in html or "challenge-platform" in html or
-                    waiting_for_source):
-                self._status.value = "网页验证尚未完成，请完成验证后再次读取页面"
-                self.update()
-                return
-            if not self._webview_future.done():
-                self._webview_future.set_result(response)
-            self.page.pop_dialog()
-        except Exception as exc:
-            self._status.value = f"读取 Edge 页面失败：{exc}"
-            self.update()
-
-    async def _capture_webview_dom(self):
-        if not self._webview or not self._webview_future:
-            return
-        try:
-            if self._webview_html:
-                html_value, self._webview_html = self._webview_html, ""
-                await self._webview.run_javascript(
-                    "document.open();document.write(" +
-                    json.dumps(html_value, ensure_ascii=False) +
-                    ");document.close()")
-            if self._webview_script:
-                script, self._webview_script = self._webview_script, ""
-                await self._webview.run_javascript(script)
-                if self._webview_delay:
-                    await asyncio.sleep(max(0, self._webview_delay) / 1000)
-            # The extension does not return JS values, so use its console event
-            # as the same kind of bridge that Legado exposes to WebView scripts.
-            script = ("console.log('" + self._webview_marker + "' + btoa(unescape("
-                      "encodeURIComponent(JSON.stringify({html:document.documentElement.outerHTML,"
-                      "url:location.href,resources:performance.getEntriesByType('resource')"
-                      ".map(e=>e.name),jsResult:(typeof window.__legadoJsResult"
-                      "===undefined?null:window.__legadoJsResult)})))))")
-            await self._webview.run_javascript(script)
-        finally:
-            self._webview_capture_pending = False
-
-    def _select_webview_payload(self, payload):
-        from app.services.java_regex import compile_pattern
-        html = str(payload.get("html") or "")
-        final_url = str(payload.get("url") or self._webview_initial_url)
-        result = {"body": html, "headers": {"content-type": "text/html"},
-                  "status": 200, "url": final_url}
-        if payload.get("jsResult") is not None:
-            result["jsResult"] = payload.get("jsResult")
-        if self._webview_source_regex:
-            pattern = compile_pattern(self._webview_source_regex)
-            matched = next((str(item) for item in payload.get("resources") or []
-                            if pattern.fullmatch(str(item))), "")
-            if not matched:
-                return None
-            result.update(body=matched, source=matched,
-                          url=self._webview_initial_url or final_url)
-        if self._webview_override_regex:
-            if not compile_pattern(self._webview_override_regex).fullmatch(final_url):
-                return None
-            result.update(body=final_url, overrideUrl=final_url,
-                          url=self._webview_initial_url or final_url)
-        return result
-
-    async def _webview_console_message(self, event):
-        message = getattr(event, "message", "") or ""
-        if not self._webview_future or self._webview_future.done() or not message.startswith(
-                self._webview_marker):
-            return
-        try:
-            payload = json.loads(base64.b64decode(
-                message[len(self._webview_marker):]).decode("utf-8"))
-        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
-            return
-        response = self._select_webview_payload(payload)
-        html = str(payload.get("html") or "")
-        waiting_for_source = response is None
-        if ("Just a moment" in html or "challenge-platform" in html or
-                waiting_for_source):
-            self._status.value = "网页验证尚未完成，请完成验证后点击“读取当前页面”"
-            self.update()
-            return
-        self._webview_future.set_result(response)
-        self.page.pop_dialog()
-
-    def _webview_resource_error(self, event):
-        self._status.value = f"网页加载失败：{getattr(event, 'data', '') or 'WebView 资源错误'}"
-        self.update()
-
-    def _cancel_webview(self, _):
-        if self._webview_future and not self._webview_future.done():
-            self._webview_future.set_exception(RuntimeError("用户取消网页验证"))
-        self.page.pop_dialog()
 
     def refresh_sources(self, update=True):
         enabled = [s for s in self.service.sources if s.enabled and (s.searchUrl or s.exploreUrl)]
@@ -1596,9 +1282,7 @@ class ReadingView(ft.Column):
                     source = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     return
-                engine = LegadoReadingEngine(
-                    webview_fetcher=available_fetcher(),
-                    state_dir=self.service.data_dir)
+                engine = self._background_engine()
                 try:
                     books = await engine.search(source, keyword, 1)
                     for book in books:
@@ -1830,9 +1514,7 @@ class ReadingView(ft.Column):
                 error="原书源已删除")
             return
         book = self._book_from_shelf(item)
-        update_engine = LegadoReadingEngine(
-            webview_fetcher=available_fetcher(),
-            state_dir=self.service.data_dir)
+        update_engine = self._background_engine()
         try:
             chapters = await update_engine.chapters(source, book)
             latest = next((chapter.name for chapter in reversed(chapters)
@@ -2410,9 +2092,7 @@ class ReadingView(ft.Column):
         """顺序预取后续章节，避免并发修改 Legado 规则变量。"""
         source = self.current_source
         candidates = self._next_readable_chapters(chapter, self.PREFETCH_CHAPTER_COUNT)
-        prefetch_engine = LegadoReadingEngine(
-            webview_fetcher=available_fetcher(),
-            state_dir=self.service.data_dir)
+        prefetch_engine = self._background_engine()
         prefetch_engine.current_book = getattr(self.engine, "current_book", None)
         prefetch_engine.js_variables.update(self.engine.js_variables)
         cache_size = sum(self._document_size(item) for item in self._chapter_cache.values())
@@ -2493,15 +2173,8 @@ class ReadingView(ft.Column):
             pass
 
     def _is_desktop_reader(self):
-        try:
-            platform = self.page.platform
-        except (AssertionError, AttributeError, RuntimeError):
-            return False
-        return platform in {
-            ft.PagePlatform.WINDOWS,
-            ft.PagePlatform.MACOS,
-            ft.PagePlatform.LINUX,
-        }
+        return platform_support.is_desktop_page(
+            platform_support.attached_page(self))
 
     def _on_reader_tap(self, event):
         # A desktop primary-button click is commonly used to select text or
@@ -2798,6 +2471,7 @@ class ReadingView(ft.Column):
                 controls.append(ft.Image(src=block.value,
                     error_content=ft.Text("图片加载失败"), **options))
             elif block.kind == "audio":
+                import flet_audio as fta
                 player = fta.Audio(src=block.value, autoplay=False)
                 controls.append(ft.Card(content=ft.Container(padding=12, content=ft.Column([
                     player,
@@ -2810,6 +2484,7 @@ class ReadingView(ft.Column):
                     ]),
                 ]))))
             elif block.kind == "video":
+                import flet_video as ftv
                 media = ftv.VideoMedia(resource=block.value, http_headers=block.headers or None)
                 controls.append(ftv.Video(
                     playlist=[media], title=block.title or "视频", autoplay=False,
@@ -2857,6 +2532,20 @@ class ReadingView(ft.Column):
         """Final message of a task: nothing left to restore on re-entry."""
         self._background_status = None
         self._status.value = text
+
+    def _set_webview_hint(self, text):
+        """Hint from the page renderer: a task may still be running behind it."""
+        self._status.value = text
+        self.update()
+
+    def _background_engine(self):
+        """An engine for work the reader did not directly ask for.
+
+        It gets the built-in browser only: opening a verification dialog over
+        whatever the reader is doing would be worse than failing the task.
+        """
+        return LegadoReadingEngine(webview_fetcher=available_fetcher(),
+                                   state_dir=self.service.data_dir)
 
     def _restore_background_status(self):
         if self._background_status:

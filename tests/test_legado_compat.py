@@ -38,7 +38,8 @@ from app.services.legado_rule_parser import (JavaDateValue, _jsoup_html_markup,
 from app.services.compat_audit import SUPPORTED_JAVA_APIS, SUPPORTED_OBJECT_APIS
 from app.services.desktop_browser import EdgeCdpSession
 from app.services.icu_charset import detect_charset
-from app.services.legado_js import JsBridgeError, JsContext, LegadoJsRuntime
+from app.services.legado_js import (JsBridgeError, JsContext, LegadoJsRuntime,
+                                    classify_js_bridge_error)
 from app.services.request_compat import (encode_form_fields,
                                          encode_url_query_fields, escape_form,
                                          escape_url_query, legado_escape,
@@ -63,8 +64,7 @@ from app.services.rule_engine import (BookItem, ChapterItem, ReaderEngine,
 from app.services.rule_engine import extract_value
 from app.services.search_model import SearchBookStore, SearchModel
 from app.services.reading_cache import ReadingCache
-from test_book_sources_async import (classify_js_bridge_error,
-                                     parse_request_config, parse_search_url)
+from app.services.legado_url import parse_request_config, parse_search_url
 
 
 class SearchModelTests(unittest.IsolatedAsyncioTestCase):
@@ -6950,6 +6950,23 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await engine.decode_cover(
             source, "https://source/cover.bin"),
             "data:image/jpeg;base64,CQ==")
+
+    async def test_media_fetch_applies_inline_options_then_block_headers(self):
+        requests = []
+
+        class Engine(LegadoReadingEngine):
+            async def _request(self, request, source=None):
+                requests.append(request)
+                self.last_response = {"bodyBytes": [7, 8]}
+                return "", "image/jpeg", request["url"]
+
+        payload = await Engine().fetch_media(
+            'https://img/1.jpg,{"headers":{"Referer":"https://source/"}}',
+            SimpleNamespace(bookSourceUrl="https://source"),
+            extra_headers={"Referer": "https://block/"})
+        self.assertEqual(b"\x07\x08", payload)
+        self.assertEqual("https://img/1.jpg", requests[0]["url"])
+        self.assertEqual("https://block/", requests[0]["headers"]["Referer"])
 
     async def test_verification_code_is_available_while_resolving_url(self):
         async def get_code(image, source):

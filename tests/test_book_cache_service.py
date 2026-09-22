@@ -22,7 +22,7 @@ class _Engine:
         self.current_book = None
         self.calls = []
         self.attempts = {}
-        self.last_response = None
+        self.media_calls = []
 
     async def chapters(self, _source, _book):
         return [ChapterItem("One", "https://book/1", index=0),
@@ -40,10 +40,9 @@ class _Engine:
                 "image", "https://img/1.jpg,{\"headers\":{\"Referer\":\"x\"}}"))
         return ChapterContent(blocks, title=chapter.name)
 
-    async def _request(self, request, _source):
-        self.last_response = {"bodyBytes": list(b"image-bytes")}
-        self.image_request = request
-        return {"body": "", "url": request["url"]}
+    async def fetch_media(self, value, _source, base_url="", extra_headers=None):
+        self.media_calls.append((value, dict(extra_headers or {})))
+        return b"image-bytes"
 
 
 class WholeBookCacheTests(unittest.IsolatedAsyncioTestCase):
@@ -71,7 +70,11 @@ class WholeBookCacheTests(unittest.IsolatedAsyncioTestCase):
             cached_doc = cache.load_content(
                 source.bookSourceUrl, book.url, "https://book/1")
             self.assertEqual(b"image-bytes", cached_doc.blocks[1].value)
-            self.assertEqual("x", engine.image_request["headers"]["Referer"])
+            # The rule value reaches the engine untouched: how Legado encodes
+            # its request options is the engine's business, not the cache's.
+            self.assertEqual(
+                [('https://img/1.jpg,{"headers":{"Referer":"x"}}', {})],
+                engine.media_calls)
 
             calls_before = len(engine.calls)
             resumed = await service.cache_book(source, book)

@@ -16,10 +16,10 @@ from yarl import URL
 
 from bs4 import BeautifulSoup
 
-from test_book_sources_async import parse_request_config, parse_search_url
 from app.services.legado_js import JsContext, split_js_rule
 from app.services.legado_rule_parser import (evaluate, is_json_text,
                                              parse_json_smart, parse_markup)
+from app.services.legado_url import parse_request_config, parse_search_url
 from app.services.java_regex import search as java_regex_search, sub as java_regex_sub
 from app.services.source_rule import compile_rule_program
 from app.services.rule_engine import (BookItem, ChapterItem, ReaderEngine,
@@ -504,6 +504,19 @@ class LegadoReadingEngine(ReaderEngine):
         mime = "image/png" if payload.startswith(b"\x89PNG") else (
             "image/webp" if payload.startswith(b"RIFF") else "image/jpeg")
         return f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
+
+    async def fetch_media(self, value: str, source, base_url: str = "",
+                          extra_headers=None) -> bytes:
+        """Download one binary resource, honouring the headers a rule attached.
+
+        Callers pass the raw rule value because the ``url,{request options}``
+        form is Legado's, not theirs: parsing it and reading the response body
+        are both the engine's business.
+        """
+        url, headers = _media_request(value, base_url or value)
+        headers.update({str(k): str(v) for k, v in (extra_headers or {}).items()})
+        await self._request({"url": url, "method": "GET", "headers": headers}, source)
+        return bytes((self.last_response or {}).get("bodyBytes") or [])
 
     async def _resolve_rule_url(self, value: str, source, key: str = "",
                                 page: int = 1) -> str:

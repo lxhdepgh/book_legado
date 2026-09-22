@@ -11,18 +11,15 @@ import json
 import sys
 import asyncio
 from datetime import datetime
-from urllib.parse import urlparse, quote, urlsplit, urljoin
 import re
 import os
 import aiohttp
 
-# Windows consoles commonly default to GBK, while book-source names and error
-# messages may contain emoji or other Unicode characters.  Keep the regression
-# runner from failing after a successful test merely while printing its report.
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+from app.services.legado_js import classify_js_bridge_error
+from app.services.legado_rule_parser import (jsonpath_get,
+                                             simplify_legado_selector,
+                                             usable_non_js_rule)
+from app.services.legado_url import clean_url, encode_url, parse_search_url
 
 try:
     from bs4 import BeautifulSoup
@@ -36,265 +33,14 @@ REQUEST_TIMEOUT = 15
 DEFAULT_TEST_KEYWORD = "仙"
 
 
-def classify_js_bridge_error(message: str) -> str:
-    """Separate missing engine APIs from source-script/network failures."""
-    text = str(message or "")
-    lowered = text.lower()
-    if "bridge:" in lowered and any(token in lowered for token in (
-            "network", "urlerror", "timeout", "ssl", "connection")):
-        return "http_error"
-    if any(token in text for token in ("暂不支持", "interactive browser",
-                                        "verification-code", "未配置网页交互")):
-        return "js_needed"
-    return "parse_error"
-
-
-# ========== URL 工具函数 ==========
-
-def clean_url(raw_url: str) -> str | None:
-    """清理 bookSourceUrl, 提取真正的 URL 部分"""
-    if not raw_url:
-        return None
-    url = raw_url.strip()
-    url = url.replace("\uff03", "#").replace("\uff20", "@")
-    url = url.rstrip(",，。、；;:：")
-    if "##" in url:
-        url = url.split("##")[0]
-    if "#" in url:
-        url = url.split("#")[0]
-    url = url.rstrip(",，。、；;:：")
-    if not (url.startswith("http://") or url.startswith("https://")):
-        return None
-    url = url.rstrip("/")
-    return url
-
-
-def encode_url(url: str) -> str:
-    """非 ASCII 字符编为百分号/IDNA 格式"""
-    try:
-        url.encode("ascii")
-        return url
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        pass
-    try:
-        parts = urlsplit(url)
-    except Exception:
-        return quote(url, safe=":/?#[]@!$&'()*+,;=-._~%")
-    if parts.scheme and parts.netloc:
-        netloc_encoded = []
-        for seg in parts.netloc.split("."):
-            try:
-                seg.encode("ascii")
-                netloc_encoded.append(seg)
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                netloc_encoded.append(seg.encode("idna").decode("ascii"))
-        safe_netloc = ".".join(netloc_encoded)
-        safe_path = quote(parts.path, safe="/%")
-        safe_query = quote(parts.query, safe="=&%")
-        result = f"{parts.scheme}://{safe_netloc}{safe_path}"
-        if safe_query:
-            result += f"?{safe_query}"
-        return result
-    return quote(url, safe=":/?#[]@!$&'()*+,;=-._~%")
-
-
-# ========== 搜索 URL 解析 ==========
-
-def parse_search_url(search_url: str, base_url: str, keyword: str,
-                     page: int = 1) -> dict | None:
-    """
-    解析 searchUrl, 返回请求参数或 None。
-
-    返回: {"url": str, "method": "GET"/"POST", "body": str|None,
-           "headers": dict|None, "parse_method": str} 或 None
-    """
-    if not search_url:
-        return None
-
-    text = search_url.strip()
-
-    # 一些书源先给出可直接请求的 URL/POST 配置，后面再附加可选的 @js
-    # 跳转或翻页处理。基础搜索检测优先使用前面的普通请求部分。
-    js_suffix = re.search(r"\n\s*@js:\s*", text, flags=re.I)
-    if js_suffix and js_suffix.start() > 0:
-        plain_prefix = text[:js_suffix.start()].strip()
-        if plain_prefix.startswith(("http://", "https://", "/")) or ",{" in plain_prefix:
-            text = plain_prefix
-
-    # @js: 标记 - 需要 JS 引擎
-    if text.startswith("@js:"):
-        return None
-
-    # <js> 标记
-    if text.startswith("<js") and "</js>" in text:
-        return None
-
-    # {{ 开头且包含 source. 等复杂模板
-    if text.startswith("{{") and ("source." in text or "java." in text):
-        return None
-
-    # ========== 处理 POST 风格: /path,{"body":"...","method":"POST"} ==========
-    if "," in text and re.search(r",\s*\{", text):
-        # 可能是 URL,JSON_CONFIG 格式
-        parts = split_post_url(text)
-        if parts:
-            url_part, config_str = parts
-            # 对 url_part 做模板替换
-            resolved_url = resolve_search_url(url_part, base_url, keyword, page)
-            if not resolved_url:
-                return None
-            # 解析 config
-            from app.services.request_compat import normalize_url_option
-            config = normalize_url_option(parse_request_config(config_str))
-            method = config.get("method", "GET")
-            body = config.get("body")
-            if isinstance(body, (dict, list)):
-                body = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
-            elif body is not None and not isinstance(body, str):
-                body = str(body)
-            # body 中可能有 {{key}}
-            if body:
-                body = body.replace("{{key}}", keyword).replace("{{page}}", str(page))
-            headers = config.get("headers")
-            request = dict(config)
-            request.update({
-                "url": resolved_url,
-                "method": method,
-                "body": body,
-                "headers": headers,
-                "parse_method": "post_template",
-            })
-            return request
-
-    # ========== 处理 GET 模板 URL ==========
-    resolved = resolve_search_url(text, base_url, keyword, page)
-    if resolved:
-        return {
-            "url": resolved,
-            "method": "GET",
-            "body": None,
-            "headers": None,
-            "parse_method": "get_template",
-        }
-
-    return None
-
-
-def parse_request_config(config_str: str) -> dict | None:
-    """兼容标准 JSON 及常见的 Legado 宽松对象写法。"""
-    try:
-        value = json.loads(config_str)
-        return value if isinstance(value, dict) else None
-    except json.JSONDecodeError:
-        pass
-    # Gson's JsonReader is lenient: accept unquoted keys and single-quoted
-    # strings without corrupting apostrophes inside ordinary double strings.
-    try:
-        relaxed = re.sub(r"([{,]\s*)([A-Za-z_][\w-]*)(\s*:)", r'\1"\2"\3', config_str)
-        output, index = [], 0
-        while index < len(relaxed):
-            char = relaxed[index]
-            if char == '"':
-                start = index
-                index += 1
-                while index < len(relaxed):
-                    if relaxed[index] == "\\":
-                        index += 2
-                    elif relaxed[index] == '"':
-                        index += 1
-                        break
-                    else:
-                        index += 1
-                output.append(relaxed[start:index])
-                continue
-            if char == "'":
-                index += 1
-                value = []
-                while index < len(relaxed):
-                    if relaxed[index] == "\\" and index + 1 < len(relaxed):
-                        value.append(relaxed[index + 1])
-                        index += 2
-                    elif relaxed[index] == "'":
-                        index += 1
-                        break
-                    else:
-                        value.append(relaxed[index])
-                        index += 1
-                output.append(json.dumps("".join(value), ensure_ascii=False))
-                continue
-            output.append(char)
-            index += 1
-        relaxed = re.sub(r",\s*([}\]])", r"\1", "".join(output))
-        value = json.loads(relaxed)
-        return value if isinstance(value, dict) else None
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
-def split_post_url(text: str) -> tuple | None:
-    """分割 POST 风格搜索URL: 'path,{"body":"..."}' → (path, config_json)"""
-    # 必须定位逗号后的配置对象，不能把 URL 模板 {{page}} 的左花括号
-    # 误判为配置开头。
-    config_match = re.search(r",\s*(\{)", text)
-    if not config_match:
-        return None
-    brace_idx = config_match.start(1)
-    url_part = text[:brace_idx].strip().rstrip(",")
-    config_part = text[brace_idx:]
-    return url_part, config_part
-
-
-def resolve_search_url(text: str, base_url: str, keyword: str, page: int) -> str | None:
-    """
-    尝试将 searchUrl 模板解析为可用的 URL。
-    返回完整 URL 或 None。
-    """
-    url = text.strip()
-
-    # 替换 {{key}} / {{searchKey}} / {{keyword}}
-    for var in ("{{key}}", "{{searchKey}}", "{{keyword}}", "{{keys}}"):
-        url = url.replace(var, keyword)
-    url = url.replace("{{page}}", str(page))
-    url = url.replace("{{pg}}", str(page))
-    url = url.replace("{{page-1}}", str(max(page - 1, 0)))
-    url = url.replace("{{page+1}}", str(page + 1))
-    url = url.replace("{{baseUrl}}", base_url.rstrip("/") + "/")
-
-    # Legado page alternatives: <first-page,second-page,later-pages>.  Once
-    # the requested page exceeds the list, the final alternative is reused.
-    def select_page(match):
-        choices = [item.strip() for item in match.group(1).split(",")]
-        if not choices:
-            return ""
-        return choices[min(max(int(page), 1) - 1, len(choices) - 1)]
-
-    url = re.sub(r"<([^<>]*)>", select_page, url)
-
-    # 检查是否还有未替换的 {{...}} 模板 (复杂表达式)
-    if "{{" in url and "}}" in url:
-        # 简单尝试替换 source.key 为 base_url
-        if "{{source.key}}" in url or "{{sourceKey}}" in url:
-            url = url.replace("{{source.key}}", base_url)
-            url = url.replace("{{sourceKey}}", base_url)
-            if "{{" not in url or "}}" not in url:
-                return url  # 替换后没有模板了
-        return None  # 仍有复杂模板, 无法处理
-
-    # Legado also uses data: URLs as an internal transport for encoded IDs.
-    if url.startswith("data:"):
-        return url
-
-    # 如果是相对路径, 拼接 base_url
-    if not (url.startswith("http://") or url.startswith("https://")):
-        url = urljoin(base_url.rstrip("/") + "/", url)
-
-    # 必须是 http/https
-    if not (url.startswith("http://") or url.startswith("https://")):
-        return None
-
-    # URL 编码
-    url = encode_url(url)
-    return url
+# Windows consoles commonly default to GBK, while book-source names and error
+# messages may contain emoji or other Unicode characters.  Keep the regression
+# runner from failing after a successful test merely while printing its report.
+# Kept out of import time so importing this module cannot reconfigure stdio.
+def configure_console_encoding() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
 # ========== bookList 结果提取 ==========
@@ -344,68 +90,6 @@ def extract_by_booklist(response_text: str, content_type: str,
     return -1
 
 
-def usable_non_js_rule(rule: str) -> str:
-    """从“JS预处理 + 普通规则”组合中提取仍可尝试的普通规则。"""
-    text = (rule or "").strip()
-    if not text:
-        return text
-    # <js>...</js> 后常跟 CSS/JSONPath，先用原始响应尝试该规则。
-    match = re.match(r"<js>[\s\S]*?</js>\s*([\s\S]+)$", text, flags=re.I)
-    if match and match.group(1).strip():
-        return match.group(1).strip()
-    # 普通 JSONPath 后附加 JS 增强时，先执行前置 JSONPath。
-    match = re.match(r"([^\n]+)\s*<js>[\s\S]*?</js>", text, flags=re.I)
-    if match and match.group(1).strip():
-        return match.group(1).strip()
-    return text
-
-
-def simplify_legado_selector(rule: str) -> str | None:
-    """
-    简化 Legado 混合选择器为基本 CSS 选择器。
-    例如:
-      class.col-6.col-md-4...@tag.a!0  → .col-6.col-md-4...
-      .content@p@text                    → .content
-      id.book-list@tag.li!-1             → #book-list
-      class.ser-ret@li||class.j_bookList@li → .ser-ret (第一个)
-    """
-    # 如果有 || 取第一个
-    if "||" in rule:
-        rule = rule.split("||")[0].strip()
-
-    # 去掉 @ 后面的部分
-    if "@" in rule:
-        rule = rule.split("@")[0].strip()
-
-    # 处理 class.xxx / id.xxx 格式
-    if rule.startswith("class."):
-        rule = "." + rule[6:]
-    elif rule.startswith("id."):
-        rule = "#" + rule[3:]
-    elif rule.startswith("tag."):
-        rule = rule[4:]
-
-    # 清理末尾的 !0, !-1 等
-    rule = re.sub(r"!\s*-?\d+\s*$", "", rule).strip()
-
-    if not rule:
-        return None
-
-    # 验证是否像 CSS 选择器
-    if rule.startswith((".", "#", "[", "a", "div", "li", "ul", "p", "span",
-                        "table", "tr", "td", "th", "h1", "h2", "h3", "h4",
-                        "body", "head", "html", "meta", "img", "input",
-                        "form", "button", "select", "option", "nav",
-                        "section", "article", "header", "footer", "main")):
-        return rule
-
-    # 如果是纯 JSONPath (如 data.books), 不是 CSS, 返回 None
-    if "." in rule and not rule.startswith("."):
-        return None
-
-    return rule if rule.startswith((".", "#", "[")) else None
-
-
 def _extract_by_css(html_text: str, css_selector: str) -> int:
     """使用 CSS 选择器提取元素数量"""
     if not HAS_BS4:
@@ -418,93 +102,6 @@ def _extract_by_css(html_text: str, css_selector: str) -> int:
         return len(items)
     except Exception:
         return -1
-
-
-def jsonpath_get(data, path: str) -> list:
-    """
-    简单的 JSONPath 实现。
-    支持: $.a.b.c, $.a[*].b, data.books, $..key (递归)
-    返回匹配值列表。
-    """
-    # 去掉 $.
-    if path.startswith("$."):
-        path = path[2:]
-    elif path.startswith("$.."):
-        path = path[1:]  # 保留一个 .
-
-    # 处理 $..xxx (递归)
-    if path.startswith(".."):
-        results = []
-        _recursive_find(data, path[2:], results)
-        return results
-
-    current = [data]
-    # 按 . 分割路径
-    parts = path.split(".")
-    for part in parts:
-        if not part:
-            continue
-        next_current = []
-        # 处理 [*]、[0]、[:10] 等数组访问
-        array_match = re.match(r"^(.*)\[([^]]+)\]$", part)
-        if array_match:
-            key, expression = array_match.groups()
-            for item in current:
-                if key and isinstance(item, dict):
-                    val = item.get(key, [])
-                elif not key:
-                    val = item
-                else:
-                    val = []
-                if not isinstance(val, list):
-                    continue
-                if expression == "*":
-                    next_current.extend(val)
-                elif expression.startswith(":"):
-                    try:
-                        next_current.extend(val[:int(expression[1:])])
-                    except ValueError:
-                        pass
-                else:
-                    try:
-                        next_current.append(val[int(expression)])
-                    except (ValueError, IndexError):
-                        pass
-        else:
-            for item in current:
-                if isinstance(item, dict):
-                    val = item.get(part)
-                    if val is not None:
-                        if isinstance(val, list):
-                            next_current.extend(val)
-                        else:
-                            next_current.append(val)
-                elif isinstance(item, list):
-                    for sub in item:
-                        if isinstance(sub, dict):
-                            val = sub.get(part)
-                            if val is not None:
-                                if isinstance(val, list):
-                                    next_current.extend(val)
-                                else:
-                                    next_current.append(val)
-        current = next_current
-        if not current:
-            break
-    return current
-
-
-def _recursive_find(data, key: str, results: list):
-    """递归查找所有 key"""
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if k == key:
-                results.append(v)
-            else:
-                _recursive_find(v, key, results)
-    elif isinstance(data, list):
-        for item in data:
-            _recursive_find(item, key, results)
 
 
 def _extract_by_json(response_text: str, json_path: str) -> int:
@@ -1068,4 +665,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    configure_console_encoding()
     asyncio.run(main())

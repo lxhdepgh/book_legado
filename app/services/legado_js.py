@@ -43,6 +43,19 @@ class JsBridgeError(RuntimeError):
     pass
 
 
+def classify_js_bridge_error(message: str) -> str:
+    """Separate missing engine APIs from source-script/network failures."""
+    text = str(message or "")
+    lowered = text.lower()
+    if "bridge:" in lowered and any(token in lowered for token in (
+            "network", "urlerror", "timeout", "ssl", "connection")):
+        return "http_error"
+    if any(token in text for token in ("暂不支持", "interactive browser",
+                                        "verification-code", "未配置网页交互")):
+        return "js_needed"
+    return "parse_error"
+
+
 class _NoRedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -654,7 +667,7 @@ class LegadoJsRuntime:
         request_method = "GET"
         if context.host_kind == "url":
             try:
-                from test_book_sources_async import parse_request_config, split_post_url
+                from app.services.legado_url import parse_request_config, split_post_url
                 from app.services.request_compat import normalize_url_option
                 parts = split_post_url(str(evaluation_base))
                 if parts:
@@ -5724,7 +5737,7 @@ class LegadoJsRuntime:
                       cookie_enabled=True, cookie_tag=None,
                       allow_webview=True, webview_js=None,
                       source_regex=None) -> str:
-        from test_book_sources_async import encode_url, parse_request_config, split_post_url
+        from app.services.legado_url import encode_url, parse_request_config, split_post_url
         from app.services.request_compat import (escape_form, escape_url_query,
                                                  normalize_url_option)
 

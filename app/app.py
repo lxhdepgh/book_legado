@@ -7,6 +7,7 @@ from pathlib import Path
 
 import flet as ft
 
+from app import platform_support
 from app.services.source_service import SourceService
 from app.services.theme_service import ThemeService
 from app.ui_feedback import show_snack_bar
@@ -121,11 +122,7 @@ class BookSourceApp:
     @staticmethod
     def _configure_window(page: ft.Page):
         """Apply window geometry only where the platform owns a desktop window."""
-        desktop = {
-            ft.PagePlatform.WINDOWS, ft.PagePlatform.MACOS,
-            ft.PagePlatform.LINUX,
-        }
-        if page.platform not in desktop:
+        if not platform_support.is_desktop_page(page):
             return
         page.window.width = 1100
         page.window.height = 780
