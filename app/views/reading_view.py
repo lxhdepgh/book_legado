@@ -19,9 +19,24 @@ from app.services.rule_engine import (UnsupportedRule, parse_explore_categories,
 from app.services.reading_engine import LegadoReadingEngine
 from app.services.reading_cache import ReadingCache
 from app.services.desktop_browser import EdgeCdpSession
+from app.services.block_pages import block_reason
+from app.services.headless_browser import available_fetcher
 from app.services.book_cache_service import WholeBookCacheService
 from app.services.reading_progress import ReadingProgressStore, ReadingSession
 from app.ui_feedback import show_snack_bar
+
+
+def _looks_like_gate(html: str) -> bool:
+    """True when a rendered page is still a wall instead of the article.
+
+    A login form is the one gate a page keeps after rendering: the challenge
+    interstitials are already recognised by the shared block-page detector.
+    """
+    if not html.strip():
+        return True
+    if block_reason(html):
+        return True
+    return bool(re.search(r"""(?i)<input[^>]+type\s*=\s*["']?password""", html))
 
 
 class ReadingView(ft.Column):
@@ -555,8 +570,30 @@ class ReadingView(ft.Column):
             ft.PagePlatform.IOS, ft.PagePlatform.MACOS,
         }
 
+    async def _render_with_builtin_browser(self, url, options):
+        """Silently render through the built-in browser before asking the user.
+
+        Rendering script-built pages needs no human, so the visible window is
+        reserved for what genuinely needs one: a challenge page or a login form
+        still comes back as a gate and falls through to it.
+        """
+        fetcher = available_fetcher()
+        if fetcher is None:
+            return None
+        try:
+            rendered = await fetcher(url, None, options)
+        except Exception:
+            return None
+        if _looks_like_gate(str(rendered.get("body") or "")):
+            return None
+        return rendered
+
     async def _fetch_with_webview(self, url, source, options=None):
         """Legado-style WebView fallback: render JS, then return final DOM HTML."""
+        options = options or {}
+        rendered = await self._render_with_builtin_browser(url, options)
+        if rendered is not None:
+            return rendered
         if self._webview_future and not self._webview_future.done():
             raise RuntimeError("已有一个网页验证任务正在进行")
         loop = asyncio.get_running_loop()
@@ -1559,7 +1596,9 @@ class ReadingView(ft.Column):
                     source = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     return
-                engine = LegadoReadingEngine(state_dir=self.service.data_dir)
+                engine = LegadoReadingEngine(
+                    webview_fetcher=available_fetcher(),
+                    state_dir=self.service.data_dir)
                 try:
                     books = await engine.search(source, keyword, 1)
                     for book in books:
@@ -1791,7 +1830,9 @@ class ReadingView(ft.Column):
                 error="原书源已删除")
             return
         book = self._book_from_shelf(item)
-        update_engine = LegadoReadingEngine(state_dir=self.service.data_dir)
+        update_engine = LegadoReadingEngine(
+            webview_fetcher=available_fetcher(),
+            state_dir=self.service.data_dir)
         try:
             chapters = await update_engine.chapters(source, book)
             latest = next((chapter.name for chapter in reversed(chapters)
@@ -2369,7 +2410,9 @@ class ReadingView(ft.Column):
         """顺序预取后续章节，避免并发修改 Legado 规则变量。"""
         source = self.current_source
         candidates = self._next_readable_chapters(chapter, self.PREFETCH_CHAPTER_COUNT)
-        prefetch_engine = LegadoReadingEngine(state_dir=self.service.data_dir)
+        prefetch_engine = LegadoReadingEngine(
+            webview_fetcher=available_fetcher(),
+            state_dir=self.service.data_dir)
         prefetch_engine.current_book = getattr(self.engine, "current_book", None)
         prefetch_engine.js_variables.update(self.engine.js_variables)
         cache_size = sum(self._document_size(item) for item in self._chapter_cache.values())

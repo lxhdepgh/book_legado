@@ -478,6 +478,37 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["reading_status"], "rule_error")
 
+    async def test_the_check_pipeline_hands_the_builtin_browser_to_the_engine(self):
+        # The check has to build its own engines; forgetting the fetcher here
+        # would silently turn every webView stage back into "需浏览器未抽检".
+        seen = {}
+
+        class FakeEngine:
+            def __init__(self, **kwargs):
+                seen.update(kwargs)
+                self.js = SimpleNamespace(close=lambda: None)
+
+        async def fake_search(source, engine, timeout):
+            return ({"search_status": "no_results", "book_count": 0,
+                     "search_keyword": "test", "search_method": "rule-engine",
+                     "search_error": None}, [])
+
+        async def fake_probe(*args, **kwargs):
+            return {"status": "ok", "status_code": 200,
+                    "response_time_ms": 1, "error": None}
+
+        fetcher = AsyncMock()
+        with patch.object(check_service, "available_fetcher",
+                          return_value=fetcher), \
+                patch.object(check_service, "_engine_search_check", fake_search), \
+                patch.object(check_service, "_probe_source", fake_probe), \
+                patch.object(check_service, "LegadoReadingEngine", FakeEngine):
+            await check_service.check_sources(
+                [_source(enabledExplore=False, exploreUrl="")],
+                concurrency=1, timeout=1)
+
+        self.assertIs(seen.get("webview_fetcher"), fetcher)
+
     def test_locally_blocked_host_is_not_counted_as_source_failure(self):
         block_page = ("<html><body><h1>拦截提示</h1>"
                       "<p>火绒安全软件已阻止你访问该网站</p></body></html>")

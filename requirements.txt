@@ -13,5 +13,6 @@ fonttools>=4.55,<5
 pillow>=10.4,<13
 pycryptodome>=3.20,<4
 quickjs>=1.19.4
+playwright>=1.49,<2
 py7zr>=0.22,<2
 rarfile>=4.2,<5

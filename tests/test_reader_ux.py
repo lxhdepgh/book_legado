@@ -14,7 +14,7 @@ from app.services.reading_engine import (ChapterContent, ContentBlock,
                                          parse_content_blocks)
 from app.services.rule_engine import (BookItem, ChapterItem, UnsupportedRule)
 from app.services.source_service import SourceService
-from app.views.reading_view import ReadingView
+from app.views.reading_view import ReadingView, _looks_like_gate
 from app.app import BookSourceApp
 from app.views.settings_view import SettingsView
 
@@ -1112,6 +1112,43 @@ class PersistentReadingTests(unittest.TestCase):
             self.assertEqual(item["durChapterPos"], 0)
             self.assertEqual(item["durChapterTitle"], chapter.name)
             self.assertGreater(item["durChapterTime"], 0)
+
+
+class BuiltinBrowserFallbackTests(unittest.IsolatedAsyncioTestCase):
+    """The rendering step that runs before the visible window is offered."""
+
+    async def _render(self, fetcher, options=None):
+        with patch("app.views.reading_view.available_fetcher",
+                   return_value=fetcher):
+            return await ReadingView._render_with_builtin_browser(
+                SimpleNamespace(), "https://site.example/c", options or {})
+
+    async def test_a_rendered_chapter_is_used_without_asking_the_user(self):
+        fetcher = AsyncMock(return_value={"body": "<p>chapter</p>"})
+        rendered = await self._render(fetcher, {"mode": "webJs"})
+        self.assertEqual(rendered, {"body": "<p>chapter</p>"})
+        fetcher.assert_awaited_once_with("https://site.example/c", None,
+                                         {"mode": "webJs"})
+
+    async def test_a_challenge_page_still_asks_for_the_visible_window(self):
+        for body in ("",
+                     "<html><body>Attention Required! | Cloudflare</body></html>",
+                     "<html><body><form><input type='password'></form></body></html>"):
+            with self.subTest(body=body):
+                fetcher = AsyncMock(return_value={"body": body})
+                self.assertIsNone(await self._render(fetcher))
+
+    async def test_a_missing_kernel_leaves_the_visible_window_as_the_fallback(self):
+        self.assertIsNone(await self._render(None))
+
+    async def test_a_launch_failure_falls_back_instead_of_breaking_the_read(self):
+        fetcher = AsyncMock(side_effect=RuntimeError("boom"))
+        self.assertIsNone(await self._render(fetcher))
+
+    def test_a_rendered_article_is_not_mistaken_for_a_login_form(self):
+        article = ("<html><body><p>" + "正文。" * 2000
+                   + "</p><a href='/login'>登录</a></body></html>")
+        self.assertFalse(_looks_like_gate(article))
 
 
 if __name__ == "__main__":

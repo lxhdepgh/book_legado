@@ -29,6 +29,7 @@ def smoke_test():
     from opencc import OpenCC
     import elementpath  # noqa: F401
     import jsonpath_ng.ext  # noqa: F401
+    import playwright  # noqa: F401
     import quickjs  # noqa: F401
 
     from app.services.legado_js import JsContext, LegadoJsRuntime

@@ -9,6 +9,7 @@ import time
 import aiohttp
 
 from app.services.block_pages import SiteBlockedError, block_reason
+from app.services.headless_browser import BrowserUnavailable, available_fetcher
 from app.services.legado_js import JsBridgeError
 from app.services.rule_engine import UnsupportedRule, resolve_explore_categories
 from app.services.reading_engine import LegadoReadingEngine
@@ -324,7 +325,7 @@ async def _reading_chain_check(source, engine, candidates, timeout,
             # 这一阶段在无浏览器环境下按 HTTP 结果判断，正文由脚本渲染时必然为
             # 空。判成"正文不可用"会把一条本机验证不了的链路报成书源失效。
             if (kind == "rule_error" and result["reading_stage"] in browser_stages
-                    and not has_browser):
+                    and (not has_browser or isinstance(exc, BrowserUnavailable))):
                 result["reading_status"] = "needs_browser"
                 result["reading_error"] = ("该阶段需要内置浏览器渲染，"
                                            "本次检测未启用浏览器")
@@ -391,10 +392,13 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
     async with aiohttp.ClientSession(
             connector=connector, headers=headers,
             cookie_jar=aiohttp.CookieJar(unsafe=True)) as session:
+        browser_fetcher = available_fetcher()
+
         async def check_source(source, index):
             probe_task = asyncio.create_task(
                 _probe_source(source, session, network_sem, timeout))
-            engine = LegadoReadingEngine(timeout=timeout)
+            engine = LegadoReadingEngine(timeout=timeout,
+                                         webview_fetcher=browser_fetcher)
             limiter = js_sem if _source_uses_js(source) else engine_sem
             try:
                 probe = await _locally_blocked_probe(probe_task, timeout)

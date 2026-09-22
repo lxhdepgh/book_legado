@@ -28,6 +28,7 @@ Thumbs.db
 bookshelf.json
 reader-cache/
 edge-webview-profile/
+chromium-profile/
 
 # Local book-source corpora under resource/ are user data, not source
 resource/*.json
