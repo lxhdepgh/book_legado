@@ -18,8 +18,9 @@ from app.services.public_suffix import effective_tld_plus_one
 from app.services.rule_engine import (UnsupportedRule, parse_explore_categories,
                                       resolve_explore_categories, BookItem,
                                       RequestConnectionError,
-                                      RequestTimeoutError)
-from app.services.reading_engine import LegadoReadingEngine
+                                      RequestTimeoutError, display_intro,
+                                      html_to_text)
+from app.services.reading_engine import LegadoReadingEngine, render_use_html_spans
 from app.services.reading_cache import ReadingCache
 from app.services.headless_browser import available_fetcher
 from app.services.book_cache_service import WholeBookCacheService
@@ -87,6 +88,24 @@ def _clock(seconds: float) -> str:
     if total < 3600:
         return f"{total // 60}:{total % 60:02d}"
     return f"{total // 3600}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
+def _intro_text(intro) -> str:
+    """A book intro as readable text, whatever renderer it asked for."""
+    kind, content = display_intro(intro)
+    if kind == "text":
+        return content
+    return content.strip() if kind == "md" else html_to_text(content)
+
+
+def _intro_control(intro) -> ft.Control:
+    """The widget a book intro needs: markdown gets a renderer, the rest text."""
+    kind, content = display_intro(intro)
+    if kind == "md":
+        return ft.Markdown(content, selectable=True,
+                           extension_set=ft.MarkdownExtensionSet.GITHUB_FLAVORED)
+    text = content if kind == "text" else html_to_text(content)
+    return ft.Text(text or "暂无简介", selectable=True)
 
 
 class ReadingView(ft.Column):
@@ -827,7 +846,8 @@ class ReadingView(ft.Column):
             self.page.run_task(self._decode_book_cover, book, cover)
         return ft.ListTile(
             leading=cover, title=ft.Text(book.name),
-            subtitle=ft.Text(" · ".join(x for x in [book.author, book.intro[:80]] if x)),
+            subtitle=ft.Text(" · ".join(
+                x for x in [book.author, _intro_text(book.intro)[:80]] if x)),
             trailing=ft.IconButton(
                 ft.Icons.BOOKMARK_ADD_OUTLINED, tooltip="加入书架",
                 on_click=lambda e, selected=book: self._add_to_bookshelf(selected),
@@ -884,7 +904,7 @@ class ReadingView(ft.Column):
                 vertical_alignment=ft.CrossAxisAlignment.START),
             ft.Divider(),
             ft.Text("简介", weight=ft.FontWeight.BOLD),
-            ft.Text(book.intro or "暂无简介", selectable=True),
+            _intro_control(book.intro),
         ]
         if error:
             controls.append(ft.Text(
@@ -1851,7 +1871,7 @@ class ReadingView(ft.Column):
             value for value in [book.author, getattr(self.current_source,
                                                      "bookSourceName", "")]
             if value) or "作者未知"
-        self._detail_intro.value = book.intro or "暂无简介"
+        self._detail_intro.value = _intro_text(book.intro) or "暂无简介"
         self._detail_cover.content = (
             ft.Image(src=book.cover_url, width=76, height=104,
                      fit=ft.BoxFit.COVER,
@@ -2051,7 +2071,7 @@ class ReadingView(ft.Column):
             value for value in [book.author, getattr(self.current_source,
                                                      "bookSourceName", "")]
             if value) or "作者未知"
-        self._detail_intro.value = book.intro or "暂无简介"
+        self._detail_intro.value = _intro_text(book.intro) or "暂无简介"
         if book.cover_url:
             self._detail_cover.content = ft.Image(
                 src=book.cover_url, width=76, height=104,
@@ -2681,7 +2701,8 @@ class ReadingView(ft.Column):
             image_style = configured_style
         for block in document.blocks:
             if block.kind == "text":
-                for value, is_heading in self._novel_paragraphs(block.value):
+                for value, is_heading in self._novel_paragraphs(
+                        render_use_html_spans(block.value)):
                     controls.append(ft.Text(
                         value,
                         selectable=False,

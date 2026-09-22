@@ -98,15 +98,15 @@ def _format_word_count(value: str) -> str:
 
 
 _RAW_INTRO_PREFIXES = ("<usehtml>", "<md>", "<useweb>")
+# Legado's viewers hand the tagged payloads to Android's HTML renderer, which
+# never paints the body of a style or script block.  A <useweb> card carries its
+# whole stylesheet, so the text conversion has to drop it.
+_STYLE_BLOCK_PATTERN = re.compile(
+    r"<(style|script)\b[^>]*>[\s\S]*?</\1\s*>", re.IGNORECASE)
 
 
-def _format_book_intro(value: str) -> str:
+def _strip_html_tags(value: str) -> str:
     text = str(value or "")
-    # BookInfo.analyzeBookInfo: a raw intro tagged for special rendering is
-    # stored verbatim, bypassing HtmlFormatter entirely.
-    trimmed = text.lstrip()
-    if trimmed.startswith(_RAW_INTRO_PREFIXES):
-        return trimmed
     text = re.sub(r"(?:&nbsp;)+", " ", text)
     text = re.sub(r"&ensp;|&emsp;", " ", text)
     text = re.sub(r"&thinsp;|&zwnj;|&zwj;", "", text)
@@ -116,6 +116,45 @@ def _format_book_intro(value: str) -> str:
     text = re.sub(r"\s*\n+\s*", "\n　　", text)
     text = re.sub(r"^[\n\s]+", "　　", text)
     return re.sub(r"[\n\s]+$", "", text)
+
+
+def _format_book_intro(value: str) -> str:
+    text = str(value or "")
+    # BookInfo.analyzeBookInfo: a raw intro tagged for special rendering is
+    # stored verbatim, bypassing HtmlFormatter entirely.
+    trimmed = text.lstrip()
+    if trimmed.startswith(_RAW_INTRO_PREFIXES):
+        return trimmed
+    return _strip_html_tags(text)
+
+
+def html_to_text(value: str) -> str:
+    """Render markup as readable text the way the viewers' HTML path does."""
+    return _strip_html_tags(_STYLE_BLOCK_PATTERN.sub("", str(value or "")))
+
+
+_INTRO_RENDERERS = (("<usehtml>", "html"), ("<md>", "md"), ("<useweb>", "web"))
+
+
+def display_intro(value) -> tuple[str, str]:
+    """Split a stored intro into the renderer it asks for and that renderer's input.
+
+    Mirrors the branches BookInfoActivity takes on ``book.getDisplayIntro()``:
+    ``<usehtml>`` goes to an HTML text view, ``<md>`` to a markdown engine and
+    ``<useweb>`` to a WebView, each unwrapped by substring(prefix, lastIndexOf("<")).
+    The kind is one of ``text``/``html``/``md``/``web``; only ``text`` content is
+    already formatted for reading, the others are raw payloads.
+    """
+    text = str(value or "").lstrip()
+    for marker, kind in _INTRO_RENDERERS:
+        if not text.startswith(marker):
+            continue
+        end = text.rfind("<")
+        if end < len(marker):
+            # A tagged intro without its closing tag cannot be unwrapped.
+            return "text", text
+        return kind, text[len(marker):end]
+    return "text", _format_book_intro(text)
 
 
 def _book_type(source) -> int:

@@ -52,7 +52,8 @@ from app.services.reading_engine import (ContentEmptyError, LegadoReadingEngine,
                                          _format_content_page,
                                          chapter_display_title,
                                          parse_content_blocks,
-                                         process_book_content)
+                                         process_book_content,
+                                         render_use_html_spans)
 from app.services.source_service import SourceService
 from app.services.source_rule import compile_rule_program
 from app.services.custom_url import CustomUrl
@@ -62,6 +63,8 @@ from app.services.rule_engine import (BookItem, ChapterItem, ReaderEngine,
                                       RequestConnectionError,
                                       RequestTimeoutError,
                                       _format_book_intro,
+                                      display_intro,
+                                      html_to_text,
                                       merge_search_items,
                                       parse_explore_categories,
                                       resolve_explore_categories, select_nodes)
@@ -244,6 +247,43 @@ class RuleParserTests(unittest.TestCase):
             self.assertEqual(_format_book_intro(raw), f"{marker}<b>简介</b>")
         self.assertEqual(_format_book_intro("<p>简介</p><br>正文"),
                          "　　简介\n　　正文")
+
+    def test_display_intro_names_the_renderer_and_unwraps_its_payload(self):
+        for marker, kind in (("<usehtml>", "html"), ("<md>", "md"),
+                             ("<useweb>", "web")):
+            closing = f"</{marker[1:]}"
+            self.assertEqual(
+                display_intro(f"  {marker}\n<b>简介</b>\n{closing}"),
+                (kind, "\n<b>简介</b>\n"))
+            # substring(prefix, lastIndexOf("<")): a payload keeps its own markup.
+            self.assertEqual(display_intro(f"{marker}a <i>b</i>{closing}"),
+                             (kind, "a <i>b</i>"))
+        self.assertEqual(display_intro("<p>简介</p>"), ("text", "　　简介"))
+        self.assertEqual(display_intro(""), ("text", ""))
+        # A marker without its closing tag cannot be unwrapped, so it stays text.
+        self.assertEqual(display_intro("<usehtml>残缺"), ("text", "<usehtml>残缺"))
+
+    def test_html_to_text_drops_what_the_html_renderer_never_paints(self):
+        self.assertEqual(
+            html_to_text("<style>p{color:red}</style>"
+                         "<script>var a=1;</script><p>正文&nbsp;一</p>"),
+            "　　正文 一")
+        # The card a <useweb> intro carries, reduced to what a reader would see.
+        kind, payload = display_intro(
+            "<useweb>\n<style>.card{color:red}</style>\n"
+            '<div class="card"><div class="title">七侠镇</div>'
+            '<div class="intro-text">正文简介</div></div>\n</useweb>')
+        self.assertEqual(kind, "web")
+        self.assertEqual(html_to_text(payload), "　　七侠镇\n　　正文简介")
+
+    def test_use_html_spans_in_content_render_as_text(self):
+        page = _format_content_page(
+            '<p>前 <usehtml><style>x{}</style><b>加粗</b>尾</usehtml>后</p>',
+            "https://example.test/c/1")
+        self.assertIn("<usehtml>", page)
+        self.assertEqual(render_use_html_spans(page), "　　前 加粗尾后")
+        # Content without a span is already formatted; the pass must not touch it.
+        self.assertEqual(render_use_html_spans("　　普通正文"), "　　普通正文")
 
     def test_search_model_merge_origin_precision_and_rank_order(self):
         existing = [

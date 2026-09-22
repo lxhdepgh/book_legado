@@ -31,7 +31,8 @@ from app.services.rule_engine import (BookItem, ChapterItem, ReaderEngine,
                                       _book_type,
                                       _legado_value_string,
                                       extract_value,
-                                      extract_values)
+                                      extract_values,
+                                      html_to_text)
 
 
 class TocEmptyError(RuntimeError):
@@ -197,7 +198,19 @@ _CONTENT_IMAGE_PATTERN = re.compile(
     r'<img[^>]*\ssrc\s*=\s*"([^">]*)"[^>]*>', re.I)
 
 
-_USE_HTML_PATTERN = re.compile(r"<usehtml>[\s\S]*?</usehtml>")
+_USE_HTML_PATTERN = re.compile(r"<usehtml>([\s\S]*?)</usehtml>")
+
+
+def render_use_html_spans(value: str) -> str:
+    """Show the spans BookContent kept verbatim instead of their markup.
+
+    ``_format_content_page`` stashes ``<usehtml>`` spans so the sanitizer cannot
+    touch them, and Legado hands each one to an HTML renderer
+    (``TextChapterLayout.setTypeHtml``).  Displaying the span as it is would put
+    the markup, and any stylesheet it carries, in front of the reader.
+    """
+    return _USE_HTML_PATTERN.sub(
+        lambda match: html_to_text(match.group(1)), str(value or ""))
 
 
 def _format_content_page(value: str, redirect_url: str) -> str:

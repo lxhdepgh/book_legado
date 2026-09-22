@@ -14,6 +14,7 @@ from app.models.book_source import BookSource
 from app.services.reading_cache import ReadingCache
 from app.services.app_paths import default_app_paths
 from app.services.reading_engine import (ChapterContent, ContentBlock,
+                                         _format_content_page,
                                          parse_content_blocks)
 from app.services.rule_engine import (BookItem, ChapterItem,
                                       RequestConnectionError,
@@ -22,7 +23,8 @@ from app.services.block_pages import SiteBlockedError
 from app.services.source_service import SourceService
 from app.services.interactive_browser import VIEWPORT
 from app.views.reading_view import (SWITCH_CONNECT_TIMEOUT, SWITCH_TIMEOUT,
-                                    ReadingView, _switch_failure_reason)
+                                    ReadingView, _intro_control, _intro_text,
+                                    _switch_failure_reason)
 from app.services.web_page_renderer import WebPageRenderer, looks_like_gate
 from app.app import BookSourceApp
 from app.views.settings_view import SettingsView
@@ -91,6 +93,79 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.view._show_error(UnsupportedRule("缺引擎"))
         self.assertEqual(self.view._status.value, "当前书源暂不支持：缺引擎")
 
+    def _marked_intro_book(self, marker, payload, prefix=""):
+        book = BookItem("七侠镇", author="牛马狂飙",
+                        url="https://m.lvsexs.com/xs/1.html")
+        book.intro = f"{prefix}{marker}{payload}</{marker[1:]}"
+        return book
+
+    async def _open_detail_dialog(self, book):
+        page = SimpleNamespace(show_dialog=lambda _dialog: None,
+                               pop_dialog=lambda: None,
+                               run_task=lambda _handler, *_args: None)
+        self.view.current_source = SimpleNamespace(
+            bookSourceName="绿色小说", bookSourceUrl="https://m.lvsexs.com",
+            coverDecodeJs="")
+
+        async def book_info(_source, target):
+            return target
+
+        self.view.engine.book_info = book_info
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=page):
+            self.view._show_book_detail(book)
+            # A dialog that was never mounted cannot push its own update.
+            self.view._book_detail_dialog.update = lambda: None
+            await self.view._load_book_detail(book, self.view.current_source)
+        return self.view._book_detail_dialog.content.content.controls[-1]
+
+    async def test_book_detail_dialog_renders_a_useweb_intro_instead_of_markup(self):
+        """<useweb> 简介是给网页渲染器用的卡片，不能把它的样式表当简介读。"""
+        book = self._marked_intro_book("<useweb>", (
+            "\n<style>.card{color:red}</style>\n"
+            '<div class="card"><div class="title">七侠镇</div>'
+            '<div class="intro-text">正文简介</div></div>\n'), prefix="  ")
+
+        intro = await self._open_detail_dialog(book)
+
+        self.assertIsInstance(intro, ft.Text)
+        self.assertEqual(intro.value, "　　七侠镇\n　　正文简介")
+        self.assertTrue(intro.selectable)
+        self.assertNotIn("<style>", intro.value)
+        self.assertNotIn("color:red", intro.value)
+
+    async def test_book_detail_dialog_renders_markdown_intros(self):
+        book = self._marked_intro_book("<md>", "# 简介\n\n- **正文**")
+
+        intro = await self._open_detail_dialog(book)
+
+        self.assertIsInstance(intro, ft.Markdown)
+        self.assertEqual(intro.value, "# 简介\n\n- **正文**")
+        self.assertEqual(intro.extension_set,
+                         ft.MarkdownExtensionSet.GITHUB_FLAVORED)
+
+    async def test_plain_intro_without_markup_still_reads_as_before(self):
+        book = BookItem("Book", author="作者", url="https://x.test/book")
+        book.intro = "<p>第一段</p><br>第二段"
+
+        intro = await self._open_detail_dialog(book)
+
+        self.assertIsInstance(intro, ft.Text)
+        self.assertEqual(intro.value, "　　第一段\n　　第二段")
+
+    async def test_result_row_and_shelf_preview_never_show_intro_markup(self):
+        book = self._marked_intro_book("<useweb>", (
+            "<style>.card{color:red}</style><div>绿野仙踪</div>"))
+        self.view.update = lambda: None
+
+        subtitle = self.view._book_control(book).subtitle
+        self.view._show_shelf_book_detail(book)
+
+        for text in (subtitle.value, self.view._detail_intro.value):
+            self.assertIn("绿野仙踪", text)
+            self.assertNotIn("<style>", text)
+            self.assertNotIn("color:red", text)
+
     async def test_text_novel_content_uses_paragraph_reading_layout(self):
         document = ChapterContent([ContentBlock(
             "text",
@@ -106,6 +181,16 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controls[1].data, "reader-text")
         self.assertEqual(controls[1].style.height, 1.7)
         self.assertTrue(all(not control.selectable for control in controls))
+
+    async def test_use_html_spans_in_chapters_render_as_text(self):
+        page = _format_content_page(
+            '<p>前 <usehtml><style>x{}</style><b>加粗</b>尾</usehtml>后</p>',
+            "https://x.test/c/1")
+        document = parse_content_blocks(page, "https://x.test/c/1")
+
+        controls = self.view._render_content(document)
+
+        self.assertEqual([control.value for control in controls], ["　　前 加粗尾后"])
 
     async def test_font_size_preserves_text_heading_hierarchy(self):
         self.view._content_host.controls = self.view._render_content(
