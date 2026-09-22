@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import hashlib
 import json
 import re
 import time
+from urllib.parse import urlsplit
 
+import aiohttp
 import flet as ft
 
 from app import platform_support
+from app.services.public_suffix import effective_tld_plus_one
 from app.services.rule_engine import (UnsupportedRule, parse_explore_categories,
                                       resolve_explore_categories, BookItem)
 from app.services.reading_engine import LegadoReadingEngine
@@ -19,6 +23,48 @@ from app.services.book_cache_service import WholeBookCacheService
 from app.services.reading_progress import ReadingProgressStore, ReadingSession
 from app.services.web_page_renderer import WebPageRenderer
 from app.ui_feedback import show_snack_bar
+
+# 换源搜索第一批只查最可能收录这本书的书源，剩下的由用户决定是否继续。
+SWITCH_FIRST_BATCH = 24
+SWITCH_CONCURRENCY = 6
+
+
+def _host_of(value) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return (urlsplit(raw if "//" in raw else f"//{raw}").hostname or "").lower()
+
+
+def _site_token(value) -> str:
+    """站点品牌词：`qbtr.me` 与 `www.qbtr.org` 都得到 `qbtr`。"""
+    host = _host_of(value)
+    if not host or host.replace(".", "").isdigit():
+        return ""
+    labels = [label for label in effective_tld_plus_one(host).split(".") if label]
+    return labels[0] if len(labels) >= 2 else ""
+
+
+def _source_judged_invalid(source) -> bool:
+    """分组里带“失效/校验超时”说明上次检测已判它不可用。"""
+    checker = getattr(source, "getInvalidGroupNames", None)
+    try:
+        return bool(checker()) if checker else False
+    except Exception:
+        return False
+
+
+def _switch_failure_reason(exc: Exception) -> str:
+    """把一次书源搜索失败归一成用户看得懂的短原因。"""
+    if "UnsupportedJavaApiError" in str(exc):
+        return "接口未模拟"
+    if isinstance(exc, UnsupportedRule):
+        return "规则不支持"
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "超时"
+    if isinstance(exc, aiohttp.ClientError):
+        return "网络错误"
+    return "规则或解析错误"
 
 
 class ReadingView(ft.Column):
@@ -94,6 +140,10 @@ class ReadingView(ft.Column):
         self._source_switch_results = None
         self._source_switch_status = None
         self._source_switch_query = None
+        self._source_switch_stop = None
+        self._source_switch_more = None
+        self._source_switch_rest = []
+        self._source_switch_generation = 0
         self._bookshelf_layout = "list"
         self._bookshelf_filter_generation = 0
         self._bookshelf_query = ft.TextField(
@@ -1024,6 +1074,8 @@ class ReadingView(ft.Column):
                      int(item.get("durChapterIndex", 0) or 0) - 1)
         if unread:
             details.append(f"未读 {unread} 章")
+        if self._shelf_source_missing(item):
+            details.append("书源已失效")
         if item.get("updateError"):
             details.append("更新失败")
         cache_key = self._book_task_key(item)
@@ -1099,7 +1151,7 @@ class ReadingView(ft.Column):
                     semantics_label="全书阅读进度",
                     semantics_value=round(book_progress * 100)),
                 self._cache_status_control(item, compact=True),
-                ft.Row([ft.Text(item.get("source_name") or "", size=10, expand=True,
+                ft.Row([ft.Text(self._shelf_source_label(item), size=10, expand=True,
                                 max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
                         ft.IconButton(ft.Icons.MORE_VERT, icon_size=18,
                                       on_click=lambda e, selected=item:
@@ -1147,10 +1199,11 @@ class ReadingView(ft.Column):
         return f"bookshelf-{layout}-{digest}"
 
     def _remove_shelf_item(self, item):
-        self._cancel_whole_book_cache(item)
-        self.service.remove_from_bookshelf(item.get("source_url", ""), item.get("url", ""))
-        self.reading_cache.remove_book(
-            item.get("source_url", ""), item.get("url", ""))
+        record = self.service.find_bookshelf_item(item) or item
+        self._cancel_whole_book_cache(record)
+        key = self.service.bookshelf_key(record)
+        self.service.remove_from_bookshelf(*key)
+        self.reading_cache.remove_book(*key)
         self._render_bookshelf()
         self.update()
 
@@ -1186,7 +1239,9 @@ class ReadingView(ft.Column):
             modal=True, title=ft.Text(item.get("name") or "书籍管理"),
             content=ft.Container(width=400, content=ft.Column([
                 ft.Text(f"作者：{item.get('author') or '未知'}"),
-                ft.Text(f"书源：{item.get('source_name') or '未知'}"),
+                ft.Text(f"书源：{self._shelf_source_label(item) or '未知'}"),
+                ft.Text("原书源已失效，请先切换书源", color=ft.Colors.RED_600,
+                        visible=self._shelf_source_missing(item)),
                 ft.Text(f"阅读进度：{reading.get('chapter_name') or '尚未阅读'}"),
                 ft.Text(f"目录：{item.get('totalChapterNum', 0)} 章 · 未读 {unread} 章"),
                 ft.Text(
@@ -1220,15 +1275,73 @@ class ReadingView(ft.Column):
             ])
         self.page.show_dialog(dialog)
 
+    def _shelf_source(self, item):
+        """A shelf entry's live book source, or None once it left the list."""
+        key = str(item.get("source_url") or item.get("origin") or "")
+        if not key:
+            return None
+        return next((source for source in self.service.sources
+                     if source.bookSourceUrl == key), None)
+
+    def _shelf_source_missing(self, item) -> bool:
+        """True when the origin is gone, e.g. after importing another corpus."""
+        return self._shelf_source(item) is None
+
+    def _shelf_source_label(self, item) -> str:
+        name = str(item.get("source_name") or "")
+        if not self._shelf_source_missing(item):
+            return name
+        return f"{name}（已失效）" if name else "书源已失效"
+
+    def _switch_candidates(self, item) -> list:
+        """候选书源：同站同域名的排最前，检测已判失效的排最后。"""
+        book_url = item.get("url") or item.get("bookUrl")
+        hosts = {host for host in (
+            _host_of(item.get("source_url") or item.get("origin")),
+            _host_of(book_url)) if host}
+        tokens = {token for token in (
+            _site_token(item.get("source_url") or item.get("origin")),
+            _site_token(book_url)) if token}
+        origin = str(item.get("source_url") or item.get("origin") or "")
+
+        def priority(source):
+            host = _host_of(source.bookSourceUrl)
+            score = 4 if host and host in hosts else 0
+            if _site_token(source.bookSourceUrl) in tokens:
+                score += 2
+            if _source_judged_invalid(source):
+                score -= 3
+            return (-score, str(source.bookSourceName or "").casefold())
+
+        return sorted(
+            (source for source in self.service.sources
+             if getattr(source, "enabled", False) and source.searchUrl and
+             source.bookSourceUrl != origin),
+            key=priority)
+
+    def _switch_start_hint(self, item) -> str:
+        candidates = self._switch_candidates(item)
+        if not candidates:
+            return "没有其他可搜索的书源，请先导入或启用书源"
+        return (f"共 {len(candidates)} 个已启用书源，先搜索最可能收录本书的 "
+                f"{min(len(candidates), SWITCH_FIRST_BATCH)} 个。")
+
     def _show_source_switch(self, item):
         self.page.pop_dialog()
+        self._source_switch_rest = []
         self._source_switch_query = ft.TextField(
             label="搜索书名", value=item.get("name") or "",
             autofocus=True, on_submit=lambda e: self._start_source_switch(item))
         self._source_switch_status = ft.Text(
-            "将在其他已启用书源中搜索同名书籍。",
-            color=ft.Colors.GREY_600)
+            self._switch_start_hint(item), color=ft.Colors.GREY_600)
         self._source_switch_results = ft.ListView(expand=True, spacing=4)
+        self._source_switch_stop = ft.TextButton(
+            "停止搜索", icon=ft.Icons.STOP, visible=False,
+            on_click=self._stop_source_switch)
+        self._source_switch_more = ft.TextButton(
+            "继续搜索剩余书源", visible=False,
+            on_click=lambda e: self._start_source_switch(
+                item, self._source_switch_rest))
         self._source_switch_dialog = ft.AlertDialog(
             modal=True, title=ft.Text("切换书源"),
             content=ft.Container(width=620, height=520, content=ft.Column([
@@ -1239,18 +1352,39 @@ class ReadingView(ft.Column):
             ], spacing=8)),
             actions=[
                 ft.TextButton("关闭", on_click=self._close_source_switch),
+                self._source_switch_stop,
+                self._source_switch_more,
                 ft.Button("搜索其他书源", icon=ft.Icons.SEARCH,
                           on_click=lambda e: self._start_source_switch(item)),
             ])
         self.page.show_dialog(self._source_switch_dialog)
 
+    def _set_switch_running(self, running):
+        if self._source_switch_stop is not None:
+            self._source_switch_stop.visible = running
+        if self._source_switch_more is not None:
+            self._source_switch_more.visible = (
+                not running and bool(self._source_switch_rest))
+
+    def _stop_source_switch(self, _=None):
+        if self._source_switch_task and not self._source_switch_task.done():
+            self._source_switch_task.cancel()
+        self._source_switch_task = None
+        # 这一轮的结果不再属于界面，工作协程也该停手。
+        self._source_switch_generation += 1
+        self._source_switch_status.value = "搜索已停止"
+        self._set_switch_running(False)
+        self.update()
+
     def _close_source_switch(self, _=None):
         if self._source_switch_task and not self._source_switch_task.done():
             self._source_switch_task.cancel()
         self._source_switch_task = None
+        self._source_switch_generation += 1
+        self._source_switch_rest = []
         self.page.pop_dialog()
 
-    def _start_source_switch(self, item):
+    def _start_source_switch(self, item, sources=None):
         if self._source_switch_task and not self._source_switch_task.done():
             return
         keyword = str(self._source_switch_query.value or "").strip()
@@ -1258,21 +1392,58 @@ class ReadingView(ft.Column):
             self._source_switch_status.value = "请输入要搜索的书名"
             self.update()
             return
+        if sources is None:
+            candidates = self._switch_candidates(item)
+            batch = candidates[:SWITCH_FIRST_BATCH]
+            self._source_switch_rest = candidates[SWITCH_FIRST_BATCH:]
+        else:
+            batch = list(sources)
+            self._source_switch_rest = []
+        self._source_switch_generation += 1
+        self._set_switch_running(True)
         self._source_switch_task = self.page.run_task(
-            self._run_source_switch, item, keyword)
-
-    async def _run_source_switch(self, item, keyword):
-        sources = [source for source in self.service.sources
-                   if source.enabled and source.searchUrl and
-                   source.bookSourceUrl != item.get("source_url")]
-        self._source_switch_results.controls.clear()
-        self._source_switch_status.value = f"正在搜索 0/{len(sources)} 个书源…"
+            self._run_source_switch, item, keyword, batch,
+            self._source_switch_generation)
         self.update()
-        queue = asyncio.Queue()
-        for source in sources:
-            queue.put_nowait(source)
+
+    def _switch_status_text(self, completed, total, matches, failures,
+                            *, running):
+        head = (f"正在搜索 {completed}/{total} 个书源" if running else
+                f"搜索完成：检查 {total} 个书源")
+        text = f"{head}，找到 {len(matches)} 个结果"
+        failed = sum(failures.values())
+        if failed:
+            detail = "、".join(f"{reason} {count}"
+                               for reason, count in failures.most_common(3))
+            text += f"（{failed} 个书源搜索失败：{detail}）"
+        rest = len(self._source_switch_rest or [])
+        if not running and rest:
+            text += f"，还有 {rest} 个书源未搜索"
+        return text
+
+    async def _run_source_switch(self, item, keyword, candidates, generation):
+        if generation != self._source_switch_generation:
+            return
         matches = []
+        failures = collections.Counter()
         completed = 0
+        queue = asyncio.Queue()
+        for source in candidates:
+            queue.put_nowait(source)
+        if self._source_switch_results is not None:
+            self._source_switch_results.controls.clear()
+        self._source_switch_status.value = self._switch_status_text(
+            0, len(candidates), matches, failures, running=True)
+        self.update()
+
+        def publish(finished):
+            if generation != self._source_switch_generation:
+                return
+            self._render_source_switch_results(item, matches)
+            self._source_switch_status.value = self._switch_status_text(
+                completed, len(candidates), matches, failures,
+                running=not finished)
+            self.update()
 
         async def worker():
             nonlocal completed
@@ -1284,35 +1455,37 @@ class ReadingView(ft.Column):
                 engine = self._background_engine()
                 try:
                     books = await engine.search(source, keyword, 1)
-                    for book in books:
-                        if keyword.casefold() in str(book.name or "").casefold():
-                            matches.append((source, book))
-                except Exception:
-                    pass
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # 静默吞掉失败会让"找不到书"和"书源坏了"看起来一样。
+                    failures[_switch_failure_reason(exc)] += 1
+                else:
+                    matches.extend(
+                        (source, book) for book in books
+                        if keyword.casefold() in str(book.name or "").casefold())
                 finally:
                     engine.js.close()
-                    queue.task_done()
                     completed += 1
-                    if completed % 5 == 0 or completed == len(sources):
-                        self._render_source_switch_results(item, matches)
-                        self._source_switch_status.value = (
-                            f"正在搜索 {completed}/{len(sources)} 个书源，"
-                            f"找到 {len(matches)} 个结果…")
-                        self.update()
+                    if matches or completed % 3 == 0 or completed == len(candidates):
+                        publish(False)
 
+        workers = [asyncio.create_task(worker())
+                   for _ in range(min(SWITCH_CONCURRENCY, len(candidates)))]
         try:
-            workers = [asyncio.create_task(worker())
-                       for _ in range(min(6, len(sources)))]
-            if workers:
+            try:
                 await asyncio.gather(*workers)
-            self._render_source_switch_results(item, matches)
-            self._source_switch_status.value = (
-                f"搜索完成：检查 {len(sources)} 个书源，找到 {len(matches)} 个结果")
-        except asyncio.CancelledError:
-            self._source_switch_status.value = "搜索已取消"
-            raise
+            finally:
+                # 关闭对话框或选中结果都会取消父任务；工作协程必须一起停，
+                # 否则它们会继续联网并把结果写回已经消失的列表。
+                for task in workers:
+                    if not task.done():
+                        task.cancel()
+            publish(True)
         finally:
-            self._source_switch_task = None
+            if generation == self._source_switch_generation:
+                self._source_switch_task = None
+                self._set_switch_running(False)
             self.update()
 
     def _render_source_switch_results(self, item, matches):
@@ -1328,7 +1501,8 @@ class ReadingView(ft.Column):
             leading=ft.Icon(ft.Icons.LANGUAGE),
             title=ft.Text(book.name or "未命名"),
             subtitle=ft.Text(" · ".join(filter(None, [
-                source.bookSourceName, book.author, book.last_chapter]))),
+                source.bookSourceName, _host_of(source.bookSourceUrl),
+                book.author, book.last_chapter]))),
             trailing=ft.Button(
                 "切换", on_click=lambda e, selected_source=source,
                 selected_book=book: self._confirm_source_switch(
@@ -1338,6 +1512,8 @@ class ReadingView(ft.Column):
     def _confirm_source_switch(self, item, source, book):
         if self._source_switch_task and not self._source_switch_task.done():
             self._source_switch_task.cancel()
+        self._source_switch_task = None
+        self._source_switch_generation += 1
         self.page.pop_dialog()
         dialog = ft.AlertDialog(
             modal=True, title=ft.Text("确认切换书源"),
@@ -1353,21 +1529,35 @@ class ReadingView(ft.Column):
         self.page.show_dialog(dialog)
 
     def _apply_source_switch(self, item, source, book):
-        old_source = item.get("source_url", "")
-        old_url = item.get("url", "")
-        self._cancel_whole_book_cache(item)
+        # 对话期间书架可能已经被重载或重绘，写入必须落在在架记录上。
+        record = self.service.find_bookshelf_item(item)
+        if record is None:
+            self.page.pop_dialog()
+            self._render_bookshelf()
+            self.update()
+            self._show_notice("切换失败：这本书已不在书架中")
+            return
+        old_source = str(record.get("source_url") or "")
+        old_url = str(record.get("url") or "")
+        self._cancel_whole_book_cache(record)
         try:
-            changed = self.service.switch_bookshelf_source(item, source, book)
-            if not changed:
-                self._show_notice("切换失败：该书源版本已在书架中")
-            else:
-                self.reading_cache.remove_book(old_source, old_url)
-                self._status.value = f"已切换到书源：{source.bookSourceName}"
+            switched = self.service.switch_bookshelf_source(record, source, book)
         except Exception as exc:
+            self.page.pop_dialog()
+            self._render_bookshelf()
+            self.update()
             self._show_error(exc, label="切换书源失败")
+            return
+        if switched:
+            self.reading_cache.remove_book(old_source, old_url)
+            message = f"已切换到书源：{source.bookSourceName}"
+        else:
+            message = "切换失败：书架中已有这本书的该书源版本"
         self.page.pop_dialog()
         self._render_bookshelf()
         self.update()
+        # 书架重绘会覆盖状态行，提示必须放在重绘之后。
+        self._show_notice(message)
 
     def _save_shelf_group(self, item, field):
         self.service.update_bookshelf_options(
@@ -1559,11 +1749,13 @@ class ReadingView(ft.Column):
         # the second book became current first, so the first book's chapter was
         # accidentally saved into the second one's progress record.
         self._persist_scroll_position()
-        source = next((source for source in self.service.sources
-                       if source.bookSourceUrl == item.get("source_url")), None)
+        source = self._shelf_source(item)
         if source is None:
-            self._status.value = "原书源已被删除，无法加载这本书"
-            self.update()
+            # 死路会让人以为书废了：这里直接给出换源入口。
+            self._show_notice(
+                "原书源已失效，无法加载这本书，请先切换书源",
+                action="切换书源",
+                on_action=lambda: self._show_source_switch(item))
             return
         self._reset_book_session(book_name=item.get("name") or "")
         self.current_source = source
@@ -2550,7 +2742,7 @@ class ReadingView(ft.Column):
         if self._background_status:
             self._status.value = self._background_status
 
-    def _show_notice(self, message, retry=None):
+    def _show_notice(self, message, retry=None, action=None, on_action=None):
         """Inline status line plus a dismissible SnackBar; errors add 重试."""
         self._background_status = None
         self._status.value = message
@@ -2559,15 +2751,17 @@ class ReadingView(ft.Column):
         except RuntimeError:
             return
         snack = ft.SnackBar(content=ft.Text(message, max_lines=3))
-        if retry is not None:
-            def _retry(_event=None):
+        label = action or ("重试" if retry is not None else None)
+        handler = on_action if on_action is not None else retry
+        if label and handler is not None:
+            def _run(_event=None):
                 try:
                     page.pop_dialog()
                 except RuntimeError:
                     pass
-                retry()
-            snack.action = "重试"
-            snack.on_action = _retry
+                handler()
+            snack.action = label
+            snack.on_action = _run
         show_snack_bar(page, snack)
 
     def _show_error(self, exc, retry=None, label=None):

@@ -207,25 +207,49 @@ class SourceService:
         return True
 
     def remove_from_bookshelf(self, source_url: str, book_url: str) -> bool:
+        key = (str(source_url or ""), str(book_url or ""))
         old_count = len(self.bookshelf)
-        self.bookshelf = [item for item in self.bookshelf if
-                          (item.get("source_url"), item.get("url")) !=
-                          (source_url, book_url)]
+        self.bookshelf = [item for item in self.bookshelf
+                          if self.bookshelf_key(item) != key]
         if len(self.bookshelf) != old_count:
             self.save_bookshelf()
             return True
         return False
 
+    @staticmethod
+    def bookshelf_key(item: dict) -> tuple[str, str]:
+        """Identity of a shelf entry, tolerating Legado's origin/bookUrl aliases."""
+        return (str(item.get("source_url") or item.get("origin") or ""),
+                str(item.get("url") or item.get("bookUrl") or ""))
+
+    def find_bookshelf_item(self, item: dict) -> dict | None:
+        """The live shelf record behind a captured item, or None once removed.
+
+        Views keep item references across dialogs and background tasks, and
+        `load_bookshelf` rebuilds every record from disk.  Callers must resolve
+        the live record before writing, or the write lands on a detached dict.
+        """
+        if any(record is item for record in self.bookshelf):
+            return item
+        key = self.bookshelf_key(item)
+        if not any(key):
+            return None
+        for record in self.bookshelf:
+            if self.bookshelf_key(record) == key:
+                return record
+        return None
+
     def switch_bookshelf_source(self, item: dict, source: BookSource, book) -> bool:
         """Replace one shelf entry's origin while retaining user-owned state."""
-        if item not in self.bookshelf:
+        record = self.find_bookshelf_item(item)
+        if record is None:
             return False
         new_key = (source.bookSourceUrl, book.url)
-        if any(other is not item and
-               (other.get("source_url"), other.get("url")) == new_key
+        if any(other is not record and
+               self.bookshelf_key(other) == new_key
                for other in self.bookshelf):
             return False
-        previous = dict(item)
+        previous = dict(record)
         try:
             identity = {
                 "name": book.name, "author": book.author,
@@ -249,19 +273,24 @@ class SourceService:
                 "latestChapterTime": 0,
                 "totalChapterNum": 0,
                 "updateError": "",
+                # The old cache lives under the old origin/book keys and the
+                # caller drops it, so the offline counters cannot survive.
+                "cachedChapterCount": 0, "cacheTotalChapterCount": 0,
+                "cacheErrorCount": 0, "cacheUpdatedAt": 0,
             }
-            item.update(identity)
+            record.update(identity)
             # Chapter URLs belong to the old origin. Keep semantic progress so
             # the new catalog can resume by chapter index/title instead.
-            if item.get("reading"):
-                item["reading"] = dict(item["reading"])
-                item["reading"]["chapter_url"] = ""
-                item["reading"]["scroll_offset"] = 0.0
+            if record.get("reading"):
+                record["reading"] = dict(record["reading"])
+                record["reading"]["chapter_url"] = ""
+                record["reading"]["scroll_offset"] = 0.0
+                record["reading"]["scroll_ratio"] = 0.0
             self.save_bookshelf()
             return True
         except Exception:
-            item.clear()
-            item.update(previous)
+            record.clear()
+            record.update(previous)
             raise
 
     def update_bookshelf_check(self, source_url: str, book_url: str, *,

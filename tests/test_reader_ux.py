@@ -801,6 +801,266 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
                          ["2", "1"])
 
 
+class _SwitchEngineStub:
+    """Stands in for the per-source engine the sweep builds for every source."""
+
+    def __init__(self, search):
+        self.search = search
+        self.js = SimpleNamespace(close=lambda: None)
+
+
+class _SwitchSearchStub:
+    """Canned results per source URL; a gate parks workers for stop tests."""
+
+    def __init__(self, books=None, errors=None, gate=None):
+        self.books = books or {}
+        self.errors = errors or {}
+        self.gate = gate
+        self.started = 0
+        self.cancelled = 0
+
+    async def search(self, source, keyword, page=1):
+        self.started += 1
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            failure = self.errors.get(source.bookSourceUrl)
+            if failure is not None:
+                raise failure
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        return list(self.books.get(source.bookSourceUrl, []))
+
+
+class _SwitchPageStub:
+    def __init__(self):
+        self.dialogs = []
+
+    def show_dialog(self, dialog):
+        self.dialogs.append(dialog)
+
+    def pop_dialog(self):
+        return self.dialogs.pop() if self.dialogs else None
+
+    def run_task(self, handler, *args):
+        return asyncio.ensure_future(handler(*args))
+
+
+class SourceSwitchTests(unittest.IsolatedAsyncioTestCase):
+    """换源流程：候选排序、分批、可中断，以及失效书源下的落库。"""
+
+    async def asyncSetUp(self):
+        self.directory = TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.service = SourceService(self.root, data_dir=self.root / "data")
+        self.view = ReadingView(self.service)
+        self.view.update = lambda: None
+        self.page = _SwitchPageStub()
+        patcher = patch.object(ReadingView, "page", new_callable=PropertyMock,
+                               return_value=self.page)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.view.engine.js.close)
+        self.addCleanup(self.directory.cleanup)
+
+    def _shelve(self, *, origin="https://dead.example",
+                url="https://dead.example/book/1"):
+        self.assertTrue(self.service.add_to_bookshelf(
+            BookSource(bookSourceName="旧书源", bookSourceUrl=origin),
+            BookItem("Book", author="作者", url=url)))
+        return self.service.bookshelf[0]
+
+    @staticmethod
+    def _target(url, name="可用书源", group=None):
+        return BookSource(bookSourceName=name, bookSourceUrl=url,
+                          searchUrl=f"{url}/search?key=${{key}}",
+                          bookSourceGroup=group)
+
+    def _install(self, stub):
+        self.view._background_engine = lambda: _SwitchEngineStub(stub.search)
+        return stub
+
+    async def _settle(self):
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    async def test_candidates_rank_the_same_brand_first_and_report_failures(self):
+        item = self._shelve(origin="https://qbtr.me",
+                            url="https://www.qbtr.cc/book/1")
+        self.service.sources = [
+            self._target("https://other.test", name="无关书源"),
+            self._target("https://zzz.test", name="已失效书源", group="失效, 正常"),
+            self._target("https://www.qbtr.org", name="全本同人小说网"),
+        ]
+        self.assertEqual(
+            [source.bookSourceUrl
+             for source in self.view._switch_candidates(item)],
+            ["https://www.qbtr.org", "https://other.test", "https://zzz.test"])
+        self.assertEqual(
+            self.view._switch_start_hint(item),
+            "共 3 个已启用书源，先搜索最可能收录本书的 3 个。")
+
+        stub = self._install(_SwitchSearchStub(
+            books={"https://www.qbtr.org": [BookItem(
+                "Book", author="作者", url="https://www.qbtr.org/book/1",
+                last_chapter="chapter 9")]},
+            errors={"https://other.test": UnsupportedRule("no such rule")}))
+        self.view._show_source_switch(item)
+        self.view._start_source_switch(item)
+        await self.view._source_switch_task
+
+        self.assertEqual(stub.started, 3)
+        self.assertEqual(
+            self.view._source_switch_status.value,
+            "搜索完成：检查 3 个书源，找到 1 个结果（1 个书源搜索失败：规则不支持 1）")
+        results = self.view._source_switch_results.controls
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].title.value, "Book")
+        self.assertEqual(results[0].subtitle.value,
+                         "全本同人小说网 · www.qbtr.org · 作者 · chapter 9")
+
+    async def test_first_batch_is_bounded_and_the_rest_stay_available(self):
+        item = self._shelve()
+        self.service.sources = [
+            self._target(f"https://s{index:02d}.test", name=f"源{index:02d}")
+            for index in range(25)]
+        stub = self._install(_SwitchSearchStub(
+            books={"https://s24.test": [BookItem("Book",
+                                                 url="https://s24.test/book/1")]}))
+
+        self.view._show_source_switch(item)
+        self.view._start_source_switch(item)
+        self.assertEqual(len(self.view._source_switch_rest), 1)
+        await self.view._source_switch_task
+
+        self.assertEqual(stub.started, 24)
+        self.assertEqual(
+            self.view._source_switch_status.value,
+            "搜索完成：检查 24 个书源，找到 0 个结果，还有 1 个书源未搜索")
+        self.assertTrue(self.view._source_switch_more.visible)
+
+        self.view._start_source_switch(item, self.view._source_switch_rest)
+        await self.view._source_switch_task
+
+        self.assertEqual(stub.started, 25)
+        self.assertEqual(len(self.view._source_switch_results.controls), 1)
+        self.assertEqual(self.view._source_switch_rest, [])
+        self.assertFalse(self.view._source_switch_more.visible)
+
+    async def test_stopping_cancels_every_running_worker(self):
+        item = self._shelve()
+        self.service.sources = [
+            self._target(f"https://s{index}.test", name=f"源{index}")
+            for index in range(4)]
+        stub = self._install(_SwitchSearchStub(gate=asyncio.Event()))
+
+        self.view._show_source_switch(item)
+        self.view._start_source_switch(item)
+        task = self.view._source_switch_task
+        await self._settle()
+        self.assertEqual(stub.started, 4)
+
+        self.view._stop_source_switch()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self._settle()
+
+        self.assertEqual(stub.cancelled, 4)
+        self.assertEqual(self.view._source_switch_status.value, "搜索已停止")
+        self.assertIsNone(self.view._source_switch_task)
+
+    async def test_apply_switch_targets_the_live_record_after_a_reload(self):
+        item = self._shelve()
+        target = self._target("https://alive.example")
+        self.service.sources = [target]
+        self.service.update_bookshelf_state(
+            item["source_url"], item["url"],
+            chapter=ChapterItem("chapter 8", "https://dead.example/c/8",
+                                index=7),
+            scroll_offset=200, scroll_ratio=0.4, font_size=20)
+        # 换源对话期间书架可能已重载：界面手里还是那份旧字典。
+        self.service.load_bookshelf()
+        self.assertIsNot(item, self.service.bookshelf[0])
+        self.view._show_source_switch(item)
+
+        self.view._apply_source_switch(
+            item, target, BookItem("Book", author="作者",
+                                   url="https://alive.example/book/1",
+                                   last_chapter="chapter 30"))
+
+        record = self.service.bookshelf[0]
+        self.assertEqual(record["source_url"], "https://alive.example")
+        self.assertEqual(record["source_name"], "可用书源")
+        self.assertEqual(record["reading"]["chapter_index"], 7)
+        self.assertEqual(record["reading"]["chapter_url"], "")
+        self.assertEqual(record["reading"]["scroll_offset"], 0.0)
+        self.assertEqual(record["reading"]["scroll_ratio"], 0.0)
+        self.assertEqual(record["reading"]["font_size"], 20)
+        self.assertEqual(self.view._status.value, "已切换到书源：可用书源")
+        self.assertIsInstance(self.page.dialogs[-1], ft.SnackBar)
+
+        reopened = SourceService(self.root, data_dir=self.root / "data")
+        reopened.load_bookshelf()
+        self.assertEqual(reopened.bookshelf[0]["origin"],
+                         "https://alive.example")
+
+    async def test_apply_switch_reports_a_book_that_left_the_shelf(self):
+        item = self._shelve()
+        self.assertTrue(self.service.remove_from_bookshelf(
+            item["source_url"], item["url"]))
+        self.view._show_source_switch(item)
+
+        self.view._apply_source_switch(
+            item, self._target("https://alive.example"),
+            BookItem("Book", url="https://alive.example/book/1"))
+
+        self.assertEqual(self.view._status.value, "切换失败：这本书已不在书架中")
+        self.assertEqual(self.service.bookshelf, [])
+
+    async def test_apply_switch_refuses_a_target_already_on_the_shelf(self):
+        item = self._shelve()
+        target = self._target("https://alive.example")
+        self.service.sources = [target]
+        self.service.add_to_bookshelf(
+            target, BookItem("Book", url="https://alive.example/book/1"))
+        self.view._show_source_switch(item)
+
+        self.view._apply_source_switch(
+            item, target, BookItem("Book", url="https://alive.example/book/1"))
+
+        self.assertEqual(self.view._status.value,
+                         "切换失败：书架中已有这本书的该书源版本")
+        self.assertEqual(len(self.service.bookshelf), 2)
+        self.assertEqual(self.service.bookshelf[0]["source_url"],
+                         "https://dead.example")
+
+    async def test_opening_a_dead_sources_book_offers_the_switch_dialog(self):
+        item = self._shelve()
+        self.view._open_shelf_item(item)
+
+        snack = self.page.dialogs[-1]
+        self.assertIsInstance(snack, ft.SnackBar)
+        self.assertEqual(snack.action, "切换书源")
+        self.assertEqual(self.view._status.value,
+                         "原书源已失效，无法加载这本书，请先切换书源")
+
+        self.page.dialogs.clear()
+        snack.on_action(None)
+
+        dialog = self.page.dialogs[-1]
+        self.assertIsInstance(dialog, ft.AlertDialog)
+        self.assertEqual(dialog.title.value, "切换书源")
+
+    async def test_a_dead_source_is_labelled_on_the_shelf_row(self):
+        item = self._shelve()
+        self.assertTrue(self.view._shelf_source_missing(item))
+        self.assertEqual(self.view._shelf_source_label(item), "旧书源（已失效）")
+
+        row = self.view._shelf_control(item)
+        self.assertIn("书源已失效", row.content.subtitle.controls[0].value)
+
+
 class PersistentReadingTests(unittest.TestCase):
     def test_settings_places_appearance_under_extensible_configuration_tabs(self):
         with TemporaryDirectory() as directory:
@@ -1037,6 +1297,7 @@ class PersistentReadingTests(unittest.TestCase):
             self.assertEqual(item["reading"]["chapter_url"], "")
             self.assertEqual(item["reading"]["font_size"], 20)
             self.assertEqual(item["reading"]["scroll_offset"], 0.0)
+            self.assertEqual(item["reading"]["scroll_ratio"], 0.0)
 
             reopened = SourceService(root, data_dir=root / "data")
             reopened.load_bookshelf()
@@ -1058,6 +1319,50 @@ class PersistentReadingTests(unittest.TestCase):
             self.assertFalse(service.switch_bookshelf_source(
                 service.bookshelf[0], new_source, new_book))
             self.assertEqual(service.bookshelf[0]["source_url"], "https://old")
+
+    def test_switch_bookshelf_source_resets_stale_cache_counters(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = SourceService(root, data_dir=root / "data")
+            old_source = BookSource(
+                bookSourceName="old", bookSourceUrl="https://old")
+            new_source = BookSource(
+                bookSourceName="new", bookSourceUrl="https://new")
+            old_book = BookItem("book", url="https://old/book")
+            service.add_to_bookshelf(old_source, old_book)
+            service.update_bookshelf_options(
+                old_source.bookSourceUrl, old_book.url,
+                cachedChapterCount=1902, cacheTotalChapterCount=2247,
+                cacheErrorCount=3, cacheUpdatedAt=123)
+            record = service.bookshelf[0]
+
+            self.assertTrue(service.switch_bookshelf_source(
+                record, new_source, BookItem("book", url="https://new/book")))
+
+            self.assertEqual(record["cachedChapterCount"], 0)
+            self.assertEqual(record["cacheTotalChapterCount"], 0)
+            self.assertEqual(record["cacheErrorCount"], 0)
+            self.assertEqual(record["cacheUpdatedAt"], 0)
+
+    def test_find_bookshelf_item_resolves_reloaded_alias_records(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = SourceService(root, data_dir=root / "data")
+            source = BookSource(
+                bookSourceName="source", bookSourceUrl="https://source")
+            book = BookItem("book", url="https://book")
+            service.add_to_bookshelf(source, book)
+            stale = service.bookshelf[0]
+
+            service.load_bookshelf()
+            live = service.find_bookshelf_item(stale)
+            self.assertIs(live, service.bookshelf[0])
+            self.assertIsNot(live, stale)
+            self.assertIs(service.find_bookshelf_item(
+                {"origin": "https://source", "bookUrl": "https://book"}), live)
+
+            service.remove_from_bookshelf("https://source", "https://book")
+            self.assertIsNone(service.find_bookshelf_item(stale))
 
     def test_catalog_and_content_survive_cache_reopen(self):
         with TemporaryDirectory() as directory:
