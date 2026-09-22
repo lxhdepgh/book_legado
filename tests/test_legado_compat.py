@@ -67,6 +67,88 @@ from app.services.reading_cache import ReadingCache
 from app.services.legado_url import parse_request_config, parse_search_url
 
 
+# The 听友M (tingyou.fm) jsLib decrypts XChaCha20-Poly1305 payloads by running
+# HChaCha20 in JS and handing the result to JCE ChaCha20-Poly1305.
+TING_KEY = "ea9d9d4f9a983fe6f6382f29c7b46b8d6dc47abc6da36662e6ddff8c78902f65"
+TING_JS_LIB = """
+function ting_hchacha_run(state){
+  function qr(s,ai,bi,ci,di){
+    s[ai]=(s[ai]+s[bi])>>>0; s[di]=(((s[di]^s[ai])<<16)|((s[di]^s[ai])>>>16))>>>0;
+    s[ci]=(s[ci]+s[di])>>>0; s[bi]=(((s[bi]^s[ci])<<12)|((s[bi]^s[ci])>>>20))>>>0;
+    s[ai]=(s[ai]+s[bi])>>>0; s[di]=(((s[di]^s[ai])<<8)|((s[di]^s[ai])>>>24))>>>0;
+    s[ci]=(s[ci]+s[di])>>>0; s[bi]=(((s[bi]^s[ci])<<7)|((s[bi]^s[ci])>>>25))>>>0;
+  }
+  for(var i=0;i<10;i++){
+    qr(state,0,4,8,12); qr(state,1,5,9,13); qr(state,2,6,10,14); qr(state,3,7,11,15);
+    qr(state,0,5,10,15); qr(state,1,6,11,12); qr(state,2,7,8,13); qr(state,3,4,9,14);
+  }
+}
+function ting_hchacha(keyBytes, nonce16){
+  var s=[
+    0x61707865,0x3320646e,0x79622d32,0x6b206574,
+    keyBytes[0]|keyBytes[1]<<8|keyBytes[2]<<16|keyBytes[3]<<24,
+    keyBytes[4]|keyBytes[5]<<8|keyBytes[6]<<16|keyBytes[7]<<24,
+    keyBytes[8]|keyBytes[9]<<8|keyBytes[10]<<16|keyBytes[11]<<24,
+    keyBytes[12]|keyBytes[13]<<8|keyBytes[14]<<16|keyBytes[15]<<24,
+    keyBytes[16]|keyBytes[17]<<8|keyBytes[18]<<16|keyBytes[19]<<24,
+    keyBytes[20]|keyBytes[21]<<8|keyBytes[22]<<16|keyBytes[23]<<24,
+    keyBytes[24]|keyBytes[25]<<8|keyBytes[26]<<16|keyBytes[27]<<24,
+    keyBytes[28]|keyBytes[29]<<8|keyBytes[30]<<16|keyBytes[31]<<24,
+    nonce16[0]|nonce16[1]<<8|nonce16[2]<<16|nonce16[3]<<24,
+    nonce16[4]|nonce16[5]<<8|nonce16[6]<<16|nonce16[7]<<24,
+    nonce16[8]|nonce16[9]<<8|nonce16[10]<<16|nonce16[11]<<24,
+    nonce16[12]|nonce16[13]<<8|nonce16[14]<<16|nonce16[15]<<24,
+  ];
+  ting_hchacha_run(s);
+  var out=new Uint8Array(32);
+  var ws=[s[0],s[1],s[2],s[3],s[12],s[13],s[14],s[15]];
+  for(var i=0;i<8;i++){var w=ws[i];out[i*4]=w&255;out[i*4+1]=(w>>>8)&255;
+    out[i*4+2]=(w>>>16)&255;out[i*4+3]=(w>>>24)&255;}
+  return out;
+}
+function __hex2bytes(hex){var len=hex.length;var out=new Uint8Array(len>>1);
+  for(var i=0;i<out.length;i++){out[i]=parseInt(hex.slice(2*i,2*i+2),16);}return out;}
+function __toByteArr(u8){var ba=new Packages.java.io.ByteArrayOutputStream();
+  for(var i=0;i<u8.length;i++){ba.write(u8[i]&255);}return ba.toByteArray();}
+function ting_decryptPayload(hexPayload, hexKey){
+  var k=__hex2bytes(hexKey);
+  var buf=__hex2bytes(hexPayload);
+  var nonce=new Uint8Array(24);
+  for(var i=0;i<24;i++){nonce[i]=buf[i+1];}
+  var ctArea=buf.subarray(25);
+  var ct=new Uint8Array(ctArea.length);
+  for(var j=0;j<ctArea.length;j++){ct[j]=ctArea[j];}
+  var ver=buf[0];
+  if(ver===2){
+    var rev=new Uint8Array(ct.length);
+    for(var r=0;r<ct.length;r++){rev[r]=ct[ct.length-1-r];}
+    ct=rev;
+  }
+  var subkey=ting_hchacha(k, nonce.subarray(0,16));
+  var nonce12=new Uint8Array(12);
+  for(var n4=0;n4<8;n4++){nonce12[4+n4]=nonce[16+n4];}
+  var cipher=Packages.javax.crypto.Cipher.getInstance("ChaCha20-Poly1305");
+  var sk=new Packages.javax.crypto.spec.SecretKeySpec(__toByteArr(subkey), "ChaCha20");
+  var gcm=new Packages.javax.crypto.spec.GCMParameterSpec(128, __toByteArr(nonce12));
+  cipher.init(javax.crypto.Cipher.DECRYPT_MODE, sk, gcm);
+  var pb=cipher.doFinal(__toByteArr(ct));
+  return new java.lang.String(pb, "UTF-8");
+}
+"""
+
+
+def xchacha20_payload(plaintext: str, version: int = 1) -> str:
+    """The ``version || nonce24 || ciphertext+tag`` blob the jsLib above reads."""
+    from Crypto.Cipher import ChaCha20_Poly1305
+    nonce = bytes(range(24))
+    ciphertext, tag = ChaCha20_Poly1305.new(
+        key=bytes.fromhex(TING_KEY), nonce=nonce).encrypt_and_digest(
+        plaintext.encode())
+    body = ciphertext + tag
+    return (bytes([version]) + nonce +
+            (body[::-1] if version == 2 else body)).hex()
+
+
 class SearchModelTests(unittest.IsolatedAsyncioTestCase):
     async def test_search_model_paging_bounded_workers_merge_and_persist(self):
         active = 0
@@ -1121,6 +1203,63 @@ class RuleParserTests(unittest.TestCase):
             "out+=(bytes[i]&0xff).toString(16).padStart(2,'0');"
             "return out+'/'+md.getAlgorithm()+'/'+md.getDigestLength()})()",
             JsContext(source=source)), hashlib.md5(b"abc").hexdigest() + "/MD5/16")
+
+    def test_byte_array_output_stream_follows_the_java_write_contract(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        context = JsContext(source=source)
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var out=new Packages.java.io.ByteArrayOutputStream();"
+            "out.write(233);out.write([1,2]);out.write([9,8,7],1,2);"
+            "out.write(new Uint8Array([255]));out.writeBytes([4]);"
+            "var written=String(out.toByteArray())+'/'+out.size();"
+            "out.reset();"
+            "return written+'/'+out.size()+'/'+String(out.toByteArray())})()",
+            context), "-23,1,2,8,7,-1,4/7/0/")
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var out=new Packages.java.io.ByteArrayOutputStream();"
+            "out.write(new Uint8Array([228,184,173]));"
+            "return out.toString('UTF-8')+'/'+String(out)})()",
+            context), "中/中")
+
+    def test_cipher_chacha20_poly1305_decrypts_xchacha20_payloads(self):
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {
+            "bookSourceUrl": "https://source", "jsLib": TING_JS_LIB})
+        context = JsContext(source=source)
+        plaintext = json.dumps({"data": [{"id": 7, "title": "三体"}]},
+                               ensure_ascii=False)
+        for version in (1, 2):
+            self.assertEqual(runtime.evaluate(
+                "@js:String(ting_decryptPayload('%s','%s'))" % (
+                    xchacha20_payload(plaintext, version), TING_KEY),
+                context), plaintext)
+
+    def test_cipher_aes_gcm_verifies_the_tag_that_jce_appends(self):
+        from Crypto.Cipher import AES
+        runtime = LegadoJsRuntime()
+        source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
+        key, nonce = bytes.fromhex("00112233445566778899aabbccddeeff"), bytes(12)
+        ciphertext, tag = AES.new(key, AES.MODE_GCM, nonce=nonce).encrypt_and_digest(
+            "正文".encode())
+        self.assertEqual(runtime.evaluate(
+            "@js:(function(){var c=Packages.javax.crypto.Cipher.getInstance('AES/GCM/NoPadding');"
+            "var s=Packages.javax.crypto.spec;"
+            "c.init(2,new s.SecretKeySpec(%s,'AES'),new s.GCMParameterSpec(128,%s));"
+            "return new java.lang.String(c.doFinal(%s),'UTF-8')})()" % (
+                json.dumps(list(key)), json.dumps(list(nonce)),
+                json.dumps(list(ciphertext + tag))),
+            JsContext(source=source)), "正文")
+        tampered = json.dumps(list(ciphertext + bytes([tag[0] ^ 1]) + tag[1:]))
+        with self.assertRaises(JsBridgeError) as caught:
+            runtime.evaluate(
+                "@js:(function(){var c=Packages.javax.crypto.Cipher.getInstance('AES/GCM/NoPadding');"
+                "var s=Packages.javax.crypto.spec;"
+                "c.init(2,new s.SecretKeySpec(%s,'AES'),new s.GCMParameterSpec(128,%s));"
+                "return new java.lang.String(c.doFinal(%s),'UTF-8')})()" % (
+                    json.dumps(list(key)), json.dumps(list(nonce)), tampered),
+                JsContext(source=source))
+        self.assertIn("MAC check failed", str(caught.exception))
 
     def test_hutool_digest_util_hex_helpers_match_hashlib(self):
         runtime = LegadoJsRuntime()

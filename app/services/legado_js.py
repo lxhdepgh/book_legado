@@ -893,11 +893,12 @@ class LegadoJsRuntime:
         }}
         result = __javaObject(result);
         src = __javaObject(src);
+        function __signedByte(value) {{
+          const number=Number(value)&255;
+          return number > 127 ? number - 256 : number;
+        }}
         function __byteArray(value) {{
-          return Array.from(value || []).map(item => {{
-            const number=Number(item)&255;
-            return number > 127 ? number - 256 : number;
-          }});
+          return Array.from(value || []).map(item => __signedByte(item));
         }}
         function __isLatin1(charset) {{
           return String(charset || '').replace(/[-_\\s]/g,'').toLowerCase() === 'iso88591' ||
@@ -1974,18 +1975,24 @@ class LegadoJsRuntime:
         function __SecretKeySpec(bytes, algorithm) {{ return {{bytes:Array.from(bytes || []), algorithm:String(algorithm)}}; }}
         function __IvParameterSpec(bytes) {{ return {{bytes:Array.from(bytes || [])}}; }}
         function __DESKeySpec(bytes) {{ return {{bytes:Array.from(bytes || []), algorithm:'DES'}}; }}
+        function __GCMParameterSpec(tLen, iv) {{
+          return {{bytes:Array.from(iv || []), tLen:Number(tLen || 128)}};
+        }}
         const __Cipher = {{
           ENCRYPT_MODE: 1, DECRYPT_MODE: 2,
           getInstance: transformation => {{
-            const state = {{transformation:String(transformation), mode:2, key:[], iv:[]}};
+            const state = {{transformation:String(transformation), mode:2, key:[], iv:[],
+                           tagBits:128}};
             return {{
               init: (mode, key, iv) => {{
                 state.mode=Number(mode); state.key=Array.from((key && key.bytes) || key || []);
                 state.iv=Array.from((iv && iv.bytes) || iv || []);
+                if (iv && iv.tLen) state.tagBits=Number(iv.tLen);
               }},
               doFinal: value => __byteArray(JSON.parse(__crypto(
                 state.mode === 1 ? 'encryptBytes' : 'decryptBytes', state.transformation,
-                JSON.stringify(state.key), JSON.stringify(state.iv), JSON.stringify(Array.from(value || [])))))
+                JSON.stringify(state.key), JSON.stringify(state.iv),
+                JSON.stringify(Array.from(value || [])), state.tagBits)))
             }};
           }}
         }};
@@ -2179,7 +2186,24 @@ class LegadoJsRuntime:
         Packages.java.io = {{IOException:__IOException,EOFException:__EOFException,
           File:__javaPackage('java.io.File'),
           ByteArrayOutputStream:function(){{
-          this._bytes=[]; this.toByteArray=()=>__byteArray(this._bytes); this.close=()=>undefined;
+          this._bytes=[];
+          this.write=function(value,offset,length){{
+            if(Array.isArray(value)||ArrayBuffer.isView(value)){{
+              const start=Number(offset||0);
+              const end=length===undefined?value.length:start+Number(length);
+              for(let index=start;index<end;index++)this._bytes.push(__signedByte(value[index]));
+            }} else {{
+              this._bytes.push(__signedByte(value));
+            }}
+          }};
+          this.writeBytes=value=>this.write(value);
+          this.toByteArray=()=>__byteArray(this._bytes);
+          this.size=()=>this._bytes.length;
+          this.reset=()=>{{this._bytes=[];}};
+          this.flush=()=>undefined;
+          this.toString=charset=>__bytesstr(JSON.stringify(this._bytes),
+            String(charset||'utf-8'));
+          this.close=()=>undefined;
         }}}};
         const __MessageDigest = {{
           getInstance: algorithm => {{
@@ -2242,7 +2266,8 @@ class LegadoJsRuntime:
           generateSecret:spec=>({{bytes:spec.bytes,algorithm:String(algorithm)}})
         }})}};
         Packages.javax.crypto.spec = {{
-          SecretKeySpec:__SecretKeySpec,IvParameterSpec:__IvParameterSpec,DESKeySpec:__DESKeySpec
+          SecretKeySpec:__SecretKeySpec,IvParameterSpec:__IvParameterSpec,
+          DESKeySpec:__DESKeySpec,GCMParameterSpec:__GCMParameterSpec
         }};
         Packages.javax.xml = {{bind:{{DatatypeConverter:__DatatypeConverter}}}};
         Packages.android.util = {{Base64:__Base64}};
@@ -2312,7 +2337,8 @@ class LegadoJsRuntime:
           if (!value) return;
           const known=[[__JavaString,'String'],[__Cipher,'Cipher'],[__Mac,'Mac'],
             [__SecretKeySpec,'SecretKeySpec'],[__IvParameterSpec,'IvParameterSpec'],
-            [__DESKeySpec,'DESKeySpec'],[__Base64,'Base64'],
+            [__DESKeySpec,'DESKeySpec'],[__GCMParameterSpec,'GCMParameterSpec'],
+            [__Base64,'Base64'],
             [__MessageDigest,'MessageDigest'],[__Inflater,'Inflater'],
             [__URLEncoder,'URLEncoder'],[__DatatypeConverter,'DatatypeConverter']];
           const match=known.find(item=>item[0]===value);
@@ -5407,7 +5433,7 @@ class LegadoJsRuntime:
 
     @classmethod
     def _crypto(cls, operation: str, transformation: str, key: str, iv: str,
-                value: str) -> str:
+                value: str, tag_bits=128) -> str:
         """Legado-compatible JCA symmetric cipher string/byte operations."""
         try:
             from Crypto.Cipher import AES, ARC2, ARC4, Blowfish, DES, DES3
@@ -5423,6 +5449,11 @@ class LegadoJsRuntime:
 
             spec = transformation.upper()
             algorithm = spec.split("/", 1)[0]
+            key_bytes, iv_bytes = decode_argument(key), decode_argument(iv)
+            if "GCM" in spec or algorithm.startswith("CHACHA20"):
+                # AEAD transformations carry their tag appended to the ciphertext.
+                return cls._aead(operation, algorithm, key_bytes, iv_bytes, value,
+                                 tag_bits)
             cipher_type = AES if algorithm == "AES" else (DES3 if algorithm in {
                 "DESEDE", "TRIPLEDES", "3DES"} else DES if algorithm == "DES" else
                 Blowfish if algorithm == "BLOWFISH" else ARC2 if algorithm in {
@@ -5430,7 +5461,6 @@ class LegadoJsRuntime:
                 else None)
             if cipher_type is None:
                 raise ValueError(f"unsupported transformation: {transformation}")
-            key_bytes, iv_bytes = decode_argument(key), decode_argument(iv)
             block_size = getattr(cipher_type, "block_size", 1)
             if cipher_type is DES3:
                 if len(key_bytes) not in {16, 24}:
@@ -5477,6 +5507,35 @@ class LegadoJsRuntime:
                     base64.b64encode(output).decode("ascii"))
         except Exception as exc:
             raise JsBridgeError(f"crypto operation failed: {exc}") from None
+
+    @classmethod
+    def _aead(cls, operation: str, algorithm: str, key_bytes: bytes, nonce: bytes,
+              value: str, tag_bits) -> str:
+        """JCA authenticated ciphers, which append the tag to the ciphertext."""
+        tag_length = max(1, int(tag_bits) // 8)
+        if algorithm.startswith("CHACHA20"):
+            from Crypto.Cipher import ChaCha20_Poly1305
+            if len(key_bytes) != 32:
+                raise ValueError("ChaCha20 key must contain 32 bytes")
+            cipher = ChaCha20_Poly1305.new(key=key_bytes, nonce=nonce)
+        else:
+            from Crypto.Cipher import AES
+            cipher = AES.new(key_bytes, AES.MODE_GCM, nonce=nonce)
+        decoded_value = json.loads(value)
+        raw = (cls._byte_values(decoded_value) if isinstance(decoded_value, list)
+               else str(decoded_value).encode())
+        decrypting = operation.startswith("decrypt")
+        if decrypting:
+            if len(raw) < tag_length:
+                raise ValueError("ciphertext is shorter than the AEAD tag")
+            output = cipher.decrypt_and_verify(raw[:-tag_length], raw[-tag_length:])
+        else:
+            ciphertext, tag = cipher.encrypt_and_digest(raw)
+            output = ciphertext + tag
+        if operation.endswith("Bytes"):
+            return json.dumps(list(output))
+        return (output.decode("utf-8", errors="replace") if decrypting else
+                base64.b64encode(output).decode("ascii"))
 
     @staticmethod
     def _symmetric_generate(transformation: str, need_key=False, need_iv=False) -> str:
