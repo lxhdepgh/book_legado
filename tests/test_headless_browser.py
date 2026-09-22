@@ -6,11 +6,15 @@ real Chromium and is skipped when the kernel is not installed.
 """
 import asyncio
 import re
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from app.models.book_source import BookSource
+from app.services import check_service
 from app.services import headless_browser
 from app.services.headless_browser import (
     DEFAULT_SCRIPT, HeadlessBrowser, _with_base, cookie_header,
@@ -318,6 +322,96 @@ class _RealRenderTests(unittest.IsolatedAsyncioTestCase):
             {"javaScript": "document.querySelector('p').textContent",
              "webViewDelayTime": 0})
         self.assertEqual(result["jsResult"], "t")
+
+
+class _SiteHandler(BaseHTTPRequestHandler):
+    pages: dict = {}
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0].split(",", 1)[0]
+        payload = self.pages.get(path, self.pages["/"]).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):
+        pass
+
+
+@unittest.skipUnless(headless_browser.chromium_installed(),
+                     "Chromium 内核未安装")
+class _PipelineWiringTests(unittest.IsolatedAsyncioTestCase):
+    """The whole chain, on 127.0.0.1: check_sources -> engine -> Chromium.
+
+    The chapter body only exists after the page script runs, so the plain check
+    cannot read it.  The two runs differ only in whether the pipeline was given
+    a fetcher, which is what makes this a test of the wiring rather than of the
+    renderer.
+    """
+
+    async def asyncSetUp(self):
+        self.profile = TemporaryDirectory()
+        self.browser = HeadlessBrowser(profile_dir=self.profile.name, timeout=30)
+        handler = type("Handler", (_SiteHandler,), {"pages": {
+            "/": "<html><body><h1>local source</h1></body></html>",
+            "/search": '<html><body><div class="item">'
+                       '<a href="/book/1"><span class="title">Local Book</span>'
+                       '</a><span class="author">Tester</span></div></body></html>',
+            "/book/1": '<html><body><h1 id="name">Local Book</h1>'
+                       '<span id="author">Tester</span>'
+                       '<ul><li><a href="/chapter/1">Diyizhang</a></li></ul>'
+                       '</body></html>',
+            "/chapter/1": "<html><body><div id='content'></div><script>"
+                          "document.getElementById('content').innerHTML="
+                          "'<p>RENDERED-CHAPTER-BODY</p>'</script></body></html>",
+        }})
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}/"
+
+    async def asyncTearDown(self):
+        self.server.shutdown()
+        await self.browser.aclose()
+        self.profile.cleanup()
+
+    def _source(self):
+        return BookSource(
+            bookSourceName="local-e2e", bookSourceUrl=self.base,
+            searchUrl="/search?key={{key}}",
+            ruleSearch={"bookList": ".item", "name": ".title@text",
+                        "author": ".author@text", "bookUrl": "a@href"},
+            ruleBookInfo={"name": "#name@text", "author": "#author@text"},
+            ruleToc={"chapterList": "li@tag.a", "chapterName": "text",
+                     "chapterUrl": 'href##$##,{"webView":true}'},
+            ruleContent={"content": "#content p@text",
+                         "webJs": "document.querySelector('#content p')"},
+            header="", enabled=True, enabledExplore=False, exploreUrl="",
+        )
+
+    async def _check(self, fetcher):
+        async def builtin_fetch(url, source=None, options=None):
+            return await self.browser.fetch(url, options)
+
+        with patch.object(check_service, "available_fetcher",
+                          return_value=fetcher and builtin_fetch):
+            results = await check_service.check_sources(
+                [self._source()], concurrency=1, timeout=30)
+        return results[0]
+
+    async def test_a_web_view_chapter_is_verified_once_a_fetcher_is_given(self):
+        without = await self._check(None)
+        self.assertEqual(without["reading_status"], "needs_browser")
+        self.assertEqual(without["reading_stage"], "content")
+        self.assertEqual(without["check_state"], "search_only")
+
+        with_browser = await self._check(True)
+        self.assertEqual(with_browser["reading_error"], None)
+        self.assertEqual(with_browser["reading_status"], "ok")
+        self.assertEqual(with_browser["reading_stage"], "complete")
+        self.assertEqual(with_browser["chapter_count"], 1)
+        self.assertEqual(with_browser["check_state"], "fully_usable")
 
 
 if __name__ == "__main__":
