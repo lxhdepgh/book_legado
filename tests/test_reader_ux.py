@@ -899,7 +899,7 @@ class SourceSwitchTests(unittest.IsolatedAsyncioTestCase):
             ["https://www.qbtr.org", "https://other.test", "https://zzz.test"])
         self.assertEqual(
             self.view._switch_start_hint(item),
-            "共 3 个已启用书源，先搜索最可能收录本书的 3 个。")
+            "将搜索全部 3 个已启用书源，同站同域名的排在最前。")
 
         stub = self._install(_SwitchSearchStub(
             books={"https://www.qbtr.org": [BookItem(
@@ -920,33 +920,24 @@ class SourceSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0].subtitle.value,
                          "全本同人小说网 · www.qbtr.org · 作者 · chapter 9")
 
-    async def test_first_batch_is_bounded_and_the_rest_stay_available(self):
+    async def test_every_candidate_is_searched_in_one_run(self):
         item = self._shelve()
         self.service.sources = [
             self._target(f"https://s{index:02d}.test", name=f"源{index:02d}")
-            for index in range(25)]
+            for index in range(40)]
         stub = self._install(_SwitchSearchStub(
-            books={"https://s24.test": [BookItem("Book",
-                                                 url="https://s24.test/book/1")]}))
+            books={"https://s39.test": [BookItem("Book",
+                                                 url="https://s39.test/book/1")]}))
 
         self.view._show_source_switch(item)
         self.view._start_source_switch(item)
-        self.assertEqual(len(self.view._source_switch_rest), 1)
         await self.view._source_switch_task
 
-        self.assertEqual(stub.started, 24)
+        self.assertEqual(stub.started, 40)
         self.assertEqual(
             self.view._source_switch_status.value,
-            "搜索完成：检查 24 个书源，找到 0 个结果，还有 1 个书源未搜索")
-        self.assertTrue(self.view._source_switch_more.visible)
-
-        self.view._start_source_switch(item, self.view._source_switch_rest)
-        await self.view._source_switch_task
-
-        self.assertEqual(stub.started, 25)
+            "搜索完成：检查 40 个书源，找到 1 个结果")
         self.assertEqual(len(self.view._source_switch_results.controls), 1)
-        self.assertEqual(self.view._source_switch_rest, [])
-        self.assertFalse(self.view._source_switch_more.visible)
 
     async def test_stopping_cancels_every_running_worker(self):
         item = self._shelve()

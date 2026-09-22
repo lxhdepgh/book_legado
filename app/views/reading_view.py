@@ -25,8 +25,8 @@ from app.services.web_page_renderer import WebPageRenderer
 from app.ui_feedback import show_snack_bar
 
 # 换源搜索第一批只查最可能收录这本书的书源，剩下的由用户决定是否继续。
-SWITCH_FIRST_BATCH = 24
-SWITCH_CONCURRENCY = 6
+SWITCH_CONCURRENCY = 8
+SWITCH_PUBLISH_INTERVAL = 0.5
 
 
 def _host_of(value) -> str:
@@ -141,8 +141,6 @@ class ReadingView(ft.Column):
         self._source_switch_status = None
         self._source_switch_query = None
         self._source_switch_stop = None
-        self._source_switch_more = None
-        self._source_switch_rest = []
         self._source_switch_generation = 0
         self._bookshelf_layout = "list"
         self._bookshelf_filter_generation = 0
@@ -1323,12 +1321,11 @@ class ReadingView(ft.Column):
         candidates = self._switch_candidates(item)
         if not candidates:
             return "没有其他可搜索的书源，请先导入或启用书源"
-        return (f"共 {len(candidates)} 个已启用书源，先搜索最可能收录本书的 "
-                f"{min(len(candidates), SWITCH_FIRST_BATCH)} 个。")
+        return (f"将搜索全部 {len(candidates)} 个已启用书源，"
+                "同站同域名的排在最前。")
 
     def _show_source_switch(self, item):
         self.page.pop_dialog()
-        self._source_switch_rest = []
         self._source_switch_query = ft.TextField(
             label="搜索书名", value=item.get("name") or "",
             autofocus=True, on_submit=lambda e: self._start_source_switch(item))
@@ -1338,10 +1335,6 @@ class ReadingView(ft.Column):
         self._source_switch_stop = ft.TextButton(
             "停止搜索", icon=ft.Icons.STOP, visible=False,
             on_click=self._stop_source_switch)
-        self._source_switch_more = ft.TextButton(
-            "继续搜索剩余书源", visible=False,
-            on_click=lambda e: self._start_source_switch(
-                item, self._source_switch_rest))
         self._source_switch_dialog = ft.AlertDialog(
             modal=True, title=ft.Text("切换书源"),
             content=ft.Container(width=620, height=520, content=ft.Column([
@@ -1353,7 +1346,6 @@ class ReadingView(ft.Column):
             actions=[
                 ft.TextButton("关闭", on_click=self._close_source_switch),
                 self._source_switch_stop,
-                self._source_switch_more,
                 ft.Button("搜索其他书源", icon=ft.Icons.SEARCH,
                           on_click=lambda e: self._start_source_switch(item)),
             ])
@@ -1362,9 +1354,6 @@ class ReadingView(ft.Column):
     def _set_switch_running(self, running):
         if self._source_switch_stop is not None:
             self._source_switch_stop.visible = running
-        if self._source_switch_more is not None:
-            self._source_switch_more.visible = (
-                not running and bool(self._source_switch_rest))
 
     def _stop_source_switch(self, _=None):
         if self._source_switch_task and not self._source_switch_task.done():
@@ -1381,10 +1370,9 @@ class ReadingView(ft.Column):
             self._source_switch_task.cancel()
         self._source_switch_task = None
         self._source_switch_generation += 1
-        self._source_switch_rest = []
         self.page.pop_dialog()
 
-    def _start_source_switch(self, item, sources=None):
+    def _start_source_switch(self, item):
         if self._source_switch_task and not self._source_switch_task.done():
             return
         keyword = str(self._source_switch_query.value or "").strip()
@@ -1392,13 +1380,7 @@ class ReadingView(ft.Column):
             self._source_switch_status.value = "请输入要搜索的书名"
             self.update()
             return
-        if sources is None:
-            candidates = self._switch_candidates(item)
-            batch = candidates[:SWITCH_FIRST_BATCH]
-            self._source_switch_rest = candidates[SWITCH_FIRST_BATCH:]
-        else:
-            batch = list(sources)
-            self._source_switch_rest = []
+        batch = self._switch_candidates(item)
         self._source_switch_generation += 1
         self._set_switch_running(True)
         self._source_switch_task = self.page.run_task(
@@ -1416,9 +1398,6 @@ class ReadingView(ft.Column):
             detail = "、".join(f"{reason} {count}"
                                for reason, count in failures.most_common(3))
             text += f"（{failed} 个书源搜索失败：{detail}）"
-        rest = len(self._source_switch_rest or [])
-        if not running and rest:
-            text += f"，还有 {rest} 个书源未搜索"
         return text
 
     async def _run_source_switch(self, item, keyword, candidates, generation):
@@ -1446,7 +1425,7 @@ class ReadingView(ft.Column):
             self.update()
 
         async def worker():
-            nonlocal completed
+            nonlocal completed, last_publish
             while True:
                 try:
                     source = queue.get_nowait()
@@ -1467,9 +1446,14 @@ class ReadingView(ft.Column):
                 finally:
                     engine.js.close()
                     completed += 1
-                    if matches or completed % 3 == 0 or completed == len(candidates):
+                    # 全量书源可能有上千个，逐条重绘结果列表会把界面拖住。
+                    now = time.monotonic()
+                    if (completed == len(candidates) or
+                            now - last_publish >= SWITCH_PUBLISH_INTERVAL):
+                        last_publish = now
                         publish(False)
 
+        last_publish = time.monotonic()
         workers = [asyncio.create_task(worker())
                    for _ in range(min(SWITCH_CONCURRENCY, len(candidates)))]
         try:
