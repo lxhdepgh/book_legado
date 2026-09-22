@@ -167,6 +167,26 @@ class CheckSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result[0]["auto_disabled"])
         self.assertFalse(source.enabled)
 
+    async def test_check_reports_java_apis_the_runtime_does_not_simulate(self):
+        def to_dict():
+            return {"bookSourceName": "gap", "bookSourceUrl": "https://gap",
+                    "searchUrl": "https://gap/search?q={{key}}",
+                    "ruleSearch": {
+                        "bookList": "$.list",
+                        "name": "@js:new Packages.com.acme.Tool().name",
+                        "bookUrl": "Packages.java.lang.String.valueOf($.url)"}}
+
+        source = SimpleNamespace(
+            bookSourceName="gap", bookSourceUrl="https://gap",
+            searchUrl="", ruleSearch={}, ruleExplore={}, header="",
+            enabled=True, enabledExplore=False, exploreUrl="", to_dict=to_dict)
+
+        first, second, third = self._patch_unusable()
+        with first, second, third:
+            result = await check_service.check_sources([source], timeout=0.1)
+
+        self.assertEqual(result[0]["unsupported_java_packages"], ["com.acme.Tool"])
+
 
 class CheckResultViewTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
@@ -182,6 +202,21 @@ class CheckResultViewTests(unittest.IsolatedAsyncioTestCase):
     def _result(name, url, state, ms=None):
         return {"name": name, "raw_url": url, "status": "ok",
                 "check_state": state, "response_time_ms": ms}
+
+    def test_detail_lists_java_apis_the_runtime_does_not_simulate(self):
+        view = self._view()
+        result = {**self._result("a", "https://a", "unknown"),
+                  "search_status": "js_error",
+                  "unsupported_java_packages": ["com.acme.Tool", "java.util.Objects"]}
+        self.assertIn("本机未模拟的 API：com.acme.Tool、java.util.Objects",
+                      view.detail_text(result))
+        self.assertIn("本机未模拟的 API：com.acme.Tool、java.util.Objects",
+                      view._build_row(result).subtitle.value)
+        result["unsupported_java_packages"] = [f"com.acme.Tool{i}" for i in range(5)]
+        self.assertIn("本机未模拟的 API：com.acme.Tool0、com.acme.Tool1、"
+                      "com.acme.Tool2 等 5 个", view.detail_text(result))
+        self.assertNotIn("本机未模拟的 API", view.detail_text(
+            self._result("b", "https://b", "fully_usable", 5)))
 
     def test_state_filter_and_sort_narrow_visible_results(self):
         view = self._view()

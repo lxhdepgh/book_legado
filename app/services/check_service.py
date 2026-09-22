@@ -9,6 +9,7 @@ import time
 import aiohttp
 
 from app.services.block_pages import SiteBlockedError, block_reason
+from app.services.compat_audit import scan_missing_java_packages, source_texts
 from app.services.headless_browser import BrowserUnavailable, available_fetcher
 from app.services.legado_js import JsBridgeError
 from app.services.rule_engine import UnsupportedRule, resolve_explore_categories
@@ -88,6 +89,12 @@ def _source_uses_js(source) -> bool:
         for value in values
         for marker in ("@js:", "<js>", "{{java.", "{{source.", "webView")
     )
+
+
+def _unsupported_java_packages(source) -> list[str]:
+    """接口缺失是书源自身的属性，不依赖网络，规则跑之前就能判定。"""
+    data = source.to_dict() if hasattr(source, "to_dict") else source
+    return scan_missing_java_packages(source_texts(data))
 
 
 def _has_readable_content(document) -> bool:
@@ -397,6 +404,9 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
         async def check_source(source, index):
             probe_task = asyncio.create_task(
                 _probe_source(source, session, network_sem, timeout))
+            # 缺口判定要走一次 JS 模拟面清单，放线程里跑，别卡住事件循环。
+            java_gaps = asyncio.create_task(
+                asyncio.to_thread(_unsupported_java_packages, source))
             engine = LegadoReadingEngine(timeout=timeout,
                                          webview_fetcher=browser_fetcher)
             limiter = js_sem if _source_uses_js(source) else engine_sem
@@ -451,7 +461,8 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
                           "raw_url": source.bookSourceUrl, **probe,
                           **search, **chain, "category_results": tags,
                           "tag_check_timeout": tag_timeout,
-                          "tag_check_skipped": tag_skipped}
+                          "tag_check_skipped": tag_skipped,
+                          "unsupported_java_packages": await java_gaps}
             finally:
                 if not probe_task.done():
                     probe_task.cancel()
@@ -496,6 +507,8 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
                         "reading_stage": "none", "reading_error": None,
                         "auto_disabled": False, "tag_check_timeout": False,
                         "tag_check_skipped": False,
+                        "unsupported_java_packages": await asyncio.to_thread(
+                            _unsupported_java_packages, source),
                     }
                 finally:
                     queue.task_done()

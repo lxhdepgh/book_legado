@@ -1491,6 +1491,47 @@ class RuleParserTests(unittest.TestCase):
             "?new Packages.java.util.ArrayList():[];out.add(1);return out.size()})()",
             JsContext(source=source)), 1)
 
+    def test_java_api_inventory_covers_namespaces_classes_and_statics(self):
+        from app.services.legado_js import implemented_java_api_paths
+        paths = implemented_java_api_paths()
+        for name in ("java.lang", "java.lang.System", "java.lang.System.currentTimeMillis",
+                     "java.util.Arrays.copyOf", "java.nio.ByteBuffer.allocate",
+                     "javax.crypto.Cipher.getInstance", "javax.crypto.spec.SecretKeySpec",
+                     "org.jsoup.Jsoup.parse", "org.jsoup.parser.Parser.xmlParser",
+                     "android.webkit.CookieManager.getInstance",
+                     "io.legado.app.help.http.CookieStore.setCookie",
+                     "cn.hutool.core.util.ZipUtil.unGzip"):
+            self.assertIn(name, paths)
+        # 未模拟的路径不会进清单，否则缺口就报不出来了。
+        for name in ("java.util.Objects", "com.example.Widget",
+                     "java.nio.charset.Charset"):
+            self.assertNotIn(name, paths)
+
+    def test_missing_java_package_scan_reports_full_reference_paths(self):
+        from app.services.compat_audit import (scan_missing_java_packages,
+                                              source_texts)
+        self.assertEqual(scan_missing_java_packages([
+            "@js:new Packages.com.acme.Tool().name",
+            "<js>var a=Packages.java.util.Objects.requireNonNull(x)</js>"]),
+            ["com.acme.Tool", "java.util.Objects.requireNonNull"])
+        self.assertEqual(scan_missing_java_packages([
+            "Packages.java.lang.String.valueOf(1)",
+            "Packages.javax.crypto.spec.SecretKeySpec(Packages.android.util.Base64)"]), [])
+        self.assertEqual(scan_missing_java_packages([]), [])
+        self.assertEqual(list(source_texts(
+            {"ruleSearch": {"bookList": "$.list"},
+             "ruleToc": {"chapterList": ["@js:Packages.com.a.B.c()"]}})),
+            ["$.list", "@js:Packages.com.a.B.c()"])
+
+    def test_book_source_corpus_needs_no_unimplemented_java_api(self):
+        from app.services.compat_audit import scan_missing_java_packages
+        corpus = sorted(Path("resource").glob("*.json"))
+        if not corpus:
+            self.skipTest("resource/ 下没有书源库文件")
+        for path in corpus:
+            gaps = scan_missing_java_packages([path.read_text(encoding="utf-8")])
+            self.assertEqual(gaps, [], f"{path.name} 需要未模拟的 API：{gaps}")
+
     def test_empty_login_maps_are_null_like_fixed_base_source(self):
         runtime = LegadoJsRuntime()
         source = SimpleNamespace(

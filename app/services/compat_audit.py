@@ -36,6 +36,7 @@ class CorpusAudit:
     rule_count: int = 0
     rule_syntax_issues: list[RuleSyntaxIssue] = field(default_factory=list)
     unsupported_java_apis: list[str] = field(default_factory=list)
+    unsupported_java_packages: list[str] = field(default_factory=list)
     unsupported_object_apis: list[str] = field(default_factory=list)
     unsupported_jsoup_pseudos: list[str] = field(default_factory=list)
     regex_count: int = 0
@@ -49,6 +50,7 @@ class CorpusAudit:
                 not self.regex_syntax_issues and
                 not self.unknown_rule_fields and
                 not self.unsupported_java_apis and
+                not self.unsupported_java_packages and
                 not self.unsupported_object_apis and
                 not self.unsupported_jsoup_pseudos)
 
@@ -130,6 +132,43 @@ SUPPORTED_JSOUP_PSEUDOS = {
     "contains", "containsOwn", "eq", "gt", "has", "lt", "matches",
     "matchesOwn", "not", "nth-child", "nth-of-type", "regex",
 }
+
+
+JAVA_PACKAGE_REFERENCE = re.compile(
+    r"Packages\.((?:[A-Za-z_$][\w$]*)(?:\.[A-Za-z_$][\w$]*)*)")
+
+
+def source_texts(value):
+    """Every string inside a source dict/model, wherever it is nested."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from source_texts(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from source_texts(child)
+
+
+def scan_missing_java_packages(texts) -> list[str]:
+    """书源用到的 ``Packages.<path>``，本运行时没有模拟的那些。
+
+    清单来自 JS 模拟面自身（``implemented_java_api_paths``），所以只报真正解析
+    不到的路径；模拟面以后补齐了，这里自动不再报。
+    """
+    references = set()
+    for text in texts:
+        references.update(JAVA_PACKAGE_REFERENCE.findall(str(text or "")))
+    if not references:
+        return []
+    from app.services.legado_js import implemented_java_api_paths
+    try:
+        implemented = implemented_java_api_paths()
+    except Exception:
+        # 没有 JS 运行时就无法区分"未模拟"和"能跑"，此时报缺口只会误导；
+        # 真正用到时规则阶段仍会抛带路径的错误。
+        return []
+    return sorted(name for name in references if name not in implemented)
 
 
 def _rule_strings(value):
@@ -342,6 +381,7 @@ def audit_source_corpus(path: str | Path) -> CorpusAudit:
                 used_rule_fields.update(section)
     audit.unknown_rule_fields = sorted(used_rule_fields - KNOWN_RULE_FIELDS)
     corpus_text = path.read_text(encoding="utf-8")
+    audit.unsupported_java_packages = scan_missing_java_packages([corpus_text])
     used_java_apis = set(re.findall(
         r"(?<!Packages\.)(?<![\w$])java\.([A-Za-z_$][\w$]*)\s*\(", corpus_text))
     audit.unsupported_java_apis = sorted(used_java_apis - SUPPORTED_JAVA_APIS)

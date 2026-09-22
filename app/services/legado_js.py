@@ -2126,6 +2126,28 @@ class LegadoJsRuntime:
             ? __javaNamespaceOriginals.get(value) : value;
         }}
         function __javaPackage(name) {{ return __javaMember(name); }}
+        function __javaApiInventory() {{
+          // 列出现在真正解析得到的全部 Packages.* 路径：命名空间、类对象和静态
+          // 成员都会登记，未模拟的路径不会出现在这里（取值只会得到 __javaMember
+          // 桩）。检测端据此在跑规则之前就知道书源需要哪些没模拟的接口。
+          const out=[];
+          const seen=new Set();
+          (function walk(node,prefix,depth){{
+            const kind=typeof node;
+            if(depth>12||node===null||
+               (kind!=='object'&&kind!=='function')||seen.has(node))return;
+            seen.add(node);
+            // 类对象是函数，静态方法就挂在函数自身上；Object.keys 不会枚举
+            // prototype/length/name，所以直接往下走不会失控。
+            for(const key of Object.keys(node)){{
+              const child=node[key];
+              const path=prefix?prefix+'.'+key:key;
+              out.push(path);
+              if(child!==null)walk(child,path,depth+1);
+            }}
+          }})(Packages,'',0);
+          return JSON.stringify(out);
+        }}
         function __parseJavaInteger(value,radix,min,max) {{
           const text=String(value),base=radix===undefined?10:Number(radix);
           if(!Number.isInteger(base)||base<2||base>36||!text.length)
@@ -6372,3 +6394,15 @@ def split_js_rule(rule: str) -> tuple[str | None, str]:
     value = (rule or "").strip()
     program = compile_rule_program(value)
     return program.leading_js()
+
+
+@lru_cache(maxsize=1)
+def implemented_java_api_paths() -> frozenset[str]:
+    """JS 模拟面真正解析得到的全部 ``Packages.<path>``。
+
+    清单由前导脚本自己导出（``__javaApiInventory``），模拟面变动时不需要维
+    护第二份手写白名单；未模拟的路径不会出现在这里。
+    """
+    runtime = LegadoJsRuntime()
+    listed = runtime.evaluate("@js:__javaApiInventory()", JsContext(source=None))
+    return frozenset(str(item) for item in json.loads(listed or "[]"))

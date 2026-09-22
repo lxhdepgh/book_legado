@@ -398,6 +398,11 @@ class CheckView(ft.Column):
             stage_label = READING_STAGE_LABELS.get(reading_stage, reading_stage)
             detail += (f" · {stage_label}失败{sample_note}："
                        f"{result.get('reading_error') or '未知错误'}")
+        missing_apis = result.get("unsupported_java_packages") or []
+        if missing_apis:
+            shown = "、".join(missing_apis[:3])
+            more = f" 等 {len(missing_apis)} 个" if len(missing_apis) > 3 else ""
+            detail += f" · 本机未模拟的 API：{shown}{more}（用到即报错）"
         if result.get("auto_disabled"):
             detail += f" · 已自动停用（{result.get('disable_reason', '不可用')}）"
         elif result.get("check_state") == "unknown":
