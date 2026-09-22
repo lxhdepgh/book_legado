@@ -13,9 +13,12 @@ import aiohttp
 import flet as ft
 
 from app import platform_support
+from app.services.block_pages import SiteBlockedError
 from app.services.public_suffix import effective_tld_plus_one
 from app.services.rule_engine import (UnsupportedRule, parse_explore_categories,
-                                      resolve_explore_categories, BookItem)
+                                      resolve_explore_categories, BookItem,
+                                      RequestConnectionError,
+                                      RequestTimeoutError)
 from app.services.reading_engine import LegadoReadingEngine
 from app.services.reading_cache import ReadingCache
 from app.services.headless_browser import available_fetcher
@@ -25,8 +28,13 @@ from app.services.web_page_renderer import WebPageRenderer
 from app.ui_feedback import show_snack_bar
 
 # 换源搜索第一批只查最可能收录这本书的书源，剩下的由用户决定是否继续。
-SWITCH_CONCURRENCY = 8
+# 每个候选都是不同域名，一轮请求不会重复压同一个站点，所以并发可以比检测高。
+SWITCH_CONCURRENCY = 32
 SWITCH_PUBLISH_INTERVAL = 0.5
+# 一次换源要跑几百上千个互不相干的站点，单个站点慢或不响应不该拖住整轮。
+# 连接阶段（DNS+TCP+TLS）单独限额，挂死的域名 5 秒就出局，正文仍可用满总时长。
+SWITCH_TIMEOUT = 10
+SWITCH_CONNECT_TIMEOUT = 5
 
 
 def _host_of(value) -> str:
@@ -60,11 +68,25 @@ def _switch_failure_reason(exc: Exception) -> str:
         return "接口未模拟"
     if isinstance(exc, UnsupportedRule):
         return "规则不支持"
+    if isinstance(exc, SiteBlockedError):
+        # 本机安全软件或站点反爬给了拦截页，书源规则本身没问题。
+        return "被拦截"
+    if isinstance(exc, RequestTimeoutError):
+        return "超时"
+    if isinstance(exc, RequestConnectionError):
+        return "网络错误"
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return "超时"
     if isinstance(exc, aiohttp.ClientError):
         return "网络错误"
     return "规则或解析错误"
+
+
+def _clock(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    if total < 3600:
+        return f"{total // 60}:{total % 60:02d}"
+    return f"{total // 3600}:{total % 3600 // 60:02d}:{total % 60:02d}"
 
 
 class ReadingView(ft.Column):
@@ -1402,9 +1424,17 @@ class ReadingView(ft.Column):
         self.update()
 
     def _switch_status_text(self, completed, total, matches, failures,
-                            *, running):
-        head = (f"正在搜索 {completed}/{total} 个书源" if running else
-                f"搜索完成：检查 {total} 个书源")
+                            *, running, elapsed=0.0):
+        if running:
+            head = f"正在搜索 {completed}/{total} 个书源"
+            if completed and elapsed >= 1:
+                # 剩余量按已完成的平均速度外推；开头几个还没跑完时给不出估计。
+                remaining = elapsed / completed * (total - completed)
+                head += f"（已用 {_clock(elapsed)}，预计还需 {_clock(remaining)}）"
+        else:
+            head = f"搜索完成：检查 {total} 个书源"
+            if elapsed >= 1:
+                head += f"，用时 {_clock(elapsed)}"
         text = f"{head}，找到 {len(matches)} 个结果"
         failed = sum(failures.values())
         if failed:
@@ -1419,6 +1449,8 @@ class ReadingView(ft.Column):
         matches = []
         failures = collections.Counter()
         completed = 0
+        rendered_matches = -1
+        started_at = time.monotonic()
         queue = asyncio.Queue()
         for source in candidates:
             queue.put_nowait(source)
@@ -1429,12 +1461,16 @@ class ReadingView(ft.Column):
         self.update()
 
         def publish(finished):
+            nonlocal rendered_matches
             if generation != self._source_switch_generation:
                 return
-            self._render_source_switch_results(item, matches)
+            # 结果列表只跟命中数有关：没有新命中就不重建上百个 ListTile。
+            if len(matches) != rendered_matches:
+                rendered_matches = len(matches)
+                self._render_source_switch_results(item, matches)
             self._source_switch_status.value = self._switch_status_text(
                 completed, len(candidates), matches, failures,
-                running=not finished)
+                running=not finished, elapsed=time.monotonic() - started_at)
             if self._source_switch_progress is not None:
                 self._source_switch_progress.value = (
                     completed / len(candidates) if candidates else 0)
@@ -1447,7 +1483,9 @@ class ReadingView(ft.Column):
                     source = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     return
-                engine = self._background_engine()
+                engine = self._background_engine(
+                    timeout=SWITCH_TIMEOUT,
+                    connect_timeout=SWITCH_CONNECT_TIMEOUT)
                 try:
                     books = await engine.search(source, keyword, 1)
                 except asyncio.CancelledError:
@@ -2729,14 +2767,19 @@ class ReadingView(ft.Column):
         self._status.value = text
         self.update()
 
-    def _background_engine(self):
+    def _background_engine(self, timeout=None, connect_timeout=None):
         """An engine for work the reader did not directly ask for.
 
         It gets the built-in browser only: opening a verification dialog over
         whatever the reader is doing would be worse than failing the task.
         """
+        kwargs = {}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        if connect_timeout is not None:
+            kwargs["connect_timeout"] = connect_timeout
         return LegadoReadingEngine(webview_fetcher=available_fetcher(),
-                                   state_dir=self.service.data_dir)
+                                   state_dir=self.service.data_dir, **kwargs)
 
     def _restore_background_status(self):
         if self._background_status:

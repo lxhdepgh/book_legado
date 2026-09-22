@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 from aiohttp import web
+from aiohttp.client_reqrep import ConnectionKey
 import base64
 import hashlib
 import json
@@ -8,6 +9,7 @@ import gzip
 import hmac
 import math
 import re
+import ssl
 import threading
 import time
 import warnings
@@ -57,6 +59,8 @@ from app.services.custom_url import CustomUrl
 from app.services.java_regex import search as java_regex_search, sub as java_regex_sub
 from app.services.public_suffix import effective_tld_plus_one
 from app.services.rule_engine import (BookItem, ChapterItem, ReaderEngine,
+                                      RequestConnectionError,
+                                      RequestTimeoutError,
                                       _format_book_intro,
                                       merge_search_items,
                                       parse_explore_categories,
@@ -1114,6 +1118,32 @@ class RuleParserTests(unittest.TestCase):
         })
         self.assertEqual(runtime.evaluate(
             "@js:typeof leakedFromMap", JsContext(source=source)), "undefined")
+
+    def test_js_runtimes_share_one_permissive_ssl_context(self):
+        """建默认 SSL 上下文要枚举整个 Windows 证书库，换源扫描付不起这个钱。"""
+        from app.services import legado_js
+
+        created = []
+        real = ssl.create_default_context
+
+        def counting_context(*args, **kwargs):
+            created.append(1)
+            return real(*args, **kwargs)
+
+        with patch.object(legado_js, "_SSL_CONTEXT", None), \
+                patch("app.services.legado_js.ssl.create_default_context",
+                      side_effect=counting_context):
+            runtimes = [LegadoJsRuntime() for _ in range(3)]
+
+        contexts = {handler._context
+                    for runtime in runtimes
+                    for handler in runtime.opener.handlers
+                    if getattr(handler, "_context", None) is not None}
+        self.assertEqual(len(created), 1)
+        self.assertEqual(len(contexts), 1)
+        context = contexts.pop()
+        self.assertFalse(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_NONE)
 
     def test_js_lib_only_treats_json_objects_as_remote_mappings(self):
         runtime = LegadoJsRuntime()
@@ -5280,6 +5310,100 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         await engine.aclose()
         self.assertTrue(plain.closed)
         self.assertEqual(engine._sessions, {})
+
+    async def test_connect_timeout_caps_only_the_connection_phase(self):
+        seen = {}
+
+        class Response:
+            status, charset, content_type = 200, "utf-8", "text/plain"
+            headers, url = {}, "https://host/page"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def read(self):
+                return b"ok"
+
+        class Session:
+            closed = False
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def request(self, *_args, **kwargs):
+                seen["timeout"] = kwargs.get("timeout")
+                return Response()
+
+        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.rule_engine.aiohttp.TCPConnector",
+                      lambda **_kwargs: object()):
+            await ReaderEngine(timeout=10, connect_timeout=5)._request(
+                {"url": "https://host/page"})
+        # 换源扫描靠 5 秒连接上限掐掉挂死域名，正文读取仍可用满 10 秒。
+        self.assertEqual(seen["timeout"].total, 10)
+        self.assertEqual(seen["timeout"].connect, 5)
+
+    async def test_engine_without_connect_timeout_matches_old_behaviour(self):
+        seen = {}
+
+        class Session:
+            closed = False
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def request(self, *_args, **kwargs):
+                seen["timeout"] = kwargs.get("timeout")
+                raise asyncio.TimeoutError("slow")
+
+        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.rule_engine.aiohttp.TCPConnector",
+                      lambda **_kwargs: object()):
+            with self.assertRaises(RequestTimeoutError):
+                await ReaderEngine(timeout=15)._request({"url": "https://host/page"})
+        self.assertEqual(seen["timeout"].total, 15)
+        self.assertIsNone(seen["timeout"].connect)
+
+    async def test_transport_failures_keep_their_kind(self):
+        """超时和拒连要能分辨：一个可能是站点慢，另一个只说明主机不可达。"""
+        class Failure:
+            def __init__(self, error):
+                self.error = error
+
+            async def __aenter__(self):
+                raise self.error
+
+            async def __aexit__(self, *_args):
+                return False
+
+        def session_raising(error):
+            class Session:
+                closed = False
+
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                def request(self, *_args, **_kwargs):
+                    return Failure(error)
+
+            return Session
+
+        refused = aiohttp.ClientConnectorError(
+            ConnectionKey("host", 80, False, None, None, None, None),
+            OSError(61, "拒绝连接"))
+        for error, expected in ((asyncio.TimeoutError("slow"), RequestTimeoutError),
+                                (refused, RequestConnectionError)):
+            with patch("app.services.rule_engine.aiohttp.ClientSession",
+                       session_raising(error)), \
+                    patch("app.services.rule_engine.aiohttp.TCPConnector",
+                          lambda **_kwargs: object()):
+                with self.assertRaises(expected) as caught:
+                    await ReaderEngine()._request({"url": "https://host/page"})
+            # 上层（检测、换源）是按 RuntimeError 兜底的，类型必须兼容。
+            self.assertIsInstance(caught.exception, RuntimeError)
 
     async def test_redirect_method_body_and_cross_origin_authorization(self):
         observed = {}

@@ -51,6 +51,18 @@ class UnsupportedRule(RuntimeError):
     pass
 
 
+class RequestConnectionError(RuntimeError):
+    """The host never answered, so the rules were not even consulted.
+
+    Callers that sweep hundreds of sources need to tell a dead host apart from
+    a broken rule: the first one says nothing about the source definition.
+    """
+
+
+class RequestTimeoutError(RequestConnectionError):
+    """The host did not finish the exchange before its time budget ran out."""
+
+
 def _trim_ascii_space(value: str) -> str:
     return re.sub(r"^[\x00-\x20]+|[\x00-\x20]+$", "", str(value or ""))
 
@@ -675,8 +687,13 @@ class ReaderEngine:
     _global_rate_states = {}
     _global_rate_lock = threading.Lock()
 
-    def __init__(self, timeout: int = 15, state_dir=None):
+    def __init__(self, timeout: int = 15, state_dir=None,
+                 connect_timeout: float | None = None):
         self.timeout = timeout
+        # None keeps aiohttp's historical behaviour: only the total budget
+        # applies.  Sweeps pass a value so a host that blackholes the SYN
+        # cannot hold a worker for the whole total budget.
+        self.connect_timeout = connect_timeout
         self.state_dir = state_dir
         self.js = LegadoJsRuntime(timeout, state_dir=state_dir)
         self.js_variables = {}
@@ -958,7 +975,8 @@ class ReaderEngine:
                 "status": 200, "message": "OK", "protocol": "http/1.1",
                 "responseKind": "str", "url": request_url}
             return text, content_type, request_url
-        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        timeout = aiohttp.ClientTimeout(total=self.timeout,
+                                        connect=self.connect_timeout)
         retry_count = self._request_retry_count(request)
         attempts = retry_count + 1
         attempt = 0
@@ -1075,11 +1093,13 @@ class ReaderEngine:
                 # connection turns out to be closed already; without the extra
                 # attempt a healthy site would look broken once we reuse sockets.
                 if stale_retried:
-                    raise RuntimeError(f"连接失败：{exc}") from exc
+                    raise RequestConnectionError(f"连接失败：{exc}") from exc
                 stale_retried = True
                 attempts += 1
-            except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as exc:
-                raise RuntimeError(f"连接失败：{exc}") from exc
+            except aiohttp.ClientConnectorError as exc:
+                raise RequestConnectionError(f"连接失败：{exc}") from exc
+            except asyncio.TimeoutError as exc:
+                raise RequestTimeoutError(f"连接超时：{exc}") from exc
         raise RuntimeError("request loop ended without a response")
 
     @staticmethod

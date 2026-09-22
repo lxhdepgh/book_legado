@@ -1,8 +1,10 @@
 import json
 import asyncio
 import base64
+import collections
 import unittest
 import flet as ft
+from aiohttp import web
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -13,10 +15,14 @@ from app.services.reading_cache import ReadingCache
 from app.services.app_paths import default_app_paths
 from app.services.reading_engine import (ChapterContent, ContentBlock,
                                          parse_content_blocks)
-from app.services.rule_engine import (BookItem, ChapterItem, UnsupportedRule)
+from app.services.rule_engine import (BookItem, ChapterItem,
+                                      RequestConnectionError,
+                                      RequestTimeoutError, UnsupportedRule)
+from app.services.block_pages import SiteBlockedError
 from app.services.source_service import SourceService
 from app.services.interactive_browser import VIEWPORT
-from app.views.reading_view import ReadingView
+from app.views.reading_view import (SWITCH_CONNECT_TIMEOUT, SWITCH_TIMEOUT,
+                                    ReadingView, _switch_failure_reason)
 from app.services.web_page_renderer import WebPageRenderer, looks_like_gate
 from app.app import BookSourceApp
 from app.views.settings_view import SettingsView
@@ -881,7 +887,8 @@ class SourceSwitchTests(unittest.IsolatedAsyncioTestCase):
                           bookSourceGroup=group)
 
     def _install(self, stub):
-        self.view._background_engine = lambda: _SwitchEngineStub(stub.search)
+        self.view._background_engine = lambda **_kwargs: _SwitchEngineStub(
+            stub.search)
         return stub
 
     async def _settle(self):
@@ -944,6 +951,92 @@ class SourceSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.view._source_switch_progress.value, 1.0)
         self.assertFalse(self.view._source_switch_progress.visible)
         self.assertTrue(self.view._source_switch_search.visible)
+
+    async def test_sweep_hands_each_engine_the_sweep_timeouts(self):
+        """一轮扫描里每个书源都要自己一份短超时，否则挂死域名会占满工作位。"""
+        item = self._shelve()
+        self.service.sources = [self._target("https://slow.test", name="慢源")]
+        seen = []
+
+        def factory(**kwargs):
+            seen.append(kwargs)
+            return _SwitchEngineStub(_SwitchSearchStub().search)
+
+        self.view._background_engine = factory
+        self.view._show_source_switch(item)
+        self.view._start_source_switch(item)
+        await self.view._source_switch_task
+
+        self.assertEqual(seen, [{"timeout": SWITCH_TIMEOUT,
+                                 "connect_timeout": SWITCH_CONNECT_TIMEOUT}])
+        # 单个站点顶多占住 5 秒连接 + 10 秒总时长，而不是默认的 15 秒一把梭。
+        self.assertLess(SWITCH_CONNECT_TIMEOUT, SWITCH_TIMEOUT)
+
+    async def test_sweep_runs_the_real_engine_against_a_live_source(self):
+        """真引擎跑一遍：短超时不能把本来能用的回环书源判死。"""
+        async def handler(_request):
+            return web.Response(
+                text='<ul><li><a href="/book/1">Book</a><i>作者</i></li></ul>',
+                content_type="text/html")
+
+        app = web.Application()
+        app.router.add_get("/search", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        self.addAsyncCleanup(runner.cleanup)
+        port = site._server.sockets[0].getsockname()[1]
+        base = f"http://127.0.0.1:{port}"
+        item = self._shelve()
+        self.service.sources = [BookSource(
+            bookSourceName="回环源", bookSourceUrl=base,
+            searchUrl=base + "/search?key={{key}}",
+            ruleSearch={"bookList": "li", "name": "a@text", "author": "i@text",
+                        "bookUrl": "a@href"})]
+
+        self.view._show_source_switch(item)
+        self.view._start_source_switch(item)
+        await self.view._source_switch_task
+
+        results = self.view._source_switch_results.controls
+        self.assertEqual([tile.title.value for tile in results], ["Book"])
+        self.assertIn("127.0.0.1", results[0].subtitle.value)
+        self.assertEqual(self.view._source_switch_status.value,
+                         "搜索完成：检查 1 个书源，找到 1 个结果")
+
+    def test_status_line_reports_elapsed_and_remaining_time(self):
+        failures = collections.Counter()
+        text = self.view._switch_status_text(
+            200, 400, [], failures, running=True, elapsed=100.0)
+        self.assertEqual(text, "正在搜索 200/400 个书源（已用 1:40，预计还需 1:40）"
+                               "，找到 0 个结果")
+        # 开头几个还没跑完时给不出速度，不硬猜。
+        self.assertEqual(
+            self.view._switch_status_text(1, 400, [], failures,
+                                          running=True, elapsed=0.2),
+            "正在搜索 1/400 个书源，找到 0 个结果")
+        self.assertEqual(
+            self.view._switch_status_text(400, 400, [], failures,
+                                          running=False, elapsed=95.0),
+            "搜索完成：检查 400 个书源，用时 1:35，找到 0 个结果")
+        # 小时级的全量扫描也要读得懂。
+        self.assertEqual(
+            self.view._switch_status_text(0, 4000, [], failures,
+                                          running=False, elapsed=3672.0),
+            "搜索完成：检查 4000 个书源，用时 1:01:12，找到 0 个结果")
+
+    def test_failure_reasons_keep_timeout_network_and_blocking_apart(self):
+        """“规则或解析错误”只该留给真正读不懂的来源。"""
+        self.assertEqual(_switch_failure_reason(RequestTimeoutError("x")), "超时")
+        self.assertEqual(_switch_failure_reason(RequestConnectionError("x")),
+                         "网络错误")
+        self.assertEqual(_switch_failure_reason(SiteBlockedError("本机安全软件")),
+                         "被拦截")
+        self.assertEqual(_switch_failure_reason(UnsupportedRule("没有该规则")),
+                         "规则不支持")
+        self.assertEqual(_switch_failure_reason(RuntimeError("正文解析结果为空")),
+                         "规则或解析错误")
 
     async def test_stopping_cancels_every_running_worker(self):
         item = self._shelve()

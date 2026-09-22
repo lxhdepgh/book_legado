@@ -12,7 +12,8 @@ from app.services.block_pages import SiteBlockedError, block_reason
 from app.services.compat_audit import scan_missing_java_packages, source_texts
 from app.services.headless_browser import BrowserUnavailable, available_fetcher
 from app.services.legado_js import JsBridgeError
-from app.services.rule_engine import UnsupportedRule, resolve_explore_categories
+from app.services.rule_engine import (RequestConnectionError, RequestTimeoutError,
+                                      UnsupportedRule, resolve_explore_categories)
 from app.services.reading_engine import LegadoReadingEngine
 
 
@@ -63,7 +64,7 @@ def _error_kind(exc: Exception) -> str:
     message = _error_text(exc).lower()
     if isinstance(exc, SiteBlockedError):
         return "blocked"
-    if isinstance(exc, asyncio.TimeoutError) or "timeout" in message:
+    if isinstance(exc, (RequestTimeoutError, asyncio.TimeoutError)) or "timeout" in message:
         return "timeout"
     if isinstance(exc, UnsupportedRule):
         return "unsupported"
@@ -71,7 +72,7 @@ def _error_kind(exc: Exception) -> str:
         return "js_error"
     if "429" in message or "rate limit" in message:
         return "rate_limited"
-    if isinstance(exc, (aiohttp.ClientError, OSError)):
+    if isinstance(exc, (RequestConnectionError, aiohttp.ClientError, OSError)):
         return "network_error"
     return "rule_error"
 

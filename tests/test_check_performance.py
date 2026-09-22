@@ -7,7 +7,9 @@ from unittest.mock import AsyncMock, patch
 from app.services import block_pages, check_service
 from app.models.book_source import BookSource
 from app.services.legado_js import LegadoJsRuntime
-from app.services.rule_engine import ExploreCategory, ReaderEngine
+from app.services.rule_engine import (ExploreCategory, ReaderEngine,
+                                      RequestConnectionError,
+                                      RequestTimeoutError)
 
 
 def _source(**overrides):
@@ -565,6 +567,11 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(check_service._error_kind(
             block_pages.SiteBlockedError("目标站点拦截了本次访问（Cloudflare，HTTP 403）")),
             "blocked")
+        # 主机级传输失败不该被算成书源规则写错了。
+        self.assertEqual(check_service._error_kind(
+            RequestTimeoutError("连接超时：")), "timeout")
+        self.assertEqual(check_service._error_kind(
+            RequestConnectionError("连接失败：拒绝连接")), "network_error")
         self.assertEqual(check_service._classify_result({
             "status": "ok", "status_code": 403, "search_status": "no_results",
             "tag_valid": 0, "reading_status": "skip"}), "blocked")

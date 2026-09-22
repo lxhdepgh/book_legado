@@ -328,8 +328,10 @@ class LegadoReadingEngine(ReaderEngine):
     """Adds detail init, paged TOC, chapter context and paged content."""
 
     def __init__(self, timeout: int = 15, webview_fetcher=None,
-                 verification_fetcher=None, state_dir=None):
-        super().__init__(timeout, state_dir=state_dir)
+                 verification_fetcher=None, state_dir=None,
+                 connect_timeout: float | None = None):
+        super().__init__(timeout, state_dir=state_dir,
+                         connect_timeout=connect_timeout)
         self.webview_fetcher = webview_fetcher
         self.verification_fetcher = verification_fetcher
         self.current_chapters: list[ChapterItem] = []

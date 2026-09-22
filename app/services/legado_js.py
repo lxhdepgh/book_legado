@@ -43,6 +43,27 @@ class JsBridgeError(RuntimeError):
     pass
 
 
+_SSL_CONTEXT_LOCK = threading.Lock()
+_SSL_CONTEXT = None
+
+
+def _unverified_ssl_context():
+    """One permissive context per process.
+
+    ``create_default_context`` enumerates the whole Windows certificate store;
+    measured at ~7ms per call, which a sweep over hundreds of sources would pay
+    hundreds of times over for a context the JS bridge never verifies against.
+    """
+    global _SSL_CONTEXT
+    with _SSL_CONTEXT_LOCK:
+        if _SSL_CONTEXT is None:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            _SSL_CONTEXT = context
+        return _SSL_CONTEXT
+
+
 def classify_js_bridge_error(message: str) -> str:
     """Separate missing engine APIs from source-script/network failures."""
     text = str(message or "")
@@ -112,10 +133,8 @@ class LegadoJsRuntime:
         self.timeout = timeout
         self.cookies = CookieJar()
         self._session_persistent_shadow = {}
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        self.opener = build_opener(HTTPCookieProcessor(self.cookies), HTTPSHandler(context=ssl_context))
+        self.opener = build_opener(HTTPCookieProcessor(self.cookies),
+                                   HTTPSHandler(context=_unverified_ssl_context()))
         self.default_headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
