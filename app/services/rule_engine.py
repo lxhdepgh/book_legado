@@ -13,6 +13,7 @@ import re
 import struct
 import threading
 import time
+import warnings
 import xml.etree.ElementTree as ET
 import zipfile
 from collections import deque
@@ -23,7 +24,7 @@ from urllib.parse import quote, unquote_to_bytes, urljoin
 
 import aiohttp
 from aiohttp_socks import ProxyConnector
-from bs4 import BeautifulSoup, UnicodeDammit
+from bs4 import BeautifulSoup, UnicodeDammit, XMLParsedAsHTMLWarning
 from multidict import CIMultiDict
 
 from app.services.block_pages import SiteBlockedError, block_reason
@@ -1067,7 +1068,11 @@ class ReaderEngine:
     def _html_declared_encoding(raw: bytes) -> str | None:
         """Port EncodingDetect.getHtmlEncode's Jsoup meta-tag pass."""
         try:
-            document = BeautifulSoup(raw.decode("utf-8", errors="replace"), "html.parser")
+            with warnings.catch_warnings():
+                # Jsoup parses every response as HTML, XML prologue included, so
+                # switching to an XML parser here would change extraction.
+                warnings.simplefilter("ignore", XMLParsedAsHTMLWarning)
+                document = BeautifulSoup(raw.decode("utf-8", errors="replace"), "html.parser")
             for meta in document.find_all("meta"):
                 charset = str(meta.get("charset") or "")
                 if charset:

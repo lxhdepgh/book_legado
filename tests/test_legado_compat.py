@@ -10,6 +10,7 @@ import math
 import re
 import threading
 import time
+import warnings
 import zipfile
 import zlib
 from io import BytesIO
@@ -5406,6 +5407,16 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ReaderEngine._html_declared_encoding(odd_spacing), "= gbk")
         with self.assertRaises(LookupError):
             ReaderEngine._decode_response_body(odd_spacing + b"text", None)
+
+    def test_xml_bodies_keep_the_html_parser_without_warning(self):
+        raw = ('<?xml version="1.0" encoding="utf-8"?><rss><channel>'
+               '<meta charset="gbk"/></channel></rss>').encode("utf-8")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            declared = ReaderEngine._html_declared_encoding(raw)
+        self.assertEqual(declared, "gbk")
+        self.assertNotIn("XMLParsedAsHTMLWarning",
+                         [type(warning.message).__name__ for warning in caught])
 
     def test_icu_detector_matches_fixed_east_asian_oracle_fixtures(self):
         chinese = ("中文章节内容测试" * 10).encode("gb18030")

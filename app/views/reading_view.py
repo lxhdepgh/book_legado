@@ -141,6 +141,8 @@ class ReadingView(ft.Column):
         self._source_switch_status = None
         self._source_switch_query = None
         self._source_switch_stop = None
+        self._source_switch_search = None
+        self._source_switch_progress = None
         self._source_switch_generation = 0
         self._bookshelf_layout = "list"
         self._bookshelf_filter_generation = 0
@@ -1332,28 +1334,39 @@ class ReadingView(ft.Column):
         self._source_switch_status = ft.Text(
             self._switch_start_hint(item), color=ft.Colors.GREY_600)
         self._source_switch_results = ft.ListView(expand=True, spacing=4)
+        self._source_switch_progress = ft.ProgressBar(value=0, visible=False)
         self._source_switch_stop = ft.TextButton(
             "停止搜索", icon=ft.Icons.STOP, visible=False,
             on_click=self._stop_source_switch)
+        self._source_switch_search = ft.Button(
+            "搜索其他书源", icon=ft.Icons.SEARCH,
+            on_click=lambda e: self._start_source_switch(item))
         self._source_switch_dialog = ft.AlertDialog(
             modal=True, title=ft.Text("切换书源"),
             content=ft.Container(width=620, height=520, content=ft.Column([
                 self._source_switch_query,
                 self._source_switch_status,
+                self._source_switch_progress,
                 ft.Divider(height=1),
                 self._source_switch_results,
             ], spacing=8)),
             actions=[
                 ft.TextButton("关闭", on_click=self._close_source_switch),
                 self._source_switch_stop,
-                ft.Button("搜索其他书源", icon=ft.Icons.SEARCH,
-                          on_click=lambda e: self._start_source_switch(item)),
+                self._source_switch_search,
             ])
         self.page.show_dialog(self._source_switch_dialog)
 
     def _set_switch_running(self, running):
         if self._source_switch_stop is not None:
             self._source_switch_stop.visible = running
+        if self._source_switch_search is not None:
+            # 搜索期间再点一次没有意义（会被直接忽略），不如让位给停止按钮。
+            self._source_switch_search.visible = not running
+        if self._source_switch_progress is not None:
+            self._source_switch_progress.visible = running
+            if running:
+                self._source_switch_progress.value = 0
 
     def _stop_source_switch(self, _=None):
         if self._source_switch_task and not self._source_switch_task.done():
@@ -1422,6 +1435,9 @@ class ReadingView(ft.Column):
             self._source_switch_status.value = self._switch_status_text(
                 completed, len(candidates), matches, failures,
                 running=not finished)
+            if self._source_switch_progress is not None:
+                self._source_switch_progress.value = (
+                    completed / len(candidates) if candidates else 0)
             self.update()
 
         async def worker():

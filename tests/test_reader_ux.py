@@ -938,6 +938,9 @@ class SourceSwitchTests(unittest.IsolatedAsyncioTestCase):
             self.view._source_switch_status.value,
             "搜索完成：检查 40 个书源，找到 1 个结果")
         self.assertEqual(len(self.view._source_switch_results.controls), 1)
+        self.assertEqual(self.view._source_switch_progress.value, 1.0)
+        self.assertFalse(self.view._source_switch_progress.visible)
+        self.assertTrue(self.view._source_switch_search.visible)
 
     async def test_stopping_cancels_every_running_worker(self):
         item = self._shelve()
@@ -951,6 +954,9 @@ class SourceSwitchTests(unittest.IsolatedAsyncioTestCase):
         task = self.view._source_switch_task
         await self._settle()
         self.assertEqual(stub.started, 4)
+        self.assertTrue(self.view._source_switch_progress.visible)
+        self.assertTrue(self.view._source_switch_stop.visible)
+        self.assertFalse(self.view._source_switch_search.visible)
 
         self.view._stop_source_switch()
         with self.assertRaises(asyncio.CancelledError):
@@ -960,6 +966,9 @@ class SourceSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stub.cancelled, 4)
         self.assertEqual(self.view._source_switch_status.value, "搜索已停止")
         self.assertIsNone(self.view._source_switch_task)
+        self.assertFalse(self.view._source_switch_progress.visible)
+        self.assertFalse(self.view._source_switch_stop.visible)
+        self.assertTrue(self.view._source_switch_search.visible)
 
     async def test_apply_switch_targets_the_live_record_after_a_reload(self):
         item = self._shelve()
