@@ -874,14 +874,15 @@ class LegadoReadingEngine(ReaderEngine):
     def _strict_value(self, node, rule: str, kind: str, source, base_url: str,
                       book=None, chapter=None, raw_result=None,
                       is_url: bool = False, collect_all: bool = False,
-                      unescape_html: bool = True) -> str:
+                      unescape_html: bool = True, rule_name: str = "") -> str:
         if not rule:
             return ""
         if "{{" in rule or "@get:" in rule or "@put:" in rule:
             value = self._field_value(node, rule, kind, source, base_url,
                                       book=book, chapter=chapter,
                                       raw_result=raw_result,
-                                      unescape_html=unescape_html)
+                                      unescape_html=unescape_html,
+                                      rule_name=rule_name)
             if is_url:
                 value = _resolve_rule_url(value, base_url)
             return value
@@ -890,7 +891,8 @@ class LegadoReadingEngine(ReaderEngine):
             value = self._field_value(node, rule, kind, source, base_url,
                                       book=book, chapter=chapter,
                                       raw_result=raw_result,
-                                      unescape_html=unescape_html)
+                                      unescape_html=unescape_html,
+                                      rule_name=rule_name)
             if is_url:
                 value = _resolve_rule_url(value, base_url)
             return value
@@ -1173,7 +1175,8 @@ class LegadoReadingEngine(ReaderEngine):
             try:
                 value = self._strict_value(
                     root, kind_rule, kind, source, redirect_url, book=book,
-                    raw_result=raw_text, collect_all=True)
+                    raw_result=raw_text, collect_all=True,
+                    rule_name="ruleBookInfo.kind")
                 values = [item for item in value.splitlines() if item]
                 if values:
                     book.kind = ",".join(values)
@@ -1185,7 +1188,8 @@ class LegadoReadingEngine(ReaderEngine):
             try:
                 value = self._strict_value(
                     root, cover_rule, kind, source, redirect_url, book=book,
-                    raw_result=raw_text, is_url=True)
+                    raw_result=raw_text, is_url=True,
+                    rule_name="ruleBookInfo.coverUrl")
                 if value:
                     book.cover_url = value
             except Exception:
@@ -1202,7 +1206,7 @@ class LegadoReadingEngine(ReaderEngine):
             try:
                 value = formatter(self._strict_value(
                     root, rule, kind, source, redirect_url, book=book,
-                    raw_result=raw_text))
+                    raw_result=raw_text, rule_name=f"ruleBookInfo.{rule_name}"))
             except Exception:
                 continue
             if value:
@@ -1213,13 +1217,13 @@ class LegadoReadingEngine(ReaderEngine):
         if rules.get("name"):
             value = _format_book_name(self._strict_value(
                 root, rules["name"], kind, source, redirect_url,
-                book=book, raw_result=raw_text))
+                book=book, raw_result=raw_text, rule_name="ruleBookInfo.name"))
             if value and (not book.name or rename):
                 book.name = value
         if rules.get("author"):
             value = _format_book_author(self._strict_value(
                 root, rules["author"], kind, source, redirect_url,
-                book=book, raw_result=raw_text))
+                book=book, raw_result=raw_text, rule_name="ruleBookInfo.author"))
             if value and (not book.author or rename):
                 book.author = value
 
@@ -1235,7 +1239,8 @@ class LegadoReadingEngine(ReaderEngine):
             rule = rules.get("tocUrl")
             value = self._strict_value(
                 root, rule, kind, source, redirect_url, book=book,
-                raw_result=raw_text, is_url=True) if rule else ""
+                raw_result=raw_text, is_url=True,
+                rule_name="ruleBookInfo.tocUrl") if rule else ""
             book.toc_url = value or base_url
             if book.toc_url == base_url:
                 book.toc_html = original_body
@@ -1320,10 +1325,12 @@ class LegadoReadingEngine(ReaderEngine):
             for page_index, node in enumerate(nodes):
                 name = self._strict_value(
                     node, str(toc_rule.get("chapterName") or ""),
-                    kind, source, final_url, book=book)
+                    kind, source, final_url, book=book,
+                    rule_name="ruleToc.chapterName")
                 url = self._strict_value(
                     node, str(toc_rule.get("chapterUrl") or ""),
-                    kind, source, final_url, book=book, is_url=True)
+                    kind, source, final_url, book=book, is_url=True,
+                    rule_name="ruleToc.chapterUrl")
                 if isinstance(url, str) and url.strip().lower().startswith(
                         ("javascript:", "void(")):
                     url = ""
@@ -1332,7 +1339,8 @@ class LegadoReadingEngine(ReaderEngine):
                     base_url=final_url,
                     book_url=book.url,
                     tag=self._field_value(node, toc_rule.get("updateTime", ""), kind,
-                                          source, final_url, book=book)
+                                          source, final_url, book=book,
+                                          rule_name="ruleToc.updateTime")
                     if toc_rule.get("updateTime") else "",
                 )
                 def truthy(rule_name):
@@ -1340,7 +1348,7 @@ class LegadoReadingEngine(ReaderEngine):
                         return False
                     raw = self._strict_value(
                         node, toc_rule[rule_name], kind, source, final_url,
-                        book=book)
+                        book=book, rule_name=f"ruleToc.{rule_name}")
                     return _legado_truthy(raw)
                 chapter.is_volume = truthy("isVolume")
                 chapter.is_vip = truthy("isVip")
@@ -1497,7 +1505,7 @@ class LegadoReadingEngine(ReaderEngine):
                     document_title = self._strict_value(
                         root, content_rule["title"], kind, source, final_url,
                         book=getattr(self, "current_book", None), chapter=chapter,
-                        raw_result=text)
+                        raw_result=text, rule_name="ruleContent.title")
                 except Exception:
                     document_title = ""
                 if document_title:
@@ -1506,7 +1514,8 @@ class LegadoReadingEngine(ReaderEngine):
             value = self._strict_value(
                 root, rule, kind, source, final_url,
                 book=getattr(self, "current_book", None), chapter=chapter,
-                raw_result=text, collect_all=True, unescape_html=False)
+                raw_result=text, collect_all=True, unescape_html=False,
+                rule_name="ruleContent.content")
             value = _format_content_page(value, final_url)
             if value:
                 parts.append(value)
@@ -1544,7 +1553,7 @@ class LegadoReadingEngine(ReaderEngine):
                 replace_context[0], sub_rule, replace_context[1], source,
                 replace_context[2],
                 book=getattr(self, "current_book", None), chapter=chapter,
-                raw_result=first_body)
+                raw_result=first_body, rule_name="ruleContent.subContent")
             if sub_value:
                 parts.append(sub_value)
         joined = "\n".join(parts)

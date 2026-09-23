@@ -1630,7 +1630,7 @@ class DiscoveryPageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("甲站", self.view._browse_title.value)
         self.assertEqual(["/l1"], [call.args[1].url for call in
                                    self.view.engine.explore.await_args_list])
-        self.assertEqual("分类一：找到 0 本书，固定榜单无后续分页",
+        self.assertEqual("分类一：该分类没有返回书籍，可稍后重试",
                          self.view._status.value)
 
     async def test_a_running_search_survives_going_back_to_the_source_list(self):

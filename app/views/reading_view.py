@@ -1145,10 +1145,13 @@ class ReadingView(ft.Column):
             if flow.has_more:
                 flow.page += 1
             self._append_book_controls(flow, added_books)
-            paging_text = "，可继续下拉加载" if flow.has_more else (
-                "，固定榜单无后续分页" if not supports_paging else "，已加载全部结果"
-            )
-            self._set_status(f"{category.title}：找到 {len(flow.books)} 本书{paging_text}")
+            if not flow.books:
+                self._set_status(f"{category.title}：该分类没有返回书籍，可稍后重试")
+            else:
+                paging_text = "，可继续下拉加载" if flow.has_more else (
+                    "，固定榜单无后续分页" if not supports_paging else "，已加载全部结果"
+                )
+                self._set_status(f"{category.title}：找到 {len(flow.books)} 本书{paging_text}")
             self._set_discovery_page("browse")
         except Exception as exc:
             self._show_error(

@@ -6718,6 +6718,149 @@ class ExploreCategoryTests(unittest.IsolatedAsyncioTestCase):
                              [("Saved", "/saved")])
 
 
+class EmptyExploreFallbackTests(unittest.IsolatedAsyncioTestCase):
+    """🎨再漫画 answers an empty rank list with a JS TypeError, not a page.
+
+    The list rule matches nothing, so the engine makes Legado's "列表为空,
+    按详情页解析" guess; the detail rules then fail on a payload they never
+    expected.  An empty category is a normal answer, and the message a real
+    failure produces must name the rule instead of engine internals.
+    """
+
+    # Both rules are the source's own text: the list rule returns the rank
+    # array (or nothing), the detail author rule reads comicInfo off it.
+    LIST_RULE = (
+        "@js:\nvar d = (typeof result === 'string') ? JSON.parse(result) : result;\n"
+        "var list = d.data.comicList || d.data || [];\nvar out = [];\n"
+        "for (var i = 0; i < list.length; i++) {\n  var x = list[i];\n"
+        "  out.push(JSON.stringify({_name: x.name || x.title || '', "
+        "_author: x.authors || '', _py: x.comic_py || ''}));\n}\nresult = out;")
+    AUTHOR_RULE = (
+        "@js:\nvar d = (typeof result === 'string') ? JSON.parse(result) : result;\n"
+        "var a = d.data.comicInfo.authorsTagList || [];\nvar s = [];\n"
+        "for (var i = 0; i < a.length; i++) { s.push(a[i].tagName); }\n"
+        "s.join(' / ')")
+    RANK_URL = "https://v4api.example/app/v1/comic/rank/list?page=1"
+
+    @classmethod
+    def _source(cls) -> BookSource:
+        return BookSource(
+            bookSourceName="🎨再漫画",
+            bookSourceUrl="https://manhua.example",
+            exploreUrl=json.dumps([{"title": "🏆 人气榜", "url": cls.RANK_URL}],
+                                  ensure_ascii=False),
+            ruleExplore={
+                "author": "$._author",
+                "bookList": cls.LIST_RULE,
+                "bookUrl": ("$._py@js:'https://v4api.example/api/v1/comic2/"
+                            "comic/detail?comic_py='+result"),
+                "name": "$._name"},
+            ruleBookInfo={"author": cls.AUTHOR_RULE,
+                          "name": "@Json:data.comicInfo.title"},
+        )
+
+    @staticmethod
+    def _payload(body) -> str:
+        return json.dumps(body, ensure_ascii=False)
+
+    def _offline_engine(self, payload: str):
+        content_type = ("application/json" if payload.lstrip().startswith(("{", "["))
+                        else "text/html")
+
+        async def request(_request, _source):
+            return payload, content_type, self.RANK_URL
+
+        engine = LegadoReadingEngine()
+        engine._request = request
+        return engine
+
+    async def test_an_empty_rank_list_reports_no_books_instead_of_raising(self):
+        source = self._source()
+        engine = self._offline_engine(self._payload({"data": []}))
+        try:
+            categories = await resolve_explore_categories(source, engine.js)
+            books = await engine.explore(source, categories[0], 1)
+        finally:
+            await engine.aclose()
+
+        self.assertEqual([], books)
+
+    async def test_a_filled_rank_list_still_reads_its_books(self):
+        source = self._source()
+        engine = self._offline_engine(self._payload(
+            {"data": [{"name": "半调子恋人", "authors": "甲", "comic_py": "a"},
+                      {"name": "第二部", "authors": "乙", "comic_py": "b"}]}))
+        try:
+            categories = await resolve_explore_categories(source, engine.js)
+            books = await engine.explore(source, categories[0], 1)
+        finally:
+            await engine.aclose()
+
+        self.assertEqual(["半调子恋人", "第二部"], [book.name for book in books])
+        self.assertEqual(["甲", "乙"], [book.author for book in books])
+
+    async def test_the_empty_list_guess_still_reads_a_detail_page(self):
+        source = BookSource(
+            bookSourceName="详情即列表",
+            bookSourceUrl="https://detail.example/",
+            exploreUrl=json.dumps([{"title": "分类", "url": "/book/1"}],
+                                  ensure_ascii=False),
+            ruleExplore={"bookList": "div.rank-item"},
+            ruleBookInfo={"author": "#info .author@text",
+                          "name": "#info h1@text"},
+        )
+        page = ('<div id="info"><h1>某某</h1>'
+                '<span class="author">作者甲</span></div>')
+        engine = self._offline_engine(page)
+        try:
+            categories = await resolve_explore_categories(source, engine.js)
+            books = await engine.explore(source, categories[0], 1)
+        finally:
+            await engine.aclose()
+
+        self.assertEqual([("某某", "作者甲")],
+                         [(book.name, book.author) for book in books])
+
+    async def test_a_failing_rule_names_itself_and_hides_input_frames(self):
+        source = self._source()
+        engine = LegadoReadingEngine()
+        payload = self._payload({"data": []})
+        try:
+            with self.assertRaises(JsBridgeError) as caught:
+                engine._strict_value(
+                    {"data": []}, self.AUTHOR_RULE, "json", source,
+                    source.bookSourceUrl, raw_result=payload,
+                    rule_name="ruleBookInfo.author")
+        finally:
+            await engine.aclose()
+
+        message = str(caught.exception)
+        self.assertIn("authorsTagList", message)
+        self.assertIn("规则：ruleBookInfo.author", message)
+        self.assertNotIn("<input>", message)
+
+    async def test_a_failing_catalog_rule_names_itself(self):
+        class Engine(LegadoReadingEngine):
+            async def _request_value(self, value, source, base_url="", page=1,
+                                     request_defaults=None):
+                return ('<ul><li><a href="/c/1">One</a></li></ul>',
+                        "text/html", "https://source.example/book")
+
+        source = SimpleNamespace(
+            bookSourceUrl="https://source.example", ruleBookInfo={},
+            ruleToc={"chapterList": "li@tag.a",
+                     "chapterName": "@js:var d = null; d.missing;",
+                     "chapterUrl": "href"},
+            to_dict=lambda: {"bookSourceUrl": "https://source.example"})
+        with self.assertRaises(JsBridgeError) as caught:
+            await Engine().chapters(
+                source, BookItem("Book", url="https://source.example/book"))
+
+        message = str(caught.exception)
+        self.assertIn("规则：ruleToc.chapterName", message)
+        self.assertNotIn("<input>", message)
+
+
 class BookshelfPersistenceTests(unittest.TestCase):
     def test_bookshelf_is_stored_outside_resource_directory(self):
         with TemporaryDirectory() as root:

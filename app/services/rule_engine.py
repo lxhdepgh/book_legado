@@ -1287,7 +1287,7 @@ class ReaderEngine:
                      key: str = "", page: int = 1, book=None, chapter=None,
                      raw_result=None, title: str = "",
                      next_chapter_url: str = "",
-                     unescape_html: bool = True) -> str:
+                     unescape_html: bool = True, rule_name: str = "") -> str:
         rule, put_rule = _split_put_rules(rule or "")
         if put_rule:
             self._put_rule_values(node, put_rule, kind, source, base_url,
@@ -1323,6 +1323,7 @@ class ReaderEngine:
                     next_chapter_url=next_chapter_url,
                     result_html_nodes=(raw_result is None and kind == "html" and
                                        hasattr(node, "select")),
+                    rule_name=rule_name,
                 )
                 # Rhino/Legado evaluates template bodies as scripts, so forms
                 # such as ``{{key; java.put('k', key)}}`` are valid and return
@@ -1373,7 +1374,7 @@ class ReaderEngine:
                 return self._field_value(
                     transformed_root, remaining, transformed_kind, source, base_url,
                     key, page, book, chapter, transformed_text, title,
-                    next_chapter_url, unescape_html)
+                    next_chapter_url, unescape_html, rule_name)
             context = JsContext(
                 source=source, key=key, page=page,
                 result=initial_result,
@@ -1388,6 +1389,7 @@ class ReaderEngine:
                 next_chapter_url=next_chapter_url,
                 result_html_nodes=(raw_result is None and kind == "html" and
                                    hasattr(node, "select")),
+                rule_name=rule_name,
             )
             transformed = self.js.evaluate(script, context)
             if not remaining:
@@ -1400,7 +1402,7 @@ class ReaderEngine:
             return self._field_value(
                 transformed_root, remaining, transformed_kind, source, base_url,
                 key, page, book, chapter, stage_result, title,
-                next_chapter_url, unescape_html,
+                next_chapter_url, unescape_html, rule_name,
             )
         get_matches = list(re.finditer(r"@get:\{([^{}]+)\}", rule))
         if get_matches:
@@ -1425,7 +1427,7 @@ class ReaderEngine:
                     node, stripped_value[js_position:], kind, source, base_url,
                     key, page, book, chapter,
                     stripped_value[:js_position].strip(), title,
-                    next_chapter_url, unescape_html)
+                    next_chapter_url, unescape_html, rule_name)
             else:
                 pieces = stripped_value.split("##")
                 value = pieces[0]
@@ -1464,6 +1466,7 @@ class ReaderEngine:
                     next_chapter_url=next_chapter_url,
                     result_html_nodes=(not selector and raw_result is None and kind == "html" and
                                        hasattr(node, "select")),
+                    rule_name=rule_name,
                 )
                 transformed = self.js.evaluate(script, context)
                 value = "" if transformed is None else transformed
@@ -1486,6 +1489,7 @@ class ReaderEngine:
                     next_chapter_url=next_chapter_url,
                     src=(raw_result if isinstance(raw_result, str) else
                          (str(node) if kind == "html" else "")),
+                    rule_name=rule_name,
                 )
                 value = self.js.evaluate(script, context)
                 if regex_suffix:
@@ -1511,6 +1515,7 @@ class ReaderEngine:
                     next_chapter_url=next_chapter_url,
                     result_html_nodes=(not selector and raw_result is None and kind == "html" and
                                        hasattr(node, "select")),
+                    rule_name=rule_name,
                 )
                 value = self.js.evaluate(script, context)
                 if regex_suffix:
@@ -1592,31 +1597,34 @@ class ReaderEngine:
         return ""
 
     def _book_from_node(self, node, kind: str, rules: dict, base_url: str,
-                        source=None, key: str = "", page: int = 1) -> BookItem:
-        def field(primary, fallback, with_base=False, tolerate=False):
+                        source=None, key: str = "", page: int = 1,
+                        rule_prefix: str = "ruleSearch") -> BookItem:
+        def field(name, with_base=False, tolerate=False):
+            primary = rules.get(name)
             if not primary:
                 return ""
             if tolerate:
                 try:
                     return self._field_value(
                         node, primary, kind, source,
-                        base_url if with_base else "", key, page)
+                        base_url if with_base else "", key, page,
+                        rule_name=f"{rule_prefix}.{name}")
                 except (UnsupportedRule, RuleParseError, JsBridgeError):
                     return ""
             return self._field_value(
                 node, primary, kind, source,
-                base_url if with_base else "", key, page)
+                base_url if with_base else "", key, page,
+                rule_name=f"{rule_prefix}.{name}")
 
-        name = _format_book_name(field(rules.get("name"), ""))
-        author = _format_book_author(field(rules.get("author"), ""))
-        intro = _format_book_intro(field(rules.get("intro"), "", tolerate=True))
-        url = field(rules.get("bookUrl"), "", True) or base_url
-        cover_url = field(rules.get("coverUrl"), "", True, tolerate=True)
-        kind_value = field(rules.get("kind"), "", tolerate=True)
-        last_chapter = field(rules.get("lastChapter"), "", tolerate=True)
+        name = _format_book_name(field("name"))
+        author = _format_book_author(field("author"))
+        intro = _format_book_intro(field("intro", tolerate=True))
+        url = field("bookUrl", with_base=True) or base_url
+        cover_url = field("coverUrl", with_base=True, tolerate=True)
+        kind_value = field("kind", tolerate=True)
+        last_chapter = field("lastChapter", tolerate=True)
         try:
-            word_count = _format_word_count(field(
-                rules.get("wordCount"), "", tolerate=True))
+            word_count = _format_word_count(field("wordCount", tolerate=True))
         except (ValueError, OverflowError):
             word_count = ""
         book = BookItem(
@@ -1634,7 +1642,8 @@ class ReaderEngine:
 
     def _books_from_nodes(self, nodes: list, kind: str, rules: dict, base_url: str,
                           source=None, key: str = "", page: int = 1,
-                          list_put: str = "") -> list[BookItem]:
+                          list_put: str = "",
+                          rule_prefix: str = "ruleSearch") -> list[BookItem]:
         # 严格规则只命中一个容器时，按字段规则批量提取并按位置组合。
         if kind == "html" and len(nodes) == 1:
             names = extract_values(nodes[0], rules.get("name", ""), kind)
@@ -1658,7 +1667,8 @@ class ReaderEngine:
                 self._put_rule_values(node, list_put, kind, source, base_url,
                                       key, page, raw_result=str(node))
             books.append(self._book_from_node(
-                node, kind, rules, base_url, source, key, page))
+                node, kind, rules, base_url, source, key, page,
+                rule_prefix))
         return books
 
     @staticmethod
@@ -1667,7 +1677,8 @@ class ReaderEngine:
 
     async def _list_rule_pipeline(self, text: str, content_type: str, rule: str,
                                   source, base_url: str, key: str = "",
-                                  page: int = 1) -> tuple[list, str]:
+                                  page: int = 1,
+                                  rule_name: str = "") -> tuple[list, str]:
         """Run every selector/JS stage in a Legado list rule in order."""
         value = str(rule or "").strip()
         original_text = text
@@ -1710,7 +1721,8 @@ class ReaderEngine:
                     JsContext(source=source, key=key, page=page,
                               result=current_result,
                               base_url=base_url, variables=self.js_variables,
-                              get_elements=js_context_result))
+                              get_elements=js_context_result,
+                              rule_name=rule_name))
                 current_result = transformed
                 text = (transformed if isinstance(transformed, str) else
                         json.dumps(transformed, ensure_ascii=False))
@@ -1784,7 +1796,8 @@ class ReaderEngine:
                 script,
                 JsContext(source=source, key=key, page=page, result=stage_result,
                           base_url=base_url, variables=self.js_variables,
-                          result_html_nodes=kind == "html"))
+                          result_html_nodes=kind == "html",
+                          rule_name=rule_name))
             current_result = transformed
             text = (transformed if isinstance(transformed, str) else
                     json.dumps(transformed, ensure_ascii=False))
@@ -1838,10 +1851,20 @@ class ReaderEngine:
         list_rule = rules.get("bookList", "")
         list_rule, list_put = self._list_rule_parts(list_rule)
         nodes, kind = await self._list_rule_pipeline(
-            text, ctype, list_rule, source, final_url, keyword, page)
+            text, ctype, list_rule, source, final_url, keyword, page,
+            rule_name="ruleSearch.bookList")
         if not nodes and not pattern:
-            book = await self._detail_book_from_response(
-                source, text, ctype, final_url, str(req.get("url") or final_url))
+            # Legado guesses that a page whose list rule matched nothing is a
+            # detail page ("列表为空,按详情页解析").  The guess can be wrong;
+            # Legado then lets the exception fall through to its search caller,
+            # which reports no books.  Do the same here so an empty result
+            # page never reads as a source failure.
+            try:
+                book = await self._detail_book_from_response(
+                    source, text, ctype, final_url,
+                    str(req.get("url") or final_url))
+            except Exception:
+                return []
             return [book] if book.name else []
         books = self._books_from_nodes(
             nodes, kind, rules, final_url, source, keyword, page, list_put)
@@ -1874,7 +1897,8 @@ class ReaderEngine:
                 else parse_markup(text, content_type))
         kind = "json" if isinstance(root, (dict, list)) else "html"
         parsed = self._book_from_node(
-            root, kind, getattr(source, "ruleBookInfo", {}) or {}, final_url, source)
+            root, kind, getattr(source, "ruleBookInfo", {}) or {}, final_url,
+            source, rule_prefix="ruleBookInfo")
         parsed.url, parsed.info_html = book_url, text
         return parsed
 
@@ -1920,14 +1944,24 @@ class ReaderEngine:
         rules.update({key: value for key, value in (source.ruleExplore or {}).items() if value})
         list_rule = rules.get("bookList", "")
         list_rule, list_put = self._list_rule_parts(list_rule)
+        list_scope = ("ruleExplore"
+                      if (source.ruleExplore or {}).get("bookList")
+                      else "ruleSearch")
         nodes, kind = await self._list_rule_pipeline(
-            text, ctype, list_rule, source, final_url, "", page)
+            text, ctype, list_rule, source, final_url, "", page,
+            rule_name=f"{list_scope}.bookList")
         if not nodes and not str(getattr(source, "bookUrlPattern", "") or ""):
-            book = await self._detail_book_from_response(
-                source, text, ctype, final_url, final_url)
+            # Same empty-list guess as the search path, with the same
+            # fallback: an unreadable guess means this category has no books.
+            try:
+                book = await self._detail_book_from_response(
+                    source, text, ctype, final_url, final_url)
+            except Exception:
+                return []
             return [book] if book.name else []
         books = self._books_from_nodes(
-            nodes, kind, rules, final_url, source, "", page, list_put)
+            nodes, kind, rules, final_url, source, "", page, list_put,
+            rule_prefix=list_scope)
         distinct = []
         seen_urls = set()
         for book in books:

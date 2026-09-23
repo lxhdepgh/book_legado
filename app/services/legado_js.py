@@ -115,6 +115,10 @@ class JsContext:
     result_html_nodes: bool = False
     index: int = 0
     g_int: int = 0
+    # Rule identity for error messages, for example "ruleBookInfo.author".  A
+    # rule script is anonymous inside QuickJS, so without it a failure can only
+    # point at an ``<input>:N`` offset into the program injected here.
+    rule_name: str = ""
 
 
 class _QuickJsDispatcher:
@@ -3708,11 +3712,19 @@ class LegadoJsRuntime:
             detail = str(exc)
             location = re.search(r"<input>:(\d+)", detail)
             if location:
+                # The frame points into the bootstrap + jsLib + rule program
+                # assembled here, never at a line anyone can open, so it is
+                # dropped.  What remains is the offset inside the rule's own
+                # script, which still means something for a jsLib-heavy rule.
+                detail = re.sub(
+                    r"\s*at [^\n]*<input>:\d+\)?", "", detail).rstrip()
                 rule_line = int(location.group(1)) - (
                     bootstrap.count("\n") + js_lib.count("\n") +
                     5)
                 if rule_line > 0:
-                    detail = f"{detail.rstrip()}\nRule line: {rule_line}"
+                    detail = f"{detail}\nRule line: {rule_line}"
+            if getattr(context, "rule_name", ""):
+                detail = f"{detail}\n规则：{context.rule_name}"
             if bridge_error and bridge_error not in detail:
                 detail = f"{detail.rstrip()}\nBridge: {bridge_error}"
             raise JsBridgeError(detail) from exc
