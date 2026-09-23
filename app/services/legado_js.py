@@ -1,6 +1,7 @@
 """基于 QuickJS 的轻量 Legado JavaScript 兼容层。"""
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -9,8 +10,10 @@ import html
 import io
 import ipaddress
 import gzip
+import itertools
 import json
 import os
+import queue
 import random
 import re
 import ssl
@@ -22,7 +25,7 @@ import zlib
 import tempfile
 import sys
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 from datetime import datetime, timezone
@@ -114,20 +117,54 @@ class JsContext:
     g_int: int = 0
 
 
+class _QuickJsDispatcher:
+    """Run every native QuickJS call on one thread, interactive work first.
+
+    QuickJS binds its native runtime data to a single thread, so evaluation is
+    inherently serial.  A plain single-worker executor is FIFO, which let a
+    32-source sweep park the reading page's own rule behind every queued
+    evaluation (measured: a 1s chapter rule waited 33s).  Jobs therefore carry
+    a priority, and a job whose caller gave up is dropped instead of executed
+    (``set_running_or_notify_cancel`` reports that).
+    """
+
+    def __init__(self):
+        self._pending = queue.PriorityQueue()
+        self._sequence = itertools.count()
+        threading.Thread(target=self._serve, name="legado-quickjs",
+                         daemon=True).start()
+
+    def submit(self, function, args, priority) -> Future:
+        future = Future()
+        self._pending.put((priority, next(self._sequence), future, function, args))
+        return future
+
+    def _serve(self):
+        while True:
+            _, _, future, function, args = self._pending.get()
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(function(*args))
+            except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
+                future.set_exception(exc)
+
+
 class LegadoJsRuntime:
     _PERSIST_LOCK = threading.RLock()
     # The Windows quickjs extension can access-violate when independent
     # Context objects are created/evaluated concurrently in different threads.
     # Network work remains concurrent; only native JS execution is serialized.
     _QUICKJS_LOCK = threading.RLock()
-    # QuickJS binds its native runtime data to the first Python thread that
-    # enters it.  A lock is not sufficient: sequential calls from different
-    # asyncio worker threads still trip ``runtime_data->thread_state`` on
-    # Windows.  Keep every Context operation on one process-wide thread.
-    _QUICKJS_EXECUTOR = ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix="legado-quickjs")
+    _QUICKJS_DISPATCHER = _QuickJsDispatcher()
     _QUICKJS_THREAD = threading.local()
+    _FOREGROUND_PRIORITY = 0
+    _BACKGROUND_PRIORITY = 1
     _MEMORY_CACHE_LIMIT = 50 * 1024 * 1024
+
+    # Sweeps, checks and prefetches set this so the reading page's rules are
+    # never queued behind them.
+    background = False
 
     def __init__(self, timeout: int = 15, state_dir: str | Path | None = None):
         self.timeout = timeout
@@ -384,15 +421,26 @@ class LegadoJsRuntime:
 
     def evaluate_url_option(self, script: str, context: JsContext) -> dict:
         """Run UrlOption.js and return both its completion URL and header map."""
+        context.host_kind = "url"
+        return self._url_option_result(
+            self.evaluate(self._url_option_wrapper(script), context))
+
+    async def evaluate_url_option_async(self, script: str, context: JsContext) -> dict:
+        context.host_kind = "url"
+        return self._url_option_result(await self.evaluate_async(
+            self._url_option_wrapper(script), context))
+
+    def _url_option_wrapper(self, script: str) -> str:
         cleaned = self._clean_script(str(script or ""))
-        wrapper = (
+        return (
             "@js:(function(){var __optionValue=eval(" +
             json.dumps(cleaned, ensure_ascii=False) +
             ");return JSON.stringify({url:__optionValue==null?java.url:String(__optionValue),"
             "headers:java.headerMap});})()"
         )
-        context.host_kind = "url"
-        value = self.evaluate(wrapper, context)
+
+    @staticmethod
+    def _url_option_result(value) -> dict:
         try:
             result = json.loads(value) if isinstance(value, str) else value
         except (TypeError, json.JSONDecodeError):
@@ -409,8 +457,29 @@ class LegadoJsRuntime:
             # A Python callback made by QuickJS may evaluate another rule.
             # Running it inline avoids deadlocking the single worker.
             return self._evaluate_serialized(script, context)
-        return self._QUICKJS_EXECUTOR.submit(
-            self._evaluate_on_quickjs_thread, script, context).result()
+        return self._submit_job(script, context).result()
+
+    async def evaluate_async(self, script: str, context: JsContext):
+        """Await one evaluation without parking the calling thread.
+
+        ``asyncio.to_thread(self.evaluate, ...)`` blocks a thread-pool worker
+        for as long as the job waits behind other evaluations, which is how a
+        busy sweep used to starve the reading page of workers *and* of its
+        place in the queue.  Awaiting the job's future instead keeps the loop
+        responsive, puts the caller in the interactive queue, and drops the job
+        outright when the caller is cancelled before it ever starts.
+        """
+        stripped = str(script or "").strip()
+        if (stripped.lower().startswith("@webjs:") or
+                getattr(self._QUICKJS_THREAD, "active", False)):
+            return self.evaluate(script, context)
+        return await asyncio.wrap_future(self._submit_job(script, context))
+
+    def _submit_job(self, script: str, context: JsContext) -> Future:
+        priority = (self._BACKGROUND_PRIORITY if self.background
+                    else self._FOREGROUND_PRIORITY)
+        return self._QUICKJS_DISPATCHER.submit(
+            self._evaluate_on_quickjs_thread, (script, context), priority)
 
     def _evaluate_on_quickjs_thread(self, script: str, context: JsContext):
         self._QUICKJS_THREAD.active = True
@@ -477,6 +546,13 @@ class LegadoJsRuntime:
         is_new_shared_context = ctx is None
         if ctx is None:
             ctx = quickjs.Context()
+            # Only the memory cap is safe to set.  set_time_limit looks like
+            # the obvious guard against runaway scripts, but the binding then
+            # refuses every call into Python ("Can not call into Python with a
+            # time limit set"), and book sources run almost entirely through
+            # Python callables.  set_max_stack_size over the default crashes
+            # the process with an access violation on deep recursion, while
+            # the default raises a catchable StackOverflow.
             ctx.set_memory_limit(128 * 1024 * 1024)
             if js_lib:
                 self._shared_js_contexts[js_lib_key] = ctx

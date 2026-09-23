@@ -731,7 +731,7 @@ class ReaderEngine:
     _global_rate_lock = threading.Lock()
 
     def __init__(self, timeout: int = 15, state_dir=None,
-                 connect_timeout: float | None = None):
+                 connect_timeout: float | None = None, background: bool = False):
         self.timeout = timeout
         # None keeps aiohttp's historical behaviour: only the total budget
         # applies.  Sweeps pass a value so a host that blackholes the SYN
@@ -739,6 +739,7 @@ class ReaderEngine:
         self.connect_timeout = connect_timeout
         self.state_dir = state_dir
         self.js = LegadoJsRuntime(timeout, state_dir=state_dir)
+        self.js.background = background
         self.js_variables = {}
         self.headers = {
             "User-Agent": (
@@ -959,8 +960,8 @@ class ReaderEngine:
         # AnalyzeUrl initializes with source.getHeaderMap(true), not a direct
         # parse of source.header.  This also evaluates dynamic declarations,
         # supplies the default UA and overlays cached login headers.
-        value = await asyncio.to_thread(
-            self.js.evaluate, "@js:source.getHeaderMap(true)",
+        value = await self.js.evaluate_async(
+            "@js:source.getHeaderMap(true)",
             JsContext(source=source, base_url=str(
                 getattr(source, "bookSourceUrl", "") or base_url or ""),
                       variables=self.js_variables))
@@ -1234,7 +1235,7 @@ class ReaderEngine:
             request_headers=(prepared.get("headers")
                              if isinstance(prepared.get("headers"), dict) else {}),
         )
-        state = await asyncio.to_thread(self.js.evaluate_url_option, script, context)
+        state = await self.js.evaluate_url_option_async(script, context)
         if state.get("url"):
             prepared["url"] = str(state["url"])
         if isinstance(state.get("headers"), dict):
@@ -1701,8 +1702,8 @@ class ReaderEngine:
                 break
             js_rule, remaining = split_js_rule(value)
             if js_rule:
-                transformed = await asyncio.to_thread(
-                    self.js.evaluate, js_rule,
+                transformed = await self.js.evaluate_async(
+                    js_rule,
                     JsContext(source=source, key=key, page=page,
                               result=current_result,
                               base_url=base_url, variables=self.js_variables,
@@ -1776,8 +1777,8 @@ class ReaderEngine:
             else:
                 script, value = suffix, ""
             stage_result = [str(item) for item in nodes] if kind == "html" else nodes
-            transformed = await asyncio.to_thread(
-                self.js.evaluate, script,
+            transformed = await self.js.evaluate_async(
+                script,
                 JsContext(source=source, key=key, page=page, result=stage_result,
                           base_url=base_url, variables=self.js_variables,
                           result_html_nodes=kind == "html"))
@@ -1879,8 +1880,8 @@ class ReaderEngine:
         # expanded before generic URL encoding or '<' and '>' become path text.
         category_url = await self._resolve_rule_url(category.url, source, page=page)
         if category_url.strip().startswith(("@js:", "<js>")):
-            js_value = await asyncio.to_thread(
-                self.js.evaluate, category_url,
+            js_value = await self.js.evaluate_async(
+                category_url,
                 JsContext(source=source, host_kind="url", page=page,
                           base_url=source.bookSourceUrl,
                           variables=self.js_variables),
@@ -1943,8 +1944,8 @@ class ReaderEngine:
             if not match:
                 break
             expression = match.group(1).strip()
-            result = await asyncio.to_thread(
-                self.js.evaluate, f"@js:{expression}",
+            result = await self.js.evaluate_async(
+                f"@js:{expression}",
                 JsContext(source=source, host_kind="url", key=key, page=page,
                           base_url=source.bookSourceUrl,
                           variables=self.js_variables),
@@ -1986,8 +1987,8 @@ class ReaderEngine:
                 if fragment:
                     result = fragment.replace("@result", result)
                 continue
-            evaluated = await asyncio.to_thread(
-                self.js.evaluate, stage.raw,
+            evaluated = await self.js.evaluate_async(
+                stage.raw,
                 JsContext(source=source, host_kind="url", key=key, page=page, result=result,
                           base_url=source.bookSourceUrl,
                           variables=self.js_variables),

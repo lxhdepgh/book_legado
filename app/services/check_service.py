@@ -198,7 +198,7 @@ async def check_categories(source, session=None, sem=None, timeout=10,
     """
     del session  # Retained for API compatibility with older callers/tests.
     own_engine = engine is None
-    engine = engine or LegadoReadingEngine(timeout=timeout)
+    engine = engine or LegadoReadingEngine(timeout=timeout, background=True)
     categories = await resolve_explore_categories(source, runtime=engine.js)
     if max_categories:
         categories = categories[:max_categories]
@@ -409,7 +409,8 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
             java_gaps = asyncio.create_task(
                 asyncio.to_thread(_unsupported_java_packages, source))
             engine = LegadoReadingEngine(timeout=timeout,
-                                         webview_fetcher=browser_fetcher)
+                                         webview_fetcher=browser_fetcher,
+                                         background=True)
             limiter = js_sem if _source_uses_js(source) else engine_sem
             try:
                 probe = await _locally_blocked_probe(probe_task, timeout)

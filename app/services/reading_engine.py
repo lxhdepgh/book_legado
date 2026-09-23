@@ -342,9 +342,9 @@ class LegadoReadingEngine(ReaderEngine):
 
     def __init__(self, timeout: int = 15, webview_fetcher=None,
                  verification_fetcher=None, state_dir=None,
-                 connect_timeout: float | None = None):
+                 connect_timeout: float | None = None, background: bool = False):
         super().__init__(timeout, state_dir=state_dir,
-                         connect_timeout=connect_timeout)
+                         connect_timeout=connect_timeout, background=background)
         self.webview_fetcher = webview_fetcher
         self.verification_fetcher = verification_fetcher
         self.current_chapters: list[ChapterItem] = []
@@ -400,8 +400,8 @@ class LegadoReadingEngine(ReaderEngine):
             if not match:
                 break
             try:
-                evaluated = await asyncio.to_thread(
-                    self.js.evaluate, f"@js:{match.group(1).strip()}",
+                evaluated = await self.js.evaluate_async(
+                    f"@js:{match.group(1).strip()}",
                     JsContext(source=source, result=content, base_url=base_url,
                               variables=self.js_variables,
                               book=getattr(self, "current_book", None),
@@ -430,8 +430,8 @@ class LegadoReadingEngine(ReaderEngine):
                 if body.startswith("##"):
                     result = _apply_replace_regex(result, body)
                     continue
-                transformed = await asyncio.to_thread(
-                    self.js.evaluate, script,
+                transformed = await self.js.evaluate_async(
+                    script,
                     JsContext(
                         source=source, result=result, base_url=final_url,
                         variables=self.js_variables,
@@ -444,8 +444,8 @@ class LegadoReadingEngine(ReaderEngine):
                 result = "" if transformed is None else str(transformed)
                 continue
             if remaining.startswith("@js:"):
-                transformed = await asyncio.to_thread(
-                    self.js.evaluate, remaining,
+                transformed = await self.js.evaluate_async(
+                    remaining,
                     JsContext(source=source, result=result, base_url=final_url,
                               variables=self.js_variables,
                               book=getattr(self, "current_book", None),
@@ -501,8 +501,8 @@ class LegadoReadingEngine(ReaderEngine):
         if not script.startswith(("@js:", "<js>")):
             script = "@js:" + script
         try:
-            decoded = await asyncio.to_thread(
-                self.js.evaluate, script,
+            decoded = await self.js.evaluate_async(
+                script,
                 JsContext(source=source, src=str(cover_url), result=list(raw),
                           base_url=str(cover_url), variables=self.js_variables),
             )
@@ -580,8 +580,8 @@ class LegadoReadingEngine(ReaderEngine):
             loop = asyncio.get_running_loop()
             self._bind_interaction(source, loop)
             try:
-                checked = await asyncio.to_thread(
-                    self.js.evaluate, login_check,
+                checked = await self.js.evaluate_async(
+                    login_check,
                     JsContext(
                         source=source, result=self.last_response["body"],
                         base_url=request.get("url", response[2]),
@@ -674,8 +674,8 @@ class LegadoReadingEngine(ReaderEngine):
         loop = asyncio.get_running_loop()
         self._bind_interaction(source, loop)
         try:
-            result = await asyncio.to_thread(
-                self.js.evaluate, script,
+            result = await self.js.evaluate_async(
+                script,
                 JsContext(source=source, result="", base_url=chapter.url,
                           variables=self.js_variables,
                           book=getattr(self, "current_book", None), chapter=chapter),
@@ -685,8 +685,8 @@ class LegadoReadingEngine(ReaderEngine):
         return result
 
     async def _stored_login_values(self, source) -> dict:
-        raw = await asyncio.to_thread(
-            self.js.evaluate, "@js:JSON.stringify(source.getLoginInfoMap())",
+        raw = await self.js.evaluate_async(
+            "@js:JSON.stringify(source.getLoginInfoMap())",
             JsContext(source=source, variables=self.js_variables))
         if isinstance(raw, dict):
             return dict(raw)
@@ -731,8 +731,8 @@ class LegadoReadingEngine(ReaderEngine):
                       else login_js + "\n")
             script = ("@js:" + prefix + "(function(){return eval(" +
                       json.dumps(code, ensure_ascii=False) + ");})()")
-            value = await asyncio.to_thread(
-                self.js.evaluate, script,
+            value = await self.js.evaluate_async(
+                script,
                 JsContext(source=source, result=stored,
                           base_url=getattr(source, "bookSourceUrl", ""),
                           variables=self.js_variables))
@@ -797,8 +797,8 @@ class LegadoReadingEngine(ReaderEngine):
         )
         self._bind_interaction(source, asyncio.get_running_loop())
         try:
-            return await asyncio.to_thread(
-                self.js.evaluate, script,
+            return await self.js.evaluate_async(
+                script,
                 JsContext(source=source, result=dict(values or {}),
                           base_url=getattr(source, "bookSourceUrl", ""),
                           variables=self.js_variables),
@@ -810,8 +810,8 @@ class LegadoReadingEngine(ReaderEngine):
         """Port SourceLoginDialog OK: persist fields, then invoke login()."""
         values = dict(values or {})
         if not values:
-            return await asyncio.to_thread(
-                self.js.evaluate, "@js:source.removeLoginInfo()",
+            return await self.js.evaluate_async(
+                "@js:source.removeLoginInfo()",
                 JsContext(source=source, variables=self.js_variables))
         payload = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
         login_js = self._login_script(source).strip()
@@ -822,8 +822,8 @@ class LegadoReadingEngine(ReaderEngine):
         )
         self._bind_interaction(source, asyncio.get_running_loop())
         try:
-            return await asyncio.to_thread(
-                self.js.evaluate, script,
+            return await self.js.evaluate_async(
+                script,
                 JsContext(source=source,
                           base_url=getattr(source, "bookSourceUrl", ""),
                           variables=self.js_variables))
@@ -1026,8 +1026,8 @@ class LegadoReadingEngine(ReaderEngine):
         while True:
             js_rule, remaining = split_js_rule(value)
             if js_rule:
-                transformed = await asyncio.to_thread(
-                    self.js.evaluate, js_rule,
+                transformed = await self.js.evaluate_async(
+                    js_rule,
                     JsContext(source=source, result=current_result,
                               base_url=base_url, src=original_text,
                               variables=self.js_variables, book=book, chapter=chapter),
@@ -1082,8 +1082,8 @@ class LegadoReadingEngine(ReaderEngine):
             else:
                 script, value = suffix, ""
             js_result = [str(item) for item in nodes] if kind == "html" else nodes
-            transformed = await asyncio.to_thread(
-                self.js.evaluate, script,
+            transformed = await self.js.evaluate_async(
+                script,
                 JsContext(source=source, result=js_result, base_url=base_url,
                           variables=self.js_variables, book=book, chapter=chapter,
                           src=original_text, result_html_nodes=kind == "html"),
@@ -1293,8 +1293,8 @@ class LegadoReadingEngine(ReaderEngine):
                 pre_update = "@js:" + pre_update
             self._bind_interaction(source, asyncio.get_running_loop())
             try:
-                await asyncio.to_thread(
-                    self.js.evaluate, pre_update,
+                await self.js.evaluate_async(
+                    pre_update,
                     JsContext(source=source, result=toc_url, base_url=toc_url,
                               variables=self.js_variables, book=book))
             finally:
@@ -1420,8 +1420,8 @@ class LegadoReadingEngine(ReaderEngine):
                 format_context.title = chapter.name
                 format_context.result = chapter.name
                 try:
-                    value = await asyncio.to_thread(
-                        self.js.evaluate, format_js, format_context)
+                    value = await self.js.evaluate_async(
+                        format_js, format_context)
                 except Exception:
                     # Legado logs formatJs failures and keeps the original title.
                     continue
@@ -1646,8 +1646,8 @@ class LegadoReadingEngine(ReaderEngine):
                 if not isinstance(block.value, bytes):
                     continue
                 try:
-                    decoded = await asyncio.to_thread(
-                        self.js.evaluate, image_decode,
+                    decoded = await self.js.evaluate_async(
+                        image_decode,
                         JsContext(
                             source=source, result=block.value,
                             src=protected_urls[id(block)],

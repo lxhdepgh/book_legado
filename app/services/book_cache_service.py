@@ -28,7 +28,7 @@ class WholeBookCacheService:
         self.cache = ReadingCache(cache_dir)
         self.state_dir = Path(state_dir)
         self.engine_factory = engine_factory or (
-            lambda: LegadoReadingEngine(state_dir=self.state_dir))
+            lambda: LegadoReadingEngine(state_dir=self.state_dir, background=True))
         self.retries = max(1, int(retries))
         self.concurrency = max(1, min(8, int(concurrency)))
 

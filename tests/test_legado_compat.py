@@ -219,6 +219,71 @@ class SearchModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model.search_id, 2)
 
 
+class QuickJsSchedulingTests(unittest.IsolatedAsyncioTestCase):
+    """一个 QuickJS worker 是硬约束，排队顺序和取消必须是可控的。"""
+
+    BUSY = "@js:(function(){var t=Date.now();while(Date.now()-t<400){};return 'x'})()"
+
+    @staticmethod
+    def _context():
+        return JsContext(source=None)
+
+    async def test_a_reading_rule_does_not_wait_for_the_queued_sweep(self):
+        reader = LegadoJsRuntime()
+        sweep = LegadoJsRuntime()
+        sweep.background = True
+        finished = []
+
+        def run_source(index):
+            sweep.evaluate(self.BUSY, self._context())
+            finished.append(index)
+
+        sources = [asyncio.create_task(asyncio.to_thread(run_source, index))
+                   for index in range(3)]
+        await asyncio.sleep(0.1)
+        await reader.evaluate_async(self.BUSY, self._context())
+
+        self.assertLessEqual(
+            len(finished), 1,
+            "阅读页的求值必须插到还排在队列里的扫描工作前面")
+        await asyncio.gather(*sources)
+
+    async def test_a_cancelled_evaluation_never_reaches_the_worker(self):
+        runtime = LegadoJsRuntime()
+        started = time.perf_counter()
+        blocker = asyncio.create_task(runtime.evaluate_async(
+            self.BUSY, self._context()))
+        await asyncio.sleep(0.15)
+        dropped = asyncio.create_task(runtime.evaluate_async(
+            self.BUSY, self._context()))
+        follower = asyncio.create_task(runtime.evaluate_async(
+            self.BUSY, self._context()))
+        await asyncio.sleep(0.05)
+        dropped.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await dropped
+        await asyncio.gather(blocker, follower)
+
+        # 三条 0.4s 的任务只该付出两条的时间：被取消的那条不能占 worker。
+        self.assertLess(time.perf_counter() - started, 1.1)
+
+    async def test_async_evaluation_still_sees_the_python_bridge(self):
+        runtime = LegadoJsRuntime()
+        context = self._context()
+        script = '@js:(function(){return java.base64Decode(java.base64Encode("abc"))})()'
+        self.assertEqual(await runtime.evaluate_async(script, context), "abc")
+        self.assertEqual(runtime.evaluate(script, context), "abc")
+
+    async def test_deep_recursion_raises_instead_of_killing_the_process(self):
+        runtime = LegadoJsRuntime()
+        with self.assertRaises(Exception) as caught:
+            runtime.evaluate(
+                "@js:(function(){function f(){return f()+1}; return f()}())",
+                self._context())
+        self.assertIn("stack overflow", str(caught.exception))
+        self.assertEqual(runtime.evaluate("@js:2+2", self._context()), 4)
+
+
 class RuleParserTests(unittest.TestCase):
     def test_content_page_formats_html_images_before_global_replace(self):
         formatted = _format_content_page(
@@ -1390,12 +1455,14 @@ class RuleParserTests(unittest.TestCase):
     def test_java_lang_system_reports_wall_clock_millis(self):
         runtime = LegadoJsRuntime()
         source = SimpleNamespace(to_dict=lambda: {"bookSourceUrl": "https://source"})
-        before = int(time.time() * 1000)
+        before = time.time() * 1000
         value = runtime.evaluate(
             "@js:Packages.java.lang.System.currentTimeMillis()",
             JsContext(source=source))
-        after = int(time.time() * 1000)
-        self.assertTrue(before <= value <= after, value)
+        after = time.time() * 1000
+        # QuickJS 读的是高精度时钟，Python 在 Windows 上的 time.time() 会落后
+        # 它十几毫秒，逐毫秒卡窗口必翻车；这里只要求对得上墙钟。
+        self.assertLess(abs(value - (before + after) / 2), 1000, value)
         self.assertEqual(runtime.evaluate(
             "@js:Packages.java.lang.System.getProperty('line.separator')",
             JsContext(source=source)), "\n")
