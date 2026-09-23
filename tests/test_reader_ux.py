@@ -2,6 +2,7 @@ import json
 import asyncio
 import base64
 import collections
+import threading
 import unittest
 import flet as ft
 from aiohttp import web
@@ -16,7 +17,7 @@ from app.services.app_paths import default_app_paths
 from app.services.reading_engine import (ChapterContent, ContentBlock,
                                          _format_content_page,
                                          parse_content_blocks)
-from app.services.rule_engine import (BookItem, ChapterItem,
+from app.services.rule_engine import (BookItem, ChapterItem, ExploreCategory,
                                       RequestConnectionError,
                                       RequestTimeoutError, UnsupportedRule)
 from app.services.block_pages import SiteBlockedError
@@ -172,7 +173,7 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
             "text",
             "第一章 初见\r\n\r\n 第一段正文。\n第二段正文。\n\n")])
 
-        controls = self.view._render_content(document)
+        controls = await self.view._render_content(document)
 
         self.assertEqual([control.value for control in controls], [
             "第一章 初见", "　　第一段正文。", "　　第二段正文。"])
@@ -183,18 +184,37 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controls[1].style.height, 1.7)
         self.assertTrue(all(not control.selectable for control in controls))
 
+    async def test_paragraph_splitting_leaves_the_event_loop_alone(self):
+        document = ChapterContent([ContentBlock("text", "第一章 初见\n正文。")])
+        loop_thread = threading.current_thread()
+        threads = []
+        original = ReadingView._novel_paragraphs
+
+        def spy(value, indent=False):
+            threads.append(threading.current_thread())
+            return original(value, indent)
+
+        with patch.object(ReadingView, "_novel_paragraphs",
+                          staticmethod(spy)):
+            controls = await self.view._render_content(document)
+
+        self.assertEqual([control.value for control in controls],
+                         ["第一章 初见", "　　正文。"])
+        self.assertTrue(threads)
+        self.assertNotEqual(threads[0], loop_thread)
+
     async def test_use_html_spans_in_chapters_render_as_text(self):
         page = _format_content_page(
             '<p>前 <usehtml><style>x{}</style><b>加粗</b>尾</usehtml>后</p>',
             "https://x.test/c/1")
         document = parse_content_blocks(page, "https://x.test/c/1")
 
-        controls = self.view._render_content(document)
+        controls = await self.view._render_content(document)
 
         self.assertEqual([control.value for control in controls], ["　　前 加粗尾后"])
 
     async def test_font_size_preserves_text_heading_hierarchy(self):
-        self.view._content_host.controls = self.view._render_content(
+        self.view._content_host.controls = await self.view._render_content(
             ChapterContent([ContentBlock("text", "序章\n正文")]))
         self.view.update = lambda: None
 
@@ -531,9 +551,9 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(count, len(self.view._bookshelf_grid.controls))
 
     async def test_search_only_source_is_labeled_without_category_parse_error(self):
-        source = SimpleNamespace(
-            enabled=True, searchUrl="/search?key={{key}}", exploreUrl="",
-            display_name="二三小说", bookSourceUrl="https://source")
+        source = BookSource(
+            bookSourceName="二三小说", bookSourceUrl="https://source.test",
+            searchUrl="/search?key={{key}}", exploreUrl="", enabled=True)
         self.view.service.sources = [source]
         self.view.current_source = source
         self.view.update = lambda: None
@@ -541,22 +561,25 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.view.refresh_sources(update=False)
         await self.view._load_categories(source)
 
-        self.assertEqual("二三小说 · 仅搜索", self.view._source.options[0].text)
+        # 列表里那一行自己说明它只能搜，不再靠下拉框的标签兜底。
+        self.assertEqual("source.test · 仅搜索",
+                         self.view._source_subtitle(source))
+        self.assertIn("仅搜索", self._subtitle_text(self.view._source_list))
         self.assertEqual("该书源仅支持关键词搜索，请输入书名或作者",
                          self.view._status.value)
         self.assertEqual([], self.view._category_host.controls)
 
     async def test_sampled_category_check_only_hides_proven_broken_tabs(self):
-        source = SimpleNamespace(
-            enabled=True, searchUrl="/search?key={{key}}",
-            exploreUrl="分类一::/l1\n分类二::/l2\n分类三::/l3",
-            display_name="站点", bookSourceUrl="https://source")
+        source = BookSource(
+            bookSourceName="站点", bookSourceUrl="https://source.test",
+            searchUrl="/search?key={{key}}",
+            exploreUrl="分类一::/l1\n分类二::/l2\n分类三::/l3", enabled=True)
         self.view.service.sources = [source]
         self.view.current_source = source
         self.view.update = lambda: None
         # Detection samples a few categories and stops at the first working
         # one, so an unsampled category is unknown rather than broken.
-        self.view.service.category_checks = {"https://source": [
+        self.view.service.category_checks = {"https://source.test": [
             {"url": "/l1", "title": "分类一", "valid": True},
             {"url": "/l2", "title": "分类二", "valid": False},
         ]}
@@ -567,6 +590,15 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         tab_bar = self.view._category_host.controls[0].content.controls[0]
         self.assertEqual(["分类一", "分类三"],
                          [tab.label for tab in tab_bar.tabs])
+
+    @staticmethod
+    def _subtitle_text(host) -> str:
+        """把书源列表里渲染出来的副标题文本拼起来，供断言使用。"""
+        texts = []
+        for row in host.controls:
+            column = row.content.content
+            texts.append(column.controls[0].controls[1].controls[1].value)
+        return " | ".join(texts)
 
     async def test_cache_badges_distinguish_states_with_semantic_theme_colors(self):
         item = {"source_url": "https://source", "url": "https://book",
@@ -893,6 +925,172 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
                          ["2", "1"])
 
 
+class _ContentEngineStub:
+    """按章节放行正文请求，用来观察谁在等谁。"""
+
+    def __init__(self):
+        self.calls = []
+        self.gates = {}
+        # 等待方会先取事件再等：按需生成，免得抢在请求启动前拿不到。
+        self.started = collections.defaultdict(asyncio.Event)
+        self.closed = 0
+        self.current_book = None
+        self.js_variables = {}
+
+    def gate(self, url):
+        gate = asyncio.Event()
+        self.gates[url] = gate
+        return gate
+
+    async def content_document(self, source, chapter, next_chapter_url=""):
+        self.calls.append(chapter.url)
+        self.started[chapter.url].set()
+        gate = self.gates.get(chapter.url)
+        if gate is not None:
+            await gate.wait()
+        return ChapterContent([ContentBlock("text", f"{chapter.name} 正文")])
+
+    async def aclose(self):
+        self.closed += 1
+
+
+class ChapterFetchPipelineTests(unittest.IsolatedAsyncioTestCase):
+    """请求归缓存，渲染才归界面：翻页、取消、预取都得守住这条线。"""
+
+    async def asyncSetUp(self):
+        self.directory = TemporaryDirectory()
+        self.service = SimpleNamespace(
+            data_dir=Path(self.directory.name), sources=[], bookshelf=[],
+            category_checks={})
+        self.view = ReadingView(self.service)
+        self.view.engine = _ContentEngineStub()
+        self.requested = []
+        self.scheduled = []
+        self.page = SimpleNamespace(
+            run_task=self._schedule, width=1000,
+            platform=ft.PagePlatform.WINDOWS)
+        self.view.update = lambda: None
+        self.view._reader.scroll_to = AsyncMock()
+        self.service.update_bookshelf_state = unittest.mock.Mock(
+            return_value=False)
+
+    def _schedule(self, function, *args):
+        self.requested.append((function, args))
+        task = asyncio.ensure_future(function(*args))
+        self.scheduled.append(task)
+        return task
+
+    def _open_book(self, chapters):
+        self.view.chapters = chapters
+        self.view._current_book = BookItem("book", url="https://book")
+        self.view.current_source = BookSource(
+            bookSourceName="source", bookSourceUrl="https://source")
+
+    def _read_cached(self, chapter):
+        return self.view.reading_cache.load_content(
+            "https://source", "https://book", chapter.url)
+
+    async def asyncTearDown(self):
+        for task in self.scheduled:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*self.scheduled, return_exceptions=True)
+        await self.view.engine.aclose()
+        self.directory.cleanup()
+
+    async def test_a_chapter_requested_twice_is_fetched_once(self):
+        chapter = ChapterItem("one", "https://source/1", index=0)
+        self._open_book([chapter])
+        gate = self.view.engine.gate(chapter.url)
+
+        first = asyncio.ensure_future(self.view._chapter_document(chapter))
+        await self.view.engine.started[chapter.url].wait()
+        second = asyncio.ensure_future(self.view._chapter_document(chapter))
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(len(self.view._content_flight), 1)
+        gate.set()
+        (one, _), (two, _) = await first, await second
+
+        self.assertEqual(self.view.engine.calls, [chapter.url])
+        self.assertIs(one, two)
+
+    async def test_a_superseded_chapter_still_reaches_the_cache(self):
+        first = ChapterItem("one", "https://source/1", index=0)
+        second = ChapterItem("two", "https://source/2", index=1)
+        self._open_book([first, second])
+        gate = self.view.engine.gate(first.url)
+
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=self.page):
+            stale = asyncio.ensure_future(self.view._run_content(first))
+            await self.view.engine.started[first.url].wait()
+            await self.view._run_content(second)
+            gate.set()
+            await stale
+
+        self.assertIs(self.view._current_chapter, second)
+        self.assertEqual(self.view._title.value, second.name)
+        self.assertIsNotNone(self._read_cached(first))
+
+    async def test_cancelling_the_render_keeps_the_request_running(self):
+        chapter = ChapterItem("one", "https://source/1", index=0)
+        self._open_book([chapter])
+        gate = self.view.engine.gate(chapter.url)
+
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=self.page):
+            render = asyncio.ensure_future(self.view._run_content(chapter))
+            await self.view.engine.started[chapter.url].wait()
+            render.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await render
+            gate.set()
+            await asyncio.gather(*list(self.view._content_flight.values()))
+
+        self.assertIsNotNone(self._read_cached(chapter))
+        self.assertEqual(self.view.engine.calls, [chapter.url])
+
+    async def test_an_abandoned_prefetch_still_lands_in_the_cache(self):
+        first = ChapterItem("one", "https://source/1", index=0)
+        second = ChapterItem("two", "https://source/2", index=1)
+        self._open_book([first, second])
+        prefetch_engine = _ContentEngineStub()
+        self.view._background_engine = lambda **_kwargs: prefetch_engine
+        gate = prefetch_engine.gate(second.url)
+
+        prefetch = asyncio.ensure_future(
+            self.view._prefetch_next_chapters(first))
+        await prefetch_engine.started[second.url].wait()
+        prefetch.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await prefetch
+
+        self.assertEqual(prefetch_engine.closed, 0)
+        gate.set()
+        await asyncio.gather(*list(self.view._content_flight.values()))
+
+        self.assertEqual(prefetch_engine.closed, 1)
+        self.assertIsNotNone(self._read_cached(second))
+
+    async def test_a_page_turn_during_a_load_is_not_swallowed(self):
+        first = ChapterItem("one", "https://source/1", index=0)
+        second = ChapterItem("two", "https://source/2", index=1)
+        self._open_book([first, second])
+        self.view._current_chapter = first
+        self.view._reading_loading = True
+
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=self.page):
+            self.view._next_chapter(None)
+            await asyncio.sleep(0.05)
+
+        self.assertEqual([(function.__name__, args)
+                          for function, args in self.requested
+                          if function.__name__ == "_run_content"],
+                         [("_run_content", (second, False))])
+
+
 class _SwitchEngineStub:
     """Stands in for the per-source engine the sweep builds for every source."""
 
@@ -933,6 +1131,7 @@ class _SwitchSearchStub:
 class _SwitchPageStub:
     def __init__(self):
         self.dialogs = []
+        self.tasks = []
 
     def show_dialog(self, dialog):
         self.dialogs.append(dialog)
@@ -941,7 +1140,9 @@ class _SwitchPageStub:
         return self.dialogs.pop() if self.dialogs else None
 
     def run_task(self, handler, *args):
-        return asyncio.ensure_future(handler(*args))
+        task = asyncio.ensure_future(handler(*args))
+        self.tasks.append(task)
+        return task
 
 
 class SourceSwitchTests(unittest.IsolatedAsyncioTestCase):
@@ -1245,6 +1446,157 @@ class SourceSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("书源已失效", row.content.subtitle.controls[0].value)
 
 
+class DiscoveryPageTests(unittest.IsolatedAsyncioTestCase):
+    """找书页：默认是书源列表，点开一行看分类，搜索单独占一页。"""
+
+    async def asyncSetUp(self):
+        self.directory = TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.service = SourceService(self.root, data_dir=self.root / "data")
+        self.view = ReadingView(self.service, discovery_only=True)
+        self.view.update = lambda: None
+        self.page = _SwitchPageStub()
+        patcher = patch.object(ReadingView, "page", new_callable=PropertyMock,
+                               return_value=self.page)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addAsyncCleanup(self.view.engine.aclose)
+        self.addCleanup(self.directory.cleanup)
+
+    @staticmethod
+    def _source(url, name, explore="", search=True, enabled=True):
+        return BookSource(
+            bookSourceName=name, bookSourceUrl=url,
+            searchUrl=f"{url}/search?key=${{key}}" if search else "",
+            exploreUrl=explore, enabled=enabled)
+
+    def _rows(self):
+        return self.view._source_list.controls
+
+    @staticmethod
+    def _row_title(row) -> str:
+        """书源列表一行的标题组件在图标、标题列之后。"""
+        return row.content.content.controls[0].controls[1].controls[0].value
+
+    async def test_usable_sources_are_listed_and_the_source_dropdown_is_gone(self):
+        self.service.sources = [
+            self._source("https://a.test", "甲站", explore="分类一::/l1"),
+            self._source("https://b.test", "乙站"),
+            self._source("https://c.test", "丙站", search=False),
+            self._source("https://d.test", "丁站", explore="分类一::/l1",
+                         enabled=False),
+        ]
+
+        self.view.refresh_sources(update=False)
+
+        self.assertFalse(hasattr(self.view, "_source"))
+        self.assertEqual(2, len(self._rows()))
+        self.assertEqual("sources", self.view._discovery_page)
+        self.assertEqual(["甲站", "乙站"],
+                         [self._row_title(row) for row in self._rows()])
+        # 当前书源跟着列表走，用于“仅当前书源”这个范围。
+        self.assertEqual("https://a.test", self.view.current_source.bookSourceUrl)
+
+    async def test_expanding_a_row_shows_its_categories_until_collapsed(self):
+        source = self._source("https://a.test", "甲站",
+                              explore="分类一::/l1\n分类二::/l2")
+        self.service.sources = [source]
+        self.view.refresh_sources(update=False)
+        chips = self.view._source_chips["https://a.test"]
+
+        self.assertFalse(chips.visible)
+        self.view._toggle_source_expand(source)
+        await asyncio.sleep(0)
+
+        self.assertTrue(chips.visible)
+        self.assertEqual(["分类一", "分类二"],
+                         [chip.label.value for chip in chips.controls[0].controls])
+        self.assertEqual("https://a.test", self.view.current_source.bookSourceUrl)
+
+        self.view._toggle_source_expand(source)
+        self.assertFalse(chips.visible)
+
+    async def test_a_search_only_row_expands_into_a_search_shortcut(self):
+        source = self._source("https://a.test", "甲站")
+        self.service.sources = [source]
+        self.view.refresh_sources(update=False)
+
+        self.view._toggle_source_expand(source)
+
+        chips = self.view._source_chips["https://a.test"]
+        self.assertTrue(chips.visible)
+        button = chips.controls[0].controls[1]
+        self.assertEqual("用此书源搜索", button.content)
+        button.on_click(None)
+
+        self.assertEqual("search", self.view._discovery_page)
+        self.assertEqual(SEARCH_SCOPE_CURRENT, self.view._search_scope_value)
+        self.assertEqual("仅当前书源", self.view._search_scope_label.value)
+        self.assertTrue(self.view._search_page.visible)
+        self.assertFalse(self.view._sources_page.visible)
+
+    async def test_the_row_menu_searches_with_that_source(self):
+        source = self._source("https://a.test", "甲站", explore="分类一::/l1")
+        self.service.sources = [source]
+        self.view.refresh_sources(update=False)
+
+        self.view._show_source_menu(source)
+        dialog = self.page.dialogs[-1]
+        self.assertEqual("甲站", dialog.title.value)
+        search_action = dialog.actions[-1]
+        self.assertEqual("用此书源搜索", search_action.content)
+        search_action.on_click(None)
+
+        self.assertEqual("search", self.view._discovery_page)
+        self.assertEqual(SEARCH_SCOPE_CURRENT, self.view._search_scope_value)
+        self.assertIs(source, self.view.current_source)
+
+    async def test_browsing_a_category_does_not_clear_the_search_results(self):
+        source = self._source("https://a.test", "甲站", explore="分类一::/l1")
+        self.service.sources = [source]
+        self.view.refresh_sources(update=False)
+        book = BookItem("寻秦记", url="https://a.test/book/1",
+                        origin="https://a.test")
+        self.view._search_flow.append([book])
+        self.view.engine.explore = AsyncMock(return_value=[])
+
+        self.view._open_category(source, ExploreCategory("分类一", "/l1"))
+        await asyncio.sleep(0)
+        await asyncio.gather(*self.page.tasks)
+
+        self.assertEqual([book], self.view._search_flow.books)
+        self.assertIsNot(self.view._browse_flow.list_view,
+                         self.view._search_flow.list_view)
+        self.assertEqual("browse", self.view._discovery_page)
+        self.assertEqual("甲站", self.view._browse_title.value)
+        self.assertEqual(["/l1"], [call.args[1].url for call in
+                                   self.view.engine.explore.await_args_list])
+        self.assertEqual("分类一：找到 0 本书，固定榜单无后续分页",
+                         self.view._status.value)
+
+    async def test_a_running_search_survives_going_back_to_the_source_list(self):
+        source = self._source("https://a.test", "甲站")
+        self.service.sources = [source]
+        stub = _SwitchSearchStub(books={
+            "https://a.test": [BookItem("寻秦记", url="https://a.test/book/1",
+                                        origin="https://a.test")]})
+        self.view._background_engine = lambda **_kwargs: _SwitchEngineStub(
+            stub.search)
+        self.view.refresh_sources(update=False)
+        self.view._set_search_scope(SEARCH_SCOPE_CURRENT)
+        self.view._keyword.value = "寻秦记"
+        self.view._search(None)
+
+        self.view._back_to_sources()
+        await self.view._search_task
+
+        self.assertEqual("sources", self.view._discovery_page)
+        self.assertEqual(["寻秦记"],
+                         [book.name for book in self.view._search_flow.books])
+        self.assertEqual("搜索完成：检查 1 个书源，找到 1 本",
+                         self.view._status.value)
+
+
 class AllSourceSearchTests(unittest.IsolatedAsyncioTestCase):
     """全书源找书：范围内的书源各搜一次，按书合并、可停止、结果落库。"""
 
@@ -1304,8 +1656,8 @@ class AllSourceSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(stub.calls), [
             ("https://a.test", 1), ("https://b.test", 1), ("https://c.test", 1)])
         # 同一本书来自两个书源，合并成一条并记下两处来源。
-        self.assertEqual([book.name for book in self.view.books], ["寻秦记"])
-        self.assertEqual(sorted(self.view.books[0].origin_set()),
+        self.assertEqual([book.name for book in self.view._search_flow.books], ["寻秦记"])
+        self.assertEqual(sorted(self.view._search_flow.books[0].origin_set()),
                          ["https://a.test", "https://b.test"])
         self.assertEqual(self.view._status.value, "搜索完成：检查 3 个书源，找到 1 本")
         self.assertEqual(self.view._search_progress.value, 1.0)
@@ -1318,7 +1670,7 @@ class AllSourceSearchTests(unittest.IsolatedAsyncioTestCase):
         self._start("寻秦记", stub)
         await self.view._search_task
 
-        self.assertEqual([book.name for book in self.view.books], ["寻秦记"])
+        self.assertEqual([book.name for book in self.view._search_flow.books], ["寻秦记"])
         self.assertEqual(
             self.view._status.value,
             "搜索完成：检查 3 个书源，找到 1 本（1 个书源搜索失败：规则不支持 1）")
@@ -1327,7 +1679,7 @@ class AllSourceSearchTests(unittest.IsolatedAsyncioTestCase):
         stub = _SwitchSearchStub()
         self._install(stub)
 
-        self.view._search_scope.value = SEARCH_SCOPE_CURRENT
+        self.view._set_search_scope(SEARCH_SCOPE_CURRENT)
         self.view._keyword.value = "寻秦记"
         self.view._search(None)
         await self.view._search_task
@@ -1335,11 +1687,32 @@ class AllSourceSearchTests(unittest.IsolatedAsyncioTestCase):
 
         # 分组范围只跑该组的书源，选项由书源列表刷新时补齐。
         self.assertIn(f"{SEARCH_SCOPE_GROUP}精品",
-                      [option.key for option in self.view._search_scope.options])
-        self.view._search_scope.value = f"{SEARCH_SCOPE_GROUP}精品"
+                      [key for key, _ in self.view._search_scope_options])
+        self.view._set_search_scope(f"{SEARCH_SCOPE_GROUP}精品")
         self.assertEqual(sorted(source.bookSourceUrl
                                 for source in self.view._search_scope_sources()),
                          ["https://a.test", "https://b.test"])
+
+    async def test_the_scope_entry_is_a_dialog_not_a_page_dropdown(self):
+        stub = _SwitchSearchStub()
+        self._install(stub)
+
+        self.view._open_scope_dialog()
+        dialog = self.page.dialogs[-1]
+        self.assertEqual("搜索范围", dialog.title.value)
+        rows = dialog.content.content.controls
+        self.assertEqual([key for key, _ in self.view._search_scope_options],
+                         [row.data for row in rows])
+        self.assertFalse(hasattr(self.view, "_search_scope_dropdown"))
+
+        group_row = next(row for row in rows
+                         if row.data == f"{SEARCH_SCOPE_GROUP}精品")
+        group_row.on_click(None)
+
+        self.assertEqual(f"{SEARCH_SCOPE_GROUP}精品",
+                         self.view._search_scope_value)
+        self.assertEqual("分组：精品", self.view._search_scope_label.value)
+        self.assertIn("个书源", self.view._status.value)
 
     async def test_search_reports_progress_and_can_be_stopped_midway(self):
         stub = _SwitchSearchStub(gate=asyncio.Event())
@@ -1368,7 +1741,7 @@ class AllSourceSearchTests(unittest.IsolatedAsyncioTestCase):
                 "寻秦记 第一部", author="黄易", url="https://a.test/book/1")]})
         self._start("寻秦记", stub)
         await self.view._search_task
-        self.assertTrue(self.view._has_more)
+        self.assertTrue(self.view._search_flow.has_more)
 
         self.view._load_more_search()
         await self.view._search_task
@@ -1406,7 +1779,7 @@ class AllSourceSearchTests(unittest.IsolatedAsyncioTestCase):
         self._start("寻秦记", stub)
         await self.view._search_task
 
-        merged = self.view.books[0]
+        merged = self.view._search_flow.books[0]
         self.assertIn("等 2 个书源",
                       self.view._book_control(merged).subtitle.value)
         # 结果行认的是书自己的来源，而不是下拉框里当前选中的书源。

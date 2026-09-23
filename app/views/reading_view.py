@@ -113,6 +113,63 @@ def _intro_control(intro) -> ft.Control:
     return ft.Text(text or "暂无简介", selectable=True)
 
 
+class _EngineLease:
+    """Hand an engine's lifetime to the requests still using it.
+
+    A prefetch task that gets abandoned must not close the engine its fetch is
+    still running on: the reader's own page turn may be waiting on that very
+    fetch.  The last request to finish closes it.
+    """
+
+    def __init__(self, engine):
+        self.engine = engine
+        self._users = 0
+        self._closed = False
+
+    def acquire(self):
+        self._users += 1
+        return self.engine
+
+    async def release(self):
+        self._users -= 1
+        if self._users <= 0 and not self._closed:
+            self._closed = True
+            await self.engine.aclose()
+
+
+class _ResultFlow:
+    """一轮结果的状态：书、页码、是否还有下一页，以及承载它们的列表。
+
+    找书页把发现分类的浏览结果和关键词搜索的结果并排放置，两份状态各自独立，
+    一边刷新不该把另一边的列表清空。
+    """
+
+    def __init__(self, on_scroll):
+        self.list_view = ft.ListView(expand=True, spacing=4,
+                                     on_scroll=on_scroll, scroll_interval=250)
+        self.books = []
+        self.page = 1
+        self.has_more = True
+        self.loading_more = False
+        self.category = 0
+
+    def reset(self):
+        self.books = []
+        self.page = 1
+        self.has_more = True
+        self.list_view.controls.clear()
+
+    def append(self, new_books):
+        existing = {book.url for book in self.books}
+        added = []
+        for book in new_books:
+            if book.url not in existing:
+                self.books.append(book)
+                existing.add(book.url)
+                added.append(book)
+        return added
+
+
 class ReadingView(ft.Column):
     DIRECTORY_BATCH_SIZE = 50
     PREFETCH_CHAPTER_COUNT = 10
@@ -154,22 +211,25 @@ class ReadingView(ft.Column):
         self._restoring_scroll = False
         self._prefetch_task = None
         self._chapter_cache = {}
+        # 同一章节只发一次请求：翻页撞上还没回来的那一份就一起等。
+        self._content_flight = {}
+        self._content_generation = 0
         self._continuous_loaded = set()
         self._pending_append_starts = {}
         self._auto_scroll_armed = True
-        self.books = []
         self.chapters = []
         self.current_source = None
         self.categories = []
-        self._result_page = 1
-        self._result_mode = None
-        self._active_category = 0
-        self._loading_more = False
         self._category_load_id = 0
+        self._category_cache = {}
+        self._category_pending = set()
+        self._expanded_sources = set()
+        self._source_chips = {}
+        self._source_icons = {}
+        self._discovery_page = "sources"
         self._chapter_visible_count = 0
         self._visible_chapters = []
         self._directory_reversed = False
-        self._has_more = True
         self._book_detail_dialog = None
         self._detail_book = None
         self._book_open_generation = 0
@@ -234,11 +294,22 @@ class ReadingView(ft.Column):
         self._bookshelf_sort.col = {"xs": 4, "sm": 3}
         self._bookshelf_layout_btn.col = {"xs": 2, "sm": 1}
         self._bookshelf_refresh_btn.col = {"xs": 2, "sm": 1}
-        self._source = ft.Dropdown(label="书源", on_select=self._source_changed)
-        self._search_scope = ft.Dropdown(
-            label="搜索范围", value=SEARCH_SCOPE_ALL, dense=True,
-            options=[ft.dropdown.Option(SEARCH_SCOPE_ALL, "全部书源")],
-            on_select=self._scope_changed)
+        self._search_scope_value = SEARCH_SCOPE_ALL
+        self._search_scope_options = [(SEARCH_SCOPE_ALL, "全部书源")]
+        self._search_scope_label = ft.Text(
+            "全部书源", size=12, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
+        self._search_scope_button = ft.Container(
+            padding=ft.Padding(12, 7, 12, 7), border_radius=10,
+            bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+            on_click=self._open_scope_dialog,
+            content=ft.Row([
+                ft.Icon(ft.Icons.TUNE, size=16,
+                        color=ft.Colors.ON_SURFACE_VARIANT),
+                ft.Text("搜索范围", size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+                ft.Row([self._search_scope_label], expand=True),
+                ft.Icon(ft.Icons.EXPAND_MORE, size=16,
+                        color=ft.Colors.ON_SURFACE_VARIANT),
+            ], spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER))
         self._keyword = ft.TextField(label="书名或关键词", expand=True, on_submit=self._search)
         self._search_btn = ft.Button("搜索", icon=ft.Icons.SEARCH, on_click=self._search)
         self._search_stop = ft.TextButton(
@@ -249,12 +320,66 @@ class ReadingView(ft.Column):
             on_click=self._show_source_login)
         self._login_fields = {}
         self._login_dialog = None
-        self._status = ft.Text("选择搜索范围后搜索", color=ft.Colors.GREY_600)
+        self._status = ft.Text("选择书源浏览分类，或直接搜索书名", color=ft.Colors.GREY_600)
         self._search_progress = ft.ProgressBar(value=0, visible=False)
-        self._results = ft.ListView(expand=True, spacing=4, on_scroll=self._on_result_scroll,
-                                    scroll_interval=250)
+        # 浏览与搜索各占一份列表：来回切换时谁也不会把谁的结果清掉。
+        self._browse_flow = _ResultFlow(on_scroll=self._on_browse_scroll)
+        self._search_flow = _ResultFlow(on_scroll=self._on_search_scroll)
         self._category_host = ft.Column(spacing=0)
-        self._discover = ft.Column(expand=True, spacing=0, controls=[self._category_host, self._results])
+        self._source_list = ft.ListView(expand=True, spacing=2)
+        self._source_chips = {}
+        self._browse_title = ft.Text("", size=16, weight=ft.FontWeight.W_500,
+                                     expand=True, max_lines=1,
+                                     overflow=ft.TextOverflow.ELLIPSIS)
+        self._sources_page = ft.Column(expand=True, spacing=0, controls=[
+            ft.Container(padding=12, content=ft.Column([
+                ft.Text("找书", size=28, weight=ft.FontWeight.BOLD),
+                ft.Container(
+                    padding=ft.Padding(12, 9, 12, 9), border_radius=10,
+                    bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+                    on_click=self._open_search_page,
+                    content=ft.Row([
+                        ft.Icon(ft.Icons.SEARCH, size=18,
+                                color=ft.Colors.ON_SURFACE_VARIANT),
+                        ft.Text("搜索书名或作者", expand=True,
+                                color=ft.Colors.ON_SURFACE_VARIANT),
+                    ], spacing=8)),
+                ft.Row([
+                    ft.Text("书源", size=13, weight=ft.FontWeight.W_500),
+                    ft.IconButton(ft.Icons.REFRESH, tooltip="刷新书源列表",
+                                  on_click=lambda e: self.refresh_sources()),
+                ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            ], spacing=8)),
+            ft.Divider(height=1),
+            self._source_list,
+        ])
+        self._browse_page = ft.Column(
+            expand=True, visible=False, spacing=0, controls=[
+                ft.Container(padding=ft.Padding(4, 2, 6, 2), content=ft.Row([
+                    ft.IconButton(ft.Icons.ARROW_BACK, tooltip="返回书源列表",
+                                  on_click=self._back_to_sources),
+                    self._browse_title,
+                    self._login_btn,
+                ], spacing=4)),
+                self._category_host,
+                ft.Divider(height=1),
+                self._browse_flow.list_view,
+            ])
+        self._search_page = ft.Column(
+            expand=True, visible=False, spacing=0, controls=[
+                ft.Container(padding=ft.Padding(4, 2, 8, 2), content=ft.Row([
+                    ft.IconButton(ft.Icons.ARROW_BACK, tooltip="返回书源列表",
+                                  on_click=self._back_to_sources),
+                    self._keyword, self._search_btn, self._search_stop,
+                ], spacing=4)),
+                ft.Container(padding=ft.Padding(12, 0, 12, 6),
+                             content=self._search_scope_button),
+                self._search_progress,
+                self._search_flow.list_view,
+            ])
+        self._discover = ft.Stack(
+            expand=True,
+            controls=[self._sources_page, self._browse_page, self._search_page])
         self._bookshelf = ft.ListView(expand=True, spacing=4)
         self._bookshelf_grid = ft.GridView(
             expand=True, max_extent=190, child_aspect_ratio=0.72,
@@ -389,24 +514,14 @@ class ReadingView(ft.Column):
         self._section_host = ft.Stack(
             expand=True,
             controls=[self._shelf_page, self._detail_page, self._reader_page])
-        self._source.col = {"xs": 6, "sm": 3}
-        self._search_scope.col = {"xs": 6, "sm": 3}
-        self._keyword.col = {"xs": 9, "sm": 4}
-        self._search_btn.col = {"xs": 3, "sm": 1}
-        self._search_stop.col = {"xs": 3, "sm": 1}
-        discovery_header = ft.Container(padding=12, content=ft.Column([
-                ft.Text("找书", size=28, weight=ft.FontWeight.BOLD),
-                ft.ResponsiveRow(
-                    [self._source, self._search_scope, self._keyword,
-                     self._search_btn, self._search_stop],
-                    columns=12, spacing=8, run_spacing=8,
-                ),
-                self._search_progress,
-                ft.Row([self._status, self._login_btn],
-                       alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-            ]))
         if discovery_only:
-            self.controls = [discovery_header, self._discover]
+            # 找书页三块内容（书源列表 / 分类浏览 / 搜索）叠在同一个位置上，
+            # 状态行固定在底部，切换子页时任务进度不会跟着消失。
+            self.controls = [
+                self._discover,
+                ft.Container(padding=ft.Padding(12, 2, 12, 6), content=self._status),
+            ]
+            self._set_discovery_page("sources")
         else:
             self._page_title = ft.Text(
                 "我的书架", size=28, weight=ft.FontWeight.BOLD)
@@ -591,8 +706,8 @@ class ReadingView(ft.Column):
 
     def did_mount(self):
         if self.discovery_only:
+            # 找书页从书源列表开始：用户自己挑一个源进去看分类，不自动翻第一个源。
             self.refresh_sources()
-            self.page.run_task(self._load_categories, self.current_source, True)
             return
         # Tab switches reuse this view object, so the mount path is also the
         # "came back into view" path: refresh the cards (offline badges follow
@@ -611,76 +726,265 @@ class ReadingView(ft.Column):
 
 
     def refresh_sources(self, update=True):
-        enabled = [s for s in self.service.sources if s.enabled and (s.searchUrl or s.exploreUrl)]
-        self._source.options = [
-            ft.dropdown.Option(str(i), self._source_option_label(source))
-            for i, source in enumerate(enabled)]
-        self._source_map = enabled
-        if enabled and (self._source.value is None or int(self._source.value) >= len(enabled)):
-            self._source.value = "0"
-            self.current_source = enabled[0]
-        elif not enabled:
-            self._source.value = None
+        """重排书源列表：能用（启用且有规则）的书源按书源顺序列出。"""
+        enabled = [s for s in self.service.sources
+                   if s.enabled and (s.searchUrl or s.exploreUrl)]
+        self._source_chips = {}
+        self._source_icons = {}
+        self._source_list.controls = [self._source_row(source)
+                                      for source in enabled]
+        if not enabled:
             self.current_source = None
+        elif self.current_source not in enabled:
+            self.current_source = enabled[0]
         self._update_login_button()
         self._refresh_search_scope()
         self._rebuild_category_tabs()
         if update:
             self.update()
 
+    def _set_discovery_page(self, page_name):
+        """找书页的三个子页：书源列表 / 分类浏览 / 搜索。"""
+        self._discovery_page = page_name
+        self._sources_page.visible = page_name == "sources"
+        self._browse_page.visible = page_name == "browse"
+        self._search_page.visible = page_name == "search"
+
+    def _source_row(self, source):
+        """书源列表的一行：点一下展开发现分类，右键/长按出菜单。"""
+        url = str(source.bookSourceUrl or "")
+        expanded = url in self._expanded_sources
+        chevron = ft.Icon(ft.Icons.EXPAND_MORE if expanded
+                         else ft.Icons.CHEVRON_RIGHT, size=18)
+        chips = ft.Column(spacing=6, visible=expanded, controls=[])
+        self._source_icons[url] = chevron
+        self._source_chips[url] = chips
+        if expanded:
+            chips.controls = self._source_chip_controls(source)
+        return ft.GestureDetector(
+            on_tap=lambda e, s=source: self._toggle_source_expand(s),
+            on_secondary_tap_down=lambda e, s=source: self._show_source_menu(s),
+            on_long_press=lambda e, s=source: self._show_source_menu(s),
+            content=ft.Container(
+                padding=ft.Padding(12, 6, 12, 6),
+                content=ft.Column([
+                    ft.Row([
+                        chevron,
+                        ft.Column([
+                            ft.Text(source.display_name, max_lines=1,
+                                    overflow=ft.TextOverflow.ELLIPSIS,
+                                    weight=ft.FontWeight.W_500),
+                            ft.Text(self._source_subtitle(source), size=11,
+                                    color=ft.Colors.GREY_600, max_lines=1,
+                                    overflow=ft.TextOverflow.ELLIPSIS),
+                        ], spacing=2, expand=True),
+                    ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    chips,
+                ], spacing=4),
+            ))
+
+    def _toggle_source_expand(self, source):
+        """点开一行：展开它的发现分类，再点收回。"""
+        url = str(source.bookSourceUrl or "")
+        if url in self._expanded_sources:
+            self._expanded_sources.discard(url)
+            chips = self._source_chips.get(url)
+            if chips is not None:
+                chips.visible = False
+            chevron = self._source_icons.get(url)
+            if chevron is not None:
+                chevron.icon = ft.Icons.CHEVRON_RIGHT
+            self.update()
+            return
+        self._expanded_sources.add(url)
+        self.current_source = source
+        self._update_login_button()
+        chevron = self._source_icons.get(url)
+        if chevron is not None:
+            chevron.icon = ft.Icons.EXPAND_MORE
+        chips = self._source_chips.get(url)
+        if chips is not None:
+            chips.controls = self._source_chip_controls(source)
+            chips.visible = True
+        if self._source_is_search_only(source):
+            self._status.value = "该书源仅支持关键词搜索，请输入书名或作者"
+        self.update()
+
+    def _source_chip_controls(self, source):
+        """一行里摊开的分类标签；还没解析过就先去解析。"""
+        if self._source_is_search_only(source):
+            return [ft.Row([
+                ft.Text("仅支持关键词搜索", size=12, color=ft.Colors.GREY_600),
+                ft.Button("用此书源搜索", icon=ft.Icons.SEARCH, height=34,
+                          on_click=lambda e, s=source:
+                          self._search_with_source(s)),
+            ])]
+        url = str(source.bookSourceUrl or "")
+        categories = self._category_cache.get(url)
+        if categories is None:
+            if url not in self._category_pending:
+                self._category_pending.add(url)
+                self.page.run_task(self._load_categories, source)
+            return [ft.Text("正在解析分类…", size=12, color=ft.Colors.GREY_600)]
+        if not categories:
+            return [ft.Text("没有可用的发现分类", size=12, color=ft.Colors.GREY_600)]
+        return [ft.Row(
+            [ft.Chip(label=ft.Text(category.title), height=34,
+                     on_click=lambda e, s=source, c=category:
+                     self._open_category(s, c))
+             for category in categories],
+            wrap=True, spacing=6, run_spacing=6)]
+
+    def _fill_source_chips(self, source):
+        """分类解析完就补进列表页那一行（若它还开着）。"""
+        url = str(source.bookSourceUrl or "")
+        chips = self._source_chips.get(url)
+        if chips is None or url not in self._expanded_sources:
+            return
+        chips.controls = self._source_chip_controls(source)
+
+    def _open_category(self, source, category):
+        """进分类浏览页：先拿标签建 Tab，再跑第一页。"""
+        self.current_source = source
+        self._update_login_button()
+        self._cancel_prefetch(clear_cache=True)
+        self._category_load_id += 1
+        self._browse_flow.reset()
+        self._rebuild_category_tabs(
+            self._category_cache.get(str(source.bookSourceUrl or "")) or
+            self._checked_categories(source))
+        self._browse_title.value = source.display_name
+        self._set_discovery_page("browse")
+        index = next((position for position, item in enumerate(self.categories)
+                      if item.url == category.url), 0)
+        self.page.run_task(self._run_explore, index, True)
+
+    def _back_to_sources(self, _=None):
+        self._set_discovery_page("sources")
+        self.update()
+
+    def _open_search_page(self, _=None, source=None):
+        """打开搜索页；带上书源就是把这一轮限定在它身上。"""
+        if source is not None:
+            self.current_source = source
+            self._update_login_button()
+            self._set_search_scope(SEARCH_SCOPE_CURRENT)
+            self._status.value = f"搜索范围：{source.display_name}，请输入书名或作者"
+        self._set_discovery_page("search")
+        self.update()
+
+    def _search_with_source(self, source):
+        self._open_search_page(source=source)
+
+    def _show_source_menu(self, source):
+        """右键/长按书源行：列出对这一个书源能做的事。"""
+        actions = [ft.TextButton("关闭", on_click=lambda e: self.page.pop_dialog())]
+        if self.engine.login_available(source):
+            actions.append(ft.TextButton(
+                "登录书源", icon=ft.Icons.LOGIN,
+                on_click=lambda e, s=source: self._login_from_menu(s)))
+        actions.append(ft.Button(
+            "用此书源搜索", icon=ft.Icons.SEARCH,
+            on_click=lambda e, s=source: self._search_from_menu(s)))
+        dialog = ft.AlertDialog(
+            modal=True, title=ft.Text(source.display_name),
+            content=ft.Container(width=420, content=ft.Column([
+                ft.Text(source.bookSourceUrl or "", size=11,
+                        color=ft.Colors.GREY_600, max_lines=2,
+                        overflow=ft.TextOverflow.ELLIPSIS),
+                ft.Text(f"状态：{'启用' if source.enabled else '停用'}"
+                        f" · 分组：{source.display_group}"),
+                ft.Text("该书源仅支持关键词搜索" if self._source_is_search_only(source)
+                        else "点一下这一行可以展开它的发现分类"),
+            ], tight=True, spacing=8)),
+            actions=actions)
+        self.page.show_dialog(dialog)
+
+    def _login_from_menu(self, source):
+        self.page.pop_dialog()
+        self.current_source = source
+        self._update_login_button()
+        self.page.run_task(self._open_source_login, source)
+
+    def _search_from_menu(self, source):
+        self.page.pop_dialog()
+        self._open_search_page(source=source)
+
+    @staticmethod
+    def _source_is_search_only(source) -> bool:
+        """只有搜索规则、没有发现分类的书源。"""
+        return (bool(str(source.searchUrl or "").strip()) and
+                not str(source.exploreUrl or "").strip())
+
+    @classmethod
+    def _source_subtitle(cls, source) -> str:
+        """列表行副标题：站点、分组，以及“只能搜”这个标记。"""
+        parts = [str(source.short_url or ""), str(source.bookSourceGroup or "")]
+        if cls._source_is_search_only(source):
+            parts.append("仅搜索")
+        return " · ".join(part for part in parts if part)
+
+    def _update_login_button(self):
+        source = self.current_source
+        self._login_btn.visible = bool(
+            source and self.engine.login_available(source))
+
     def _refresh_search_scope(self):
         """搜索范围选项：全部 / 各分组 / 仅当前书源，保持已选值有效。"""
-        previous = str(self._search_scope.value or SEARCH_SCOPE_ALL)
+        previous = str(self._search_scope_value or SEARCH_SCOPE_ALL)
         groups = []
         if hasattr(self.service, "get_groups"):
             try:
                 groups = list(self.service.get_groups())
             except Exception:
                 groups = []
-        options = [ft.dropdown.Option(SEARCH_SCOPE_ALL, "全部书源"),
-                   ft.dropdown.Option(SEARCH_SCOPE_CURRENT, "仅当前书源")]
-        options.extend(
-            ft.dropdown.Option(f"{SEARCH_SCOPE_GROUP}{group}", f"分组：{group}")
-            for group in groups)
-        self._search_scope.options = options
-        valid = {option.key for option in options}
-        self._search_scope.value = (previous if previous in valid
+        options = [(SEARCH_SCOPE_ALL, "全部书源"),
+                   (SEARCH_SCOPE_CURRENT, "仅当前书源")]
+        options.extend((f"{SEARCH_SCOPE_GROUP}{group}", f"分组：{group}")
+                       for group in groups)
+        self._search_scope_options = options
+        valid = {key for key, _ in options}
+        self._search_scope_value = (previous if previous in valid
                                     else SEARCH_SCOPE_ALL)
+        self._search_scope_label.value = self._search_scope_text()
+
+    def _search_scope_text(self) -> str:
+        for key, label in self._search_scope_options:
+            if key == self._search_scope_value:
+                return label
+        return "全部书源"
+
+    def _set_search_scope(self, value):
+        self._search_scope_value = value
+        self._search_scope_label.value = self._search_scope_text()
+
+    def _open_scope_dialog(self, _=None):
+        """搜索范围入口：和 Legado 一样用对话框选，不在页面上摆一个下拉框。"""
+
+        def choose(key):
+            def handler(_):
+                self._set_search_scope(key)
+                self.page.pop_dialog()
+                self._scope_changed()
+            return handler
+
+        dialog = ft.AlertDialog(
+            modal=True, title=ft.Text("搜索范围"),
+            content=ft.Container(width=380, content=ft.Column(
+                tight=True, spacing=0, controls=[
+                    ft.ListTile(
+                        dense=True, data=key, title=ft.Text(label),
+                        selected=key == self._search_scope_value,
+                        on_click=choose(key))
+                    for key, label in self._search_scope_options])),
+            actions=[ft.TextButton("关闭",
+                                   on_click=lambda e: self.page.pop_dialog())])
+        self.page.show_dialog(dialog)
 
     def _scope_changed(self, e=None):
         count = len(self._search_scope_sources())
         self._status.value = f"搜索范围：{count} 个书源，可开始搜索"
         self.update()
-
-    def _source_changed(self, e):
-        if self._source.value is not None:
-            self.current_source = self._source_map[int(self._source.value)]
-            self._update_login_button()
-            self._cancel_prefetch(clear_cache=True)
-            self._reset_results()
-            self._category_load_id += 1
-            self._rebuild_category_tabs([])
-            if not str(self.current_source.exploreUrl or "").strip():
-                self._status.value = "该书源仅支持关键词搜索，请输入书名或作者"
-                self.update()
-                return
-            self._status.value = "正在解析发现分类…"
-            self.update()
-            self.page.run_task(self._load_categories, self.current_source, True,
-                               self._category_load_id)
-
-    @staticmethod
-    def _source_option_label(source):
-        label = source.display_name
-        if (str(source.searchUrl or "").strip() and
-                not str(source.exploreUrl or "").strip()):
-            return f"{label} · 仅搜索"
-        return label
-
-    def _update_login_button(self):
-        source = self.current_source
-        self._login_btn.visible = bool(
-            source and self.engine.login_available(source))
 
     def _show_source_login(self, _):
         if self.current_source:
@@ -744,8 +1048,11 @@ class ReadingView(ft.Column):
             self._login_dialog = None
 
     async def _load_categories(self, source, run_first=False, load_id=None):
+        """解析一个书源的发现分类：列表页展开的标签和浏览页的 Tab 共用这一份。"""
         if source is None:
             return
+        url = str(source.bookSourceUrl or "")
+        self._category_pending.discard(url)
         if not str(source.exploreUrl or "").strip():
             if (source is self.current_source and
                     (load_id is None or load_id == self._category_load_id)):
@@ -763,6 +1070,9 @@ class ReadingView(ft.Column):
                         self._load_categories, source))
                 self.update()
             return
+        categories = self._checked_categories(source, categories)
+        self._category_cache[url] = categories
+        self._fill_source_chips(source)
         if (source is not self.current_source or
                 (load_id is not None and load_id != self._category_load_id)):
             return
@@ -773,22 +1083,23 @@ class ReadingView(ft.Column):
             self._set_status("该书源的发现分类未生成可用入口，可使用关键词搜索")
         self.update()
 
-    def _rebuild_category_tabs(self, categories=None):
-        self.categories = (categories if categories is not None else
-                           (parse_explore_categories(self.current_source)
-                            if self.current_source else []))
+    def _checked_categories(self, source, categories=None):
+        """把检测结果套到分类上：只隐藏它证明坏掉的，其余照旧展示。"""
+        values = list(categories if categories is not None else
+                      (parse_explore_categories(source) if source else []))
         checked = getattr(self.service, "category_checks", {}).get(
-            self.current_source.bookSourceUrl if self.current_source else ""
-        )
-        if checked is not None:
-            # Detection only samples a few categories and stops at the first
-            # working one, so the list is not a full audit: hide the ones it
-            # proved broken and keep the rest instead of dropping everything
-            # that was never sampled.
-            broken_urls = {item["url"] for item in checked
-                           if not item.get("valid")}
-            self.categories = [category for category in self.categories
-                               if category.url not in broken_urls]
+            source.bookSourceUrl if source else "")
+        if checked is None:
+            return values
+        # 检测只抽样了几个分类，所以这个列表不是完整审计：它证明坏掉的先不摆出来，
+        # 没抽到的保持原样。
+        broken_urls = {item["url"] for item in checked
+                       if not item.get("valid")}
+        return [category for category in values
+                if category.url not in broken_urls]
+
+    def _rebuild_category_tabs(self, categories=None):
+        self.categories = self._checked_categories(self.current_source, categories)
         if not self.categories:
             self._category_host.controls = []
             return
@@ -810,39 +1121,39 @@ class ReadingView(ft.Column):
         self.page.run_task(self._run_explore, self._category_tabs.selected_index, True)
 
     async def _run_explore(self, index, reset=True):
+        flow = self._browse_flow
         if index < 0 or index >= len(self.categories):
             return
-        if self._loading_more:
+        if flow.loading_more:
             return
         if reset:
-            self._reset_results()
-            self._active_category = index
-            self._result_mode = "explore"
+            flow.reset()
+            flow.category = index
         category = self.categories[index]
         supports_paging = any(token in category.url for token in
                               ("{{page}}", "{{page-1}}", "{{page+1}}", "<,"))
-        self._loading_more = True
-        self._set_busy(f"正在加载“{category.title}”第 {self._result_page} 页…")
+        flow.loading_more = True
+        self._set_busy(f"正在加载“{category.title}”第 {flow.page} 页…")
         try:
-            new_books = await self.engine.explore(self.current_source, category, self._result_page)
-            added_books = self._append_books(new_books)
+            new_books = await self.engine.explore(self.current_source, category, flow.page)
+            added_books = flow.append(new_books)
             added = len(added_books)
-            self._has_more = supports_paging and bool(new_books) and added > 0
-            if self._has_more:
-                self._result_page += 1
-            self._append_book_controls(added_books)
-            paging_text = "，可继续下拉加载" if self._has_more else (
+            flow.has_more = supports_paging and bool(new_books) and added > 0
+            if flow.has_more:
+                flow.page += 1
+            self._append_book_controls(flow, added_books)
+            paging_text = "，可继续下拉加载" if flow.has_more else (
                 "，固定榜单无后续分页" if not supports_paging else "，已加载全部结果"
             )
-            self._set_status(f"{category.title}：找到 {len(self.books)} 本书{paging_text}")
-            self._show_section("shelf")
+            self._set_status(f"{category.title}：找到 {len(flow.books)} 本书{paging_text}")
+            self._set_discovery_page("browse")
         except Exception as exc:
             self._show_error(
                 exc, retry=lambda: self.page.run_task(
                     self._run_explore, index, False))
-            self._has_more = False
+            flow.has_more = False
         finally:
-            self._loading_more = False
+            flow.loading_more = False
         self.update()
 
     def _search(self, e):
@@ -860,7 +1171,7 @@ class ReadingView(ft.Column):
 
     def _search_scope_sources(self):
         """搜索范围：全部 / 分组 / 仅当前书源，按书源顺序排队。"""
-        scope = str(self._search_scope.value or SEARCH_SCOPE_ALL)
+        scope = str(self._search_scope_value or SEARCH_SCOPE_ALL)
         if scope == SEARCH_SCOPE_CURRENT:
             sources = [self.current_source] if self.current_source else []
         else:
@@ -882,11 +1193,10 @@ class ReadingView(ft.Column):
         self._search_id = int(time.time() * 1000)
         self._search_key = keyword
         self._search_model_instance = self._search_model(self._search_generation)
-        self._reset_results()
-        self._result_mode = "search"
+        self._search_flow.reset()
         self._set_search_running(True)
         self._status.value = f"正在搜索 {len(sources)} 个书源…"
-        self._show_section("shelf")
+        self._set_discovery_page("search")
         self._search_task = self.page.run_task(
             self._run_search, self._search_generation, keyword, sources,
             self._search_id)
@@ -894,7 +1204,8 @@ class ReadingView(ft.Column):
 
     def _load_more_search(self):
         """加载下一页：沿用同一个 search id，SearchModel 自己 page++ 并接着合并。"""
-        if self._loading_more or not self._has_more:
+        flow = self._search_flow
+        if flow.loading_more or not flow.has_more:
             return
         if not self._search_key or self._search_model_instance is None:
             return
@@ -909,9 +1220,9 @@ class ReadingView(ft.Column):
         # 先让这一轮作废，再取消任务：收尾的协程看到 generation 变了就不再回写界面。
         self._search_generation += 1
         self._cancel_search_task()
-        self._has_more = False
+        self._search_flow.has_more = False
         self._set_search_running(False)
-        self._status.value = f"搜索已停止，已找到 {len(self.books)} 本"
+        self._status.value = f"搜索已停止，已找到 {len(self._search_flow.books)} 本"
         # 停止后既没有"加载更多"也没有"已经到底"，只留已经拿到的结果。
         self._render_search_results(with_footer=False)
         self.update()
@@ -924,7 +1235,7 @@ class ReadingView(ft.Column):
             task.cancel()
 
     def _set_search_running(self, running):
-        self._loading_more = running
+        self._search_flow.loading_more = running
         self._search_stop.visible = running
         self._search_btn.visible = not running
         self._search_progress.visible = running
@@ -978,7 +1289,7 @@ class ReadingView(ft.Column):
             # 取消照常往外抛，任务是取消的这一点对调用方仍然是实话。
             if generation == self._search_generation:
                 self._search_task = None
-                self._has_more = self._search_found
+                self._search_flow.has_more = self._search_found
                 self._set_search_running(False)
                 self._publish_search(finished=True)
 
@@ -988,14 +1299,15 @@ class ReadingView(ft.Column):
         if not finished and now - self._search_last_publish < SWITCH_PUBLISH_INTERVAL:
             return
         self._search_last_publish = now
+        flow = self._search_flow
         model = self._search_model_instance
         if model is not None:
-            self.books = list(model.books)
-        if finished or len(self.books) != self._rendered_search_count:
-            self._rendered_search_count = len(self.books)
+            flow.books = list(model.books)
+        if finished or len(flow.books) != self._rendered_search_count:
+            self._rendered_search_count = len(flow.books)
             self._render_search_results()
         self._status.value = self._switch_status_text(
-            self._search_completed, self._search_total, self.books,
+            self._search_completed, self._search_total, flow.books,
             self._search_failures, running=not finished,
             elapsed=now - self._search_started_at, noun="本")
         self._search_progress.value = (
@@ -1004,22 +1316,24 @@ class ReadingView(ft.Column):
         self.update()
 
     def _render_search_results(self, with_footer=True):
-        self._results.controls = [
-            self._book_control(book) for book in self.books]
+        flow = self._search_flow
+        flow.list_view.controls = [
+            self._book_control(book) for book in flow.books]
         if with_footer:
-            self._append_result_footer()
+            self._append_result_footer(flow)
 
-    def _append_result_footer(self):
-        if self._has_more:
+    def _append_result_footer(self, flow):
+        if flow.has_more:
             footer = ft.Button("加载更多", icon=ft.Icons.EXPAND_MORE,
-                               on_click=self._load_more)
+                               on_click=lambda e, target=flow:
+                               self._load_more(target))
             footer.data = "result-footer"
-            self._results.controls.append(footer)
-        elif self.books:
+            flow.list_view.controls.append(footer)
+        elif flow.books:
             footer = ft.Text("已经到底了", text_align=ft.TextAlign.CENTER,
                              color=ft.Colors.GREY_500)
             footer.data = "result-footer"
-            self._results.controls.append(footer)
+            flow.list_view.controls.append(footer)
 
     def _source_by_url(self, url):
         for source in self.service.sources:
@@ -1052,22 +1366,6 @@ class ReadingView(ft.Column):
                 int(time.time() * 1000) - SEARCH_STORE_TTL_MS)
             self._search_store_instance = store
         return self._search_store_instance
-
-    def _reset_results(self):
-        self.books = []
-        self._result_page = 1
-        self._has_more = True
-        self._results.controls.clear()
-
-    def _append_books(self, new_books):
-        existing = {book.url for book in self.books}
-        added = []
-        for book in new_books:
-            if book.url not in existing:
-                self.books.append(book)
-                existing.add(book.url)
-                added.append(book)
-        return added
 
     def _book_control(self, book):
         cover = (ft.Image(src=book.cover_url, width=42, height=56,
@@ -2217,25 +2515,33 @@ class ReadingView(ft.Column):
                       if self._resume_chapter(self._detail_resume) is chapter else 0)
             self.page.run_task(self._run_content, chapter, False, offset)
 
-    def _append_book_controls(self, books):
+    def _append_book_controls(self, flow, books):
         """追加新结果，只替换列表末尾的翻页提示。"""
-        if self._results.controls and getattr(self._results.controls[-1], "data", None) == "result-footer":
-            self._results.controls.pop()
-        self._results.controls.extend(self._book_control(book) for book in books)
-        self._append_result_footer()
+        controls = flow.list_view.controls
+        if controls and getattr(controls[-1], "data", None) == "result-footer":
+            controls.pop()
+        controls.extend(self._book_control(book) for book in books)
+        self._append_result_footer(flow)
 
-    def _on_result_scroll(self, e):
+    def _on_browse_scroll(self, e):
+        self._maybe_load_more(e, self._browse_flow)
+
+    def _on_search_scroll(self, e):
+        self._maybe_load_more(e, self._search_flow)
+
+    def _maybe_load_more(self, e, flow):
         pixels = getattr(e, "pixels", 0) or 0
         maximum = getattr(e, "max_scroll_extent", 0) or 0
-        if self._has_more and not self._loading_more and maximum and maximum - pixels < 320:
-            self._load_more()
+        if (flow.has_more and not flow.loading_more and maximum and
+                maximum - pixels < 320):
+            self._load_more(flow)
 
-    def _load_more(self, e=None):
-        if self._loading_more or not self._has_more:
+    def _load_more(self, flow, e=None):
+        if flow.loading_more or not flow.has_more:
             return
-        if self._result_mode == "explore":
-            self.page.run_task(self._run_explore, self._active_category, False)
-        elif self._result_mode == "search":
+        if flow is self._browse_flow:
+            self.page.run_task(self._run_explore, flow.category, False)
+        else:
             self._load_more_search()
 
     def _load_book(self, book):
@@ -2446,13 +2752,16 @@ class ReadingView(ft.Column):
         if (open_generation is not None and
                 open_generation != self._book_open_generation):
             return
-        if self._reading_loading or chapter.is_volume:
+        if chapter.is_volume:
             return
         if self._current_chapter is not None and self._current_chapter is not chapter:
             self._persist_scroll_position()
             self._pending_scroll_offset = 0.0
             self._pending_scroll_ratio = 0.0
         self._cancel_prefetch()
+        # 后发起的加载接管界面，先发起的那次静默让位（它的请求照常落地进缓存）。
+        self._content_generation += 1
+        generation = self._content_generation
         self._reading_loading = True
         self._restoring_scroll = not append
         self._set_busy(f"正在加载 {chapter.name}…")
@@ -2461,28 +2770,16 @@ class ReadingView(ft.Column):
             if 0 <= chapter.index < len(self.chapters) - 1:
                 next_chapter_url = next((item.url for item in self.chapters[chapter.index + 1:]
                                          if not item.is_volume and item.url), "")
-            content = self._chapter_cache.pop(chapter.url, None)
-            content_from_cache = content is not None
-            if content is None and self._current_book is not None:
-                content = await asyncio.to_thread(
-                    self.reading_cache.load_content,
-                    self.current_source.bookSourceUrl,
-                    self._current_book.url, chapter.url)
-                content_from_cache = content is not None
-            if content is None:
-                content = await self.engine.content_document(
-                    self.current_source, chapter, next_chapter_url)
-                if self._current_book is not None:
-                    await asyncio.to_thread(
-                        self.reading_cache.save_content,
-                        self.current_source.bookSourceUrl,
-                        self._current_book.url, chapter.url, content)
-            if (open_generation is not None and
-                    open_generation != self._book_open_generation):
-                self._restoring_scroll = False
-                self._reading_loading = False
+            content, content_from_cache = await self._chapter_document(
+                chapter, next_chapter_url)
+            if (generation != self._content_generation or
+                    (open_generation is not None and
+                     open_generation != self._book_open_generation)):
                 return
-            rendered = self._render_content(content)
+            rendered = await self._render_content(content)
+            if generation != self._content_generation:
+                # 切段在工作线程里跑，回来时可能已经被更晚的翻页顶掉。
+                return
             chapter_text_length = sum(
                 len(str(control.value or ""))
                 for control in rendered
@@ -2537,8 +2834,12 @@ class ReadingView(ft.Column):
                              if content_from_cache else chapter.name)
             self._show_section("reader")
         except Exception as exc:
-            self._show_error(
-                exc, retry=lambda: self._load_content(chapter))
+            if generation == self._content_generation:
+                self._show_error(
+                    exc, retry=lambda: self._load_content(chapter))
+        if generation != self._content_generation:
+            # 更晚的加载已经接管界面：这次既不回写状态也不滚动。
+            return
         # Mount the new document while input remains locked. Restoring the
         # saved offset after unlocking lets an early wheel event race with the
         # final scroll_to(0), which visibly snaps the chapter back to its top.
@@ -2571,12 +2872,86 @@ class ReadingView(ft.Column):
             self._prefetch_task = self.page.run_task(
                 self._prefetch_next_chapters, chapter)
 
+    def _content_key(self, chapter):
+        book = self._current_book
+        return (getattr(self.current_source, "bookSourceUrl", ""),
+                getattr(book, "url", ""), chapter.url)
+
+    def _remember_document(self, key, document):
+        """Keep a fetched chapter in memory while the prefetch budget allows."""
+        size = self._document_size(document)
+        cached = sum(self._document_size(item)
+                     for item in self._chapter_cache.values())
+        if cached + size > self.PREFETCH_CACHE_LIMIT:
+            return
+        self._chapter_cache[key] = document
+
+    async def _chapter_document(self, chapter, next_chapter_url="", lease=None):
+        """The document for one chapter, requested at most once at a time.
+
+        翻页时旧请求不会被取消：它跑完照样写进缓存，只有渲染被放弃——这正是
+        “回到这一章还在”的那份数据。
+        """
+        key = self._content_key(chapter)
+        cached = self._chapter_cache.get(key)
+        if cached is not None:
+            return cached, True
+        pending = self._content_flight.get(key)
+        if pending is None:
+            pending = asyncio.ensure_future(self._fetch_chapter_document(
+                chapter, next_chapter_url,
+                lease.engine if lease is not None else self.engine, key, lease))
+            self._content_flight[key] = pending
+            pending.add_done_callback(
+                lambda task, key=key: self._forget_content_flight(key, task))
+        # shield：等待方被取消不该把请求一起带走。
+        return await asyncio.shield(pending)
+
+    async def _fetch_chapter_document(self, chapter, next_chapter_url,
+                                      engine, key, lease=None):
+        source = self.current_source
+        book = self._current_book
+        if lease is not None:
+            lease.acquire()
+        try:
+            if book is not None:
+                document = await asyncio.to_thread(
+                    self.reading_cache.load_content,
+                    source.bookSourceUrl, book.url, chapter.url)
+                if document is not None:
+                    self._remember_document(key, document)
+                    return document, True
+            document = await engine.content_document(
+                source, chapter, next_chapter_url)
+            if book is not None:
+                await asyncio.to_thread(
+                    self.reading_cache.save_content,
+                    source.bookSourceUrl, book.url, chapter.url, document)
+            self._remember_document(key, document)
+            return document, False
+        finally:
+            if lease is not None:
+                await lease.release()
+
+    def _forget_content_flight(self, key, task):
+        if self._content_flight.get(key) is task:
+            self._content_flight.pop(key, None)
+        if not task.cancelled():
+            # 没人等在结果上时也要取走异常，否则 asyncio 会记一条警告。
+            task.exception()
+
+    def _cancel_content_flight(self):
+        for task in self._content_flight.values():
+            task.cancel()
+        self._content_flight.clear()
+
     def _cancel_prefetch(self, clear_cache=False):
         if self._prefetch_task and not self._prefetch_task.done():
             self._prefetch_task.cancel()
         self._prefetch_task = None
         if clear_cache:
             self._chapter_cache.clear()
+            self._cancel_content_flight()
 
     def _next_readable_chapters(self, chapter, limit):
         try:
@@ -2593,37 +2968,34 @@ class ReadingView(ft.Column):
                    for block in document.blocks)
 
     async def _prefetch_next_chapters(self, chapter):
-        """顺序预取后续章节，避免并发修改 Legado 规则变量。"""
+        """顺序预取后续章节，避免并发修改 Legado 规则变量。
+
+        预取任务本身可以被放弃，它发出的请求不行：请求交给带引用计数的引擎，
+        跑完照样进缓存，阅读页翻到这一章时直接接上这份结果。
+        """
         source = self.current_source
         candidates = self._next_readable_chapters(chapter, self.PREFETCH_CHAPTER_COUNT)
-        prefetch_engine = self._background_engine()
-        prefetch_engine.current_book = getattr(self.engine, "current_book", None)
-        prefetch_engine.js_variables.update(self.engine.js_variables)
-        cache_size = sum(self._document_size(item) for item in self._chapter_cache.values())
+        lease = _EngineLease(self._background_engine())
+        lease.engine.current_book = getattr(self.engine, "current_book", None)
+        lease.engine.js_variables.update(self.engine.js_variables)
+        # 自己也算一个持有者：任务被取消时不能让计数归零，把还在跑的请求的
+        # 引擎顺手关掉。
+        lease.acquire()
         try:
             for candidate in candidates:
-                if source is not self.current_source or candidate.url in self._chapter_cache:
+                if (source is not self.current_source or
+                        self._content_key(candidate) in self._chapter_cache):
                     continue
                 following = self._next_readable_chapters(candidate, 1)
                 next_url = following[0].url if following else ""
-                document = await prefetch_engine.content_document(source, candidate, next_url)
-                size = self._document_size(document)
-                if cache_size + size > self.PREFETCH_CACHE_LIMIT:
-                    break
-                self._chapter_cache[candidate.url] = document
-                if self._current_book is not None:
-                    await asyncio.to_thread(
-                        self.reading_cache.save_content,
-                        source.bookSourceUrl, self._current_book.url,
-                        candidate.url, document)
-                cache_size += size
+                await self._chapter_document(candidate, next_url, lease=lease)
         except asyncio.CancelledError:
             raise
         except Exception:
             # 预加载失败不能影响当前章节阅读，实际翻页时仍会正常请求。
             return
         finally:
-            await prefetch_engine.aclose()
+            await lease.release()
 
     def _adjacent_chapter(self, direction):
         if not self._current_chapter or not self.chapters:
@@ -2854,13 +3226,15 @@ class ReadingView(ft.Column):
                 self.update()
 
     def _previous_chapter(self, _):
+        # 正在加载时按翻页也照常受理：后发起的请求接管界面，先发起的那次
+        # 让位但仍然把结果写进缓存，不再出现“点了没反应”。
         chapter = self._adjacent_chapter(-1)
-        if chapter and not self._reading_loading:
+        if chapter:
             self.page.run_task(self._run_content, chapter, False)
 
     def _next_chapter(self, _):
         chapter = self._adjacent_chapter(1)
-        if chapter and not self._reading_loading:
+        if chapter:
             self.page.run_task(self._run_content, chapter, False)
 
     def _show_directory(self, _):
@@ -2946,18 +3320,37 @@ class ReadingView(ft.Column):
         if updated:
             self._refresh_detail_resume()
 
-    def _render_content(self, document):
+    def _content_plan(self, document):
+        """把正文切成段落数据——纯计算，不碰 Flet 控件。
+
+        一章几千行的正则切分留在事件循环上就是几十上百毫秒的卡顿，所以这段
+        交给线程跑；循环里只保留构造控件这一步。
+        """
+        indent = bool(self._reader_preferences["indent"])
+        plan = []
+        for block in document.blocks:
+            if block.kind == "text":
+                plan.append(("text", self._novel_paragraphs(
+                    render_use_html_spans(block.value), indent)))
+            else:
+                plan.append((block.kind, block))
+        return plan
+
+    async def _render_content(self, document):
+        plan = await asyncio.to_thread(self._content_plan, document)
+        return self._content_controls(plan, document.image_style)
+
+    def _content_controls(self, plan, image_style=""):
         controls = []
-        image_style = str(document.image_style or "").upper()
+        image_style = str(image_style or "").upper()
         current_book = getattr(self.engine, "current_book", None)
         configured_style = str((getattr(current_book, "read_config", {}) or {}).get(
             "imageStyle", "") or "").upper()
         if configured_style:
             image_style = configured_style
-        for block in document.blocks:
-            if block.kind == "text":
-                for value, is_heading in self._novel_paragraphs(
-                        render_use_html_spans(block.value)):
+        for kind, block in plan:
+            if kind == "text":
+                for value, is_heading in block:
                     controls.append(ft.Text(
                         value,
                         selectable=False,
@@ -2971,11 +3364,11 @@ class ReadingView(ft.Column):
                                     else ft.TextAlign.START),
                         data="reader-heading" if is_heading else "reader-text",
                     ))
-            elif block.kind == "image":
+            elif kind == "image":
                 options = self._image_render_options(image_style, self._font_size)
                 controls.append(ft.Image(src=block.value,
                     error_content=ft.Text("图片加载失败"), **options))
-            elif block.kind == "audio":
+            elif kind == "audio":
                 import flet_audio as fta
                 player = fta.Audio(src=block.value, autoplay=False)
                 controls.append(ft.Card(content=ft.Container(padding=12, content=ft.Column([
@@ -2988,7 +3381,7 @@ class ReadingView(ft.Column):
                                       on_click=lambda e, p=player: self.page.run_task(p.pause)),
                     ]),
                 ]))))
-            elif block.kind == "video":
+            elif kind == "video":
                 import flet_video as ftv
                 media = ftv.VideoMedia(resource=block.value, http_headers=block.headers or None)
                 controls.append(ftv.Video(
@@ -2997,22 +3390,26 @@ class ReadingView(ft.Column):
                 ))
         return controls
 
-    def _novel_paragraphs(self, value):
+    HEADING_PATTERN = re.compile(
+        r"^(?:第[0-9０-９零〇一二三四五六七八九十百千万两]+"
+        r"[章节卷回部篇集]|卷[0-9０-９零〇一二三四五六七八九十百千万两]+|"
+        r"序章|序言|前言|楔子|引子|后记|尾声|番外)(?:\s|$|[：:、.-])")
+    INDENT_KEEP_PREFIXES = ("　　", "•", "·", "- ", "— ")
+
+    @classmethod
+    def _novel_paragraphs(cls, value, indent=False):
         """Turn source text into readable novel paragraphs without changing data."""
         normalized = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
         normalized = normalized.replace("\xa0", " ")
         paragraphs = []
-        heading_pattern = re.compile(
-            r"^(?:第[0-9０-９零〇一二三四五六七八九十百千万两]+"
-            r"[章节卷回部篇集]|卷[0-9０-９零〇一二三四五六七八九十百千万两]+|"
-            r"序章|序言|前言|楔子|引子|后记|尾声|番外)(?:\s|$|[：:、.-])")
         for raw_line in normalized.split("\n"):
             line = re.sub(r"[ \t\f\v]+", " ", raw_line).strip()
             if not line:
                 continue
-            is_heading = len(line) <= 48 and bool(heading_pattern.match(line))
-            if (self._reader_preferences["indent"] and not is_heading and
-                    not line.startswith(("　　", "•", "·", "- ", "— "))):
+            is_heading = (len(line) <= 48 and
+                          bool(cls.HEADING_PATTERN.match(line)))
+            if (indent and not is_heading and
+                    not line.startswith(cls.INDENT_KEEP_PREFIXES)):
                 line = f"　　{line.lstrip('　')}"
             paragraphs.append((line, is_heading))
         return paragraphs
@@ -3055,7 +3452,8 @@ class ReadingView(ft.Column):
         if connect_timeout is not None:
             kwargs["connect_timeout"] = connect_timeout
         return LegadoReadingEngine(webview_fetcher=available_fetcher(),
-                                   state_dir=self.service.data_dir, **kwargs)
+                                   state_dir=self.service.data_dir,
+                                   background=True, **kwargs)
 
     def _restore_background_status(self):
         if self._background_status:
