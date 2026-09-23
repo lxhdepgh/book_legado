@@ -1129,7 +1129,10 @@ class ReaderEngine:
             except aiohttp.ClientConnectorError as exc:
                 raise RequestConnectionError(f"连接失败：{exc}") from exc
             except asyncio.TimeoutError as exc:
-                raise RequestTimeoutError(f"连接超时：{exc}") from exc
+                # aiohttp 的超时异常字符串通常是空的，照抄只会得到“连接超时：”。
+                limit = timeout.total or timeout.connect
+                detail = str(exc) or (f"{limit:g} 秒无响应" if limit else "响应超时")
+                raise RequestTimeoutError(f"连接超时：{detail}") from exc
         raise RuntimeError("request loop ended without a response")
 
     @staticmethod

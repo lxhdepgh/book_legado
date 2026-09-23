@@ -5512,6 +5512,43 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
             # 上层（检测、换源）是按 RuntimeError 兜底的，类型必须兼容。
             self.assertIsInstance(caught.exception, RuntimeError)
 
+    async def test_a_timeout_says_how_long_we_waited(self):
+        """aiohttp 的超时异常字面为空，照抄只会得到一句“连接超时：”。"""
+        class Session:
+            closed = False
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def request(self, *_args, **_kwargs):
+                raise asyncio.TimeoutError()
+
+        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.rule_engine.aiohttp.TCPConnector",
+                      lambda **_kwargs: object()):
+            with self.assertRaises(RequestTimeoutError) as caught:
+                await ReaderEngine(timeout=10)._request({"url": "https://host/page"})
+
+        self.assertEqual(str(caught.exception), "连接超时：10 秒无响应")
+
+    async def test_a_timeout_reason_from_the_transport_is_kept(self):
+        class Session:
+            closed = False
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def request(self, *_args, **_kwargs):
+                raise asyncio.TimeoutError("read timeout")
+
+        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.rule_engine.aiohttp.TCPConnector",
+                      lambda **_kwargs: object()):
+            with self.assertRaises(RequestTimeoutError) as caught:
+                await ReaderEngine(timeout=10)._request({"url": "https://host/page"})
+
+        self.assertEqual(str(caught.exception), "连接超时：read timeout")
+
     async def test_redirect_method_body_and_cross_origin_authorization(self):
         observed = {}
 
