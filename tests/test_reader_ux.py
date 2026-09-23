@@ -22,7 +22,8 @@ from app.services.rule_engine import (BookItem, ChapterItem,
 from app.services.block_pages import SiteBlockedError
 from app.services.source_service import SourceService
 from app.services.interactive_browser import VIEWPORT
-from app.views.reading_view import (SWITCH_CONNECT_TIMEOUT, SWITCH_TIMEOUT,
+from app.views.reading_view import (SEARCH_SCOPE_CURRENT, SEARCH_SCOPE_GROUP,
+                                    SWITCH_CONNECT_TIMEOUT, SWITCH_TIMEOUT,
                                     ReadingView, _intro_control, _intro_text,
                                     _switch_failure_reason)
 from app.services.web_page_renderer import WebPageRenderer, looks_like_gate
@@ -912,9 +913,11 @@ class _SwitchSearchStub:
         self.gate = gate
         self.started = 0
         self.cancelled = 0
+        self.calls = []
 
     async def search(self, source, keyword, page=1):
         self.started += 1
+        self.calls.append((source.bookSourceUrl, page))
         try:
             if self.gate is not None:
                 await self.gate.wait()
@@ -1240,6 +1243,189 @@ class SourceSwitchTests(unittest.IsolatedAsyncioTestCase):
 
         row = self.view._shelf_control(item)
         self.assertIn("书源已失效", row.content.subtitle.controls[0].value)
+
+
+class AllSourceSearchTests(unittest.IsolatedAsyncioTestCase):
+    """全书源找书：范围内的书源各搜一次，按书合并、可停止、结果落库。"""
+
+    async def asyncSetUp(self):
+        self.directory = TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.service = SourceService(self.root, data_dir=self.root / "data")
+        self.view = ReadingView(self.service)
+        self.view.update = lambda: None
+        self.page = _SwitchPageStub()
+        patcher = patch.object(ReadingView, "page", new_callable=PropertyMock,
+                               return_value=self.page)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addAsyncCleanup(self.view.engine.aclose)
+        self.addCleanup(self.directory.cleanup)
+        self.service.sources = [
+            self._source("https://a.test", "甲源", group="精品"),
+            self._source("https://b.test", "乙源", group="精品"),
+            self._source("https://c.test", "丙源"),
+        ]
+        self.view.refresh_sources(update=False)
+
+    @staticmethod
+    def _source(url, name, group=None):
+        return BookSource(bookSourceName=name, bookSourceUrl=url,
+                          searchUrl=f"{url}/search?key=${{key}}",
+                          bookSourceGroup=group)
+
+    def _install(self, stub):
+        self.view._background_engine = lambda **_kwargs: _SwitchEngineStub(
+            stub.search)
+        return stub
+
+    async def _settle(self):
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    def _start(self, keyword, stub):
+        self._install(stub)
+        self.view._keyword.value = keyword
+        self.view._search(None)
+        return self.view._search_task
+
+    @staticmethod
+    def _book(url, name="寻秦记", author="黄易"):
+        return BookItem(name, author=author, url=f"{url}/book/1", origin=url)
+
+    async def test_every_source_in_scope_is_searched_and_books_are_merged(self):
+        stub = _SwitchSearchStub(books={
+            "https://a.test": [self._book("https://a.test")],
+            "https://b.test": [self._book("https://b.test")],
+        })
+        self._start("寻秦记", stub)
+        await self.view._search_task
+
+        self.assertEqual(sorted(stub.calls), [
+            ("https://a.test", 1), ("https://b.test", 1), ("https://c.test", 1)])
+        # 同一本书来自两个书源，合并成一条并记下两处来源。
+        self.assertEqual([book.name for book in self.view.books], ["寻秦记"])
+        self.assertEqual(sorted(self.view.books[0].origin_set()),
+                         ["https://a.test", "https://b.test"])
+        self.assertEqual(self.view._status.value, "搜索完成：检查 3 个书源，找到 1 本")
+        self.assertEqual(self.view._search_progress.value, 1.0)
+        self.assertFalse(self.view._search_progress.visible)
+
+    async def test_a_failing_source_is_counted_without_stopping_the_sweep(self):
+        stub = _SwitchSearchStub(
+            books={"https://a.test": [self._book("https://a.test")]},
+            errors={"https://b.test": UnsupportedRule("no such rule")})
+        self._start("寻秦记", stub)
+        await self.view._search_task
+
+        self.assertEqual([book.name for book in self.view.books], ["寻秦记"])
+        self.assertEqual(
+            self.view._status.value,
+            "搜索完成：检查 3 个书源，找到 1 本（1 个书源搜索失败：规则不支持 1）")
+
+    async def test_scope_can_narrow_to_the_current_source_or_one_group(self):
+        stub = _SwitchSearchStub()
+        self._install(stub)
+
+        self.view._search_scope.value = SEARCH_SCOPE_CURRENT
+        self.view._keyword.value = "寻秦记"
+        self.view._search(None)
+        await self.view._search_task
+        self.assertEqual(stub.calls, [("https://a.test", 1)])
+
+        # 分组范围只跑该组的书源，选项由书源列表刷新时补齐。
+        self.assertIn(f"{SEARCH_SCOPE_GROUP}精品",
+                      [option.key for option in self.view._search_scope.options])
+        self.view._search_scope.value = f"{SEARCH_SCOPE_GROUP}精品"
+        self.assertEqual(sorted(source.bookSourceUrl
+                                for source in self.view._search_scope_sources()),
+                         ["https://a.test", "https://b.test"])
+
+    async def test_search_reports_progress_and_can_be_stopped_midway(self):
+        stub = _SwitchSearchStub(gate=asyncio.Event())
+        task = self._start("寻秦记", stub)
+        await self._settle()
+
+        self.assertTrue(self.view._search_progress.visible)
+        self.assertTrue(self.view._search_stop.visible)
+        self.assertFalse(self.view._search_btn.visible)
+        self.assertIn("正在搜索", self.view._status.value)
+
+        self.view._stop_search()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self._settle()
+
+        self.assertEqual(stub.cancelled, 3)
+        self.assertEqual(self.view._status.value, "搜索已停止，已找到 0 本")
+        self.assertFalse(self.view._search_progress.visible)
+        self.assertFalse(self.view._search_stop.visible)
+        self.assertTrue(self.view._search_btn.visible)
+
+    async def test_load_more_asks_the_same_search_id_for_the_next_page(self):
+        stub = _SwitchSearchStub(books={
+            "https://a.test": [BookItem(
+                "寻秦记 第一部", author="黄易", url="https://a.test/book/1")]})
+        self._start("寻秦记", stub)
+        await self.view._search_task
+        self.assertTrue(self.view._has_more)
+
+        self.view._load_more_search()
+        await self.view._search_task
+
+        pages = collections.Counter(page for _, page in stub.calls)
+        self.assertEqual(pages, {1: 3, 2: 3})
+
+    async def test_results_are_stored_and_the_switch_dialog_opens_them_offline(self):
+        stub = _SwitchSearchStub(books={
+            "https://a.test": [self._book("https://a.test")],
+            "https://b.test": [self._book("https://b.test")],
+        })
+        self._start("寻秦记", stub)
+        await self.view._search_task
+        self.assertIsNotNone(
+            self.view._search_store().first_by_name_author("寻秦记", "黄易"))
+
+        # 换源列表打开就用本地结果，不再联网。
+        self.view._background_engine = lambda **_kwargs: self.fail(
+            "换源列表不该为本地结果联网")
+        self.view._show_source_switch({
+            "name": "寻秦记", "author": "黄易", "url": "https://dead.test/book/1",
+            "source_url": "https://dead.test", "source_name": "旧源"})
+
+        tiles = self.view._source_switch_results.controls
+        self.assertEqual([tile.title.value for tile in tiles], ["寻秦记", "寻秦记"])
+        self.assertEqual(self.view._source_switch_status.value,
+                         "本地已有 2 个结果，点“搜索其他书源”可联网核对")
+
+    async def test_result_rows_name_their_own_source_and_rank_exact_names_first(self):
+        stub = _SwitchSearchStub(books={
+            "https://a.test": [self._book("https://a.test")],
+            "https://b.test": [self._book("https://b.test")],
+        })
+        self._start("寻秦记", stub)
+        await self.view._search_task
+
+        merged = self.view.books[0]
+        self.assertIn("等 2 个书源",
+                      self.view._book_control(merged).subtitle.value)
+        # 结果行认的是书自己的来源，而不是下拉框里当前选中的书源。
+        self.assertIn(self.view._source_for_book(merged),
+                      self.service.sources[:2])
+
+        item = {"name": "寻秦记", "author": "黄易", "url": "https://dead.test/1",
+                "source_url": "https://dead.test"}
+        self.view._show_source_switch(item)
+        self.view._render_source_switch_results(item, [
+            (self.view.service.sources[2], BookItem("寻秦记 后传", url="u1")),
+            (self.view.service.sources[1], BookItem("寻秦记", url="u2")),
+            (self.view.service.sources[0], BookItem("寻秦记", url="u3")),
+        ])
+        self.assertEqual(
+            [tile.title.value
+             for tile in self.view._source_switch_results.controls],
+            # 书名完全一致的两条在前，同分时按候选顺序（甲源在乙源之前）。
+            ["寻秦记", "寻秦记", "寻秦记 后传"])
 
 
 class PersistentReadingTests(unittest.TestCase):

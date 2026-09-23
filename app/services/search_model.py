@@ -82,6 +82,24 @@ class SearchBookStore:
                 "ORDER BY origin_order LIMIT 1", (str(name), str(author))).fetchone()
         return self._decode(row[0]) if row else None
 
+    def list_by_name_author(self, name: str, author: str = "",
+                            limit: int = 500) -> list[BookItem]:
+        """Legado's changeSourceByGroup: every stored row for one book.
+
+        An empty author means "any author", like Legado's ``like '%%'``.
+        """
+        sql = "SELECT payload FROM search_books WHERE name=?"
+        params: list = [str(name)]
+        if str(author or "").strip():
+            sql += " AND author LIKE ?"
+            params.append(f"%{author}%")
+        sql += " ORDER BY origin_order, book_url LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self._lock, self._connect() as db:
+            rows = db.execute(sql, params).fetchall()
+        return [book for book in (self._decode(row[0]) for row in rows)
+                if book is not None]
+
     def clear(self, name: str, author: str) -> None:
         with self._lock, self._connect() as db:
             db.execute("DELETE FROM search_books WHERE name=? AND author=?",
@@ -98,11 +116,13 @@ class SearchModel:
 
     A different ``search_id`` cancels the previous generation and starts page
     one. Reusing the same id increments the page. Sources are consumed by at
-    most ``min(thread_count, 9)`` workers and each source has the historical
-    30-second timeout.
+    most ``min(thread_count, MAX_THREAD)`` workers and each source has the
+    historical 30-second timeout.
     """
 
-    MAX_THREAD = 9
+    # Legado 的 9 只是 OkHttp 派发线程数，搜索 flow 本身按 threadCount（默认 32）
+    # 在飞；我们的 worker 直接持有请求，所以上限应该落在 flow 这一层。
+    MAX_THREAD = 32
 
     def __init__(self, search_one: Callable[[object, str, int],
                                              Awaitable[list[BookItem]]], *,
@@ -188,11 +208,15 @@ class SearchModel:
                     async with self._state_lock:
                         if generation != self._generation or search_id != self.search_id:
                             return
-                        if self.store is not None:
-                            await asyncio.to_thread(self.store.insert, items)
                         self.books = merge_search_items(
                             self.books, items, self.key, self.precision)
                         await self._notify()
+                    if self.store is not None:
+                        # 落库只是给换源列表备用，写失败不该吞掉已经合并好的这一条。
+                        try:
+                            await asyncio.to_thread(self.store.insert, items)
+                        except Exception:
+                            pass
                 except asyncio.CancelledError:
                     raise
                 except Exception:

@@ -216,11 +216,14 @@ class BookItem:
 def merge_search_items(existing: list[BookItem], new_items: list[BookItem],
                        search_key: str, precision: bool = False) -> list[BookItem]:
     """Port SearchModel.mergeItems, including origin aggregation and ordering."""
-    equal, contains, other = [], [], []
+    equal, tags, contains, other = [], [], [], []
 
     def category(book: BookItem):
         if book.name == search_key or book.author == search_key:
             return equal
+        # 分类名命中关键词也算相关：搜索词经常是"玄幻"这类题材而不是书名。
+        if search_key and search_key in str(book.kind or ""):
+            return tags
         if search_key in book.name or search_key in book.author:
             return contains
         return other
@@ -240,8 +243,9 @@ def merge_search_items(existing: list[BookItem], new_items: list[BookItem],
             book.origins = book.origin_set()
             target.append(book)
     equal.sort(key=lambda item: len(item.origin_set()), reverse=True)
+    tags.sort(key=lambda item: len(item.origin_set()), reverse=True)
     contains.sort(key=lambda item: len(item.origin_set()), reverse=True)
-    return equal + contains + ([] if precision else other)
+    return equal + tags + contains + ([] if precision else other)
 
 
 @dataclass
@@ -745,20 +749,6 @@ class ReaderEngine:
         self._source_cookie_jars = {}
         self._sessions = {}
         self.last_response = None
-
-    def create_search_model(self, *, thread_count: int = 16,
-                            precision: bool = False, on_update=None,
-                            on_start=None, on_finish=None, on_cancel=None):
-        """Create the stateful multi-source search path used by the UI/API."""
-        from app.services.search_model import SearchBookStore, SearchModel
-
-        store = None
-        if self.state_dir is not None:
-            store = SearchBookStore(Path(self.state_dir) / "search-books.sqlite3")
-        return SearchModel(
-            self.search, thread_count=thread_count, precision=precision,
-            store=store, on_update=on_update, on_start=on_start,
-            on_finish=on_finish, on_cancel=on_cancel)
 
     def _cookie_jar_for_source(self, source=None):
         if source is None:
