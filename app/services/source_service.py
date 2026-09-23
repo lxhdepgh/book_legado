@@ -412,6 +412,27 @@ class SourceService:
         """另存为"""
         return self.save(path)
 
+    def update_source_rule(self, source_url: str, field: str, value: str,
+                           *, backup: bool = True) -> Path | None:
+        """改一条书源的规则字段并落盘，返回备份文件（没有可备份的返回 None）。"""
+        source = next((item for item in self._sources
+                       if item.bookSourceUrl == source_url), None)
+        if source is None:
+            raise KeyError(f"没有这条书源：{source_url}")
+        rules = dict(getattr(source, "ruleContent", None) or {})
+        rules[field] = value
+        source.ruleContent = rules
+        backup_path = None
+        if backup and self.sources_path.exists():
+            backup_path = self.sources_path.with_name(
+                self.sources_path.name + ".bak")
+            try:
+                shutil.copy2(self.sources_path, backup_path)
+            except OSError:
+                backup_path = None
+        self.save()
+        return backup_path
+
     @property
     def sources(self) -> list[BookSource]:
         return self._sources

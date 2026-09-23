@@ -286,7 +286,7 @@ async def _reading_chain_check(source, engine, candidates, timeout,
     result = {"reading_status": "skip", "reading_stage": "none",
               "reading_error": None, "chapter_count": None,
               "sample_book": None, "sample_chapter": None,
-              "reading_tried": 0}
+              "sample_chapter_urls": [], "reading_tried": 0}
     books = [item for item in candidates if getattr(item, "url", "")]
     if not books:
         return result
@@ -313,8 +313,12 @@ async def _reading_chain_check(source, engine, candidates, timeout,
             result["reading_stage"] = "catalog"
             chapters = await asyncio.wait_for(
                 engine.chapters(source, book), timeout=stage_timeout)
-            readable = next((item for item in chapters
-                             if not item.is_volume and getattr(item, "url", "")), None)
+            readable_chapters = [item for item in chapters
+                                 if not item.is_volume and getattr(item, "url", "")]
+            # 目录已经在手上，顺手把正文样本页地址留给规则自愈用。
+            result["sample_chapter_urls"] = [item.url
+                                             for item in readable_chapters[:3]]
+            readable = next(iter(readable_chapters), None)
             result["chapter_count"] = len([item for item in chapters if not item.is_volume])
             if readable is None:
                 raise RuntimeError("目录中没有可读取章节")

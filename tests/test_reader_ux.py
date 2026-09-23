@@ -925,6 +925,35 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
                          ["2", "1"])
 
 
+DESTROYED_SESSION = "An attempt to fetch destroyed session."
+
+
+class _ClosedPage:
+    """窗口关闭后的 Page：会话已被销毁，之后任何界面写入都会抛错。"""
+
+    width = 1000
+    platform = ft.PagePlatform.WINDOWS
+
+    def __init__(self):
+        self.scheduled = []
+        self.dialogs = []
+
+    @property
+    def session(self):
+        raise RuntimeError(DESTROYED_SESSION)
+
+    def update(self, *_controls):
+        raise RuntimeError(DESTROYED_SESSION)
+
+    def show_dialog(self, dialog):
+        self.dialogs.append(dialog)
+        raise RuntimeError(DESTROYED_SESSION)
+
+    def run_task(self, function, *args):
+        self.scheduled.append((function, args))
+        return asyncio.ensure_future(function(*args))
+
+
 class _ContentEngineStub:
     """按章节放行正文请求，用来观察谁在等谁。"""
 
@@ -1072,6 +1101,36 @@ class ChapterFetchPipelineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(prefetch_engine.closed, 1)
         self.assertIsNotNone(self._read_cached(second))
+
+    async def test_a_closed_window_does_not_break_the_content_tail(self):
+        """关窗销毁会话：滚动没有应答、刷新无处可写，都不能甩给 Future 回调。"""
+        chapter = ChapterItem("one", "https://source/1", index=0)
+        self._open_book([chapter])
+        page = _ClosedPage()
+        self.view._reader.scroll_to = AsyncMock(
+            side_effect=RuntimeError("Session closed"))
+        del self.view.update
+
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=page):
+            await self.view._run_content(chapter)
+
+        self.assertIs(self.view._current_chapter, chapter)
+        self.assertFalse(self.view._reading_loading)
+        self.assertIsNotNone(self._read_cached(chapter))
+        self.assertEqual(page.scheduled, [])
+
+    async def test_an_error_after_the_window_closed_only_updates_the_status(self):
+        chapter = ChapterItem("one", "https://source/1", index=0)
+        self._open_book([chapter])
+        page = _ClosedPage()
+
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=page):
+            self.view._show_error(RequestTimeoutError("连接超时：10 秒无响应"))
+
+        self.assertIn("连接超时：10 秒无响应", self.view._status.value)
+        self.assertEqual(page.dialogs, [])
 
     async def test_a_page_turn_during_a_load_is_not_swallowed(self):
         first = ChapterItem("one", "https://source/1", index=0)

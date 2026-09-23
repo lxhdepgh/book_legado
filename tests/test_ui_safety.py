@@ -23,6 +23,28 @@ class UiSafetyTests(unittest.TestCase):
         show_snack_bar(page, snack)
         self.assertEqual([snack], shown)
 
+    def test_snack_bar_skips_a_destroyed_session(self):
+        """关窗后的 SnackBar 无处可显示，也不该再去碰已经被销毁的会话。"""
+
+        class DeadPage:
+            @property
+            def session(self):
+                raise RuntimeError("An attempt to fetch destroyed session.")
+
+            def show_dialog(self, dialog):
+                raise AssertionError("销毁的会话不该被触碰")
+
+        self.assertFalse(
+            show_snack_bar(DeadPage(), ft.SnackBar(content=ft.Text("x"))))
+
+    def test_snack_bar_does_not_raise_when_the_session_closes_mid_call(self):
+        def boom(_snack):
+            raise RuntimeError("Session closed")
+
+        page = SimpleNamespace(show_dialog=boom)
+        self.assertFalse(
+            show_snack_bar(page, ft.SnackBar(content=ft.Text("x"))))
+
     def test_single_source_toggle_rolls_back_when_save_fails(self):
         source = BookSource(bookSourceName="A", bookSourceUrl="https://a")
         service = SimpleNamespace(sources=[source], save=lambda: None)

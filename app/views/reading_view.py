@@ -20,14 +20,17 @@ from app.services.rule_engine import (UnsupportedRule, parse_explore_categories,
                                       RequestConnectionError,
                                       RequestTimeoutError, display_intro,
                                       html_to_text)
-from app.services.reading_engine import LegadoReadingEngine, render_use_html_spans
+from app.services.rule_repair import rule_needs_script
+from app.views.rule_repair_ui import diagnose_and_offer
+from app.services.reading_engine import (ContentEmptyError, LegadoReadingEngine,
+                                         render_use_html_spans)
 from app.services.reading_cache import ReadingCache
 from app.services.search_model import SearchBookStore, SearchModel
 from app.services.headless_browser import available_fetcher
 from app.services.book_cache_service import WholeBookCacheService
 from app.services.reading_progress import ReadingProgressStore, ReadingSession
 from app.services.web_page_renderer import WebPageRenderer
-from app.ui_feedback import show_snack_bar
+from app.ui_feedback import page_is_alive, show_snack_bar
 
 # 找书与换源共用这一套：一轮要跑几百上千个互不相干的站点，并发可以比检测高，
 # 但单个站点慢或不响应不该拖住整轮。
@@ -2835,8 +2838,10 @@ class ReadingView(ft.Column):
             self._show_section("reader")
         except Exception as exc:
             if generation == self._content_generation:
+                label, action = self._repair_action(exc, chapter)
                 self._show_error(
-                    exc, retry=lambda: self._load_content(chapter))
+                    exc, retry=lambda: self._load_content(chapter),
+                    action=label, on_action=action)
         if generation != self._content_generation:
             # 更晚的加载已经接管界面：这次既不回写状态也不滚动。
             return
@@ -2855,20 +2860,18 @@ class ReadingView(ft.Column):
                 # temporary zero scroll extent.
                 if target_offset:
                     await asyncio.sleep(0.05)
-                await self._reader.scroll_to(
-                    offset=target_offset, duration=0)
+                await self._scroll_reader_to(target_offset)
                 if target_offset:
                     # Paragraph/image measurement can continue after the first
                     # frame in a frozen desktop build. Confirm once more after
                     # layout settles so the target cannot be clamped to zero.
                     await asyncio.sleep(0.15)
-                    await self._reader.scroll_to(
-                        offset=target_offset, duration=0)
+                    await self._scroll_reader_to(target_offset)
         finally:
             self._restoring_scroll = False
             self._reading_loading = False
             self.update()
-        if self._current_chapter is chapter:
+        if self._current_chapter is chapter and self._ui_alive():
             self._prefetch_task = self.page.run_task(
                 self._prefetch_next_chapters, chapter)
 
@@ -3459,6 +3462,29 @@ class ReadingView(ft.Column):
         if self._background_status:
             self._status.value = self._background_status
 
+    def _ui_alive(self) -> bool:
+        """关窗之后没有界面可写：后台任务应当就此收手。"""
+        try:
+            page = self.page
+        except RuntimeError:
+            return False
+        return page_is_alive(page)
+
+    def update(self, *args, **kwargs):
+        """关窗销毁会话后，界面写不进去也没有人看，收尾任务不必再抛错。"""
+        try:
+            super().update(*args, **kwargs)
+        except RuntimeError:
+            if self._ui_alive():
+                raise
+
+    async def _scroll_reader_to(self, offset):
+        """scroll_to 是要客户端应答的 invoke 调用：窗口没了就没人应答。"""
+        try:
+            await self._reader.scroll_to(offset=offset, duration=0)
+        except (RuntimeError, TimeoutError):
+            pass
+
     def _show_notice(self, message, retry=None, action=None, on_action=None):
         """Inline status line plus a dismissible SnackBar; errors add 重试."""
         self._background_status = None
@@ -3466,6 +3492,8 @@ class ReadingView(ft.Column):
         try:
             page = self.page
         except RuntimeError:
+            return
+        if not page_is_alive(page):
             return
         snack = ft.SnackBar(content=ft.Text(message, max_lines=3))
         label = action or ("重试" if retry is not None else None)
@@ -3481,7 +3509,50 @@ class ReadingView(ft.Column):
             snack.on_action = _run
         show_snack_bar(page, snack)
 
-    def _show_error(self, exc, retry=None, label=None):
+    def _show_error(self, exc, retry=None, label=None, action=None, on_action=None):
         prefix = label or ("当前书源暂不支持" if isinstance(exc, UnsupportedRule)
                            else "操作失败")
-        self._show_notice(f"{prefix}：{exc}", retry=retry)
+        self._show_notice(f"{prefix}：{exc}", retry=retry,
+                          action=action, on_action=on_action)
+
+    def _repair_action(self, exc, chapter):
+        """正文规则失配时，错误提示里直接给一条自愈入口。
+
+        重试只是把同一条规则再跑一次；规则没坏的时候才轮到它。
+        """
+        if (not isinstance(exc, ContentEmptyError) or
+                self.current_source is None or
+                rule_needs_script(self.current_source)):
+            return None, None
+        return ("查找正文规则",
+                lambda: self.page.run_task(self._repair_content_rule, chapter))
+
+    def _repair_samples(self, chapter):
+        """复核样本：同书另外两章，尽量避开相邻页。"""
+        readable = [item for item in self.chapters
+                    if not item.is_volume and item.url and item is not chapter]
+        if not readable:
+            return []
+        step = max(1, len(readable) // 3)
+        return readable[step::step][:2] or readable[:2]
+
+    async def _repair_content_rule(self, chapter):
+        """读到空正文时：本地挖候选、抽样复核，确认后写回书源再重读。"""
+        source = self.current_source
+        if source is None:
+            return
+        self._set_busy("正在诊断正文规则…")
+        try:
+            await diagnose_and_offer(
+                self.page, self.service, source, chapter,
+                book=self._current_book,
+                extra_chapters=self._repair_samples(chapter),
+                on_stage=self._set_busy,
+                on_applied=lambda: self.page.run_task(
+                    self._reload_after_repair, chapter))
+        finally:
+            self._restore_background_status()
+
+    async def _reload_after_repair(self, chapter):
+        self._cancel_prefetch(clear_cache=True)
+        self._load_content(chapter)

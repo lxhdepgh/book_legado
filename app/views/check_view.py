@@ -12,7 +12,10 @@ from app.services.check_service import (CHECK_CONCURRENCY, CHECK_MAX_CONCURRENCY
                                         CHECK_TAG_CATEGORIES,
                                         READING_CHAIN_CANDIDATES,
                                         TAG_SOURCE_CONCURRENCY, check_sources)
+from app.services.rule_engine import ChapterItem
+from app.services.rule_repair import rule_needs_script
 from app.ui_feedback import show_snack_bar
+from app.views.rule_repair_ui import diagnose_and_offer
 
 
 CHECK_STATE_LABELS = {
@@ -57,6 +60,7 @@ class CheckView(ft.Column):
         self.service = service
         self.file_picker = file_picker
         self._running = False
+        self._repairing = False
         self._results = {}
         self._retry_targets = None
         self._summary = ft.Text("尚未检测", color=ft.Colors.GREY_600)
@@ -423,7 +427,71 @@ class CheckView(ft.Column):
                             color=color),
             title=ft.Text(result["name"]),
             subtitle=ft.Text(self.detail_text(result)),
+            trailing=(ft.IconButton(ft.Icons.BUILD_OUTLINED,
+                                    tooltip="查找可用的正文规则（改前需确认）",
+                                    on_click=lambda event, row=result:
+                                    self._start_repair(row))
+                      if self._repairable(result) else None),
         )
+
+    def _repairable(self, result):
+        """只有"规则跑通了但正文为空"才有规则可找：网络和拦截修不了。"""
+        if result.get("reading_stage") != "content":
+            return False
+        if not result.get("sample_chapter_urls"):
+            return False
+        if result.get("reading_status") != "rule_error":
+            return False
+        source = self._source_for(result)
+        return source is not None and not rule_needs_script(source)
+
+    def _source_for(self, result):
+        url = result.get("raw_url")
+        return next((source for source in self.service.sources
+                     if source.bookSourceUrl == url), None)
+
+    def _start_repair(self, result):
+        if self._running:
+            self._show_notice("检测正在运行，先等这一轮跑完")
+            return
+        if self._repairing:
+            self._show_notice("上一条书源还在诊断中，先等它出结果")
+            return
+        source = self._source_for(result)
+        urls = [str(url) for url in (result.get("sample_chapter_urls") or []) if url]
+        if source is None or not urls:
+            self._show_notice("这条结果没有可用于诊断的章节地址")
+            return
+        self._repairing = True
+        self.page.run_task(self._repair_source, source, result)
+
+    async def _repair_source(self, source, result):
+        urls = [str(url) for url in (result.get("sample_chapter_urls") or []) if url]
+        chapter = ChapterItem(str(result.get("sample_chapter") or "样本 1"), urls[0])
+        extras = [ChapterItem(f"样本 {index + 2}", url)
+                  for index, url in enumerate(urls[1:3])]
+        try:
+            await diagnose_and_offer(
+                self.page, self.service, source, chapter, extra_chapters=extras,
+                on_stage=self._set_progress_text,
+                on_applied=lambda: self._recheck_after_repair(source))
+        finally:
+            self._repairing = False
+            self._summary.value = (f"共 {len(self._results)} 条结果"
+                                   if self._results else "尚未检测")
+            self._safe_update()
+
+    def _set_progress_text(self, text):
+        self._summary.value = text
+        self._safe_update()
+
+    def _recheck_after_repair(self, source):
+        """改完立刻自证一次：赢了就绿，输了还能再修。"""
+        if self._running:
+            self._show_notice("书源已更新，等这轮检测跑完再重测这一条")
+            return
+        self._retry_targets = [source]
+        self.page.run_task(self._run_check)
 
     # ── 导出 ──
 
