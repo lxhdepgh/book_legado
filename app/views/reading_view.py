@@ -24,6 +24,7 @@ from app.services.rule_repair import rule_needs_script
 from app.views.rule_repair_ui import diagnose_and_offer
 from app.services.reading_engine import (ContentEmptyError, LegadoReadingEngine,
                                          render_use_html_spans)
+from app.services.engine_worker import worker_engine
 from app.services.reading_cache import ReadingCache
 from app.services.search_model import SearchBookStore, SearchModel
 from app.services.headless_browser import available_fetcher
@@ -199,11 +200,13 @@ class ReadingView(ft.Column):
         self.renderer = WebPageRenderer(
             lambda: platform_support.attached_page(self),
             self._set_webview_hint)
-        self.engine = LegadoReadingEngine(
+        # 引擎跑在专属循环上（app/services/engine_worker.py）：目录/正文的规则
+        # 求值是同步的，放在界面循环上会把点击、滚动一起冻住。
+        self.engine = worker_engine(LegadoReadingEngine(
             webview_fetcher=self.renderer.render,
             verification_fetcher=self.renderer.verification_code,
             state_dir=service.data_dir,
-        )
+        ))
         self._current_chapter = None
         self._current_book = None
         self._pending_scroll_offset = 0.0
@@ -3569,9 +3572,9 @@ class ReadingView(ft.Column):
             kwargs["timeout"] = timeout
         if connect_timeout is not None:
             kwargs["connect_timeout"] = connect_timeout
-        return LegadoReadingEngine(webview_fetcher=available_fetcher(),
-                                   state_dir=self.service.data_dir,
-                                   background=True, **kwargs)
+        return worker_engine(LegadoReadingEngine(webview_fetcher=available_fetcher(),
+                                                 state_dir=self.service.data_dir,
+                                                 background=True, **kwargs))
 
     def _restore_background_status(self):
         if self._background_status:

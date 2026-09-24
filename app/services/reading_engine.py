@@ -347,6 +347,10 @@ class LegadoReadingEngine(ReaderEngine):
                          connect_timeout=connect_timeout, background=background)
         self.webview_fetcher = webview_fetcher
         self.verification_fetcher = verification_fetcher
+        # The engine may run on its own loop (app/services/engine_worker.py).
+        # The WebView and verification callbacks drive widgets, so they must run
+        # on the loop that owns those widgets, not on the engine's loop.
+        self.interaction_loop = None
         self.current_chapters: list[ChapterItem] = []
         self.js.reget_book_handler = self._js_reget_book
         self.js.refresh_book_handler = self._js_refresh_book
@@ -472,6 +476,18 @@ class LegadoReadingEngine(ReaderEngine):
         except OSError:
             pass
 
+    def _interaction_target_loop(self):
+        """The loop that owns the widgets behind the interaction callbacks."""
+        return self.interaction_loop or asyncio.get_running_loop()
+
+    async def _call_ui(self, func, *args):
+        """Await a widget-owning coroutine on the loop that owns the widgets."""
+        loop = self.interaction_loop
+        if loop is None or loop is asyncio.get_running_loop():
+            return await func(*args)
+        return await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(func(*args), loop))
+
     def _bind_interaction(self, source, loop):
         if self.webview_fetcher:
             self.js.browser_fetcher = lambda url, _title="", options=None: (
@@ -535,7 +551,7 @@ class LegadoReadingEngine(ReaderEngine):
 
     async def _resolve_rule_url(self, value: str, source, key: str = "",
                                 page: int = 1) -> str:
-        self._bind_interaction(source, asyncio.get_running_loop())
+        self._bind_interaction(source, self._interaction_target_loop())
         try:
             resolved = await super()._resolve_rule_url(value, source, key, page)
             # Remote search/explore scripts commonly return a new AnalyzeUrl
@@ -577,8 +593,7 @@ class LegadoReadingEngine(ReaderEngine):
             cookie_header = "; ".join(
                 f"{name}={morsel.value}" for name, morsel in aiohttp_cookies.items())
             self.js.import_cookie_header(response_url, cookie_header)
-            loop = asyncio.get_running_loop()
-            self._bind_interaction(source, loop)
+            self._bind_interaction(source, self._interaction_target_loop())
             try:
                 checked = await self.js.evaluate_async(
                     login_check,
@@ -610,10 +625,11 @@ class LegadoReadingEngine(ReaderEngine):
 
     async def _fetch_browser_response(self, url: str, source=None, options=None):
         try:
-            value = await self.webview_fetcher(url, source, options or {})
+            value = await self._call_ui(self.webview_fetcher, url, source,
+                                        options or {})
         except TypeError:
             # Preserve adapters written against the earlier two-argument API.
-            value = await self.webview_fetcher(url, source)
+            value = await self._call_ui(self.webview_fetcher, url, source)
         if isinstance(value, dict):
             body = str(value.get("body") or "")
             final_url = str(value.get("url") or url)
@@ -671,8 +687,7 @@ class LegadoReadingEngine(ReaderEngine):
             return None
         if not script.startswith(("@js:", "<js>")):
             script = "@js:" + script
-        loop = asyncio.get_running_loop()
-        self._bind_interaction(source, loop)
+        self._bind_interaction(source, self._interaction_target_loop())
         try:
             result = await self.js.evaluate_async(
                 script,
@@ -780,7 +795,8 @@ class LegadoReadingEngine(ReaderEngine):
         """Execute a loginUi button without persisting its current fields."""
         if re.match(r"^https?://", str(action or ""), flags=re.I):
             if self.webview_fetcher:
-                return await self.webview_fetcher(str(action), source)
+                return await self._call_ui(self.webview_fetcher, str(action),
+                                           source)
             self.js._start_browser(str(action), "")
             return None
         login_url = self._login_script(source).strip()
@@ -789,13 +805,13 @@ class LegadoReadingEngine(ReaderEngine):
         if not action and target:
             if not self.webview_fetcher:
                 raise RuntimeError("该书源需要网页登录，但当前平台未配置网页交互")
-            return await self.webview_fetcher(target, source)
+            return await self._call_ui(self.webview_fetcher, target, source)
         script = "@js:" + (
             f"var __login={json.dumps(login_url, ensure_ascii=False)};"
             "if(__login && !/^https?:\\/\\//i.test(__login)){eval(__login);}" 
             f"eval({json.dumps(str(action or ''), ensure_ascii=False)});"
         )
-        self._bind_interaction(source, asyncio.get_running_loop())
+        self._bind_interaction(source, self._interaction_target_loop())
         try:
             return await self.js.evaluate_async(
                 script,
@@ -820,7 +836,7 @@ class LegadoReadingEngine(ReaderEngine):
             login_js + "\nif(typeof login==='function'){login.apply(this);}" +
             "else{throw('Function login not implements!!!')}"
         )
-        self._bind_interaction(source, asyncio.get_running_loop())
+        self._bind_interaction(source, self._interaction_target_loop())
         try:
             return await self.js.evaluate_async(
                 script,
@@ -1296,7 +1312,7 @@ class LegadoReadingEngine(ReaderEngine):
         if pre_update:
             if not pre_update.startswith(("@js:", "<js>")):
                 pre_update = "@js:" + pre_update
-            self._bind_interaction(source, asyncio.get_running_loop())
+            self._bind_interaction(source, self._interaction_target_loop())
             try:
                 await self.js.evaluate_async(
                     pre_update,
