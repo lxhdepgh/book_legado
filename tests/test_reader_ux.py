@@ -38,6 +38,9 @@ class ReaderInteractionTests(unittest.IsolatedAsyncioTestCase):
         service = SimpleNamespace(
             data_dir=Path(self.directory.name), sources=[], bookshelf=[],
             category_checks={})
+        # 书架渲染要按 in_bookshelf 过滤试读记录：替身借用真实实现的过滤。
+        service.is_shelved = SourceService.is_shelved
+        service.shelved_books = lambda: SourceService.shelved_books(service)
         self.view = ReadingView(service)
 
     async def asyncTearDown(self):
@@ -1858,6 +1861,293 @@ class AllSourceSearchTests(unittest.IsolatedAsyncioTestCase):
              for tile in self.view._source_switch_results.controls],
             # 书名完全一致的两条在前，同分时按候选顺序（甲源在乙源之前）。
             ["寻秦记", "寻秦记", "寻秦记 后传"])
+
+
+class _AppPageStub(_SwitchPageStub):
+    """够 BookSourceApp.build() 跑起来的 Page 替身：不接前端，只记挂载结果。"""
+
+    def __init__(self):
+        super().__init__()
+        self.controls = []
+        self.services = []
+        self.window = SimpleNamespace(width=1100, height=780,
+                                      min_width=720, min_height=600)
+        self.platform = ft.PagePlatform.WINDOWS
+        self.width = 1100
+
+    def add(self, *controls):
+        self.controls.extend(controls)
+
+    def update(self, *targets):
+        pass
+
+
+class FoundBookReadingTests(unittest.IsolatedAsyncioTestCase):
+    """找书页开读：找到书就直接进正文，不再先加书架、再去书架里找它。"""
+
+    async def asyncSetUp(self):
+        self.directory = TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.service = SourceService(self.root, data_dir=self.root / "data")
+        self.source = BookSource(bookSourceName="甲站",
+                                 bookSourceUrl="https://a.test")
+        self.service.sources = [self.source]
+        self.page = _SwitchPageStub()
+        self.view = ReadingView(self.service, discovery_only=True)
+        self.view.update = lambda: None
+        patcher = patch.object(ReadingView, "page", new_callable=PropertyMock,
+                               return_value=self.page)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addAsyncCleanup(self.view.engine.aclose)
+        self.addCleanup(self.directory.cleanup)
+
+    def _book(self, name="寻秦记", url="https://a.test/book"):
+        return BookItem(name, url=url, origin=self.source.bookSourceUrl)
+
+    def _reader(self):
+        """一本已缓存目录的书要用的阅读页：正文链路全程离线。"""
+        reader = ReadingView(self.service)
+        reader.update = lambda: None
+        reader.engine.chapters = AsyncMock(
+            side_effect=AssertionError("目录已缓存，不该联网"))
+        self.addAsyncCleanup(reader.engine.aclose)
+        return reader
+
+    async def test_a_result_row_can_read_the_book_instead_of_only_shelving_it(self):
+        book = self._book()
+        handed = []
+        self.view._on_read_book = lambda source, found: handed.append(
+            (source, found))
+
+        row = self.view._book_control(book)
+        read_button, shelf_button = row.trailing.controls
+        self.assertEqual("直接阅读", read_button.tooltip)
+        self.assertEqual("加入书架", shelf_button.tooltip)
+
+        read_button.on_click(None)
+
+        self.assertEqual([(self.source, book)], handed)
+        self.assertEqual([], self.service.bookshelf)
+
+    async def test_the_detail_dialog_reads_the_book_without_shelving_first(self):
+        book = self._book()
+        handed = []
+        self.view._on_read_book = lambda source, found: handed.append(
+            (source, found))
+
+        async def book_info(_source, target):
+            return target
+
+        self.view.engine.book_info = book_info
+        self.view._show_book_detail(book)
+        # A dialog that was never mounted cannot push its own update.
+        self.view._book_detail_dialog.update = lambda: None
+        await self.page.tasks[-1]
+
+        dialog = self.view._book_detail_dialog
+        self.assertEqual(["关闭", "加入书架", "开始阅读"],
+                         [action.content for action in dialog.actions])
+        dialog.actions[-1].on_click(None)
+
+        self.assertEqual([(self.source, book)], handed)
+        self.assertEqual([], self.page.dialogs)
+
+    async def test_open_book_shelves_the_book_and_starts_reading_it(self):
+        reader = self._reader()
+        book = self._book()
+        chapter = ChapterItem("第一章", "https://a.test/1", index=0)
+        reader.reading_cache.save_catalog(
+            self.source.bookSourceUrl, book.url, [chapter])
+
+        reader.open_book(self.source, book)
+        await reader._book_open_task
+
+        self.assertIs(reader._current_book, book)
+        self.assertEqual("detail", reader._section)
+        self.assertEqual([("甲站", book.url, "寻秦记")],
+                         [(item["source_name"], item["url"], item["name"])
+                          for item in self.service.bookshelf])
+        self.assertEqual([chapter.url], [item.url for item in reader.chapters])
+
+    async def test_open_book_resumes_a_shelved_book_at_its_saved_chapter(self):
+        reader = self._reader()
+        book = self._book()
+        saved = ChapterItem("第二章", "https://a.test/2", index=1)
+        reader.reading_cache.save_catalog(self.source.bookSourceUrl, book.url, [
+            ChapterItem("第一章", "https://a.test/1", index=0), saved])
+        self.service.add_to_bookshelf(self.source, book)
+        self.service.update_bookshelf_state(
+            self.source.bookSourceUrl, book.url, chapter=saved,
+            scroll_offset=120.0)
+        reader._run_content = AsyncMock()
+
+        reader.open_book(self.source, book)
+        await reader._book_open_task
+
+        # 已在书架的书不重复入库，但位置要接着上次读。
+        self.assertEqual(1, len(self.service.bookshelf))
+        self.assertEqual(saved.url, reader._run_content.await_args.args[0].url)
+        self.assertEqual(120.0, reader._run_content.await_args.args[2])
+
+    async def test_reading_a_found_book_keeps_it_off_the_shelf(self):
+        reader = self._reader()
+        book = self._book()
+        chapter = ChapterItem("第一章", "https://a.test/1", index=0)
+        reader.reading_cache.save_catalog(
+            self.source.bookSourceUrl, book.url, [chapter])
+
+        reader.open_book(self.source, book, shelve=False)
+        await reader._book_open_task
+
+        # 进度、变量、目录缓存都要写回这条记录，所以记录必须在；
+        # 只是书架列表不认它（对齐 Legado 的 BookType.notShelf）。
+        record = self.service.bookshelf[0]
+        self.assertEqual(book.url, record["url"])
+        self.assertFalse(self.service.is_shelved(record))
+        self.assertEqual([], self.service.shelved_books())
+        self.assertIs(reader._current_book, book)
+
+    async def test_leaving_a_staged_book_asks_whether_to_shelve_it(self):
+        back = []
+        reader = self._reader()
+        reader._on_back_to_find_book = lambda: back.append(True)
+        book = self._book()
+        reader.reading_cache.save_catalog(
+            self.source.bookSourceUrl, book.url,
+            [ChapterItem("第一章", "https://a.test/1", index=0)])
+        reader.open_book(self.source, book, shelve=False)
+        await reader._book_open_task
+        self.page.dialogs.clear()
+
+        reader._back_to_shelf(None)
+
+        dialog = self.page.dialogs[-1]
+        self.assertEqual(["不放入", "放入书架"],
+                         [action.content for action in dialog.actions])
+        self.assertEqual([], back)
+
+        dialog.actions[1].on_click(None)
+
+        self.assertNotIn(dialog, self.page.dialogs)
+        self.assertTrue(self.service.is_shelved(self.service.bookshelf[0]))
+        # 书进了书架，但人是从找书进来的，落回找书页。
+        self.assertEqual([True], back)
+
+    async def test_leaving_a_staged_book_without_shelving_drops_record_and_cache(self):
+        back = []
+        reader = self._reader()
+        reader._on_back_to_find_book = lambda: back.append(True)
+        book = self._book()
+        reader.reading_cache.save_catalog(
+            self.source.bookSourceUrl, book.url,
+            [ChapterItem("第一章", "https://a.test/1", index=0)])
+        reader.open_book(self.source, book, shelve=False)
+        await reader._book_open_task
+        self.page.dialogs.clear()
+
+        reader._back_to_shelf(None)
+        self.page.dialogs[-1].actions[0].on_click(None)
+
+        self.assertEqual([], self.service.bookshelf)
+        self.assertIsNone(reader.reading_cache.load_catalog(
+            self.source.bookSourceUrl, book.url))
+        self.assertEqual([True], back)
+
+    async def test_a_shelved_book_still_leaves_the_reader_without_a_prompt(self):
+        reader = self._reader()
+        book = self._book()
+        reader.reading_cache.save_catalog(
+            self.source.bookSourceUrl, book.url,
+            [ChapterItem("第一章", "https://a.test/1", index=0)])
+        reader.open_book(self.source, book)
+        await reader._book_open_task
+        self.page.dialogs.clear()
+
+        reader._back_to_shelf(None)
+
+        self.assertEqual([], self.page.dialogs)
+        self.assertEqual("shelf", reader._section)
+
+    async def test_the_app_hands_a_found_book_to_the_reading_page(self):
+        (self.root / "bookSource.json").write_text(json.dumps([
+            {"bookSourceName": "甲站", "bookSourceUrl": "https://a.test",
+             "searchUrl": "https://a.test/search?key=${key}"}],
+            ensure_ascii=False), encoding="utf-8")
+        page = _AppPageStub()
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=page):
+            with patch.dict("os.environ", {
+                    "LEGADO_BOOKSOURCE_DATA_DIR": str(self.root / "app-data"),
+                    "LEGADO_BOOKSOURCE_CACHE_DIR": str(self.root / "app-cache")},
+                    clear=False):
+                app = BookSourceApp(self.root)
+                app.build(page)
+                self.addAsyncCleanup(app._reading_view.engine.aclose)
+                self.addAsyncCleanup(app._discover_view.engine.aclose)
+                source = app.service.sources[0]
+                book = BookItem("寻秦记", url="https://a.test/book",
+                                origin=source.bookSourceUrl)
+                chapter = ChapterItem("第一章", "https://a.test/1", index=0)
+                app._reading_view.reading_cache.save_catalog(
+                    source.bookSourceUrl, book.url, [chapter])
+                app._reading_view.engine.chapters = AsyncMock(
+                    side_effect=AssertionError("目录已缓存，不该联网"))
+
+                self.assertEqual(app._discover_view._on_read_book,
+                                 app._open_found_book)
+                app._navigate_to(0)
+                app._discover_view._start_reading(book)
+
+                self.assertEqual(1, app._current_index)
+                await app._reading_view._book_open_task
+
+                self.assertIs(app._reading_view._current_book, book)
+                self.assertEqual([chapter.url],
+                                 [item.url for item in app._reading_view.chapters])
+                # 找书里开读的是试读：记录留着写进度，书架列表里没有它。
+                record = app.service.bookshelf[0]
+                self.assertEqual(book.url, record["url"])
+                self.assertFalse(app.service.is_shelved(record))
+                self.assertEqual([], app.service.shelved_books())
+
+                app._reading_view._on_back_to_find_book()
+                self.assertEqual(0, app._current_index)
+
+    async def test_a_restart_drops_a_staged_record_and_its_cache(self):
+        (self.root / "bookSource.json").write_text(json.dumps([
+            {"bookSourceName": "甲站", "bookSourceUrl": "https://a.test",
+             "searchUrl": "https://a.test/search?key=${key}"}],
+            ensure_ascii=False), encoding="utf-8")
+        data_dir = self.root / "app-data"
+        cache_dir = self.root / "app-cache"
+        data_dir.mkdir(parents=True)
+        (data_dir / "bookshelf.json").write_text(json.dumps([
+            {"name": "寻秦记", "url": "https://a.test/book",
+             "source_url": "https://a.test", "in_bookshelf": False},
+            {"name": "留在书架上的书", "url": "https://a.test/kept",
+             "source_url": "https://a.test"}], ensure_ascii=False),
+            encoding="utf-8")
+        ReadingCache(cache_dir).save_catalog(
+            "https://a.test", "https://a.test/book",
+            [ChapterItem("第一章", "https://a.test/1", index=0)])
+        page = _AppPageStub()
+        with patch.object(ReadingView, "page", new_callable=PropertyMock,
+                          return_value=page):
+            with patch.dict("os.environ", {
+                    "LEGADO_BOOKSOURCE_DATA_DIR": str(data_dir),
+                    "LEGADO_BOOKSOURCE_CACHE_DIR": str(cache_dir)},
+                    clear=False):
+                app = BookSourceApp(self.root)
+                app.build(page)
+                self.addAsyncCleanup(app._reading_view.engine.aclose)
+                self.addAsyncCleanup(app._discover_view.engine.aclose)
+
+                # 没读完的试读不跨会话，缓存也跟着清掉；书架自己的书不受影响。
+                self.assertEqual(["留在书架上的书"],
+                                 [item["name"] for item in app.service.bookshelf])
+                self.assertIsNone(ReadingCache(cache_dir).load_catalog(
+                    "https://a.test", "https://a.test/book"))
 
 
 class PersistentReadingTests(unittest.TestCase):

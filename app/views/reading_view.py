@@ -179,11 +179,16 @@ class ReadingView(ft.Column):
     PREFETCH_CACHE_LIMIT = 64 * 1024 * 1024
 
     def __init__(self, service, discovery_only=False, on_section_change=None,
-                 on_open_settings=None):
+                 on_open_settings=None, on_read_book=None,
+                 on_back_to_find_book=None):
         super().__init__(spacing=0, expand=True)
         self.service = service
         self._on_section_change = on_section_change
         self._on_open_settings = on_open_settings
+        # 找书页自己不承载正文，只把 (书源, 书) 交给阅读页，由它去打开。
+        self._on_read_book = on_read_book
+        # 从找书开读的书不在书架里，退出时落回找书页而不是书架页。
+        self._on_back_to_find_book = on_back_to_find_book
         self.reading_cache = ReadingCache(getattr(service, "cache_dir", service.data_dir))
         self.whole_book_cache = WholeBookCacheService(
             getattr(service, "cache_dir", service.data_dir), service.data_dir)
@@ -1388,12 +1393,31 @@ class ReadingView(ft.Column):
             subtitle=ft.Text(" · ".join(
                 x for x in [book.author, self._source_label(book),
                             _intro_text(book.intro)[:80]] if x)),
-            trailing=ft.IconButton(
-                ft.Icons.BOOKMARK_ADD_OUTLINED, tooltip="加入书架",
-                on_click=lambda e, selected=book: self._add_to_bookshelf(selected),
-            ),
+            # 搜索结果要能直接开读：加入书架只是另一种去处，不该是唯一出口。
+            trailing=ft.Row(tight=True, spacing=0, controls=[
+                ft.IconButton(
+                    ft.Icons.PLAY_ARROW, tooltip="直接阅读",
+                    on_click=lambda e, selected=book:
+                    self._start_reading(selected)),
+                ft.IconButton(
+                    ft.Icons.BOOKMARK_ADD_OUTLINED, tooltip="加入书架",
+                    on_click=lambda e, selected=book:
+                    self._add_to_bookshelf(selected)),
+            ]),
             on_click=lambda e, selected=book: self._show_book_detail(selected),
         )
+
+    def _start_reading(self, book):
+        """Read a found book now, instead of shelving it and hunting for it later."""
+        source = self._source_for_book(book)
+        if source is None:
+            self._show_notice(f"《{book.name}》找不到对应书源，无法打开")
+            return
+        if self._on_read_book is not None:
+            # 找书页只是入口：正文在阅读页里，切换标签页由上层来安排。
+            self._on_read_book(source, book)
+            return
+        self.open_book(source, book, shelve=False)
 
     def _show_book_detail(self, book):
         source = self._source_for_book(book)
@@ -1457,12 +1481,21 @@ class ReadingView(ft.Column):
             content=ft.ListView(controls=controls, spacing=8))
         self._book_detail_dialog.actions = [
             ft.TextButton("关闭", on_click=self._close_book_detail),
-            ft.Button(
+            ft.TextButton(
                 "加入书架", icon=ft.Icons.BOOKMARK_ADD_OUTLINED,
                 on_click=lambda e, selected=book:
                 self._add_detail_to_bookshelf(selected)),
+            ft.Button(
+                "开始阅读", icon=ft.Icons.PLAY_ARROW,
+                on_click=lambda e, selected=book:
+                self._read_detail_book(selected)),
         ]
         self._book_detail_dialog.update()
+
+    def _read_detail_book(self, book):
+        # 对话框是页面级的，切标签页之前必须先收掉它。
+        self._close_book_detail(None)
+        self._start_reading(book)
 
     def _add_detail_to_bookshelf(self, book):
         self._add_to_bookshelf(book)
@@ -1501,8 +1534,10 @@ class ReadingView(ft.Column):
 
     def _render_bookshelf(self):
         query = str(self._bookshelf_query.value or "").strip().lower()
+        # 找书试读的临时记录留在库里给进度用，但书架不认它们。
+        shelf = self.service.shelved_books()
         groups = sorted({str(item.get("groupName") or "").strip()
-                         for item in self.service.bookshelf
+                         for item in shelf
                          if str(item.get("groupName") or "").strip()})
         group_value = self._bookshelf_group.value or "__all__"
         self._bookshelf_group.options = [
@@ -1512,7 +1547,7 @@ class ReadingView(ft.Column):
             ft.dropdown.Option("__none__", "未分组"),
             *[ft.dropdown.Option(group, group) for group in groups],
         ]
-        items = [item for item in self.service.bookshelf if not query or query in
+        items = [item for item in shelf if not query or query in
                  f"{item.get('name', '')} {item.get('author', '')}".lower()]
         if group_value == "__unread__":
             items = [item for item in items if
@@ -1541,7 +1576,7 @@ class ReadingView(ft.Column):
             items.sort(key=lambda item: int((self.service.reading_state(item) or {}).get(
                 "last_read_at") or 0), reverse=True)
         recent = max(
-            self.service.bookshelf,
+            shelf,
             key=lambda item: int((self.service.reading_state(item) or {}).get(
                 "last_read_at") or 0), default=None)
         recent_state = self.service.reading_state(recent) if recent else None
@@ -1576,7 +1611,7 @@ class ReadingView(ft.Column):
                 ], spacing=8)))
         list_controls = [self._shelf_control(item) for item in items]
         grid_controls = [self._shelf_grid_control(item) for item in items]
-        if not self.service.bookshelf:
+        if not shelf:
             list_controls = [self._empty_bookshelf_control()]
             grid_controls = [self._empty_bookshelf_control()]
         # Replacing the keyed collection root prevents Flet 0.86 from retaining
@@ -1597,7 +1632,7 @@ class ReadingView(ft.Column):
         # Only the visible line is replaced here: a running background task
         # keeps its own text in `_background_status` so did_mount can put it
         # back when the tab returns.
-        self._status.value = (f"书架中有 {len(self.service.bookshelf)} 本书"
+        self._status.value = (f"书架中有 {len(shelf)} 本书"
                               + (f"，当前显示 {len(items)} 本" if query else ""))
 
     @staticmethod
@@ -2326,7 +2361,7 @@ class ReadingView(ft.Column):
             self._run_refresh_bookshelf)
 
     async def _run_refresh_bookshelf(self):
-        candidates = [item for item in list(self.service.bookshelf)
+        candidates = [item for item in self.service.shelved_books()
                       if item.get("canUpdate", True)]
         self._bookshelf_refresh_btn.disabled = True
         try:
@@ -2391,11 +2426,35 @@ class ReadingView(ft.Column):
             download_urls=item.get("download_urls", ""),
             variables=item.get("variables") or {})
 
+    def open_book(self, source, book, shelve=True):
+        """Open a book in the reader, without a trip through the shelf.
+
+        The reading record is what progress, rule variables and the catalog
+        cache are written back to, so one is always created.  `shelve=False`
+        stages it for 找书试读 (Legado's BookType.notShelf): the shelf list
+        hides it, and 返回 asks whether the book should join the shelf.
+        """
+        if source is None or book is None:
+            return
+        added = self.service.add_to_bookshelf(source, book, shelved=shelve)
+        record = self._shelf_record(source, book)
+        self._show_book(source, book,
+                        self.service.reading_state(record) if record else None)
+        if added and self._ui_alive():
+            show_snack_bar(self.page, ft.SnackBar(content=ft.Text(
+                f"《{book.name}》已加入书架，正在打开" if shelve else
+                f"《{book.name}》未加入书架，正在打开")))
+
+    def _shelf_record(self, source, book):
+        """The live shelf record of a book, or None while it is not shelved."""
+        key = (str(getattr(source, "bookSourceUrl", "") or ""),
+               str(getattr(book, "url", "") or ""))
+        for record in self.service.bookshelf:
+            if self.service.bookshelf_key(record) == key:
+                return record
+        return None
+
     def _open_shelf_item(self, item):
-        # Persist the old book before replacing any of its context. Previously
-        # the second book became current first, so the first book's chapter was
-        # accidentally saved into the second one's progress record.
-        self._persist_scroll_position()
         source = self._shelf_source(item)
         if source is None:
             # 死路会让人以为书废了：这里直接给出换源入口。
@@ -2404,14 +2463,20 @@ class ReadingView(ft.Column):
                 action="切换书源",
                 on_action=lambda: self._show_source_switch(item))
             return
-        self._reset_book_session(book_name=item.get("name") or "")
+        self._show_book(source, self._book_from_shelf(item),
+                        self.service.reading_state(item))
+
+    def _show_book(self, source, book, reading=None):
+        # Persist the old book before replacing any of its context. Previously
+        # the second book became current first, so the first book's chapter was
+        # accidentally saved into the second one's progress record.
+        self._persist_scroll_position()
+        self._reset_book_session(book_name=book.name or "")
         self.current_source = source
-        book = self._book_from_shelf(item)
         self._book_open_generation += 1
         generation = self._book_open_generation
         if self._book_open_task and not self._book_open_task.done():
             self._book_open_task.cancel()
-        reading = self.service.reading_state(item)
         self._detail_resume = reading
         self._show_shelf_book_detail(book)
         self._book_open_task = self.page.run_task(
@@ -2504,9 +2569,56 @@ class ReadingView(ft.Column):
         self._book_open_generation += 1
         if self._book_open_task and not self._book_open_task.done():
             self._book_open_task.cancel()
+        record = self._current_shelf_record()
+        if record is not None and not self.service.is_shelved(record):
+            self._ask_about_staged_book(record)
+            return
+        self._leave_reader()
+
+    def _current_shelf_record(self):
+        """The live record of whatever the reader has open, shelved or staged."""
+        book = self._current_book or self._detail_book
+        if book is None or self.current_source is None:
+            return None
+        return self._shelf_record(self.current_source, book)
+
+    def _ask_about_staged_book(self, record):
+        """Legado's 「返回时提示放入书架」: ask before a 试读 record is dropped."""
+        name = record.get("name") or "这本书"
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("放入书架"),
+            content=ft.Text(f"是否将《{name}》放入书架？\n"
+                            "不放入会删除这本书的阅读进度与缓存。"),
+            actions=[
+                ft.TextButton("不放入", on_click=lambda e,
+                              selected=record: self._discard_staged_book(selected)),
+                ft.Button("放入书架", on_click=lambda e,
+                          selected=record: self._shelve_staged_book(selected)),
+            ],
+        )
+        self.page.show_dialog(dialog)
+
+    def _shelve_staged_book(self, record):
+        self.page.pop_dialog()
+        self.service.promote_to_bookshelf(*self.service.bookshelf_key(record))
+        self._leave_reader(back_to_find_book=True)
+        if self._ui_alive():
+            show_snack_bar(self.page, ft.SnackBar(content=ft.Text(
+                f"《{record.get('name') or '未命名'}》已加入书架")))
+
+    def _discard_staged_book(self, record):
+        self.page.pop_dialog()
+        # 不放入书架 = 读完就散：记录、进度和缓存一起清掉。
+        self._remove_shelf_item(record)
+        self._leave_reader(back_to_find_book=True)
+
+    def _leave_reader(self, back_to_find_book: bool = False):
         self._show_section("shelf")
         self._render_bookshelf()
         self.update()
+        if back_to_find_book and self._on_back_to_find_book is not None:
+            self._on_back_to_find_book()
 
     def _continue_from_detail(self, _):
         # The detail page can stay mounted for the whole reading session. Do

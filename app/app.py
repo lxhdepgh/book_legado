@@ -57,10 +57,13 @@ class BookSourceApp:
                             bgcolor=ft.Colors.RED_100))
 
         # 创建视图
-        self._discover_view = ReadingView(self.service, discovery_only=True)
+        self._discover_view = ReadingView(
+            self.service, discovery_only=True,
+            on_read_book=self._open_found_book)
         self._reading_view = ReadingView(
             self.service, on_section_change=self._on_reading_section_change,
-            on_open_settings=lambda: self._navigate_to(2))
+            on_open_settings=lambda: self._navigate_to(2),
+            on_back_to_find_book=lambda: self._navigate_to(0))
         self._book_source_view = BookSourceView(
             self.service,
             on_imported=self._on_imported,
@@ -72,6 +75,10 @@ class BookSourceApp:
             on_saved=self._appearance_message,
             reader_view=self._reading_view,
         )
+
+        # 上次运行没读完的试读不跨会话：对齐 Legado 启动时清理 notShelf 残留。
+        for source_url, book_url in self.service.discard_unshelved_books():
+            self._reading_view.reading_cache.remove_book(source_url, book_url)
 
         # 主页容器
         content = ft.Container(
@@ -181,6 +188,13 @@ class BookSourceApp:
         self._side_nav.label_type = (
             ft.NavigationRailLabelType.NONE if self._side_nav.extended
             else ft.NavigationRailLabelType.SELECTED)
+
+    def _open_found_book(self, source, book):
+        """找书页找到的书直接开读：切到阅读页，先当试读、不加入书架。"""
+        if self._reading_view is None or self._page is None:
+            return
+        self._navigate_to(1)
+        self._reading_view.open_book(source, book, shelve=False)
 
     def _on_reading_section_change(self, section: str):
         immersive = section == "reader" and self._current_index == 1

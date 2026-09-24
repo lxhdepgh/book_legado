@@ -175,11 +175,18 @@ class SourceService:
             json.dumps(self.bookshelf, ensure_ascii=False, indent=2), encoding="utf-8")
         temp_path.replace(path)
 
-    def add_to_bookshelf(self, source: BookSource, book) -> bool:
+    def add_to_bookshelf(self, source: BookSource, book, shelved: bool = True) -> bool:
+        """Add a reading record.  `shelved=False` stages it for 找书试读。
+
+        A staged record carries progress, rule variables and the catalog cache
+        exactly like a shelf one; the shelf list just filters it out.  This is
+        Legado's BookType.notShelf: the book row exists, `BookDao` hides it.
+        """
         key = (source.bookSourceUrl, book.url)
         if any((item.get("source_url"), item.get("url")) == key for item in self.bookshelf):
             return False
         self.bookshelf.append({
+            "in_bookshelf": bool(shelved),
             "name": book.name, "author": book.author, "intro": book.intro,
             "url": book.url, "cover_url": book.cover_url,
             "toc_url": getattr(book, "toc_url", ""),
@@ -215,6 +222,42 @@ class SourceService:
             self.save_bookshelf()
             return True
         return False
+
+    @staticmethod
+    def is_shelved(item: dict) -> bool:
+        """Whether a record belongs on the shelf; files without the flag are."""
+        return bool(item.get("in_bookshelf", True))
+
+    def shelved_books(self) -> list[dict]:
+        """The records the shelf UI may show, staged 找书试读 records excluded."""
+        return [item for item in self.bookshelf if self.is_shelved(item)]
+
+    def promote_to_bookshelf(self, source_url: str, book_url: str) -> bool:
+        """Turn a staged record into a shelf one, keeping its reading state."""
+        key = (str(source_url or ""), str(book_url or ""))
+        for item in self.bookshelf:
+            if self.bookshelf_key(item) != key:
+                continue
+            if self.is_shelved(item):
+                return False
+            item["in_bookshelf"] = True
+            self.save_bookshelf()
+            return True
+        return False
+
+    def discard_unshelved_books(self) -> list[tuple[str, str]]:
+        """Drop staged records left behind by an earlier session.
+
+        Legado does the same in MainViewModel.init: a book that was read from
+        搜索 but never shelved does not survive a restart.  The keys are
+        returned so callers can clear those books' caches too.
+        """
+        discarded = [self.bookshelf_key(item) for item in self.bookshelf
+                     if not self.is_shelved(item)]
+        if discarded:
+            self.bookshelf = self.shelved_books()
+            self.save_bookshelf()
+        return discarded
 
     @staticmethod
     def bookshelf_key(item: dict) -> tuple[str, str]:
