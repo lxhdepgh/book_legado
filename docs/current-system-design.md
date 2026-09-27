@@ -726,7 +726,9 @@ submit_login / login_target`，`tests/test_legado_compat.py` 有对拍），断�
 2. **`flet_video` 懒建**：原生插件，读小说的人不该在打开阅读器时就付它的加载成本；
    控件只在第一次起播时 import + 构造。
 3. **先上屏再下发**：`playlist` 赋值和 `play()` 必须在控件已有 `page` 之后发，否则命令
-   落进空管道。服务侧的顺序是 open → play → seek，位置回读用 `get_current_position()`。
+   落进空管道。换片的「要播」意图**与换源同一条消息**下发（`playlist=[media]` +
+   `autoplay=True`，不再补 `play()`）；叫停在控件上落的是 `pause()` 而不是 `stop()`。
+   两条都是 web 面实测出来的（见下"web 面的三处实错"），位置回读用 `get_current_position()`。
 4. **服务在引擎循环、控件在界面循环**：控制器碰控件一律走 `ui_call` / `ui_await`
    （§5.3、`engine-hub-loop-split`）。测试与探针要**自己** `set_ui_loop(...)`——生产由
    `build_app_shell` 登记，绕开装配层的探针不登记，则 `ui_call` 退回引擎守护循环，
@@ -735,17 +737,47 @@ submit_login / login_target`，`tests/test_legado_compat.py` 有对拍），断�
 播放进度与阅读进度**分列**存储（v7 `books.play_chapter_index` + `play_position`，见 §6）；
 书架行"读到第几章"仍只跟阅读进度，不随播放推进（差距已记 §1.4）。
 
-连播（第二十二轮接上）：客户端 `on_complete` → `VideoPlayBar.on_ended` →
+连播（第二十二轮接上，第二十四轮取证）：客户端 `on_complete` → `VideoPlayBar.on_ended` →
 `ReaderController.video_ended` → 服务 `mark_ended()`（清了位置再发 `ended` 态）→
 `_finish_video_entry()` 按列表顺序点下一条。三条闸门都是必要的：
 **只认"正在放"**（停止/收起后客户端还会补发完成事件，照单连播会把刚收掉的播放器点亮回来）、
 **等落库期间换条/切页就放弃**（`index != self._video_index` 或 `_view is None`）、
 **报错不连播**（书源里的视频常常整本都坏，连播就是一路错到底）。片尾位置必须清零，
-否则"接着看"从那一秒起播。护栏 `tests/test_reader_video_panel.py` + `test_media_play_m4.py`
-（含 7 条变异核验，其中"绕回第一条"那条第一轮是**绿的**——"没发生"的判据写得会在
-"该发生的"落账那一刻就成立，见 dev 日志第二十二轮）。真实挂载面由离线浏览器探针取证
-（Playwright 点语义树 + 回环假视频源，见 `flet-web-probe-ui-verification`），静态测试桩掉了
-`ftv.Video` 这一面；**"客户端真产 `on_complete`"这一环仍在探针修，未取证**。
+否则"接着看"从那一秒起播。
+
+**web 面的三处实错**（`.probe/probe_complete_source.py` / `probe_stop_recovery.py` 用
+ffmpeg 现制的 6s/4s 真片 + 无头 Chromium 量出来的，不是读码猜的）：
+
+1. **起播竞态**：`playlist=[media]` 之后立刻 `play()`，客户端回
+   `The play() request was interrupted by a new load request.` /
+   `The element has no supported sources.`，面板停在 error、位置恒为 0。改法是让播放意图
+   随换源那一条消息一起下发（`autoplay=True`），`play()` 在那一发之后**故意不发**。
+2. **建控件自带一发伪 `completed`**：`ftv.Video` 构造后约 40 毫秒回 `on_complete(data=False)`
+   + `on_error('MEDIA_ELEMENT_ERROR: Empty src attribute')`，**传不传空 `playlist=[]` 都一样**。
+   真片尾是 6 秒那片放完时的 `data=True`。所以 `VideoPlayBar` 只做两件事：`on_complete`
+   认 `data` 为真才算片尾（否则起播那一瞬间就能把整本翻到最后一页），`Empty src attribute`
+   那条报错丢掉（此时用户那本还没开始放，涂红等于凭空报错）。真坏源的话
+   （`no supported sources` / `FFmpegDemuxer`）照原样递上去。
+3. **`stop()` 会把播放面弄废**：控件的 `stop()` 之后 `<video>` 被摘出文档，再换任何片——
+   假源照样被要（UA 是 Mozilla）、位置一动不动，并回
+   `The play() request was interrupted because the media was removed from the document.`。
+   三种救法实测：停止改用 `pause()` 能放、`stop()` 后补 `play()` 放不起来、`stop()` 后重建控件
+   能放（但要视图层配合）。故 `FletVideoBackend.stop()` 在控件上落 `pause()`。
+
+真实挂载面的端到端证据：`.probe/probe_auto_next.py` **8/8 通过**（0.1s 客户端去要片，
+位置序列 0→4 往上走，**+6.06s 客户端报真片尾**后面板自己换到第 2 集、回环新增一次
+`/clip/ep2.webm` 请求；按停止后补发 `data=True` 的完成事件不再连播；最后一条放完停在
+`ended` 不绕回第一条）。还有一条跨源前提记在这儿：flet_web 给页面带了
+`Cross-Origin-Embedder-Policy: require-corp`，视频地址在**另一个端口**（书源都是这样）时，
+服务端不回 `Cross-Origin-Resource-Policy: cross-origin` 就被浏览器拦成"没有可用源"——
+这解释了 web 面看第三方视频书为什么会黑屏，不是本项目能替源站补的头。
+
+护栏 `tests/test_reader_video_panel.py` + `test_media_play_m4.py`；变异核验两轮共 8 条
+（面板两条过滤器 4 条，`.probe/mutate_web_artifacts.py`；后端起播/叫停 4 条，
+`.probe/mutate_media_start.py`）全红。第二十二轮那条"绕回第一条"的变异第一轮是
+**绿的**——"没发生"的判据写得会在"该发生的"落账那一刻就成立（见 dev 日志第二十二轮）。
+上一轮"客户端真产 `on_complete`"未取证的空洞已在第二十四轮补上；顺带发现：**当时那条
+PASS 是伪事件给的**（`completed=False` 被当成片尾），所以连播的取证必须等真位置走完再看。
 
 ### 5.13 规则编辑器：选源 → 选字段 → 合并保存（`views/source/code_editor_view.py`）
 

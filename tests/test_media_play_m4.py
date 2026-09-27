@@ -278,6 +278,7 @@ def test_flet_video_backend_delegates_to_control():
     class _FakeControl:
         def __init__(self):
             self.playlist: list = []
+            self.autoplay = False
             self.calls: list = []
             self.position = 42.0
 
@@ -308,13 +309,75 @@ def test_flet_video_backend_delegates_to_control():
     assert ctrl.playlist == [{"resource": "https://v/x.mp4",
                               "headers": {"Referer": "https://b/"}}]
     assert not hasattr(ctrl, "source")
+    # 「要播」随换源那一条消息一起下发（分两步发就是 web 面那次 play 竞态）。
+    assert ctrl.autoplay is True
     asyncio.run(backend.play())
+    assert ctrl.calls == [], f"刚换完源又补一发 play()：{ctrl.calls}"
     asyncio.run(backend.pause())
+    asyncio.run(backend.play())
     asyncio.run(backend.stop())
-    assert ["play", "pause", "stop"] == ctrl.calls
+    # 叫停在控件上落的是 pause()：web 面的 stop() 会把播放面从文档里摘掉（见下条护栏）
+    assert ["pause", "play", "pause"] == ctrl.calls
     asyncio.run(backend.seek(10.0))
     assert ("seek", ("duration", 10)) in ctrl.calls
     assert asyncio.run(backend.current_position()) == 42.0
+
+
+def test_backend_stop_pauses_the_control_instead_of_killing_it():
+    """「停止」只能叫停，不能把播放面**永久弄废**。
+
+    web 面实测（``.probe/probe_stop_recovery.py``）：控件的 ``stop()`` 会把 ``<video>``
+    从文档里摘掉，之后换任何片都放不起来（假源被要、位置不动，回一发
+    "media was removed from the document"）。所以后端 ``stop()`` 下发的是 ``pause()``：
+    真叫停了（画面与声音都停），又留着重新起播的能力。
+    变异核验按这条承诺打：把 ``_call("pause")`` 换成 ``_call("stop")`` 必须变红。
+    """
+    class _FakeControl:
+        def __init__(self):
+            self.playlist: list = []
+            self.calls: list = []
+
+        def pause(self):
+            self.calls.append("pause")
+
+        def stop(self):
+            self.calls.append("stop")
+
+    ctrl = _FakeControl()
+    backend = FletVideoBackend(control=ctrl, media_factory=lambda url, headers: url)
+    asyncio.run(backend.open("https://v/x.mp4"))
+    ctrl.calls.clear()
+    asyncio.run(backend.stop())
+    assert ctrl.calls == ["pause"], f"叫停下发的不是 pause()：{ctrl.calls}"
+    assert backend.state == "idle"
+
+
+def test_the_play_intent_resumes_after_a_stop():
+    """暂停/叫停之后按播放，必须是**真发** play()——标记没复位就是按了没反应。"""
+    class _FakeControl:
+        def __init__(self):
+            self.playlist: list = []
+            self.autoplay = False
+            self.calls: list = []
+
+        def play(self):
+            self.calls.append("play")
+
+        def pause(self):
+            self.calls.append("pause")
+
+        def stop(self):
+            self.calls.append("stop")
+
+    for how in ("pause", "stop"):
+        ctrl = _FakeControl()
+        backend = FletVideoBackend(
+            control=ctrl, media_factory=lambda url, headers: url)
+        asyncio.run(backend.open("https://v/x.mp4"))
+        asyncio.run(getattr(backend, how)())
+        ctrl.calls.clear()
+        asyncio.run(backend.play())
+        assert ctrl.calls == ["play"], f"{how} 之后的 play() 被吞了：{ctrl.calls}"
 
 
 def test_flet_video_backend_refuses_to_guess_units_or_types():
@@ -378,12 +441,14 @@ def test_flet_video_backend_marshals_every_control_touch():
         media_factory=lambda url, headers: url,
         duration_factory=lambda seconds: int(seconds))
     asyncio.run(backend.open("https://v/x.mp4"))
-    asyncio.run(backend.play())
     asyncio.run(backend.pause())
+    asyncio.run(backend.play())
     asyncio.run(backend.seek(3.0))
     asyncio.run(backend.stop())
     assert asyncio.run(backend.current_position()) == 7.5
-    # 6 步：open(换片) / play / pause / seek / stop / current_position
+    # 6 步：open(换片，播放意图随它一起下发) / pause / play / seek / stop / position。
+    # 换源后紧跟的那发 play() 是**故意不发**的（web 面会撞上正在起的 load），
+    # 所以这里先 pause 再 play，才看得见真正下发的那一次。
     assert len(marshalled) == 6, "有控件操作没经界面循环"
     assert ctrl.playlist == ["https://v/x.mp4"]
     assert ("seek", 3) in ctrl.calls

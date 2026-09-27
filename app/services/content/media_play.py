@@ -133,6 +133,7 @@ class FletVideoBackend(VideoBackend):
         self._media_factory = media_factory
         self._duration_factory = duration_factory
         self._ui_marshal = ui_marshal
+        self._intent_with_load = False   # 本次 play() 是否已由换源那条消息带过
         self.available = control is not None
 
     async def _on_ui(self, step, *args):
@@ -157,25 +158,51 @@ class FletVideoBackend(VideoBackend):
         if self._media_factory is None:
             raise RuntimeError("FletVideoBackend 未注入 media_factory（VideoMedia 只能视图层造）")
         media = self._media_factory(self.media_url, dict(headers or {}))
-        await self._on_ui(self._set_playlist, media)
+        await self._on_ui(self._load, media)
         self.state = "playing"
+        self._intent_with_load = True
 
-    async def _set_playlist(self, media):
+    async def _load(self, media):
+        """换源与"要播"**同一条消息**下发。
+
+        分两步（先 playlist 再 play()）在 web 面上必炸：play() 撞上正在起的 load，
+        客户端回 `The element has no supported sources.` /
+        `The play() request was interrupted by a new load request.`，面板停在 error、
+        位置一直是 0（`.probe/probe_ftv_play.py` 三种发法实测：只有这条不发 play() 的
+        与"等 get_duration 再 play()"两种真在放）。
+        """
         self._control.playlist = [media]
+        self._control.autoplay = True
         return None
 
     async def play(self) -> None:
         self.state = "playing"
+        if self._intent_with_load:
+            # 播放意图刚随换源下发过，再补一发 play() 就是上面那次竞态本身。
+            self._intent_with_load = False
+            return
         await self._on_ui(self._call, "play")
 
     async def pause(self) -> None:
         self.state = "paused"
+        self._intent_with_load = False   # 按过暂停之后，play() 得真发出去
         await self._on_ui(self._call, "pause")
 
     async def stop(self) -> None:
-        # 基类只改状态：不叫控件 stop() 的话，用户按了"停止"画面还在放、声音还在。
+        """叫停：状态归 idle，控件上落的却是 ``pause()`` 而不是 ``stop()``。
+
+        基类只改状态的话，用户按了"停止"画面还在放、声音还在，所以叫停必须真下发一步。
+        不发控件那个 ``stop()``：web 面实测它会把 ``<video>`` 从文档里摘掉，**这个
+        播放面就此废掉**——之后再换片，假源照样被要、位置一动不动，并回一发
+        "The play() request was interrupted because the media was removed from the
+        document."（``.probe/probe_stop_recovery.py`` 三种救法实测：只有"停止用 pause"
+        和"stop 后重建控件"能再放起来，重建得视图层配合，不值）。
+        位置在叫停前已由服务侧读走（``stop_playback``），重播走 ``open()`` 换片，
+        实测从片头正常起播。
+        """
         self.state = "idle"
-        await self._on_ui(self._call, "stop")
+        self._intent_with_load = False
+        await self._on_ui(self._call, "pause")
 
     async def seek(self, position: float) -> None:
         if self._control is None or self._duration_factory is None:

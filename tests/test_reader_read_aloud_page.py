@@ -434,7 +434,10 @@ def test_a_fallback_backend_shows_its_own_name():
 # --------------------------------------------------------------------------- #
 def test_the_voice_options_come_from_the_profile_table(voiced_rig):
     """下拉不能写死：选项来自 list_profiles，第一项才是"内置语音"。"""
-    assert _voice_options(voiced_rig) == ["builtin", str(HTTP_PROFILE["id"])], \
+    # 选项是 attach 之后在引擎循环上拉回来的（_load_preferences → _load_voice_profiles），
+    # 中间隔着三次 await。立刻断言会撞进那个窗口：全量套件下偶发只剩内置那一项。
+    assert _settled(
+        lambda: _voice_options(voiced_rig) == ["builtin", str(HTTP_PROFILE["id"])]), \
         "语音档没进下拉，读到的还是内置嗓音"
     labels = [str(o.text) for o in voiced_rig.view.read_aloud._voice.options]
     assert labels == ["内置语音", "书源 TTS"]

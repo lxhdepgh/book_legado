@@ -723,7 +723,15 @@ class ReaderAutoContinueTests(unittest.TestCase):
         self.controller.attach(self.view)
         self.controller._set_chapters([dict(c) for c in self.CHAPTERS])
         self.controller.ui_call(self.controller._open_index(0))
-        self._settled(lambda: self.controller._chapter_index == 0)
+        # 挂载那一阵 `_restoring_scroll` / `_reading_loading` 都还立着，
+        # `_on_reader_scroll` 会整段早退：只等 `_chapter_index` 的话，紧跟着的那一发
+        # 滚动会被当成噪音丢掉（真用户还在继续滚，下一条事件就落进来了；用例只发一发，
+        # 于是全量套件偶发 "接不上下一章"）。等首屏真收工再滚。
+        self.assertTrue(self._settled(
+            lambda: self.controller._chapter_index == 0
+            and not self.controller._reading_loading
+            and not self.controller._restoring_scroll),
+            "首章没有挂载完成（或一直卡在加载中标记）")
 
     def tearDown(self):
         self.controller.detach()

@@ -38,6 +38,17 @@ _STATE_META: dict[str, tuple[str, object, str]] = {
 }
 _DEFAULT_META = _STATE_META["idle"]
 
+#: ``on_complete`` 里"这一条确实放完了"的取值。插件上线的是字符串（``"True"``/``"False"``），
+#: 单元测里递的是真 ``bool``，两种都认。
+_COMPLETED_VALUES = {"true", "1", "yes"}
+
+
+def _as_completed(data) -> bool:
+    """``data=True`` → 真放完了；``None``/``False``/``"False"`` → 只是"重新开始了"。"""
+    if isinstance(data, bool):
+        return data
+    return str(data or "").strip().lower() in _COMPLETED_VALUES
+
 
 class VideoPlayBar(ft.Container):
     """视频面板：播放器 + 上一章/播放暂停/下一章/停止 + 播放列表入口。"""
@@ -125,27 +136,45 @@ class VideoPlayBar(ft.Container):
         self._player = ftv.Video(
             playlist=[], autoplay=False, aspect_ratio=16 / 9,
             controls=ftv.AdaptiveVideoControls(),
-            on_complete=self._player_handler("on_ended"),
-            on_error=self._player_handler("on_failed", with_detail=True))
+            on_complete=self._completed_handler,
+            on_error=self._error_handler)
         self._player_host.visible = True
         self._player_host.content = self._player
         return True
 
-    def _player_handler(self, slot_name: str, with_detail: bool = False):
-        """播放器事件 → 面板槽（放完 / 放坏了）。
+    # ------------------------------------------------------------------ #
+    # 播放器事件甄别（实测出来的两条伪事件，见各自主释）
+    # ------------------------------------------------------------------ #
+    def _completed_handler(self, event=None) -> None:
+        """``on_complete`` 只在**真放到片尾**时才算数。
 
-        槽按**事件到达时**再取：控制器可能在 ``ensure_player()`` 之后才绑定，
-        用默认参数把当时的 None 钉死，这条链就永远不响。
+        0.86 的 web 面在建控件后约 40 毫秒就发过一发 ``data=False`` 的 completed
+        （换源时 media_kit 也会补 ``completed=false`` 表示"重新开始了"），
+        而 ``data=True`` 才是"这一条放完了"（实测 6 秒假片：``False`` 在 +0.04s、
+        ``True`` 在 +6.03s，见 ``.probe/probe_complete_source.py``）。照单全收的话，
+        连播会在起播那一瞬间把整本翻到最后一页。
         """
-        def _handler(event=None):
-            callback = getattr(self, slot_name, None)
-            if callback is None:
-                return
-            if with_detail:
-                callback(str(getattr(event, "data", "") or ""))
-            else:
-                callback()
-        return _handler
+        if not _as_completed(getattr(event, "data", None)):
+            return
+        callback = self.on_ended
+        if callback is not None:
+            callback()
+
+    def _error_handler(self, event=None) -> None:
+        """``on_error`` 丢掉"空 src"那条：它是**建控件自带**的，不是用户那本坏了。
+
+        控件一上来没有片可放，web 面的 ``<video>`` 就回
+        ``MEDIA_ELEMENT_ERROR: Empty src attribute``——同一条探针里两个形状的控件
+        （传 ``playlist=[]`` 与不传）都在 +0.04s 报过它。此时控制器刚把状态写成
+        playing，面板会凭空红成"播放失败"。真坏源报的是别的话（"no supported sources"、
+        ``FFmpegDemuxer``），照原样递上去。
+        """
+        detail = str(getattr(event, "data", "") or "").strip()
+        if "empty src" in detail.lower():
+            return
+        callback = self.on_failed
+        if callback is not None:
+            callback(detail)
 
     @property
     def player_control(self):

@@ -533,9 +533,56 @@ def test_player_events_reach_slots_bound_after_the_player_was_built():
     assert bar.ensure_player() is True
     bar.on_ended = lambda: fired.append("ended")
     bar.on_failed = lambda detail: fired.append(f"failed:{detail}")
-    bar.player_control.on_complete(None)
+    bar.player_control.on_complete(SimpleNamespace(data=True))
     bar.player_control.on_error(SimpleNamespace(data="boom"))
     assert fired == ["ended", "failed:boom"]
+
+
+def test_a_reset_completion_event_does_not_count_as_the_end_of_the_entry():
+    """``completed=False`` 是"重新开始了"，不是"放完了"。
+
+    web 面实测（``.probe/probe_complete_source.py``）：控件建出来约 40 毫秒就发一发
+    ``data=False`` 的 completed，6 秒假片真放到片尾才发 ``data=True``。照单全收的表现
+    是**起播那一瞬间连播到最后一页**——单测里那条"放完就播下一条"用手动调槽，测不出来。
+    """
+    def bar_reporting_to(fired: list):
+        bar = VideoPlayBar()
+        bar.ensure_player()
+        bar.on_ended = lambda: fired.append("ended")
+        return bar
+
+    for event in (None, SimpleNamespace(data=False), SimpleNamespace(data="False"),
+                  SimpleNamespace(data="0"), SimpleNamespace(data="")):
+        fired: list = []
+        bar_reporting_to(fired).player_control.on_complete(event)
+        assert fired == [], f"伪完成事件被当成片尾（{event!r}）"
+
+    # 反面：真片尾那一发还是要响，否则这条过滤只是把连播关掉。
+    fired = []
+    bar_reporting_to(fired).player_control.on_complete(SimpleNamespace(data=True))
+    assert fired == ["ended"], "真放完了却没报到控制器"
+
+
+def test_the_empty_src_error_at_construction_is_not_reported_as_a_broken_book():
+    """建控件自带的 "Empty src attribute" 不能把刚起播的面板涂红。"""
+    def bar_reporting_to(fired: list):
+        bar = VideoPlayBar()
+        bar.ensure_player()
+        bar.on_failed = lambda got: fired.append(got)
+        return bar
+
+    for detail in ("MEDIA_ELEMENT_ERROR: Empty src attribute",
+                   "Empty src attribute",
+                   "media error: EMPTY SRC ATTRIBUTE"):
+        fired: list = []
+        bar_reporting_to(fired).player_control.on_error(SimpleNamespace(data=detail))
+        assert fired == [], f"建控件的伪报错递给了控制器（{detail}）"
+
+    # 反面：真坏源的话（书源里最常见）必须照原样报上去。
+    fired = []
+    bar_reporting_to(fired).player_control.on_error(SimpleNamespace(
+        data="DOMAIN_FORMAT error code=4: no supported sources"))
+    assert fired == ["DOMAIN_FORMAT error code=4: no supported sources"]
 
 
 # --------------------------------------------------------------------------- #
