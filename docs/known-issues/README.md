@@ -4,7 +4,9 @@
 
 ## 索引
 
-（暂无条目。新条目命名建议：`NNN_简短描述.md`，如 `001_flet_tabs_length.md`，并在上方追加一行索引。）
+- [001 Flet 0.86 表面 API 变化导致界面点了没反应](001_flet_0_86_surface_breaks.md) — `ChoiceChip`/`no_selection`/`ImageFit`/`src_base64`/图标枚举，静态测试全绿也掩盖不住。
+- [002 界面到服务的书条目必须是对象，试读记录「加入书架」要转正](002_findbook_shelve_dict_snapshot_and_staged_promote.md) — dict 快照透传炸 `book.url`；同键暂存行不是重复。
+- [003 分层重构把编排从视图搬进服务时，能力被"最小可用版"替换掉](003_refactor_dropped_orchestration_capabilities.md) — 串行换源、进度条不刷、清理没人调：测试全绿的退化；09-26/27 两型复发（服务注册了界面零订阅、进度事件从来没写过却被文档当成有）；补的护栏若只钉"没发生"会假绿。
 
 ## 历史参考
 

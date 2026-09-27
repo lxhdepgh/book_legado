@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, patch
 
 from app.services import block_pages, check_service
 from app.models.book_source import BookSource
-from app.services.legado_js import LegadoJsRuntime
-from app.services.rule_engine import (ExploreCategory, ReaderEngine,
+from app.services.engine.legado_js import LegadoJsRuntime
+from app.services.engine.rule_engine import (ExploreCategory, ReaderEngine,
                                       RequestConnectionError,
                                       RequestTimeoutError)
 
@@ -438,7 +438,7 @@ class CheckSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["reading_error"])
 
     async def test_reading_chain_stops_on_deterministic_rule_error(self):
-        from app.services.legado_rule_parser import RuleParseError
+        from app.services.engine.legado_rule_parser import RuleParseError
         books = [SimpleNamespace(name=f"b{i}", url=f"https://example/b{i}")
                  for i in range(3)]
         engine = SimpleNamespace(

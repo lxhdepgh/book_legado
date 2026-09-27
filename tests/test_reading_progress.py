@@ -1,7 +1,14 @@
+"""ReadingPosition/ReadingSession 连续滚动定位模型单元测试（M7 改指新位置）。
+
+M7 删除了冻结副本 ``app/services/reading_progress.py``；该定位模型已"零逻辑改动"
+迁入 :mod:`app.services.reading.reading_service`（ReadingPosition/ReadingSession），
+本测试随 import 改指新位置，断言保持不变。
+"""
 import unittest
 from types import SimpleNamespace
 
-from app.services.reading_progress import ReadingPosition, ReadingSession
+from app.services.reading.reading_service import (
+    ReadingPosition, ReadingSession)
 
 
 class ReadingProgressTests(unittest.TestCase):

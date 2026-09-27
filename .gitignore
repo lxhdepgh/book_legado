@@ -37,6 +37,11 @@ resource/*.json
 *.tmp
 *.log
 
+# Scratch dirs from offline verification runs (pytest --basetemp / UI probes)
+.tmp_pt/
+.probe/
+.zcode/
+
 # Vendored reference sources downloaded for comparison
 other_history/
 
@@ -48,3 +53,6 @@ tools/legado_diff/chunks/
 
 # Gradle caches from the differential harness
 tools/legado_diff/harness/.gradle/
+
+# Pre-refactor snapshot kept locally for behaviour comparison (207M, not source control)
+old_code/

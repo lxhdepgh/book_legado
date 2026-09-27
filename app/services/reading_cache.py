@@ -11,8 +11,8 @@ import uuid
 from dataclasses import asdict
 from pathlib import Path
 
-from app.services.reading_engine import ChapterContent, ContentBlock
-from app.services.rule_engine import ChapterItem
+from app.services.engine.reading_engine import ChapterContent, ContentBlock
+from app.services.engine.rule_engine import ChapterItem
 
 
 class ReadingCache:

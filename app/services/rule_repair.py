@@ -16,8 +16,8 @@ from bs4 import BeautifulSoup
 
 from app.models.book_source import BookSource
 from app.services.block_pages import block_reason
-from app.services.reading_engine import ChapterContent, LegadoReadingEngine
-from app.services.rule_engine import ChapterItem
+from app.services.engine.reading_engine import ChapterContent, LegadoReadingEngine
+from app.services.engine.rule_engine import ChapterItem
 
 # 样本页至少要有这么多汉字，否则说明抓到的是拦截页或渲染前的空壳。
 CONTENT_FIX_MIN_CHARS = 200

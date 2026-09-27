@@ -1,26 +1,25 @@
-"""正文规则自愈：候选挖掘、回放验证、写回与两处入口。"""
+﻿"""正文规则自愈：候选挖掘、回放验证、写回（M7 裁剪版）。
+
+M7 删除了旧视图入口（CheckView / ReadingView / rule_repair_ui.show_fix_dialog），
+对应"两处入口"的 UI 测试随之移除；本文件只保留对核心资产
+:mod:`app.services.rule_repair` 的纯逻辑守门（候选挖掘 / ProbeEngine 回放 /
+诊断闭环 / SourceService 写回），行为零改动。
+"""
 from __future__ import annotations
 
 import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
-from unittest.mock import PropertyMock, patch
-
-import flet as ft
 
 from app.models.book_source import BookSource
 from app.services import rule_repair
-from app.services.reading_engine import ContentEmptyError
-from app.services.rule_engine import ChapterItem, UnsupportedRule
+from app.services.engine.reading_engine import ContentEmptyError
+from app.services.engine.rule_engine import ChapterItem, UnsupportedRule
 from app.services.rule_repair import (ProbeEngine, diagnose_content_rule,
                                       extract_candidates, merge_content_rule,
                                       rule_needs_script)
 from app.services.source_service import SourceService
-from app.views.check_view import CheckView
-from app.views.reading_view import ReadingView
-from app.views.rule_repair_ui import show_fix_dialog
 
 SAMPLE_PAGE = "https://www.52shuku.net/bl/23_b/bkfks_2.html"
 SECOND_PAGE = "https://www.52shuku.net/bl/23_b/bkfks_12.html"
@@ -303,167 +302,3 @@ class WriteBackTests(unittest.TestCase):
                 "https://missing.example", "content", ".a@text")
 
 
-class FixDialogTests(unittest.IsolatedAsyncioTestCase):
-    async def test_confirming_the_dialog_writes_the_rule_back(self):
-        applied = []
-        service = SimpleNamespace(
-            update_source_rule=lambda url, field, value: applied.append(
-                (url, field, value)) or Path("bookSource.json.bak"))
-        dialogs, snack_bars = [], []
-        page = SimpleNamespace(show_dialog=dialogs.append,
-                               pop_dialog=lambda: None,
-                               session=object(),
-                               show_snack_bar=snack_bars.append)
-        fix = rule_repair.RuleFix(
-            "示例书源", "https://www.po5.net", "content", "#nr1@html",
-            "#nr1@html||.article-content@p@text",
-            (rule_repair.RepairSample("第1页", SAMPLE_PAGE, 3144, "萧青梧…"),),
-            SAMPLE_PAGE)
-        show_fix_dialog(page, service, fix, on_applied=lambda: applied.append("重试"))
-        self.assertEqual(len(dialogs), 1)
-        dialog = dialogs[0]
-        texts = [item.value for item in dialog.content.content.controls]
-        self.assertIn("#nr1@html||.article-content@p@text", texts)
-        self.assertIn("#nr1@html", texts)
-        self.assertTrue(any("第1页（3144 字）" in item for item in texts))
-        self.assertTrue(any("萧青梧…" in item for item in texts))
-        dialog.actions[1].on_click(None)
-        self.assertEqual(applied[0], ("https://www.po5.net", "content",
-                                      "#nr1@html||.article-content@p@text"))
-        self.assertEqual(applied[-1], "重试")
-
-
-class _ReadingViewStub:
-    """只借 ReadingView 的两个纯方法，不搭整个页面。"""
-
-
-class ReaderEntryTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.directory = TemporaryDirectory()
-        service = SimpleNamespace(
-            data_dir=Path(self.directory.name), sources=[], bookshelf=[],
-            category_checks={}, save=lambda: True)
-        self.view = ReadingView(service)
-
-    async def asyncTearDown(self):
-        await self.view.engine.aclose()
-        self.directory.cleanup()
-
-    async def test_the_empty_body_error_offers_the_rule_fix(self):
-        self.view.current_source = BookSource.from_dict(SOURCE)
-        chapter_item = chapter("第1页", SAMPLE_PAGE)
-        label, handler = self.view._repair_action(
-            ContentEmptyError("chapter content is empty"), chapter_item)
-        self.assertEqual(label, "查找正文规则")
-        self.assertIsNotNone(handler)
-
-    async def test_other_errors_and_script_sources_keep_the_plain_retry(self):
-        chapter_item = chapter("第1页", SAMPLE_PAGE)
-        self.assertEqual(
-            self.view._repair_action(UnsupportedRule("no"), chapter_item),
-            (None, None))
-        self.view.current_source = None
-        self.assertEqual(
-            self.view._repair_action(
-                ContentEmptyError("chapter content is empty"), chapter_item),
-            (None, None))
-        self.view.current_source = BookSource.from_dict(
-            {**SOURCE, "ruleContent": {"content": "@js:java.get('x')"}})
-        self.assertEqual(
-            self.view._repair_action(
-                ContentEmptyError("chapter content is empty"), chapter_item),
-            (None, None))
-
-    async def test_samples_come_from_the_same_book_and_skip_the_failing_one(self):
-        self.view.chapters = [chapter(f"第{index}章", f"https://x/{index}")
-                              for index in range(1, 10)]
-        failing = self.view.chapters[0]
-        samples = self.view._repair_samples(failing)
-        self.assertEqual(len(samples), 2)
-        self.assertNotIn(failing, samples)
-        self.assertTrue(all(item.url for item in samples))
-
-
-class CheckViewEntryTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.directory = TemporaryDirectory()
-        service = SimpleNamespace(
-            sources=[BookSource.from_dict(SOURCE)], category_checks={},
-            data_dir=Path(self.directory.name), save=lambda: True)
-        self.view = CheckView(service)
-
-    async def asyncTearDown(self):
-        self.directory.cleanup()
-
-    def _result(self, **overrides):
-        result = {"name": "示例书源", "raw_url": "https://www.po5.net",
-                  "status": "ok", "search_status": "ok",
-                  "check_state": "content_unavailable",
-                  "reading_stage": "content", "reading_status": "rule_error",
-                  "reading_error": "正文解析结果为空",
-                  "sample_chapter": "第1页",
-                  "sample_chapter_urls": [SAMPLE_PAGE, SECOND_PAGE]}
-        result.update(overrides)
-        return result
-
-    async def test_a_failed_content_stage_gets_a_repair_button(self):
-        row = self.view._build_row(self._result())
-        self.assertIsNotNone(row.trailing)
-        self.assertIn("正文规则", row.trailing.tooltip)
-
-    async def test_network_failures_and_script_rules_have_no_button(self):
-        self.assertIsNone(
-            self.view._build_row(self._result(reading_status="network_error")).trailing)
-        self.assertIsNone(
-            self.view._build_row(self._result(reading_stage="catalog")).trailing)
-        self.assertIsNone(
-            self.view._build_row(self._result(sample_chapter_urls=[])).trailing)
-        self.view.service.sources = [BookSource.from_dict(
-            {**SOURCE, "ruleContent": {"content": "@js:java.get('x')"}})]
-        self.assertIsNone(self.view._build_row(self._result()).trailing)
-
-    async def test_the_button_diagnoses_the_source_and_waits_for_confirmation(self):
-        calls = []
-
-        async def fake_diagnose(page, service, source, chapter_item, **kwargs):
-            calls.append((source.bookSourceUrl, chapter_item.url,
-                          [item.url for item in kwargs["extra_chapters"]]))
-            return True
-
-        scheduled = []
-
-        def run_task(handler, *args):
-            scheduled.append(handler(*args))
-
-        page = SimpleNamespace(run_task=run_task,
-                               update=lambda *args, **kwargs: None)
-        with patch("app.views.check_view.diagnose_and_offer",
-                   side_effect=fake_diagnose), \
-                patch.object(CheckView, "page", new_callable=PropertyMock,
-                             return_value=page):
-            self.view._start_repair(self._result())
-            for task in scheduled:
-                await task
-        self.assertEqual(calls,
-                         [("https://www.po5.net", SAMPLE_PAGE, [SECOND_PAGE])])
-        self.assertFalse(self.view._repairing)
-
-    async def test_a_second_diagnosis_waits_for_the_first(self):
-        notices = []
-        self.view._repairing = True
-        self.view._show_notice = notices.append
-        scheduled = []
-        page = SimpleNamespace(run_task=lambda handler, *args: scheduled.append(handler))
-        with patch.object(CheckView, "page", new_callable=PropertyMock,
-                          return_value=page):
-            self.view._start_repair(self._result())
-        self.assertEqual(scheduled, [])
-        self.assertIn("还在诊断中", notices[0])
-
-    async def test_a_running_check_defers_the_automatic_recheck(self):
-        notices = []
-        self.view._show_notice = notices.append
-        self.view._running = True
-        self.view._recheck_after_repair(BookSource.from_dict(SOURCE))
-        self.assertIsNone(self.view._retry_targets)
-        self.assertIn("等这轮检测跑完", notices[0])

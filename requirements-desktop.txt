@@ -5,3 +5,6 @@
 # cannot run inside an Android/iOS bundle.
 -r requirements.txt
 playwright>=1.49,<2
+# 开发/测试依赖（桌面目标）
+pytest>=8.0
+

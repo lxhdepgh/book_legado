@@ -24,6 +24,30 @@ def clean_url(raw_url: str) -> str | None:
     return url
 
 
+#: 已经自带协议的地址不再加工：``scheme://`` 之外还要认无头内核真会收到的
+#: ``data:`` / ``about:`` 这类不跟 ``//`` 的 scheme（"host:8080/path" 这种
+#: 光看冒号分不清是不是协议，所以要求 ``://`` 或落在名单里）。
+_SCHEME_PATTERN = re.compile(
+    r"^(?:[A-Za-z][A-Za-z0-9+.\-]*://|(?:data|about|blob|javascript|mailto):)",
+    re.IGNORECASE)
+
+
+def fix_url(raw_url: str) -> str:
+    """给没有协议的地址补 ``https://``（对齐 Legado ``UrlUtil.fixUrl``）。
+
+    浏览器内核只认绝对 URL：地址栏手输的 ``www.baidu.com`` 原样递给
+    ``page.goto`` 得到的是 ``Protocol error (Page.navigate): Cannot navigate
+    to invalid URL``——一句话把整次渲染判死，用户看不到"为什么不行"。
+    已带协议的地址原样返回，所以重复调用无害。
+    """
+    url = str(raw_url or "").strip()
+    if not url or _SCHEME_PATTERN.match(url):
+        return url
+    if url.startswith("//"):
+        return f"https:{url}"
+    return f"https://{url}"
+
+
 def encode_url(url: str) -> str:
     """非 ASCII 字符编为百分号/IDNA 格式"""
     try:

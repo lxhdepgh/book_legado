@@ -11,10 +11,10 @@ import aiohttp
 from app.services.block_pages import SiteBlockedError, block_reason
 from app.services.compat_audit import scan_missing_java_packages, source_texts
 from app.services.headless_browser import BrowserUnavailable, available_fetcher
-from app.services.legado_js import JsBridgeError
-from app.services.rule_engine import (RequestConnectionError, RequestTimeoutError,
+from app.services.engine.legado_js import JsBridgeError
+from app.services.engine.rule_engine import (RequestConnectionError, RequestTimeoutError,
                                       UnsupportedRule, resolve_explore_categories)
-from app.services.reading_engine import LegadoReadingEngine
+from app.services.engine.reading_engine import LegadoReadingEngine
 
 
 CHECK_CONCURRENCY = 8

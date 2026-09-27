@@ -176,6 +176,18 @@ class _BrowserTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(page.closed)
         self.assertEqual(page.route_pattern, "**/*")
 
+    async def test_a_bare_address_gets_a_scheme_before_the_kernel_sees_it(self):
+        """回归：地址栏输 www.baidu.com，Playwright 报 "Cannot navigate to
+        invalid URL"——内核只认绝对 URL，补协议必须赶在 page.goto 之前。"""
+        page, _, _ = await self.run_fetch("www.baidu.com")
+        self.assertEqual(page.goto_url, "https://www.baidu.com")
+
+    async def test_a_data_url_is_handed_over_untouched(self):
+        """无头内核确实会收到 data: 文档（规则里的内联页），不能被补成 https://。"""
+        url = "data:text/html,<title>t</title>"
+        page, _, _ = await self.run_fetch(url)
+        self.assertEqual(page.goto_url, url)
+
     async def test_injected_html_is_reported_under_the_base_url(self):
         page, _, result = await self.run_fetch(
             options={"html": "<html><head><title>t</title></head>"

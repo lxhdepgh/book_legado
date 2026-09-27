@@ -382,7 +382,7 @@ class WebPageRenderer:
             self._capture_pending = False
 
     def _select_payload(self, payload):
-        from app.services.java_regex import compile_pattern
+        from app.services.engine.java_regex import compile_pattern
         html = str(payload.get("html") or "")
         final_url = str(payload.get("url") or self._initial_url)
         result = {"body": html, "headers": {"content-type": "text/html"},

@@ -3,6 +3,7 @@
 aiohttp>=3.9.0
 aiohttp-socks>=0.10,<1
 beautifulsoup4>=4.12.0
+charset-normalizer>=3.0.0
 html5lib>=1.1,<2
 elementpath>=5.0.0
 flet>=0.86.0
@@ -11,9 +12,34 @@ flet-video>=0.86.0,<0.87
 flet-webview>=0.86.0,<0.87
 jsonpath-ng>=1.7.0,<2
 opencc-python-reimplemented>=0.1.7,<0.2
+# [M2-2.3] Java 原子组 (?>...) 与所有格量词 X*+/X++/X?+ 的编译后端（纯 Python，
+# 跨平台）；检出这两种写法时替代标准库 re。
+regex>=2024.0.0
 fonttools>=4.55,<5
 pillow>=10.4,<13
 pycryptodome>=3.20,<4
 quickjs>=1.19.4
 py7zr>=0.22,<2
 rarfile>=4.2,<5
+# [M4-本地书] LocalBookService 本地书解析（services/content/local_book_service.py 懒加载 import）。
+# ebooklib 纯 Python（py3-none-any wheel）解析 epub；pymupdf 解析 pdf，三端 abi3 wheels
+# （win/macOS/manylinux）；lxml 为 ebooklib 传递依赖，三端均有 wheels。跨平台无原生分支。
+EbookLib>=0.18
+pymupdf>=1.24
+# [M4-RSS] RssService 标准 feed 解析（services/content/rss_service.py 懒加载 import）。
+# feedparser 纯 Python（py3-none-any wheel），解析 RSS/Atom；sgmllib 由其
+# 自带 feedparser-sgmllib 包提供，三端无原生分支。跨平台。
+feedparser>=6.0.10
+# [M4-朗读] ReadAloudService 三后端（services/content/read_aloud.py 懒加载 import）。
+# pyttsx3 为系统 TTS 桥（Win SAPI / macOS NSSpeech / Linux espeak），无音频设备环境
+# 加载失败时服务自动降级回退 edge-tts；edge-tts 为纯 Python aiohttp 在线神经语音。
+# 两库均跨平台可装（pyttsx3 经 pywin32/comtypes 在 Windows 走 SAPI），服务未用不 import。
+pyttsx3>=2.90
+edge-tts>=6.1
+# [M5-二维码] QrCodeService（services/tools/qr_code_service.py 懒加载 import）。
+# qrcode 纯 Python（py3-none-any wheel）生成二维码 PNG（渲染后端走 Pillow）；
+# opencv-python-headless 三端有 abi3 wheels（win_amd64/macosx/manylinux），
+# 其 QRCodeDetector 识别图片文件/剪贴板截图（桌面无摄像头，不做摄像头扫码）。
+# headless 变体免 GUI（libGL）依赖，PyInstaller 可打包。服务未用不 import。
+qrcode>=7.4
+opencv-python-headless>=4.8

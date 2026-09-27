@@ -32,21 +32,21 @@ from bs4 import BeautifulSoup
 from PIL import Image
 
 from app.models.book_source import BookSource
-from app.services.legado_rule_parser import (JavaDateValue, _jsoup_html_markup,
+from app.services.engine.legado_rule_parser import (JavaDateValue, _jsoup_html_markup,
                                               _selection_indices,
                                               evaluate, jsoup_values,
                                               parse_markup,
                                               select_jsoup,
                                               split_rule_expression)
 from app.services.compat_audit import SUPPORTED_JAVA_APIS, SUPPORTED_OBJECT_APIS
-from app.services.icu_charset import detect_charset
-from app.services.legado_js import (JsBridgeError, JsContext, LegadoJsRuntime,
+from app.services.engine.icu_charset import detect_charset
+from app.services.engine.legado_js import (JsBridgeError, JsContext, LegadoJsRuntime,
                                     classify_js_bridge_error)
 from app.services.request_compat import (encode_form_fields,
                                          encode_url_query_fields, escape_form,
                                          escape_url_query, legado_escape,
                                          normalize_url_option)
-from app.services.reading_engine import (ContentEmptyError, LegadoReadingEngine,
+from app.services.engine.reading_engine import (ContentEmptyError, LegadoReadingEngine,
                                          TocEmptyError, _legado_truthy,
                                          _apply_replace_regex,
                                          _format_content_page,
@@ -56,10 +56,10 @@ from app.services.reading_engine import (ContentEmptyError, LegadoReadingEngine,
                                          render_use_html_spans)
 from app.services.source_service import SourceService
 from app.services.source_rule import compile_rule_program
-from app.services.custom_url import CustomUrl
-from app.services.java_regex import search as java_regex_search, sub as java_regex_sub
-from app.services.public_suffix import effective_tld_plus_one
-from app.services.rule_engine import (BookItem, ChapterItem, ReaderEngine,
+from app.services.engine.custom_url import CustomUrl
+from app.services.engine.java_regex import search as java_regex_search, sub as java_regex_sub
+from app.services.engine.public_suffix import effective_tld_plus_one
+from app.services.engine.rule_engine import (BookItem, ChapterItem, ReaderEngine,
                                       RequestConnectionError,
                                       RequestTimeoutError,
                                       _format_book_intro,
@@ -68,10 +68,10 @@ from app.services.rule_engine import (BookItem, ChapterItem, ReaderEngine,
                                       merge_search_items,
                                       parse_explore_categories,
                                       resolve_explore_categories, select_nodes)
-from app.services.rule_engine import extract_value
+from app.services.engine.rule_engine import extract_value
 from app.services.search_model import SearchBookStore, SearchModel
 from app.services.reading_cache import ReadingCache
-from app.services.legado_url import parse_request_config, parse_search_url
+from app.services.legado_url import fix_url, parse_request_config, parse_search_url
 
 
 # The 听友M (tingyou.fm) jsLib decrypts XChaCha20-Poly1305 payloads by running
@@ -889,7 +889,7 @@ class RuleParserTests(unittest.TestCase):
         self.assertEqual(java_regex_search(r"\P{N}+", "12章A").group(0), "章A")
 
     def test_java_regex_contiguous_match_anchor(self):
-        from app.services.java_regex import finditer as java_regex_finditer
+        from app.services.engine.java_regex import finditer as java_regex_finditer
         matches = [item.group(0) for item in java_regex_finditer(r"\G\d,?", "1,2,3x4")]
         self.assertEqual(matches, ["1,", "2,", "3"])
         self.assertEqual(java_regex_sub(r"\G\d,?", "x", "1,2,3x4"), "xxxx4")
@@ -1226,7 +1226,7 @@ class RuleParserTests(unittest.TestCase):
 
     def test_js_runtimes_share_one_permissive_ssl_context(self):
         """建默认 SSL 上下文要枚举整个 Windows 证书库，换源扫描付不起这个钱。"""
-        from app.services import legado_js
+        from app.services.engine import legado_js
 
         created = []
         real = ssl.create_default_context
@@ -1236,7 +1236,7 @@ class RuleParserTests(unittest.TestCase):
             return real(*args, **kwargs)
 
         with patch.object(legado_js, "_SSL_CONTEXT", None), \
-                patch("app.services.legado_js.ssl.create_default_context",
+                patch("app.services.engine.legado_js.ssl.create_default_context",
                       side_effect=counting_context):
             runtimes = [LegadoJsRuntime() for _ in range(3)]
 
@@ -1630,7 +1630,7 @@ class RuleParserTests(unittest.TestCase):
             JsContext(source=source)), 1)
 
     def test_java_api_inventory_covers_namespaces_classes_and_statics(self):
-        from app.services.legado_js import implemented_java_api_paths
+        from app.services.engine.legado_js import implemented_java_api_paths
         paths = implemented_java_api_paths()
         for name in ("java.lang", "java.lang.System", "java.lang.System.currentTimeMillis",
                      "java.util.Arrays.copyOf", "java.nio.ByteBuffer.allocate",
@@ -1774,7 +1774,7 @@ class RuleParserTests(unittest.TestCase):
         class Opener:
             def open(self, _request, timeout=None): return Response()
 
-        with patch("app.services.legado_js.build_opener",
+        with patch("app.services.engine.legado_js.build_opener",
                    lambda *_handlers: Opener()):
             data = json.loads(runtime._request_json(
                 'https://example.com/start,{"__rawJsoupRequest":true,'
@@ -1822,7 +1822,7 @@ class RuleParserTests(unittest.TestCase):
         class Opener:
             def open(self, _request, timeout=None): return Response()
 
-        with patch("app.services.legado_js.build_opener",
+        with patch("app.services.engine.legado_js.build_opener",
                    lambda *_handlers: Opener()):
             post_value = runtime.evaluate(
                 '@js:java.ajax("https://example.com/post,{\\"method\\":\\"POST\\",'
@@ -2560,7 +2560,7 @@ class RuleParserTests(unittest.TestCase):
             runtime = LegadoJsRuntime(state_dir=directory)
             runtime.store_set_cookie("https://example.com/", "; ".join(
                 f"k{index}=" + str(index) * 600 for index in range(8)))
-            with patch("app.services.legado_js.random.choice",
+            with patch("app.services.engine.legado_js.random.choice",
                        side_effect=lambda values: values[0]):
                 cookie = runtime.export_cookie_header("https://example.com/")
             self.assertLessEqual(len(cookie), 4096)
@@ -2684,7 +2684,7 @@ class RuleParserTests(unittest.TestCase):
                 "bookSourceUrl": "https://example.com",
                 "enabledCookieJar": enabled,
             })
-            with patch("app.services.legado_js.build_opener", opener):
+            with patch("app.services.engine.legado_js.build_opener", opener):
                 value = runtime.evaluate(
                     '@js:java.ajax("https://example.com/page")',
                     JsContext(source=source),
@@ -2714,7 +2714,7 @@ class RuleParserTests(unittest.TestCase):
                 captured["cookie"] = request.get_header("Cookie")
                 return Response()
 
-        with patch("app.services.legado_js.build_opener",
+        with patch("app.services.engine.legado_js.build_opener",
                    lambda *_handlers: Opener()):
             result = json.loads(runtime._request_json(
                 'https://example.com/,{"__rawJsoupRequest":true}',
@@ -3274,7 +3274,7 @@ class RuleParserTests(unittest.TestCase):
                 },
             }), encoding="utf-8")
 
-            with patch("app.services.legado_js.time.time", return_value=101.0):
+            with patch("app.services.engine.legado_js.time.time", return_value=101.0):
                 runtime = LegadoJsRuntime(state_dir=directory)
 
             try:
@@ -3288,10 +3288,10 @@ class RuleParserTests(unittest.TestCase):
     def test_cache_expiry_removes_database_and_file_entries(self):
         with TemporaryDirectory() as directory:
             runtime = LegadoJsRuntime(state_dir=directory)
-            with patch("app.services.legado_js.time.time", return_value=100.0):
+            with patch("app.services.engine.legado_js.time.time", return_value=100.0):
                 runtime._cache_put("db", json.dumps("value"), 1)
                 runtime._file_cache_put("file", json.dumps("value"), 1)
-            with patch("app.services.legado_js.time.time", return_value=102.0):
+            with patch("app.services.engine.legado_js.time.time", return_value=102.0):
                 self.assertEqual(runtime._cache_get("db"), "")
                 self.assertEqual(runtime._file_cache_get("file"), "")
             runtime._MEMORY_CACHE_LIMIT = 5
@@ -5273,8 +5273,8 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
                     "Cookie": "sid=temporary; local=1"})
         engine = ReaderEngine()
         engine.js.set_cookie("https://host.example/", "sid=stored; shared=1")
-        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
-                patch("app.services.rule_engine.aiohttp.TCPConnector",
+        with patch("app.services.engine.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.engine.rule_engine.aiohttp.TCPConnector",
                       lambda **_kwargs: object()):
             await engine._request({"url": "https://host.example/page"}, source)
         headers = captured[0]
@@ -5312,8 +5312,8 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
                 return Response()
 
         engine = ReaderEngine()
-        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
-                patch("app.services.rule_engine.aiohttp.TCPConnector",
+        with patch("app.services.engine.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.engine.rule_engine.aiohttp.TCPConnector",
                       lambda **_kwargs: object()):
             decoded = await engine._request(
                 {"url": "https://host/default", "type": "hex"})
@@ -5329,7 +5329,9 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
                          "gzip")
         self.assertFalse(sessions[0]["auto_decompress"])
         self.assertEqual(len(sessions), 1)
-        self.assertEqual(requests[0]["headers"]["Accept-Encoding"], "gzip")
+        # [M1-2.16] 默认 Accept-Encoding 对齐 Legado DecompressInterceptor
+        self.assertEqual(requests[0]["headers"]["Accept-Encoding"], "gzip, deflate")
+        # 显式声明 Accept-Encoding 的场景不受默认注入影响
         self.assertEqual(requests[1]["headers"].getall("Accept-Encoding"),
                          ["gzip"])
 
@@ -5380,8 +5382,8 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
                     raise aiohttp.ServerDisconnectedError("keep-alive 已断开")
                 return Response()
 
-        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
-                patch("app.services.rule_engine.aiohttp.TCPConnector",
+        with patch("app.services.engine.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.engine.rule_engine.aiohttp.TCPConnector",
                       lambda **_kwargs: object()):
             result = await ReaderEngine()._request({"url": "https://host/page"})
         self.assertEqual(result[0], "ok")
@@ -5393,8 +5395,8 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
                 raise aiohttp.ServerDisconnectedError("keep-alive 已断开")
 
         calls.clear()
-        with patch("app.services.rule_engine.aiohttp.ClientSession", AlwaysDead), \
-                patch("app.services.rule_engine.aiohttp.TCPConnector",
+        with patch("app.services.engine.rule_engine.aiohttp.ClientSession", AlwaysDead), \
+                patch("app.services.engine.rule_engine.aiohttp.TCPConnector",
                       lambda **_kwargs: object()):
             with self.assertRaises(RuntimeError):
                 await ReaderEngine()._request({"url": "https://host/page"})
@@ -5444,8 +5446,8 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
                 seen["timeout"] = kwargs.get("timeout")
                 return Response()
 
-        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
-                patch("app.services.rule_engine.aiohttp.TCPConnector",
+        with patch("app.services.engine.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.engine.rule_engine.aiohttp.TCPConnector",
                       lambda **_kwargs: object()):
             await ReaderEngine(timeout=10, connect_timeout=5)._request(
                 {"url": "https://host/page"})
@@ -5453,7 +5455,8 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen["timeout"].total, 10)
         self.assertEqual(seen["timeout"].connect, 5)
 
-    async def test_engine_without_connect_timeout_matches_old_behaviour(self):
+    async def test_engine_timeout_three_stage_total_connect_read(self):
+        """[M1-2.13] total 由调用方控制（15s）、connect 显式 15s、sock_read 60s。"""
         seen = {}
 
         class Session:
@@ -5466,13 +5469,14 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
                 seen["timeout"] = kwargs.get("timeout")
                 raise asyncio.TimeoutError("slow")
 
-        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
-                patch("app.services.rule_engine.aiohttp.TCPConnector",
+        with patch("app.services.engine.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.engine.rule_engine.aiohttp.TCPConnector",
                       lambda **_kwargs: object()):
             with self.assertRaises(RequestTimeoutError):
                 await ReaderEngine(timeout=15)._request({"url": "https://host/page"})
         self.assertEqual(seen["timeout"].total, 15)
-        self.assertIsNone(seen["timeout"].connect)
+        self.assertEqual(seen["timeout"].connect, 15)  # [M1-2.13]
+        self.assertEqual(seen["timeout"].sock_read, 60)  # [M1-2.13]
 
     async def test_transport_failures_keep_their_kind(self):
         """超时和拒连要能分辨：一个可能是站点慢，另一个只说明主机不可达。"""
@@ -5503,9 +5507,9 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
             OSError(61, "拒绝连接"))
         for error, expected in ((asyncio.TimeoutError("slow"), RequestTimeoutError),
                                 (refused, RequestConnectionError)):
-            with patch("app.services.rule_engine.aiohttp.ClientSession",
+            with patch("app.services.engine.rule_engine.aiohttp.ClientSession",
                        session_raising(error)), \
-                    patch("app.services.rule_engine.aiohttp.TCPConnector",
+                    patch("app.services.engine.rule_engine.aiohttp.TCPConnector",
                           lambda **_kwargs: object()):
                 with self.assertRaises(expected) as caught:
                     await ReaderEngine()._request({"url": "https://host/page"})
@@ -5523,8 +5527,8 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
             def request(self, *_args, **_kwargs):
                 raise asyncio.TimeoutError()
 
-        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
-                patch("app.services.rule_engine.aiohttp.TCPConnector",
+        with patch("app.services.engine.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.engine.rule_engine.aiohttp.TCPConnector",
                       lambda **_kwargs: object()):
             with self.assertRaises(RequestTimeoutError) as caught:
                 await ReaderEngine(timeout=10)._request({"url": "https://host/page"})
@@ -5541,8 +5545,8 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
             def request(self, *_args, **_kwargs):
                 raise asyncio.TimeoutError("read timeout")
 
-        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
-                patch("app.services.rule_engine.aiohttp.TCPConnector",
+        with patch("app.services.engine.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.engine.rule_engine.aiohttp.TCPConnector",
                       lambda **_kwargs: object()):
             with self.assertRaises(RequestTimeoutError) as caught:
                 await ReaderEngine(timeout=10)._request({"url": "https://host/page"})
@@ -5696,8 +5700,8 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
                 return responses.pop(0)
 
         engine = ReaderEngine()
-        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
-                patch("app.services.rule_engine.aiohttp.TCPConnector", lambda **_kwargs: object()):
+        with patch("app.services.engine.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.engine.rule_engine.aiohttp.TCPConnector", lambda **_kwargs: object()):
             result = await engine._request({"url": "https://host/page", "retry": 3})
         self.assertEqual(result[0], "ok")
         self.assertEqual(len(calls), 2)
@@ -5717,8 +5721,8 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
                 return Failure()
 
         # A pooled engine would keep reusing the session patched above.
-        with patch("app.services.rule_engine.aiohttp.ClientSession", FailedSession), \
-                patch("app.services.rule_engine.aiohttp.TCPConnector", lambda **_kwargs: object()):
+        with patch("app.services.engine.rule_engine.aiohttp.ClientSession", FailedSession), \
+                patch("app.services.engine.rule_engine.aiohttp.TCPConnector", lambda **_kwargs: object()):
             with self.assertRaises(RuntimeError):
                 await ReaderEngine()._request({"url": "https://host/page", "retry": 3})
         self.assertEqual(len(calls), 1)
@@ -5977,9 +5981,9 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
             bookSourceUrl="https://source", enabledCookieJar=False,
             header='{"proxy":"socks5://127.0.0.1:1080@user@pass"}',
         )
-        with patch("app.services.rule_engine.ProxyConnector.from_url",
+        with patch("app.services.engine.rule_engine.ProxyConnector.from_url",
                    return_value=socks_connector) as make_socks, \
-                patch("app.services.rule_engine.aiohttp.ClientSession", Session):
+                patch("app.services.engine.rule_engine.aiohttp.ClientSession", Session):
             result = await ReaderEngine()._request({
                 "url": "https://host/page",
                 "proxy": "socks5://ignored.example:1080",
@@ -6032,8 +6036,8 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
             bookSourceUrl=f"https://occupied-{time.monotonic_ns()}",
             concurrentRate="10", header="", enabledCookieJar=False)
         engine = ReaderEngine()
-        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
-                patch("app.services.rule_engine.aiohttp.TCPConnector",
+        with patch("app.services.engine.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.engine.rule_engine.aiohttp.TCPConnector",
                       lambda **_kwargs: object()):
             first = asyncio.create_task(engine._request(
                 {"url": "https://host/first"}, source))
@@ -6112,8 +6116,8 @@ class VariableTests(unittest.IsolatedAsyncioTestCase):
             header="", to_dict=lambda: {"bookSourceUrl": "https://source.example"})
         engine = ReaderEngine()
         engine.js.set_cookie("https://source.example/", "client=1; Path=/")
-        with patch("app.services.rule_engine.aiohttp.ClientSession", Session), \
-                patch("app.services.rule_engine.aiohttp.TCPConnector",
+        with patch("app.services.engine.rule_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.engine.rule_engine.aiohttp.TCPConnector",
                       lambda **_kwargs: object()):
             await engine._request({"url": "https://source.example/page"}, source)
         self.assertEqual(captured["headers"]["Cookie"], "client=1")
@@ -8152,8 +8156,8 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
         document = parse_content_blocks(
             '<img src="https://x/encrypted.jpg">', "https://x/")
         engine = LegadoReadingEngine()
-        with patch("app.services.reading_engine.aiohttp.ClientSession", Session), \
-                patch("app.services.reading_engine.aiohttp.TCPConnector",
+        with patch("app.services.engine.reading_engine.aiohttp.ClientSession", Session), \
+                patch("app.services.engine.reading_engine.aiohttp.TCPConnector",
                       lambda **_kwargs: object()):
             await engine._load_protected_images(document, source)
         self.assertEqual(document.blocks[0].value, b"")
@@ -8239,6 +8243,31 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
             "第1章 出海\n正文\n第1章 出海", "##{{chapter.title}}",
             source, chapter)
         self.assertEqual(value, "正文")
+
+
+class FixUrlTests(unittest.TestCase):
+    """UrlUtil.fixUrl 的 Python 面：浏览器/投屏内核只认绝对 URL。
+
+    地址栏手输 www.baidu.com 直接送进 page.goto 会得到
+    "Protocol error (Page.navigate): Cannot navigate to invalid URL"。
+    """
+
+    def test_bare_hosts_get_https_and_idempotency(self):
+        self.assertEqual(fix_url("www.baidu.com"), "https://www.baidu.com")
+        self.assertEqual(fix_url("  www.baidu.com  "), "https://www.baidu.com")
+        self.assertEqual(fix_url("//cdn.site.example/a.js"),
+                         "https://cdn.site.example/a.js")
+        # 幂等：控制器与内核两道都会补，第二次必须原样通过
+        self.assertEqual(fix_url(fix_url("www.baidu.com")), "https://www.baidu.com")
+
+    def test_anything_that_already_carries_a_scheme_is_left_alone(self):
+        for url in ("http://x/a", "https://x/a", "file:///D:/t.html",
+                    "data:text/html,<p>x</p>", "about:blank"):
+            self.assertEqual(fix_url(url), url)
+        self.assertEqual(fix_url(""), "")
+        # host:port 里的冒号不是协议分隔符，别把它当成 scheme 放过
+        self.assertEqual(fix_url("localhost:8080/search"),
+                         "https://localhost:8080/search")
 
 
 if __name__ == "__main__":

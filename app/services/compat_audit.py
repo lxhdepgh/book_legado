@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.models.book_source import BookSource
-from app.services.legado_js import LegadoJsRuntime
+from app.services.engine.legado_js import LegadoJsRuntime
 
 
 @dataclass(slots=True)
@@ -133,6 +133,25 @@ SUPPORTED_JSOUP_PSEUDOS = {
     "matchesOwn", "not", "nth-child", "nth-of-type", "regex",
 }
 
+# [M2-2.1] JsoupXpath（seimicrawler JXDocument / Xsoup）私有构造静态缺口登记。
+# 差分语料 tools/legado_diff（684 条记录，其中 xpath 7 条）全量回灌后，真实书源
+# 命中的私有轴/函数已由 xpath_values 的方言改写表等价翻译：
+#   following-sibling-one:: / preceding-sibling-one:: → following-sibling::*[1] 等；
+#   first() → 1；尾部 html()/outerHtml()/allText()/num()；属性比较 ^= $= *= ~= !~；
+#   自定义函数 substring-ex/substring-after-last/substring-before-last/format-date/sum。
+# 语料中未发现其它未覆盖的私有轴/函数。下列条目是**已知无法在 elementpath（W3C
+# 数据模型）上等价复现**的类别——它们依赖 jsoup 节点树身份，桌面以 html5lib/elementpath
+# 复刻时不可能逐字节逼近，登记为已知上限（导入期静态提示，不在运行期静默取错值）。
+# 仅登记常量与注释，不改变 compat_audit 既有审计行为。
+UNTRANSLATABLE_XPATH_CONSTRUCTS = {
+    # 依赖 jsoup 节点对象身份（==）而非文档位置的兄弟/祖先链式选取；
+    # elementpath 按节点位置定位，无法表达“同一个 JXNode 引用”。
+    "jsoup-node-identity-axes",
+    # JXDocument.asString() 对 jsoup Elements 集合身份的取值语义；跨选中节点集
+    # 的隐式上下文切换不在 elementpath 单表达式能力内。
+    "jsoup-elements-asstring-identity",
+}
+
 
 JAVA_PACKAGE_REFERENCE = re.compile(
     r"Packages\.((?:[A-Za-z_$][\w$]*)(?:\.[A-Za-z_$][\w$]*)*)")
@@ -161,7 +180,7 @@ def scan_missing_java_packages(texts) -> list[str]:
         references.update(JAVA_PACKAGE_REFERENCE.findall(str(text or "")))
     if not references:
         return []
-    from app.services.legado_js import implemented_java_api_paths
+    from app.services.engine.legado_js import implemented_java_api_paths
     try:
         implemented = implemented_java_api_paths()
     except Exception:
@@ -221,7 +240,7 @@ def _validate_regex_field(field_path: str, value: str) -> None:
         pattern = pattern.split("##", 1)[0]
     if pattern:
         try:
-            from app.services.java_regex import compile_pattern
+            from app.services.engine.java_regex import compile_pattern
             compile_pattern(pattern)
         except re.error:
             if field_path.endswith(".replaceRegex"):
@@ -233,7 +252,7 @@ def _validate_regex_field(field_path: str, value: str) -> None:
 
 def _validate_rule_syntax(rule: str) -> None:
     """Compile the non-JS dialect portions of one source rule."""
-    from app.services.legado_rule_parser import _jsoup_part, select_jsoup, split_balanced
+    from app.services.engine.legado_rule_parser import _jsoup_part, select_jsoup, split_balanced
 
     original = str(rule)
     if re.search(r"<js>|@js:", original, flags=re.I):

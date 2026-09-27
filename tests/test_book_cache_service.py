@@ -1,13 +1,19 @@
+"""整书离线缓存 WholeBookCacheService 单元测试（M7 改指新位置）。
+
+M7 删除了冻结副本 ``app/services/book_cache_service.py``；内层 WholeBookCacheService
+已"零逻辑改动"迁入 :mod:`app.services.reading.book_cache_service`，本测试随 import
+改指新位置，断言保持不变。
+"""
 import asyncio
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from app.services.book_cache_service import WholeBookCacheService
+from app.services.reading.book_cache_service import WholeBookCacheService
 from app.services.reading_cache import ReadingCache
-from app.services.reading_engine import ChapterContent, ContentBlock
-from app.services.rule_engine import BookItem, ChapterItem
+from app.services.engine.reading_engine import ChapterContent, ContentBlock
+from app.services.engine.rule_engine import BookItem, ChapterItem
 
 
 class _Js:

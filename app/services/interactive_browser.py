@@ -105,6 +105,14 @@ class InteractiveBrowser:
             on_frame=self._push_frame, size=dict(VIEWPORT), quality=FRAME_QUALITY)
         self._started = True
 
+    async def goto(self, url: str) -> None:
+        """跳到新地址，会话不重开（前进/后退省掉一次内核启动）。"""
+        if self._page is None:
+            raise BrowserUnavailable("交互式浏览器未启动")
+        self._initial_url = str(url or "")
+        if url:
+            await self._page.goto(str(url), wait_until="domcontentloaded")
+
     async def _apply_headers(self, header_map: dict) -> None:
         headers = {str(name): str(value) for name, value in (header_map or {}).items()}
         if not headers:
@@ -210,7 +218,7 @@ class InteractiveBrowser:
         }
         if script:
             result["jsResult"] = script_value
-        from app.services.java_regex import compile_pattern
+        from app.services.engine.java_regex import compile_pattern
         if source_regex:
             pattern = compile_pattern(source_regex)
             matched = next((str(item) for item in state.get("resources") or []

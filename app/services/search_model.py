@@ -11,16 +11,28 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable
 
-from app.services.rule_engine import BookItem, merge_search_items
+from app.services.engine.rule_engine import BookItem, merge_search_items
 
 
 class SearchBookStore:
-    """Small SQLite equivalent of the Room ``searchBooks`` table."""
+    """Small SQLite equivalent of the Room ``searchBooks`` table.
 
-    def __init__(self, path: str | Path):
+    M6 介质垫片（契约 §3）：构造可传 ``conn=主库连接`` 让 store 直接读写主库
+    ``search_books`` 表（schema v6 已建表），不再自建 ``search-books.sqlite3``；
+    不传 conn 时行为与旧版完全一致（文件模式）。SearchModel 业务逻辑零改动。
+    """
+
+    def __init__(self, path: str | Path | None = None, *, conn=None):
+        self._external = conn  # M6：注入主库连接垫片；None 则走文件模式
+        self._lock = threading.RLock()
+        if conn is not None:
+            # 主库表由 schema v6 建立，此处不建文件、不建表、不自管事务。
+            self.path = None
+            return
+        if path is None:
+            raise ValueError("文件模式需传入 path，或改用 conn 注入主库连接")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
         with self._connect() as db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS search_books ("
@@ -34,6 +46,11 @@ class SearchBookStore:
 
     @contextmanager
     def _connect(self):
+        if self._external is not None:
+            # 共享主库连接（StorageService 以 isolation_level=None autocommit 打开）：
+            # 仅借用，不关闭、不提交、不回滚。
+            yield self._external
+            return
         db = sqlite3.connect(self.path, timeout=15)
         try:
             yield db

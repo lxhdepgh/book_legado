@@ -24,7 +24,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from app.services.app_paths import default_app_paths
-from app.services.java_regex import compile_pattern
+from app.services.engine.java_regex import compile_pattern
+from app.services.legado_url import fix_url
 
 
 # BackstageWebView.getJs() falls back to this when the rule carries no script.
@@ -227,6 +228,8 @@ class HeadlessBrowser:
         return await asyncio.wrap_future(future)
 
     async def _fetch(self, url: str, options: dict) -> dict:
+        # 内核只认绝对 URL，补协议必须发生在进 goto 之前（见 fix_url 注释）。
+        url = fix_url(url)
         context = await self._ensure_browser()
         script = str(options.get("javaScript") or options.get("webJs") or "").strip()
         mode = str(options.get("mode") or "")
