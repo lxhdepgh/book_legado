@@ -287,6 +287,40 @@ class DebugRunTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# 3b. 试跑落在**真服务的表面**上：替身有方法、真服务没有，绿灯就是骗人的
+# --------------------------------------------------------------------------- #
+class RealEngineSurfaceTests(unittest.TestCase):
+    """第二十六轮浏览器面实测的实错：单测全绿，按钮一次都没取出过值。
+
+    ``RuleEngineService`` 从来没有 ``extract_values``，控制器那句 ``getattr`` 探测
+    永远落空，于是回落到 ``select_nodes(sample, kind, "")``——空列表规则在一段正文里
+    一个容器都选不出来，求值对象是空列表，任何规则都只会回"没取到值"。而替身自己
+    定义了这个方法，所以那条回落分支从来没被任何用例走过。
+    """
+
+    def test_the_service_actually_offers_single_field_evaluation(self):
+        hits = RuleEngineService().extract_values(
+            ".title@text", "<div class='title'>远航</div>", "html")
+        self.assertEqual(hits, ["远航"],
+                         "服务面上取不到值，「试跑当前规则」就是坏的")
+
+    def test_the_service_reads_json_samples_as_json(self):
+        hits = RuleEngineService().extract_values(
+            "$.data[*].title", '{"data":[{"title":"远航"},{"title":"归途"}]}', "json")
+        self.assertEqual(hits, ["远航", "归途"])
+
+    def test_the_button_end_to_end_runs_on_the_real_service(self):
+        """不装替身：真服务接进 rig，粘样本点试跑，屏幕上得是真取到的值。"""
+        view, controller = _rig([_record()], engine=RuleEngineService())
+        view._source_dd.on_select(SimpleNamespace(value="https://src1/"))
+        view._field_dd.on_select(SimpleNamespace(value="ruleSearch.name"))
+        view.set_sample("<div class='item'><span class='title'>远航</span></div>")
+        controller.run_debug(view.get_text())
+        self.assertIn("远航", view._debug.value)
+        self.assertNotIn("没取到值", view._debug.value)
+
+
+# --------------------------------------------------------------------------- #
 # 4. 关键字识别区不再重复正文
 # --------------------------------------------------------------------------- #
 class HighlightPanelTests(unittest.TestCase):

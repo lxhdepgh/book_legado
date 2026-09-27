@@ -366,18 +366,18 @@ class CodeEditorController(BaseController):
         return "json" if str(sample or "").lstrip()[:1] in {"{", "["} else "html"
 
     async def _eval_field(self, rule: str, sample: str) -> list[str]:
-        """经 RuleEngineService 句柄做单字段求值；回落直接调引擎模块纯函数。"""
-        kind = self._kind_of(rule, sample)
-        method = (getattr(self._rule_engine, "extract_values", None)
-                  or getattr(self._rule_engine, "eval_field", None))
-        if method is not None:
-            result = method(rule, sample, kind)
-            if asyncio.iscoroutine(result):
-                result = await result
-            return list(result or [])
-        from app.services.engine import rule_engine
-        nodes, _ = rule_engine.select_nodes(sample, kind, "")
-        return rule_engine.extract_values(nodes, rule, kind)
+        """单字段求值：交给 :meth:`RuleEngineService.extract_values`（纯函数，不联网）。
+
+        以前这里先探服务上的方法、再回落到 ``rule_engine.select_nodes(sample, kind, "")``：
+        服务上**根本没有**那个方法（第二十六轮浏览器面实测），于是每次都走回落，而回落
+        拿空列表规则选容器——一段正文里一个容器都选不出来，求值对象是空列表，任何规则
+        都只会回"没取到值"。判据与求值两头都错，"未就绪"那句永远轮不到说。
+        """
+        result = self._rule_engine.extract_values(rule, sample,
+                                                  self._kind_of(rule, sample))
+        if asyncio.iscoroutine(result):        # 真身是同步纯函数，替身可写 async
+            result = await result
+        return list(result or [])
 
     def _render_debug(self, future, rule: str) -> None:
         if self._view is None:  # 视图已 detach：在途结果丢弃

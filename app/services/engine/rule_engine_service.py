@@ -246,6 +246,23 @@ class RuleEngineService(Service):
         engine = await self._get_engine(source)
         return await engine.content(source, chapter)
 
+    def extract_values(self, rule: str, sample: str, kind: str = "") -> list[str]:
+        """把一段示例正文当作**被求值的节点**，按一条规则取值（同步纯函数）。
+
+        规则编辑器「试跑当前规则」要的就是这个：没有书源、不发请求。这里刻意不走
+        :func:`rule_engine.select_nodes`——那条是"先按列表规则选容器、再逐容器取
+        字段"的搜索管线，试跑现场只有一条字段规则和一段正文，空列表规则选不出任何
+        容器，于是求值对象是空列表，**任何规则都只会回"没取到值"**。
+        """
+        from app.services.engine import rule_engine
+        kind = str(kind or "").lower()
+        if kind != "json":
+            kind = ("json" if str(sample or "").lstrip()[:1] in {"{", "["}
+                    else "html")
+        root = (rule_engine.parse_json_smart(sample) if kind == "json"
+                else rule_engine.parse_markup(sample, "html"))
+        return list(rule_engine.extract_values(root, rule, kind) or [])
+
     # ------------------------------------------------------------------ #
     # 书源登录（Legado loginUi / loginUrl）
     # ------------------------------------------------------------------ #
