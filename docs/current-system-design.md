@@ -714,8 +714,9 @@ submit_login / login_target`，`tests/test_legado_compat.py` 有对拍），断�
 承接方（M5 核对表 1.4 那格 ✗ 就是这么来的）。现在只有一条链：
 
 `ReaderView._collect_videos()` → 条目行「在本页播放」→ `ReaderController.play_video` →
-`MediaPlayService.open_book/play_chapter`（`FletVideoBackend`）→ `VideoPlayStateEvent`
-→ `_on_media_play_state` 镜像回 `VideoPlayBar`。七槽绑定见 reader_controller.py:201-207。
+`MediaPlayService.open_book/play_chapter`（`FletVideoBackend`）→ `MediaPlayStateEvent`
+→ `_on_media_play_state` 镜像回 `VideoPlayBar`。九槽绑定见 reader_controller.py:201-211
+（七条按钮 + 播放器自己上报的两条 `on_ended`/`on_failed`）。
 
 四条别人必须守住的实现约束（都是这一轮踩出来的）：
 
@@ -732,10 +733,53 @@ submit_login / login_target`，`tests/test_legado_compat.py` 有对拍），断�
    界面一帧也收不到，看着像"点了没反应"。
 
 播放进度与阅读进度**分列**存储（v7 `books.play_chapter_index` + `play_position`，见 §6）；
-书架行"读到第几章"仍只跟阅读进度，不随播放推进（差距已记 §1.4）。`ended` 未接控件事件，
-所以**不会自动连播下一条**。护栏：`tests/test_reader_video_panel.py` + `test_media_play_m4.py`；
-真实挂载面由离线浏览器探针取证（Playwright 点语义树 + 回环假视频源，见
-`flet-web-probe-ui-verification`），静态测试桩掉了 `ftv.Video` 这一面。
+书架行"读到第几章"仍只跟阅读进度，不随播放推进（差距已记 §1.4）。
+
+连播（第二十二轮接上）：客户端 `on_complete` → `VideoPlayBar.on_ended` →
+`ReaderController.video_ended` → 服务 `mark_ended()`（清了位置再发 `ended` 态）→
+`_finish_video_entry()` 按列表顺序点下一条。三条闸门都是必要的：
+**只认"正在放"**（停止/收起后客户端还会补发完成事件，照单连播会把刚收掉的播放器点亮回来）、
+**等落库期间换条/切页就放弃**（`index != self._video_index` 或 `_view is None`）、
+**报错不连播**（书源里的视频常常整本都坏，连播就是一路错到底）。片尾位置必须清零，
+否则"接着看"从那一秒起播。护栏 `tests/test_reader_video_panel.py` + `test_media_play_m4.py`
+（含 7 条变异核验，其中"绕回第一条"那条第一轮是**绿的**——"没发生"的判据写得会在
+"该发生的"落账那一刻就成立，见 dev 日志第二十二轮）。真实挂载面由离线浏览器探针取证
+（Playwright 点语义树 + 回环假视频源，见 `flet-web-probe-ui-verification`），静态测试桩掉了
+`ftv.Video` 这一面；**"客户端真产 `on_complete`"这一环仍在探针修，未取证**。
+
+### 5.13 规则编辑器：选源 → 选字段 → 合并保存（`views/source/code_editor_view.py`）
+
+「找书 → 规则」页签（`DEST_SOURCE_EDITOR` = `sources.editor`，`registry.py:158`）第二十三轮
+重做。旧形态只有一个编辑框：进来面对一份不知道属于哪本书的 JSON，改完只能整份手贴。现在的
+编辑单位是**一条规则字段**：
+
+书源下拉（`SourceService.list_sources`，进页即拉，`↻` 可重拉）→ 规则字段下拉（首项固定
+「整份书源 JSON」，其余**只列这份 JSON 里真实存在的字符串字段**，按 搜索/发现/详情/目录/正文/书评
+分组）→ 编辑框 → 关键字识别摘要 → 示例正文框 → 「保存并校验」/「试跑调试」。
+从书源列表带来源跳入走导航载荷 `load_source(record)`（`NavigationHost._open_nav_action` 认
+`load_source`/`load_record`），这条路径只把该源**并进**下拉（`add_source_option`），
+不能整表替换——否则切源得退回上一页。
+
+三条不能省的约束：
+
+1. **字段模式保存 = 合并，不是新建**。`_merged()` 拿 `_current` 深拷贝后只改那一个键；
+   没有 `_current`（还没选源就点保存）直接拒绝——凭空造一条只有该字段的书源去覆盖库里那条
+   等于删数据。
+2. **切字段先暂存**（`_stash_text` 只动内存，不写库不调校验），且换目标用**事件递来的键**，
+   不回读下拉 `.value`：控件状态什么时候落定不归控制器管。
+3. **试跑要先有示例正文**。本页不联网抓样本（见「全库联网扫描触发杀软拦截」），没样本就
+   **不调引擎**并说明原因——拿空串求值回显「没命中」，会把「规则写错了」和「没给正文」
+   混成同一个结果。引擎按 `_kind_of(rule, sample)` 选 html/json（`$.`/`[` 开头的规则走 JSONPath）。
+
+高亮层是关键字识别，不是逐 token 上色：`tokenize_rule` 切完只列**识别到的**规则关键字
+（`@text` / `css:` / `$.JSONPath` / `<js>…</js>` / `|| && %%`，去重封顶 40 个）。两个坑记下来：
+正则组名是 `str`（Python 里 `string` 不是合法组名），对外统一成 `string`，否则引号串
+从来没被上过色；JSON 文档模式若整串跳掉引号段，`".title@text"` 里的 `@text` 会一起丢，
+所以要**钻进引号串里再切一次**。
+
+红线照旧：本视图零 `app.services.*` import，高亮词表是方言常量；控制器可以 import flet，
+`WHOLE_SOURCE` 常量从视图侧惰性取，避免两份字面量漂移。护栏 `tests/test_source_rule_editor.py`
+（12 条变异核验全红）。
 
 ## 6. 存储（三类介质，设计 §6.2 落地态）
 

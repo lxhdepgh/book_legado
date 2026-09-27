@@ -69,7 +69,7 @@ DEST_RSS = "reading.rss"                   # 订阅源 / 文章 / 正文
 # --------------------------------------------------------------------------- #
 DEST_SOURCE_LIST = "sources.list"        # 书源列表/分组/启用停用/导入导出/检测入口
 DEST_SOURCE_IMPORT = "sources.import"    # 书源 JSON 文件导入 + 在线导入 URL
-DEST_SOURCE_EDITOR = "sources.editor"    # 规则代码编辑器（语法高亮 + 保存即校验）
+DEST_SOURCE_EDITOR = "sources.editor"    # 规则编辑器（选书源 + 按字段编辑 + 保存即校验）
 DEST_SOURCE_CHECK = "sources.check"      # 书源检测（四段流水线结果渲染）
 DEST_SOURCE_REPAIR = "sources.repair"    # 正文规则自愈报告确认写回
 

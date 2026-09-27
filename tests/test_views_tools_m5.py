@@ -241,6 +241,8 @@ class CodeEditorDebugTests(unittest.TestCase):
         self._sync_engine_call(ctrl)
 
         source = {"ruleSearch": {"bookNameRule": "div.title@text"}}
+        # 第二十三轮起试跑要先有示例正文（本页不联网抓样本），没样本就不调引擎。
+        view.set_sample('<div class="title">甲</div>')
         ctrl.run_debug(json.dumps(source, ensure_ascii=False))
         self.assertTrue(view._debug_host.visible)
         self.assertIn("div.title@text", view._debug.value)

@@ -9,7 +9,7 @@
 
 - :class:`BookSourceListView` 书源列表：分组 / 启用停用 / 导入导出 / 检测入口；
 - :class:`SourceImportView`    导入：本地 JSON 文件 + 在线 URL 多类型；
-- :class:`CodeEditorView`     规则编辑器：自绘输入框 + 分词高亮层 + 保存即校验；
+- :class:`CodeEditorView`     规则编辑器：选书源 + 选规则字段 + 关键字识别 + 保存即校验；
 - :class:`CheckView`          检测：CheckFinishedEvent 逐源渲染；
 - :class:`RuleRepairView`     自愈：RepairReportReadyEvent 报告确认写回。
 """

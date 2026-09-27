@@ -468,16 +468,25 @@ def test_a_finished_entry_starts_the_next_one():
 
 
 def test_the_last_finished_entry_does_not_wrap_around():
-    """最后一条放完就停：绕回第一条会把人困在死循环里。"""
-    view, controller, media = _rig([_video_block("https://v/1.mp4", "第一集")])
-    view.on_play_video("https://v/1.mp4")
-    assert _settled(lambda: "play_chapter" in media.names())
-    _emit(controller, "playing", chapter=0)
+    """最后一条放完就停：绕回第一条会把人困在死循环里。
+
+    两条断言分开等：`== [("mark_ended",)]` 这类"没有谁"的判据在 mark_ended 落账
+    那一刻就成立，绕回的那发是**之后**才发生的，所以要等够一个窗口再收。
+    """
+    view, controller, media = _rig([
+        _video_block("https://v/1.mp4", "第一集"),
+        _video_block("https://v/2.mp4", "第二集")])
+    view.on_play_video("https://v/2.mp4")
+    assert _settled(lambda: any(c[0] == "play_chapter" and c[1] == 1
+                                for c in media.calls))
+    _emit(controller, "playing", chapter=1)
 
     media.calls.clear()
     view.video_play.on_ended()
-    assert _settled(lambda: media.calls == [("mark_ended",)])
-    assert [c for c in media.calls if c[0] == "play_chapter"] == []
+    assert _settled(lambda: ("mark_ended",) in media.calls)
+    time.sleep(0.15)
+    assert [c for c in media.calls if c[0] == "play_chapter"] == [], \
+        f"最后一条放完还去点播条目：{media.calls}"
 
 
 def test_a_late_completion_after_stop_is_ignored():
@@ -509,6 +518,7 @@ def test_a_broken_entry_reports_error_and_does_not_advance():
     view.video_play.on_failed("403 Forbidden")
     assert view.video_play.state == "error"
     assert "403" in str(view.video_play._state_label.value)
+    time.sleep(0.15)
     assert media.calls == [], "报错不该触发任何播放动作"
 
 
