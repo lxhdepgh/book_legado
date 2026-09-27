@@ -224,7 +224,11 @@ def _open(rig) -> None:
     rig.controller.ui_call(rig.controller.open_book(
         SimpleNamespace(bookSourceUrl=SOURCE_URL),
         BookItem(name="书名", url=BOOK_URL)))
-    assert _settled(lambda: rig.controller._chapter_index == 0), "开书没挂出第一章"
+    # `_chapter_index` 在 `_run_chapter` 的 try 里就落了（reader_controller.py:457），
+    # 播放条的 visible/标题要到 :458 与 finally :479 才写完：只等前者就会撞进窗口。
+    assert _settled(lambda: rig.controller._chapter_index == 0
+                    and not rig.controller._reading_loading
+                    and not rig.controller._restoring_scroll), "开书没挂出第一章"
 
 
 def _press(rig) -> None:

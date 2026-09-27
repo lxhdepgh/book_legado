@@ -129,10 +129,26 @@ def _open(rig) -> None:
     rig.controller.ui_call(rig.controller.open_book(
         SimpleNamespace(bookSourceUrl=SOURCE_URL),
         BookItem(name="书名", url=BOOK_URL)))
-    assert _settled(lambda: rig.controller._chapter_index == 0), "开书没挂出第一章"
+    assert _settled(lambda: rig.controller._chapter_index == 0 and _idle(rig)), \
+        "开书没挂出第一章"
+
+
+def _idle(rig) -> bool:
+    """首屏/追加**真收工**：`_chapter_index` 在 `_run_chapter` 的 try 里就落了（
+    `reader_controller.py:457`），标题与两个标记要到 :458 与 finally :479 才写完。
+    只等前者，下一步读标题/发滚动就撞在窗口里。"""
+    return not rig.controller._reading_loading and not rig.controller._restoring_scroll
 
 
 def _scroll(rig, pixels, maximum) -> None:
+    """模拟一次真实滚动事件（视图那条 on_scroll 也接到同一个处理器上）。
+
+    发之前先等加载收工：挂载那一阵 `_restoring_scroll` / `_reading_loading` 还立着，
+    `_on_reader_scroll` 在 :827 与 :845 两处整段早退，这一发就被当成挂载噪音丢了。
+    真用户的手指是连续的，收工之后必然还有一发落在处理里；用例只发**一发**，
+    丢了就永远等不到——单跑绿、全量套件负载一高（窗口变长）偶发红。
+    """
+    assert _settled(lambda: _idle(rig)), "滚动前没等到加载收工"
     rig.controller._on_reader_scroll(SimpleNamespace(
         pixels=pixels, max_scroll_extent=maximum))
 
@@ -211,6 +227,14 @@ def test_appended_chapter_is_cached_separately(rig):
 
 
 def test_inertial_scroll_never_appends_the_same_chapter_twice(rig):
+    """同一位置连甩四下只接一章。
+
+    这份 rig 只有两章可读（`CHAPTERS` 里那个是卷标题），所以"防御全拆 → 一路往后
+    走到第三、第四、第五种"那个症状在这里**天生看不见**（`_adjacent_chapter(1)` 到
+    头就返回 None）。带牙齿的那条在 `test_views_reading_m2.py`
+    ::`ReaderAutoContinueTests::test_a_chapter_is_never_appended_twice`（三章 rig，
+    去布防 + 已挂集合两道一起拆才红）。
+    """
     _open(rig)
     for _ in range(4):
         _scroll(rig, 900, 1000)

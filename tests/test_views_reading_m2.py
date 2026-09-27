@@ -745,9 +745,24 @@ class ReaderAutoContinueTests(unittest.TestCase):
         return False
 
     def _scroll(self, pixels, maximum):
-        """模拟一次真实滚动事件（视图那条 on_scroll 也接到同一个处理器上）。"""
+        """模拟一次真实滚动事件（视图那条 on_scroll 也接到同一个处理器上）。
+
+        发之前等加载收工：追加那一阵 `_reading_loading` / `_restoring_scroll` 还立着，
+        `_on_reader_scroll` 在 `reader_controller.py:827` 与 `:845` 两处整段早退，
+        这一发就被当成挂载噪音丢了。真用户的手指是连续的、收工后必然还有一发落在处理里；
+        用例只发**一发**，丢了就永远等不到（单跑绿、全量负载下偶发红）。
+        要测"加载中被丢掉"本身，用 `_scroll_now`。
+        """
+        self.assertTrue(self._settled(self._idle), "滚动前没等到加载收工")
+        self._scroll_now(pixels, maximum)
+
+    def _scroll_now(self, pixels, maximum):
         self.controller._on_reader_scroll(SimpleNamespace(
             pixels=pixels, max_scroll_extent=maximum))
+
+    def _idle(self):
+        return (not self.controller._reading_loading
+                and not self.controller._restoring_scroll)
 
     def _texts(self):
         """屏幕上挂出来的文本（剥掉段首缩进：这里要验的是"哪几章在屏上"）。"""
@@ -772,13 +787,42 @@ class ReaderAutoContinueTests(unittest.TestCase):
                                1000.0)
 
     def test_a_chapter_is_never_appended_twice(self):
+        """同一章只能接一遍：这条性质上有**两道**防御，删任意一道另一道都兜得住。
+
+        变异核验实测（`.probe/mutate_scroll_harness.py`）：单独去掉追加后的
+        `_auto_scroll_armed = False`（`reader_controller.py:856`）**照样绿**，
+        单独放行加载闸门（:845）也**照样绿**——第二道 `_continuous_loaded` 成员判定
+        （:854）把活儿接了过去。所以这条用例钉的是"这条链整体没做出第二遍"，
+        不是名字里某一道闸；要证明单道闸存在得把两道一起拆（组合变异已核验会红）。
+        """
         self._scroll(900, 1000)
         self.assertTrue(self._settled(lambda: "/c2" in self.session.viewports))
+        # 等第二章挂载收工再连发：不然这几发全被加载闸门丢掉，用例是"vacuously 绿"，
+        # 真正该挡的那道逻辑一次都没被压到。
+        self.assertTrue(self._settled(self._idle))
         for _ in range(3):               # 同一位置反复触发（惯性滚动的常态）
-            self._scroll(900, 1000)
+            self._scroll_now(900, 1000)
         time.sleep(0.2)
         self.assertEqual(self._texts(), ["第一章正文", "第二章", "第二章正文"],
-                         "没有布防/去布防，一章能被接好几遍")
+                         "布防/去布防与已挂集合两道防御一起失效")
+
+    def test_a_bottom_scroll_during_a_load_is_dropped_and_a_later_one_works(self):
+        """挂载途中的"到底"不作数，但闸门开了之后同一发必须接得上。
+
+        那一刻的文档几何是布局中间态而不是"用户读完了"（与 :815 那条"偏移 0 的挂载
+        噪音"同源），所以 `_on_reader_scroll` 在 :845 整段早退。**代价写在这儿**：
+        被挡掉的这一发没人补判，用户要再滚一下才接得上——真实手指是连续的所以看不出来。
+        反面那半不能省：只断"没接上"的话，把续读整个弄坏也能让这条绿。
+        """
+        self.controller._reading_loading = True
+        self._scroll_now(900, 1000)
+        self.assertFalse(
+            self._settled(lambda: "/c2" in self.session.viewports, timeout=0.5),
+            "加载中间态的几何被当成读完了，凭空接进第二章")
+        self.controller._reading_loading = False
+        self._scroll(900, 1000)
+        self.assertTrue(self._settled(lambda: "/c2" in self.session.viewports),
+                        "闸门放行后还是不接章：上面那个「没接上」就是假过的")
 
     def test_tracking_follows_the_appended_chapter(self):
         self._scroll(900, 1000)
@@ -795,7 +839,8 @@ class ReaderAutoContinueTests(unittest.TestCase):
     def test_position_persistence_skips_the_mount_noise(self):
         """换整篇文档时那次"偏移 0"的瞬时事件不是用户进度，不能落库。"""
         self.controller._restoring_scroll = True
-        self._scroll(0, 0)
+        # 这条测的就是"挂载窗口里那一发必须被丢掉"，所以直接发、不等收工。
+        self._scroll_now(0, 0)
         self.assertFalse(self._settled(
             lambda: self.reading.save_progress.await_count > 0, timeout=0.5),
             "挂载噪音被当成阅读进度写盘，下次打开会回到章首")
