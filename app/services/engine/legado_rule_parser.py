@@ -12,7 +12,7 @@ from xml.dom import Node, minidom
 from datetime import datetime
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from typing import Any, NamedTuple
 
 from bs4 import (BeautifulSoup, CData, Comment, Doctype, NavigableString,
                  ProcessingInstruction, Tag)
@@ -649,8 +649,19 @@ def split_rule_expression(value: str, separators: tuple[str, ...],
     The first separator found outside ``[]``/``()`` becomes ``elementsType``;
     subsequent recursion handles other operator types. ``code`` selects the
     JSONPath escaping rules used by chompCodeBalanced.
+
+    The grouping depends only on the rule text, so it is cached; the cached
+    tuple is copied out because callers pop parts off the returned list.
     """
-    text = str(value or "")
+    parts, operator = _split_rule_expression(str(value or ""),
+                                             tuple(separators), bool(code))
+    return list(parts), operator
+
+
+@lru_cache(maxsize=2048)
+def _split_rule_expression(value: str, separators: tuple[str, ...],
+                           code: bool) -> tuple[tuple[str, ...], str]:
+    text = value
 
     def positions(target: str | None = None):
         found, stack, quote = [], [], ""
@@ -698,7 +709,7 @@ def split_rule_expression(value: str, separators: tuple[str, ...],
 
     outside = positions()
     if not outside:
-        return [text], ""
+        return (text,), ""
     operator = outside[0][1]
     cuts = positions(operator)
     parts, start = [], 0
@@ -706,7 +717,7 @@ def split_rule_expression(value: str, separators: tuple[str, ...],
         parts.append(text[start:index])
         start = index + len(operator)
     parts.append(text[start:])
-    return [part.strip() for part in parts if part.strip()], operator
+    return tuple(part.strip() for part in parts if part.strip()), operator
 
 
 @lru_cache(maxsize=2048)
@@ -851,8 +862,26 @@ def _selector_regex_filters(selector: str) -> tuple[str, list[tuple[object, str]
     return value.strip() or "*", filters
 
 
-def select_jsoup(context: Any, selector: str) -> list[Tag]:
-    """Select with the Jsoup pseudos used by Legado book-source rules."""
+class _JsoupPlan(NamedTuple):
+    """A Jsoup selector with everything selector-text-only already computed.
+
+    同一批 400 个节点用的是同一条规则；重写器（约十趟正则 + 一个手写的括号
+    扫描器）只依赖选择器文本，跑 400 遍是纯粹的重复劳动。DOM 匹配留在
+    :func:`_apply_jsoup_plan` 里，那里才看节点。
+    """
+
+    mode: str                                        # css / bare_wildcard / empty
+    css: str = ""
+    attribute_filters: tuple = ()
+    attribute_prefixes: tuple = ()
+    filters: tuple = ()
+    document_not_equal: tuple = ()                   # (属性名, 期望值)
+    had_hex_escape: bool = False
+    wildcard_local: str = ""
+
+
+def _jsoup_plan(selector: str, context: Any = None) -> _JsoupPlan:
+    """Compile the selector-text-only half of :func:`select_jsoup`."""
     attribute_filters = []
     attribute_prefixes = []
 
@@ -904,6 +933,12 @@ def select_jsoup(context: Any, selector: str) -> list[Tag]:
     document_not_equal = re.fullmatch(
         r'\s*\[([\w:-]+)!=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\]]*))\]\s*',
         selector)
+    document_not_equal_pair = ()
+    if document_not_equal:
+        document_not_equal_pair = (
+            document_not_equal.group(1),
+            next((part for part in document_not_equal.groups()[1:]
+                  if part is not None), "").strip())
     had_hex_escape = bool(re.search(r"\\[0-9A-Fa-f]{1,6}", selector))
     if had_hex_escape:
         selector = re.sub(r"\\([0-9A-Fa-f]{1,6})", r"\1", selector)
@@ -913,10 +948,8 @@ def select_jsoup(context: Any, selector: str) -> list[Tag]:
     selector = re.sub(r",(?:\s*,)+\s*(?=\S)", ",", selector)
     wildcard_namespace = re.fullmatch(r"\s*\*\|([\w-]+)\s*", selector)
     if wildcard_namespace:
-        local_name = wildcard_namespace.group(1).casefold()
-        return [node for node in context.find_all(True)
-                if (str(node.name).casefold() == local_name or
-                    str(node.name).casefold().endswith(":" + local_name))]
+        return _JsoupPlan("bare_wildcard",
+                          wildcard_local=wildcard_namespace.group(1).casefold())
     # SoupSieve has no wildcard namespace for literal colon-named HTML tags.
     # Expand the wildcard from the actual DOM names so it remains usable in
     # compound selectors such as ``div > *|span`` and ``p + *|content``.
@@ -965,7 +998,7 @@ def select_jsoup(context: Any, selector: str) -> list[Tag]:
         selector,
     )
     if unsupported_unquoted_attribute:
-        return []
+        return _JsoupPlan("empty")
     css, filters = _selector_regex_filters(selector)
     # Jsoup's class and non-regex attribute evaluators compare ASCII/Unicode
     # case-insensitively. CSS/SoupSieve defaults these values to sensitive.
@@ -976,6 +1009,26 @@ def select_jsoup(context: Any, selector: str) -> list[Tag]:
         r'(\[[\w:-]+(?:!=|\^=|\$=|\*=|\|=|=)'
         r'(?:"[^"]*"|\'[^\']*\'|[^\]\s]+))\]',
         r'\1 i]', css)
+    return _JsoupPlan("css", css=css,
+                      attribute_filters=tuple(attribute_filters),
+                      attribute_prefixes=tuple(attribute_prefixes),
+                      filters=tuple(filters),
+                      document_not_equal=document_not_equal_pair,
+                      had_hex_escape=had_hex_escape)
+
+
+def _apply_jsoup_plan(context: Any, plan: _JsoupPlan) -> list[Tag]:
+    """Run a compiled selector against one node: the only context-dependent half."""
+    if plan.mode == "empty":
+        return []
+    if plan.mode == "bare_wildcard":
+        local_name = plan.wildcard_local
+        return [node for node in context.find_all(True)
+                if (str(node.name).casefold() == local_name or
+                    str(node.name).casefold().endswith(":" + local_name))]
+    css, filters = plan.css, plan.filters
+    attribute_filters, attribute_prefixes = plan.attribute_filters, plan.attribute_prefixes
+    had_hex_escape = plan.had_hex_escape
     try:
         nodes = list(context.select(css))
         if (isinstance(context, Tag) and
@@ -992,10 +1045,9 @@ def select_jsoup(context: Any, selector: str) -> list[Tag]:
             if not_equal:
                 expected = not_equal.group(2) or not_equal.group(3) or ""
                 document_matches = _attr(context, not_equal.group(1)).casefold() != expected.casefold()
-            elif document_not_equal:
-                expected = next((part for part in document_not_equal.groups()[1:]
-                                 if part is not None), "").strip()
-                document_matches = (_attr(context, document_not_equal.group(1)).casefold() !=
+            elif plan.document_not_equal:
+                attribute, expected = plan.document_not_equal
+                document_matches = (_attr(context, attribute).casefold() !=
                                     expected.casefold())
             if document_matches:
                 nodes.insert(0, context)
@@ -1045,6 +1097,23 @@ def select_jsoup(context: Any, selector: str) -> list[Tag]:
         else:
             nodes = [node for node in nodes if regex.search(_jsoup_text(node))]
     return nodes
+
+
+@lru_cache(maxsize=512)
+def _cached_jsoup_plan(selector: str) -> _JsoupPlan:
+    return _jsoup_plan(selector)
+
+
+def select_jsoup(context: Any, selector: str) -> list[Tag]:
+    """Select with the Jsoup pseudos used by Legado book-source rules.
+
+    一份列表规则要对每个节点跑一遍，选择器文本却只有一个，所以重写结果按文本缓存
+    （上限 512 条，参考实现同理是按规则缓存）。带 ``*|`` 的那条路要从**当前节点**的
+    标签名里展开通配，结果随 context 变，留在原路径不缓存。
+    """
+    text = str(selector)
+    plan = _jsoup_plan(text, context) if "*|" in text else _cached_jsoup_plan(text)
+    return _apply_jsoup_plan(context, plan)
 
 
 def xpath_values(root: Any, rule: str) -> list[Any]:
@@ -1272,6 +1341,7 @@ def _apply_selection(values: list[Any], selection: str, exclude: bool) -> list[A
     return [values[position] for position in indices]
 
 
+@lru_cache(maxsize=2048)
 def _jsoup_part(part: str) -> tuple[str, str, bool]:
     part = str(part).strip()
     part = re.sub(r"\[\^([^\]]+)\]", r"[class^=\1]", part)

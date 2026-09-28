@@ -25,7 +25,10 @@ import logging
 from collections import OrderedDict
 from typing import Any
 
+import aiohttp
+
 from app.services.engine.reading_engine import LegadoReadingEngine
+from app.services.engine.rule_engine import dns_ip_resolver
 from app.services.engine._prefs import set_override
 
 logger = logging.getLogger(__name__)
@@ -87,8 +90,10 @@ class RuleEngineService(Service):
     #: 服务名（§0.4 冻结词汇表，仪表盘/事件按此路由）。
     name = "RuleEngineService"
 
-    #: 默认池上限：同时驻留的引擎实例数（对应"短命"语义：热门源复用、冷门源淘汰）。
-    DEFAULT_POOL_SIZE = 8
+    #: 默认池上限：与换源扫描的并发数对齐（Legado 的 threadCount 也是 32）。
+    #: 池小于并发数时，扫描会把已建好的引擎连同它的会话一起淘汰掉；
+    #: 引擎本身很便宜（实测构造 0.55ms），省下的只是对象，代价是冷连接。
+    DEFAULT_POOL_SIZE = 32
 
     def __init__(self, state_dir=None, pool_size: int = DEFAULT_POOL_SIZE,
                  timeout: int = 15, connect_timeout: float | None = None,
@@ -104,6 +109,11 @@ class RuleEngineService(Service):
         self._pool: OrderedDict[str, LegadoReadingEngine] = OrderedDict()
         self._pool_lock = asyncio.Lock()
         self._default_engine: LegadoReadingEngine | None = None
+        # 每个事件循环共享一条 TCP 连接池（对标 OkHttp 单例 client 的
+        # ConnectionPool）。aiohttp 的对象绑死在创建它的循环上，而本服务的入口
+        # 可能来自引擎循环，也可能来自直接 require 本服务的后台服务，所以按循环
+        # 分桶，绝不把一条 connector 交给两个循环用。
+        self._shared_connectors: "OrderedDict[Any, Any]" = OrderedDict()
 
     # ------------------------------------------------------------------ #
     # 生命周期扩展点（基类统管状态机：STARTING→RUNNING / STOPPING→DISPOSED）
@@ -129,6 +139,17 @@ class RuleEngineService(Service):
                 except Exception:  # pragma: no cover
                     pass
                 self._default_engine = None
+            if self._shared_connectors:
+                # 会话不拥有 connector（engine.aclose 只关会话），所以全池释放完
+                # 之后由这里做唯一的关闭。绑在别的循环上的留给那个循环自己关。
+                current = asyncio.get_running_loop()
+                for loop in list(self._shared_connectors):
+                    if loop is not current:
+                        continue
+                    try:
+                        await self._shared_connectors.pop(loop).close()
+                    except Exception:  # pragma: no cover
+                        pass
         logger.info("RuleEngineService 已停止")
 
     def _apply_global_prefs(self) -> None:
@@ -155,10 +176,10 @@ class RuleEngineService(Service):
     async def _get_engine(self, source=None) -> LegadoReadingEngine:
         """取书源对应的引擎实例；没有则新建，超池则淘汰最久未用（LRU）。
 
-        池化理由：LegadoReadingEngine 内部持有 aiohttp 连接池 + QuickJS 线程 +
-        Cookie/JS 状态，构造昂贵；按源复用避免重复握手与状态重建。但又不能无限驻留
-        （每个实例占一条连接池/一组线程），故用 LRU 上限做"短命"淘汰——淘汰即
-        aclose() 释放，下次用到再重建。
+        池化理由：LegadoReadingEngine 持有该源的 Cookie/JS 状态与 put/get 变量袋，
+        换源与检测要按源把这些状态留住。引擎本身构造并不贵（实测 0.55ms），真正
+        不能丢的是会话状态；TCP 连接池已经上移到 :meth:`_shared_connector`，按循环
+        共享一条，所以淘汰一个冷门源不再连带丢掉别人的热连接。
         """
         if source is None:
             if self._default_engine is None:
@@ -180,6 +201,23 @@ class RuleEngineService(Service):
                 asyncio.ensure_future(self._release(stale))
             return engine
 
+    def _shared_connector(self):
+        """当前循环专属的共享 TCP 连接池（没有运行中的循环就返回 None）。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        connector = self._shared_connectors.get(loop)
+        if connector is None or connector.closed:
+            # [对齐 OkHttp ConnectionPool] 全局上限沿用 aiohttp 默认（与引擎
+            # 单独建池时一致），每主机 5 条与 ReaderEngine._session_for 同值。
+            # resolver 也必须同值：dnsIp 钉表挂在 resolver 上，共享池少了它，
+            # 走这条路的书源就会悄悄按系统 DNS 解析（钉表形同失效）。
+            connector = aiohttp.TCPConnector(
+                ssl=False, limit_per_host=5, resolver=dns_ip_resolver())
+            self._shared_connectors[loop] = connector
+        return connector
+
     def _new_engine(self) -> LegadoReadingEngine:
         engine = LegadoReadingEngine(
             timeout=self.timeout,
@@ -187,6 +225,7 @@ class RuleEngineService(Service):
             verification_fetcher=self.verification_fetcher,
             state_dir=self.state_dir,
             connect_timeout=self.connect_timeout,
+            shared_connector=self._shared_connector(),
         )
         # F7：视图装配期经 inject_interaction_loop 写入 _interaction_loop；
         # 池化引擎在装配后才懒建，这里继承 UI loop，让 webview/验证码回调

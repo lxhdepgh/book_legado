@@ -806,6 +806,15 @@ class _DnsIpResolver(aiohttp.ThreadedResolver):
         return await super().resolve(host, port=port, family=family)
 
 
+def dns_ip_resolver() -> _DnsIpResolver:
+    """dnsIp 钉表 resolver（无状态，只读全局钉表）。
+
+    引擎自建 connector 和池服务那条共享 connector **必须用同一个 resolver**，
+    否则走共享路径的书源会悄悄失去 dnsIp 钉表能力。
+    """
+    return _DnsIpResolver()
+
+
 class ReaderEngine:
     _global_rate_states = {}
     _global_rate_lock = threading.Lock()
@@ -813,7 +822,8 @@ class ReaderEngine:
     _COOKIE_STORE_SQLITE_KEY = "legado_cookie_store"
 
     def __init__(self, timeout: float | None = None, state_dir=None,
-                 connect_timeout: float | None = None, background: bool = False):
+                 connect_timeout: float | None = None, background: bool = False,
+                 shared_connector=None):
         # [M1-2.13] total 兜底 90s（近似 Legado call 60s）；显式传值时以调用方为准。
         if timeout is None:
             timeout = DEFAULT_TOTAL_TIMEOUT
@@ -823,6 +833,10 @@ class ReaderEngine:
         # cannot hold a worker for the whole total budget.
         self.connect_timeout = connect_timeout
         self.state_dir = state_dir
+        # A pool owner may hand every engine the same TCPConnector so that
+        # evicting an engine costs neither its warm sockets nor the other
+        # engines' ones.  The engine never closes a connector it does not own.
+        self._shared_connector = shared_connector
         self.js = LegadoJsRuntime(timeout, state_dir=state_dir)
         self.js.background = background
         self.js_variables = {}
@@ -867,16 +881,25 @@ class ReaderEngine:
         key = (jar_key, normalized_proxy)
         session = self._sessions.get(key)
         if session is None or session.closed:
+            shared = self._shared_connector
             if socks_proxy:
-                connector = ProxyConnector.from_url(normalized_proxy, ssl=False)
+                connector, owner = (
+                    ProxyConnector.from_url(normalized_proxy, ssl=False)), True
+            elif shared is not None and not shared.closed:
+                # OkHttp keeps one ConnectionPool for the whole client, so an
+                # engine that comes and goes still reuses warm sockets.  The
+                # session must not own this connector: aclose() on one source's
+                # engine would otherwise drop every other source's keep-alive.
+                connector, owner = shared, False
             else:
                 # [M1-2.18] 主会话每主机并发上限对齐 OkHttp=5（全局 limit=100 保持默认不变）。
                 # [M1-2.14] 接入 dnsIp 钉表 resolver（命中域名直连 IP、按原域名发 Host）。
-                connector = aiohttp.TCPConnector(
+                connector, owner = aiohttp.TCPConnector(
                     ssl=False, limit_per_host=5,
-                    resolver=self._dns_resolver())
+                    resolver=self._dns_resolver()), True
             session = aiohttp.ClientSession(
                 connector=connector,
+                connector_owner=owner,
                 # [M1-2.15] aiohttp 自带罐关闭 cookie 合并，仅保留连接池；
                 # 请求 Cookie 头统一走 export_cookie_header 单点，响应 Set-Cookie 走
                 # save_response_cookies，消除 host-only 精确域 vs 二级域补发的双发。
@@ -889,7 +912,7 @@ class ReaderEngine:
         """惰性创建并缓存 dnsIp resolver（必须在运行中的事件循环里构造）。"""
         resolver = getattr(self, "_dns_resolver_instance", None)
         if resolver is None:
-            resolver = _DnsIpResolver()
+            resolver = dns_ip_resolver()
             self._dns_resolver_instance = resolver
         return resolver
 

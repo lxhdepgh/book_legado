@@ -390,9 +390,11 @@ class LegadoReadingEngine(ReaderEngine):
 
     def __init__(self, timeout: int = 15, webview_fetcher=None,
                  verification_fetcher=None, state_dir=None,
-                 connect_timeout: float | None = None, background: bool = False):
+                 connect_timeout: float | None = None, background: bool = False,
+                 shared_connector=None):
         super().__init__(timeout, state_dir=state_dir,
-                         connect_timeout=connect_timeout, background=background)
+                         connect_timeout=connect_timeout, background=background,
+                         shared_connector=shared_connector)
         self.webview_fetcher = webview_fetcher
         self.verification_fetcher = verification_fetcher
         # The engine may run on its own loop (app/services/engine_worker.py).

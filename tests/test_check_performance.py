@@ -652,5 +652,152 @@ class LocalHotPathTests(unittest.TestCase):
         self.assertGreaterEqual(LegadoJsRuntime._clean_script.cache_info().hits, 1)
 
 
+class RuleCompileCacheTests(unittest.TestCase):
+    """规则文本相同的编译工作不许按节点数量重做一遍。"""
+
+    def setUp(self):
+        from app.services.engine import legado_rule_parser as parser
+        self.parser = parser
+        for cached in (parser._cached_jsoup_plan, parser._split_rule_expression,
+                       parser._jsoup_part):
+            cached.cache_clear()
+
+    def test_selector_plan_is_compiled_once_per_selector_text(self):
+        parser = self.parser
+        compiles = []
+        original = parser._jsoup_plan
+
+        def counting(selector, context=None):
+            compiles.append(selector)
+            return original(selector, context)
+
+        parser._jsoup_plan = counting
+        try:
+            left = parser.parse_markup(
+                "<ul><li><b class='n'>甲</b></li><li><b class='n'>乙</b></li></ul>")
+            right = parser.parse_markup(
+                "<ul><li><b class='n'>丙</b></li></ul>")
+            selector = "b.n"
+            nodes = []
+            for item in left.select("li"):
+                for _ in range(3):
+                    nodes.extend(parser.select_jsoup(item, selector))
+            second = parser.select_jsoup(right.select("li")[0], selector)
+        finally:
+            parser._jsoup_plan = original
+        self.assertEqual(len(compiles), 1,
+                         "同一串选择器被重新编译了 %d 次" % len(compiles))
+        self.assertEqual([node.get_text() for node in nodes],
+                         ["甲"] * 3 + ["乙"] * 3)
+        # 缓存的是"怎么匹配"，不是匹配结果：换了 DOM 必须换答案。
+        self.assertEqual([node.get_text() for node in second], ["丙"])
+
+    def test_expression_split_survives_caller_mutation(self):
+        parser = self.parser
+        parts, operator = parser.split_rule_expression("a@b@c", ("@",), code=False)
+        parts.pop()               # jsoup_values 会弹掉尾段
+        again, again_operator = parser.split_rule_expression("a@b@c", ("@",),
+                                                            code=False)
+        self.assertEqual(again, ["a", "b", "c"])
+        self.assertEqual(again_operator, "@")
+
+
+class SharedConnectorPoolTests(unittest.IsolatedAsyncioTestCase):
+    """池里的引擎共享一条连接池，淘汰一个不能关掉别人在用的套接字。"""
+
+    @staticmethod
+    def _source(url: str):
+        return SimpleNamespace(bookSourceUrl=url, enabledCookieJar=True)
+
+    async def test_pool_hands_every_engine_the_same_connector(self):
+        from app.services.engine.rule_engine_service import RuleEngineService
+        service = RuleEngineService(pool_size=4, timeout=5)
+        await service.on_start()
+        sessions = []
+        try:
+            for index in range(3):
+                engine = await service._get_engine(self._source(
+                    f"https://s{index}.test"))
+                sessions.append(engine._session_for(self._source(
+                    f"https://s{index}.test"), "", False))
+        finally:
+            for session in sessions:
+                await session.close()
+            await service.on_stop()
+        connectors = {session._connector for session in sessions}
+        self.assertEqual(len(connectors), 1, "引擎各自建了连接池")
+        self.assertTrue(all(session._connector_owner is False
+                            for session in sessions),
+                        "会话认领了共享 connector，关会话就会关全池")
+
+    async def test_eviction_does_not_close_the_shared_connector(self):
+        """被淘汰引擎的会话关掉时，共享连接池必须活着留给别的源用。"""
+        from app.services.engine.rule_engine_service import RuleEngineService
+        service = RuleEngineService(pool_size=2, timeout=5)
+        await service.on_start()
+        sessions = []
+        try:
+            for url in ("https://a.test", "https://b.test"):
+                engine = await service._get_engine(self._source(url))
+                sessions.append(engine._session_for(self._source(url), "", False))
+            connector = sessions[0]._connector
+            self.assertIs(sessions[1]._connector, connector)
+            # 第三个源进场把 a 挤出去，a 的引擎随之 aclose()。
+            await service._get_engine(self._source("https://c.test"))
+            await asyncio.sleep(0.05)     # 淘汰是 ensure_future 投递的
+            self.assertNotIn("https://a.test", service._pool)
+            self.assertTrue(sessions[0].closed, "被淘汰引擎的会话没关")
+            self.assertFalse(connector.closed,
+                             "淘汰冷门源把全池共用的热连接一起关掉了")
+            self.assertFalse(sessions[1].closed)
+            self.assertIs(sessions[1]._connector, connector)
+        finally:
+            for session in sessions:
+                if not session.closed:
+                    await session.close()
+            await service.on_stop()
+        self.assertTrue(connector.closed)
+        self.assertEqual(service._shared_connectors, {})
+
+    async def test_shared_connector_keeps_the_dns_ip_resolver(self):
+        """共享池必须带上 dnsIp resolver，否则走这条路的书源钉表形同失效。
+
+        只做类型断言，不调 `resolve()`——少了 resolver 时它会去查真 DNS，
+        护栏就变成联网用例了。
+        """
+        from app.services.engine import rule_engine as RE
+        from app.services.engine.rule_engine_service import RuleEngineService
+        service = RuleEngineService(pool_size=2, timeout=5)
+        await service.on_start()
+        try:
+            shared = service._shared_connector()
+            self.assertIsInstance(shared._resolver, RE._DnsIpResolver,
+                                  "共享 connector 没挂 dnsIp resolver，钉表被绕过")
+            engine = await service._get_engine(self._source("https://d.test"))
+            own = engine._session_for(self._source("https://d.test"), "", False)
+            self.assertIsInstance(own._connector._resolver, RE._DnsIpResolver)
+        finally:
+            await service.on_stop()
+
+    async def test_socks_proxy_keeps_its_own_connector(self):
+        """代理会话仍然自建 connector：共享池只服务直连，别把代理塞进公共池。"""
+        from app.services.engine.rule_engine_service import RuleEngineService
+        service = RuleEngineService(pool_size=2, timeout=5)
+        await service.on_start()
+        try:
+            engine = await service._get_engine(self._source("https://p.test"))
+            source = self._source("https://p.test")
+            plain = engine._session_for(source, "", False)
+            via_proxy = engine._session_for(
+                source, "socks5://127.0.0.1:1080", True)
+            self.assertIsNot(plain._connector, via_proxy._connector)
+            self.assertEqual(list(service._shared_connectors.values()),
+                             [plain._connector])
+        finally:
+            await via_proxy.close()
+            await plain.close()
+            await service.on_stop()
+
+
 if __name__ == "__main__":
     unittest.main()
