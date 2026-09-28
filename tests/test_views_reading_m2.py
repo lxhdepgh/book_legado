@@ -300,7 +300,7 @@ class SourceSwitchProgressTests(unittest.IsolatedAsyncioTestCase):
         async def switch_source(item, candidates, keyword="", on_progress=None):
             seen["on_progress"] = on_progress
             if on_progress is not None:
-                on_progress(1, 2, 1)      # 扫完 1/2，1 个源失败
+                on_progress(1, 2, 1, 2)      # 扫完 1/2，1 个源失败、2 个本机忙不过来
             return []
 
         reading.switch_source = switch_source
@@ -331,8 +331,13 @@ class SourceSwitchProgressTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("on_progress", seen, "控制器没把进度回调传给服务")
             self.assertIsNotNone(seen["on_progress"])
             self.assertAlmostEqual(dialog._progress.value, 0.5, places=2)
-            self.assertTrue(any("1/2" in s and "失败" in s for s in statuses),
+            self.assertTrue(any("1/2" in s and "1 个失败" in s for s in statuses),
                             f"扫描中状态没报进度/失败数：{statuses}")
+            self.assertTrue(any("本机忙不过来" in s for s in statuses),
+                            "「本机忙不过来」的源没单独报出来，用户会去删好源："
+                            f"{statuses}")
+            self.assertFalse(any("3 个失败" in s for s in statuses),
+                             f"繁忙数被混进了失败数：{statuses}")
             self.assertTrue(any("扫描完成" in s for s in statuses),
                             f"扫描结束没收口：{statuses}")
         finally:

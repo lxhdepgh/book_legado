@@ -391,8 +391,8 @@ def test_switch_source_scans_concurrently_with_timeout(env, monkeypatch):
             {"name": "书名", "author": "作者", "url": "b-src-1",
              "source_url": "src-1"},
             sources, keyword="书名",
-            on_progress=lambda done, tot, fails: progress.append(
-                (done, tot, fails)))
+            on_progress=lambda done, tot, fails, starved: progress.append(
+                (done, tot, fails, starved)))
 
     started = time.monotonic()
     matches = asyncio.run(scan())
@@ -405,9 +405,99 @@ def test_switch_source_scans_concurrently_with_timeout(env, monkeypatch):
     # 单源失败只计数不中止：39 个源命中、1 个失败（src-7 超时、src-9 连接错）
     assert len(matches) == total - 2
     assert progress and progress[-1][0] == total
-    assert sum(done == tot for done, tot, _ in progress) == 1, \
+    assert sum(done == tot for done, tot, *_ in progress) == 1, \
         "中间进度按 0.5s 节流，不是每源刷一次"
     assert progress[-1][2] >= 1, "失败要计数并回给界面"
+    assert progress[-1][3] == 0, "空等网络不是本机的错，不该记成繁忙"
+
+
+def test_switch_timeout_separates_machine_busy_from_slow_source(env, monkeypatch):
+    """同一个"超时"要拆成两种错：源慢，还是我们把本机解析挤爆了。
+
+    判据是超时窗口内**本线程 CPU 占墙钟的比例**（:func:`_switch_starved`），所以
+    这条把它做成三路差分：前两个源都由同一个 ``asyncio.wait_for`` 掐断、都由
+    ``_switch_failure_reason`` 归一成同一个"超时"，唯一差别是一个只在空等处时间、
+    另一个在事件循环上烧 CPU；第三个源烧完 CPU 后抛真错，用来钉"繁忙"只改判超时，
+    不许把网络错误也一起洗成"本机忙"。混成一个数时界面写"38 个失败"，用户去删的
+    却是 38 个好源，所以失败数必须**排除**繁忙数。
+    """
+    from app.services.reading import reading_service as rs
+    from app.services.engine.rule_engine import RequestConnectionError
+    monkeypatch.setattr(rs, "SWITCH_TIMEOUT", 0.3)
+    monkeypatch.setattr(rs, "SWITCH_CONCURRENCY", 1)   # 串行：三个窗口互不掺时间
+
+    sources = [SimpleNamespace(bookSourceUrl=f"src-{i}", bookSourceName=f"源{i}",
+                               enabled=True, searchUrl="/q") for i in (1, 2, 3)]
+
+    class _Engine:
+        async def search(self, source, keyword, page=1):
+            if source.bookSourceUrl == "src-1":
+                await asyncio.sleep(5)               # 纯空等：慢的是对面那台站
+                return []
+            if source.bookSourceUrl == "src-2":
+                until = time.perf_counter() + 5      # 远超 SWITCH_TIMEOUT：必被掐断
+                while time.perf_counter() < until:
+                    sum(i * i for i in range(3000))  # 忙的是我们自己的解析线程
+                    await asyncio.sleep(0)           # 让出一次，超时才掐得断
+                return []
+            until = time.perf_counter() + 0.1        # 在超时**之内**跑完：不是超时
+            while time.perf_counter() < until:
+                sum(i * i for i in range(3000))
+                await asyncio.sleep(0)
+            raise RequestConnectionError("拒绝连接")
+
+    svc = ReadingService(rule_engine=_Engine(), storage=env.storage,
+                         settings=env.settings)
+    asyncio.run(svc.on_start())
+    progress: list[tuple] = []
+
+    asyncio.run(svc.switch_source(
+        {"name": "书名", "source_url": "src-0"}, sources, keyword="书名",
+        on_progress=lambda done, tot, fails, starved: progress.append(
+            (done, tot, fails, starved))))
+
+    assert progress[-1] == (3, 3, 2, 1), (
+        f"空等的那个和真错的那个都算失败，只有烧 CPU 的超时算繁忙（实测 {progress[-1]}）")
+
+
+def test_switch_never_runs_more_workers_than_the_cap(env, monkeypatch):
+    """「有界并发」的全部含义在这个上限上：漏了它，20 个源会一起涌进唯一的事件循环线程。
+
+    断言写成等号而不是 ``<=``：只钉"没超过"的话，把 worker 数写成 1 也算绿，
+    而那时候整轮扫描要跑几十秒——上限的意义是**用满**它。
+    """
+    from app.services.reading import reading_service as rs
+    monkeypatch.setattr(rs, "SWITCH_CONCURRENCY", 3)
+
+    total = 20
+    sources = [SimpleNamespace(bookSourceUrl=f"src-{i}", bookSourceName=f"源{i}",
+                               enabled=True, searchUrl="/q") for i in range(total)]
+
+    class _Engine:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.seen: list[str] = []
+
+        async def search(self, source, keyword, page=1):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.seen.append(source.bookSourceUrl)
+            try:
+                await asyncio.sleep(0.01)
+            finally:
+                self.active -= 1
+            return []
+
+    engine = _Engine()
+    svc = ReadingService(rule_engine=engine, storage=env.storage,
+                         settings=env.settings)
+    asyncio.run(svc.on_start())
+    asyncio.run(svc.switch_source({"name": "书名", "source_url": "src-0"},
+                                  sources, keyword="书名"))
+
+    assert engine.max_active == 3, f"并发峰值应是上限值，实测 {engine.max_active}"
+    assert len(engine.seen) == total, "每个候选源都要扫到"
 
 
 def test_search_store_seeds_expire_on_start(env):

@@ -254,6 +254,83 @@ def test_search_book_store_shim_main_db(migrated_storage):
     assert store.get("https://shim/b/2") is None
 
 
+def test_search_book_store_insert_is_a_single_transaction(migrated_storage):
+    """一批种子只提交一次——autocommit 下逐行 INSERT 就是逐行 journal + fsync。
+
+    实测：400 行逐行提交 1141ms，包成一条事务 11.6ms（**98×**），而换源扫描每个源
+    都要落一次种子，这是整轮墙钟里最大的一块（修前单源扫描 1312ms / 修后 177ms）。
+    护栏钉的是**语句序列**而不是时间：计时在 CI 上不可复现，"只提交一次"是可数的。
+    """
+    storage, _, _ = migrated_storage
+    statements: list[str] = []
+    storage.db.set_trace_callback(
+        lambda sql: statements.append(sql.strip().split(None, 1)[0].upper()))
+    try:
+        SearchBookStore(conn=storage.db).insert(
+            [BookItem(name=f"事务书{i}", author="甲", url=f"tx/{i}", origin="o")
+             for i in range(50)])
+    finally:
+        storage.db.set_trace_callback(None)
+
+    assert statements.count("BEGIN") == 1, f"整批没包进一条事务：{statements[:4]}"
+    assert statements.count("COMMIT") == 1
+    assert statements.count("ROLLBACK") == 0
+    assert storage.db.execute(
+        "SELECT COUNT(*) FROM search_books WHERE author='甲'").fetchone()[0] == 50
+
+
+def test_search_book_store_insert_joins_an_open_transaction(migrated_storage):
+    """调用方已经开着事务时只加入，不抢先 BEGIN，也不替别人 COMMIT。
+
+    抢先 BEGIN 会撞上 sqlite 的 "cannot start a transaction within a transaction"；
+    抢先 COMMIT 会把调用方还没定型的半成品落盘。两条都由这同一夹具钉住。
+    """
+    storage, _, _ = migrated_storage
+    store = SearchBookStore(conn=storage.db)
+
+    with storage.transaction():
+        store.insert([BookItem(name="在途书", author="乙", url="tx/open", origin="o")])
+        assert storage.db.execute(
+            "SELECT COUNT(*) FROM search_books WHERE book_url='tx/open'").fetchone()[0] == 1
+
+    def _failed_batch():
+        with storage.transaction():
+            store.insert([BookItem(name="回滚书", author="乙",
+                                   url="tx/rollback", origin="o")])
+            raise RuntimeError("外层要回滚")
+
+    try:
+        _failed_batch()
+    except RuntimeError:
+        pass
+    assert storage.db.execute(
+        "SELECT COUNT(*) FROM search_books WHERE book_url='tx/rollback'").fetchone()[0] == 0, \
+        "种子把外层事务提前提交了"
+    assert storage.db.execute(
+        "SELECT COUNT(*) FROM search_books WHERE book_url='tx/open'").fetchone()[0] == 1
+
+
+def test_search_book_store_insert_leaves_no_partial_batch(migrated_storage):
+    """半批落盘比整批失败更糟：坏行之前的种子会留在库里，下次换源被当成候选。
+
+    ``BookItem.__post_init__`` 会把 None 归一成空串，所以 NOT NULL 这条路走不通，
+    这里用触发器在**批次中间**造一次真失败——ABORT 只回滚触发它的那条语句，
+    前面几行仍留在事务里，正好由 :meth:`SearchBookStore._batch` 的 ROLLBACK 收掉。
+    """
+    storage, _, _ = migrated_storage
+    storage.db.execute(
+        "CREATE TRIGGER block_bad_row BEFORE INSERT ON search_books "
+        "WHEN NEW.name='坏行' BEGIN SELECT RAISE(ABORT, '测试拦截'); END")
+    with pytest.raises(sqlite3.Error):          # RAISE(ABORT) 落到 python 侧的类名不保证
+        SearchBookStore(conn=storage.db).insert([
+            BookItem(name="好行", author="丙", url="tx/good", origin="o"),
+            BookItem(name="坏行", author="丙", url="tx/bad", origin="o")])
+    assert storage.db.execute(
+        "SELECT COUNT(*) FROM search_books WHERE book_url='tx/good'").fetchone()[0] == 0, \
+        "坏行之前的种子留下了"
+    assert storage.db.in_transaction is False, "失败后事务没关，后续写会接进这条残局"
+
+
 # --------------------------------------------------------------------- #
 # 8. 书架往返走主库（add_to_bookshelf → bookshelf 表可见）
 # --------------------------------------------------------------------- #

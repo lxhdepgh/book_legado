@@ -878,12 +878,134 @@ class _JsoupPlan(NamedTuple):
     document_not_equal: tuple = ()                   # (属性名, 期望值)
     had_hex_escape: bool = False
     wildcard_local: str = ""
+    fast: tuple = ()                                 # ((tag, (class...)), ...)
+
+
+_FAST_CHUNK_RE = re.compile(
+    r"\A(?P<tag>[A-Za-z_][\w-]*)?(?P<classes>(?:\.[A-Za-z_][\w-]*)*)\Z")
+_FAST_CLASS_RE = re.compile(r"\.([A-Za-z_][\w-]*)")
+
+
+def _fast_steps(selector: str) -> tuple:
+    """把"纯后代链 + tag/.class"这一族拆成步骤；别的形状返回 ``()`` 走原路。
+
+    故意只放这一族：属性选择器、``#id``、伪类、命名空间、组合符各要和 SoupSieve
+    再对齐一条，而列表与字段规则里最贵的那一族恰好只用 tag+class
+    （400 个节点 × N 条规则），实测这一族的匹配开销是通用匹配机的四分之一。
+    形状闸门同时也是"不需要 SoupSieve 之后再筛一遍"的证明：``_jsoup_plan``
+    往属性正则 / ``[^attr]`` 前缀 / 伪类过滤 / ``!=`` / hex-escape 里记的每一条
+    都要求文本出现 ``[``、``:`` 或 ``\\``，这三个字符在本族里连 chunk 都进不去。
+
+    大小写判据不是自己定的，是**复刻** :func:`_jsoup_plan` 里那条
+    ``(?<![\\\\w])\\\\.`` 重写：只有紧跟在非单词字符后面的 ``.class`` 会被换成
+    ``[class~="x" i]``（不区分大小写），其余 ``.class`` 保持 CSS 原义（区分大小写）。
+    所以每个 class 都带着自己的 ``foldable`` 标记，标签名则统一按不区分大小写比
+    （SoupSieve 对 HTML 标签名如此，实测 ``LI`` 命中 ``<li>``）。
+    """
+    text = str(selector).strip()
+    if not text:
+        return ()
+    steps = []
+    for chunk in text.split():
+        match = _FAST_CHUNK_RE.match(chunk)
+        if not match or not (match.group("tag") or match.group("classes")):
+            return ()
+        tag = (match.group("tag") or "").casefold()
+        classes = []
+        for dot in _FAST_CLASS_RE.finditer(chunk):
+            before = chunk[dot.start() - 1] if dot.start() else ""
+            foldable = not before or not (before.isalnum() or before == "\\")
+            name = dot.group(1)
+            classes.append((name.casefold() if foldable else name, foldable))
+        steps.append((tag, tuple(classes)))
+    return tuple(steps)
+
+
+def _fast_match(node: Tag, tag: str, classes: tuple) -> bool:
+    if tag and str(node.name).casefold() != tag:
+        return False
+    if classes:
+        raw = node.get("class")
+        tokens = ([token for value in raw for token in str(value).split()]
+                  if isinstance(raw, list) else
+                  (str(raw).split() if raw else []))
+        folded = None
+        for wanted, foldable in classes:
+            if foldable:
+                if folded is None:
+                    folded = {token.casefold() for token in tokens}
+                if wanted not in folded:
+                    return False
+            elif wanted not in tokens:
+                return False
+    return True
+
+
+def _fast_chain_matches(node: Any, steps: tuple) -> bool:
+    """节点是否命中整条后代链，祖先**不限定在 context 之内**。
+
+    实测 SoupSieve 的 `select` 从某个元素跑时，祖先那几段可以看穿到文档顶
+    （`body p` 从 ul 上照样命中 ul 里的 p），所以这里也是从节点往上裸走 parent，
+    不以 context 为界。
+    """
+    if (not isinstance(node, Tag) or isinstance(node, BeautifulSoup)
+            or not _fast_match(node, *steps[-1])):
+        return False
+    index, parent = len(steps) - 2, node.parent
+    while index >= 0:
+        if parent is None or isinstance(parent, BeautifulSoup):
+            return False
+        if isinstance(parent, Tag) and _fast_match(parent, *steps[index]):
+            index -= 1
+        parent = parent.parent
+    return True
+
+
+_TAG_CASE_INSENSITIVE_KEY = "_legado_tag_case_insensitive"
+
+
+def _tag_case_insensitive(context: Any) -> bool:
+    """这份文档的标签名匹配是否不区分大小写。
+
+    实测：SoupSieve 的标签名大小写由 builder 决定，``builder.is_xml`` 为真时
+    ``item`` 匹配不到 ``<Item>``，而快路径两边都 casefold，就会多命中。
+    :func:`parse_markup` 的两条 XML 路都建在 ``html.parser`` 上（名字保留大小写、
+    匹配仍不敏感），所以今天走不到 ``False``；这道闸门是给"XML 换成真 XML
+    builder"那一步留的——那也正是解析层唯一还开着的口子。
+
+    问题只问一次，且**绝不能**对节点用 ``getattr(node, "builder", ...)``：
+    bs4 的 ``Tag.__getattr__`` 是 "``tag.subtag`` 等于 ``tag.find("subtag")``" 那条
+    遗留 API，问一次就在子树上跑一次全量查找——第一版正是这样写的，一次搜索从
+    223ms 顶到 5.2s（``_find_all`` 8000 次），是 cProfile 抓出来的。
+    所以这里沿 ``parent``（Tag 的真实属性）走到文档根，只用 ``__dict__`` 读，
+    并把结论记在根上。
+    """
+    node = context
+    while node.parent is not None:
+        node = node.parent
+    cached = node.__dict__.get(_TAG_CASE_INSENSITIVE_KEY)
+    if cached is None:
+        builder = node.__dict__.get("builder")
+        # builder 缺失=孤立节点（不在 parse_markup 产出的文档里），按 HTML 语义走。
+        cached = True if builder is None else not builder.is_xml
+        node.__dict__[_TAG_CASE_INSENSITIVE_KEY] = cached
+    return cached
+
+
+def _fast_select(context: Any, steps: tuple) -> list[Tag]:
+    results = [node for node in context.find_all(True)
+               if _fast_chain_matches(node, steps)]
+    if (isinstance(context, Tag) and not isinstance(context, BeautifulSoup)
+            and _fast_chain_matches(context, steps)):
+        results.insert(0, context)
+    return results
 
 
 def _jsoup_plan(selector: str, context: Any = None) -> _JsoupPlan:
     """Compile the selector-text-only half of :func:`select_jsoup`."""
     attribute_filters = []
     attribute_prefixes = []
+    fast = _fast_steps(selector)
 
     def attribute_regex(match):
         attribute_filters.append((match.group(1), match.group(2)))
@@ -1009,12 +1131,16 @@ def _jsoup_plan(selector: str, context: Any = None) -> _JsoupPlan:
         r'(\[[\w:-]+(?:!=|\^=|\$=|\*=|\|=|=)'
         r'(?:"[^"]*"|\'[^\']*\'|[^\]\s]+))\]',
         r'\1 i]', css)
+    # 快路径只认这一族本身：属性正则 / `[^attr]` 前缀 / 伪类过滤 / `!=` / hex-escape
+    # 都要在 SoupSieve 结果之上再筛一遍，而那几种写法没有一个字符能进 _FAST_CHUNK_RE
+    # 的 chunk，所以不需要第二道"fast 但带后置过滤"的闸门（它不可判定，也测不出）。
     return _JsoupPlan("css", css=css,
                       attribute_filters=tuple(attribute_filters),
                       attribute_prefixes=tuple(attribute_prefixes),
                       filters=tuple(filters),
                       document_not_equal=document_not_equal_pair,
-                      had_hex_escape=had_hex_escape)
+                      had_hex_escape=had_hex_escape,
+                      fast=fast)
 
 
 def _apply_jsoup_plan(context: Any, plan: _JsoupPlan) -> list[Tag]:
@@ -1026,6 +1152,13 @@ def _apply_jsoup_plan(context: Any, plan: _JsoupPlan) -> list[Tag]:
         return [node for node in context.find_all(True)
                 if (str(node.name).casefold() == local_name or
                     str(node.name).casefold().endswith(":" + local_name))]
+    if plan.fast and _tag_case_insensitive(context):
+        return _fast_select(context, plan.fast)
+    return _css_select(context, plan)
+
+
+def _css_select(context: Any, plan: _JsoupPlan) -> list[Tag]:
+    """SoupSieve 那条通用路径：什么形状都认，代价是每个节点走一遍通用匹配机。"""
     css, filters = plan.css, plan.filters
     attribute_filters, attribute_prefixes = plan.attribute_filters, plan.attribute_prefixes
     had_hex_escape = plan.had_hex_escape

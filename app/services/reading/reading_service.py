@@ -49,8 +49,15 @@ _READER_PREFIX = "reader."
 
 # 换源扫描（对齐 Legado ChangeBookSourceViewModel：mapParallel(32) + 每源 withTimeout）。
 # 引擎会话是池化的，所以超时用 asyncio.wait_for 兜在调用点，而非新建短命引擎。
-SWITCH_CONCURRENCY = 32
+# 并发数**不照抄 32**：参考实现那 32 路摊在 9 条真实 OS 线程上，我们的执行域只有
+# 一条事件循环线程（app/core/engine_worker.py），32 路只是 32 个协程。实测 32 源
+# 回环扫描的墙钟-并发曲线：1 路 5758 / 2 路 5447 / 4 路 5302 / 8 路 5927 / 16 路
+# 5899 / 32 路 6523 ms——最低点在 4，之后只涨不降（见 §6.6）。取 8 而不是 4：
+# 回环没有网络段，真实网络上多出来的路数换的是等待重叠，这张表读出来的是**下限**。
+SWITCH_CONCURRENCY = 8
 SWITCH_TIMEOUT = 10
+#: 一次"超时"里，本线程用掉的 CPU 占墙钟的比例高于此值 ⇒ 判"本机繁忙"。
+SWITCH_BUSY_RATIO = 0.5
 SWITCH_PUBLISH_INTERVAL = 0.5
 
 #: 搜索种子库的保留期（Legado：`searchBookDao.clearExpired(now - 1 天)`）。
@@ -82,6 +89,33 @@ def _local_source_for(origin: str, book):
 def _is_local_source(source) -> bool:
     from app.services.content.local_book_service import is_local_source_url
     return is_local_source_url(getattr(source, "bookSourceUrl", ""))
+
+
+#: 换源失败原因里唯一一条"不是书源的错"：本机把时间花在替别的源解析上。
+SWITCH_BUSY_REASON = "本机繁忙"
+
+
+def _switch_cpu_share(wall_start: float, cpu_start: float) -> float:
+    """这次等待里，本线程真正用掉的 CPU 占墙钟的比例。"""
+    wall = time.perf_counter() - wall_start
+    if wall <= 0:
+        return 0.0
+    return max(0.0, min(1.0, (time.thread_time() - cpu_start) / wall))
+
+
+def _switch_starved(wall_start: float, cpu_start: float) -> bool:
+    """一次"超时"该不该改记成本机排队。
+
+    ``wait_for`` 读的是墙钟，而换源扫描的并发只是同一条事件循环线程上的几个协程：
+    一个源被取出的那刻起，它的预算就在被别的源的解析烧掉。实测零延迟回环上单源孤立
+    跑一次 155.5ms，同一批源 32 路并发时把预算压到 2s，32 个源里有 19 个被掐断——
+    它们自己的活只值 155ms，其余全是排队。
+    把这些算成"书源超时"，用户看到的就是一屏"全都失败"，
+    而真实网络只要再叠 1–2s 就会开始把健康源报成故障源。
+    ``time.thread_time()`` 只累计**本线程**用掉的 CPU：等待期间 CPU÷墙钟高，
+    说明线程一直在算（多半是别人的书在解析）；低才是真的在对端上耗着。
+    """
+    return _switch_cpu_share(wall_start, cpu_start) >= SWITCH_BUSY_RATIO
 
 
 def _switch_failure_reason(exc: Exception) -> str:
@@ -827,9 +861,12 @@ class ReadingService(Service):
         ``candidates`` 为按优先级排好序的书源列表（同站同域名在前、已判失效在
         后，排序在调用侧 ``BookshelfController._switch_candidates`` 里做）。
         扫描是**有界并发 + 每源超时**（Legado 的 `mapParallel(threadCount=32)` +
-        `withTimeout`）：逐源串行的话，上千个书源里只要有几个慢站就把整轮拖到
-        用户以为卡死；单源失败只计入 ``failures``，不让整轮中止。
-        ``on_progress(completed, total, failures)`` 用 0.5s 节流回调，供界面刷进度。
+        `withTimeout`，我们按实测拐点收：见 ``SWITCH_CONCURRENCY``）：逐源串行的话，
+        上千个书源里只要有几个慢站就把整轮拖到用户以为卡死；单源失败只计入
+        ``failures``，不让整轮中止。
+        ``on_progress(completed, total, failures, starved)`` 用 0.5s 节流回调，
+        供界面刷进度；``starved`` 是"本机繁忙"的源数——那些不是书源的错，
+        不能和 ``failures`` 混成一个数（见 :func:`_switch_starved`）。
         命中判定用**书名包含**（Legado 默认不校验作者，作者只当加分项），
         最后按 (书名精确 > 作者对得上 > 书源优先级 > 站名) 排序返回
         ``{"source_url", "source_name", "book": 快照}`` 列表。
@@ -855,8 +892,12 @@ class ReadingService(Service):
             if not force and now - state["published_at"] < SWITCH_PUBLISH_INTERVAL:
                 return
             state["published_at"] = now
+            # "本机繁忙"不是书源的错，不能混进"失败"这个数里：混了以后界面写着
+            # "38 个失败"，用户去删的却是 38 个好源。
+            starved = failures.get(SWITCH_BUSY_REASON, 0)
             try:
-                on_progress(state["completed"], total, sum(failures.values()))
+                on_progress(state["completed"], total,
+                            sum(failures.values()) - starved, starved)
             except Exception as exc:  # 进度只是反馈，不能带崩扫描
                 logger.debug("换源进度回调失败：%s", exc)
 
@@ -867,6 +908,8 @@ class ReadingService(Service):
                 except asyncio.QueueEmpty:
                     return
                 name = str(getattr(source, "bookSourceUrl", "") or "")
+                wall_start = time.perf_counter()
+                cpu_start = time.thread_time()
                 try:
                     books = await asyncio.wait_for(
                         self._engine.search(source, key, 1), SWITCH_TIMEOUT)
@@ -875,8 +918,12 @@ class ReadingService(Service):
                 except Exception as exc:
                     # 静默吞掉失败会让"找不到书"和"书源坏了"看起来一样。
                     reason = _switch_failure_reason(exc)
+                    if reason == "超时" and _switch_starved(wall_start, cpu_start):
+                        reason = SWITCH_BUSY_REASON
                     failures[reason] = failures.get(reason, 0) + 1
-                    logger.debug("换源扫描 %s 失败（%s）：%s", name, reason, exc)
+                    logger.debug("换源扫描 %s 失败（%s，线程占用 %.0f%%）：%s",
+                                 name, reason,
+                                 100 * _switch_cpu_share(wall_start, cpu_start), exc)
                 else:
                     if books and self._search_store is not None:
                         # 落库与本轮命中无关：这次没对上的结果，下次换源还用得上。

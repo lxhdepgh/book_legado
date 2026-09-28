@@ -799,5 +799,114 @@ class SharedConnectorPoolTests(unittest.IsolatedAsyncioTestCase):
             await service.on_stop()
 
 
+class JsoupFastPathTests(unittest.TestCase):
+    """``tag``/``.class`` 后代链的 find_all 快路径必须与 SoupSieve 逐节点同解。
+
+    快路径的收益来自"少做事"：它绕开通用匹配机，所以任何一点语义偏移都会变成
+    取值错书而不报错。护栏因此按**节点身份**（``id``）而不是文本比对，并且要同时
+    钉住两件事——两条路径结果一致（差分），以及快路径**确实被走到**（否则整条
+    测试可以在快路径退化成"永远不用"时假绿）。
+    """
+
+    # (markup, content_type)：规整 HTML / 标签未闭合 / 大小写混排 / 两条 XML 路
+    DOCUMENTS = [
+        ("<html><body><ul class='list'><li class='item'><a href='/1' class='title'>甲</a>"
+         "</li><li class='item'><span class='author'>乙</span></li></ul>"
+         "<div id='main'><p class='item'>丙</p>"
+         "<div class='Box'><b class='N'>丁</b></div></div></body></html>", ""),
+        ("<div class=list><li><p>x<div class=Box><span class='item'>y", ""),
+        ("<UL CLASS='Book'><LI><A HREF='#'>a</A></LI><LI CLASS='item'>b</LI></UL>", ""),
+        ("<?xml version='1.0'?><items><Item class='Book'><title>甲</title></Item>"
+         "<item class='book'><title>乙</title></item></items>", "application/xml"),
+        ("<items><Item class='Book'><title>甲</title></Item>"
+         "<item class='book'><title>乙</title></item></items>", "text/xml"),
+    ]
+    # 该走快路径的形状（纯后代链 + tag/.class）。`item`/`LI` 钉标签名大小写，
+    # `li.Item` 钉"紧跟在单词字符后的 .class 保持区分大小写"那条复刻判据。
+    FASTABLE = ["li", ".item", "li.item", "ul li", ".list .item", "div p",
+                "LI", "ul .title", ".Box b", "div li", "item", "li.Item"]
+    # 必须留在原路的形状：属性、#id、伪类、组合符、列表、通配、正则后缀
+    GATED = ["li[class=item]", "#main", "li:nth-child(2)", ".item:contains(甲)",
+             "ul > li", "li, p", "a[href='/1']", "[class]", ".item:not(.title)",
+             "li:matches(甲|乙)", ".item[class~=x]", "*"]
+
+    def setUp(self):
+        from app.services.engine import legado_rule_parser as parser
+        self.parser = parser
+        for cached in (parser._cached_jsoup_plan,):
+            cached.cache_clear()
+
+    def test_fast_path_matches_soupsieve_node_for_node(self):
+        parser = self.parser
+        fast_used = 0
+        for markup, content_type in self.DOCUMENTS:
+            document = parser.parse_markup(markup, content_type)
+            contexts = [document] + document.find_all(True)
+            for selector in self.FASTABLE:
+                plan = parser._jsoup_plan(selector)
+                if not plan.fast:
+                    continue          # 形状没进快路径，由 gated 那条测试负责
+                fast_used += 1
+                for context in contexts:
+                    expected = [id(node) for node in parser._css_select(context, plan)]
+                    actual = [id(node) for node in parser._fast_select(context, plan.fast)]
+                    self.assertEqual(
+                        expected, actual,
+                        "快路径与 SoupSieve 结果不同（%s / %s / context=%r）"
+                        % (selector, markup[:40], getattr(context, "name", None)))
+        # "该发生的仍然发生"：快路径若整体失效，上面的循环会一路 continue 假绿。
+        self.assertGreaterEqual(fast_used, len(self.FASTABLE),
+                               "没有任何选择器进入快路径，差分是空转")
+
+    def test_select_jsoup_actually_avoids_soupsieve_for_simple_shapes(self):
+        parser = self.parser
+        document = parser.parse_markup(self.DOCUMENTS[0][0])
+        target = document.select_one("ul")
+        expected = parser._css_select(target, parser._jsoup_plan(".list .item"))
+        self.assertTrue(expected, "样本没有命中，这条测试会是空转")
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("快路径没生效，纯 tag+class 链仍然调了 SoupSieve")
+
+        original = parser._css_select
+        parser._css_select = forbidden
+        try:
+            self.assertEqual([id(node) for node in parser.select_jsoup(target, ".list .item")],
+                             [id(node) for node in expected])
+            self.assertEqual([node.get_text() for node in parser.select_jsoup(document, "li.item")],
+                             ["甲", "乙"])
+        finally:
+            parser._css_select = original
+
+    def test_gated_shapes_stay_on_the_general_path(self):
+        parser = self.parser
+        for selector in self.GATED:
+            self.assertEqual(parser._jsoup_plan(selector).fast, (),
+                             "形状 %r 不该进快路径" % selector)
+        # 闸门不能把结果一起改掉：属性选择器照旧取到值。
+        document = parser.parse_markup(self.DOCUMENTS[0][0])
+        self.assertEqual([node.get_text() for node in parser.select_jsoup(document, "li[class=item]")],
+                         ["甲", "乙"])
+
+    def test_xml_builder_keeps_tag_names_case_sensitive(self):
+        """真 XML builder 上 SoupSieve 的标签名区分大小写，快路径必须让位。
+
+        ``parse_markup`` 的两条 XML 路都建在 html.parser 上（匹配不区分大小写），
+        所以这条走的是 bs4 的 ``xml`` builder：它代表"以后换成真 XML 建树"时
+        唯一会被快路径悄悄改掉的语义。
+        """
+        from bs4 import BeautifulSoup
+        parser = self.parser
+        document = BeautifulSoup(
+            "<items><Item class='Book'>甲</Item><item class='book'>乙</item></items>", "xml")
+        plan = parser._jsoup_plan("item")
+        self.assertTrue(plan.fast, "样本形状没进快路径，这条差分是空转")
+        self.assertEqual([node.name for node in parser._fast_select(document, plan.fast)],
+                         ["Item", "item"])
+        self.assertEqual([node.name for node in parser.select_jsoup(document, "item")],
+                         ["item"],
+                         "真 XML 文档上快路径把标签名大小写吞掉了，与 SoupSieve 不同解")
+
+
 if __name__ == "__main__":
     unittest.main()

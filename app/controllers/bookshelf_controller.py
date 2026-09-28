@@ -420,12 +420,16 @@ class BookshelfController(BaseController):
         self._switch_task = self.ui_call(self._run_switch(record, dialog))
 
     async def _run_switch(self, record: dict, dialog: SourceSwitchDialog) -> None:
-        def on_progress(completed: int, total: int, failures: int) -> None:
+        def on_progress(completed: int, total: int, failures: int,
+                        starved: int = 0) -> None:
             if self._switch_dialog is not dialog:
                 return  # 对话框已关，不再刷旧句柄
             dialog.set_progress(completed / total if total else 0)
             dialog.set_running(True, f"正在扫描 {completed}/{total} 个书源"
-                               + (f"，{failures} 个失败" if failures else ""))
+                               + (f"，{failures} 个失败" if failures else "")
+                               # 这些源是被我们自己的解析挤掉的，不能写成"失败"
+                               # 让用户去删好源。
+                               + (f"，{starved} 个本机忙不过来" if starved else ""))
 
         try:
             matches = await self._reading.switch_source(
