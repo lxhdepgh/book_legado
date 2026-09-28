@@ -1,4 +1,9 @@
-"""ReadAloudBar：阅读器底部的朗读迷你播放条（设计 §1.1 / §7.2「特殊形态」清单）。
+"""ReadAloudBar：阅读器**顶部**的朗读迷你播放条（设计 §1.1 / §7.2「特殊形态」清单）。
+
+第二十九轮把它从窗口底部挪到工具栏正下方（用户："朗读功能放到区域上方，和书内
+搜索、设置放在一起"）：它和工具栏那几颗动作键是同一块"阅读时手要够到的控制区"，
+沉在底部时离自己的入口有一屏远。收起/展开由 ``ReaderView`` 的工具栏那颗按钮管，
+本文件只管这一条里面有什么。
 
 ``ReadAloudService`` 早就有 speak/stop/状态事件，但**界面一处都没接**：用户听不到
 书，也停不下来。这里补的正是那条缺失的承接面——播放条本身不含业务，状态与章节
@@ -51,7 +56,7 @@ def backend_label(name: str) -> str:
 
 
 class ReadAloudBar(ft.Container):
-    """底部朗读条：播放/停止 + 当前章节 + 语速 + 连读下一章开关。"""
+    """顶部朗读条：播放/停止 + 当前章节 + 语速 + 连读下一章开关。"""
 
     def __init__(self) -> None:
         super().__init__(
@@ -78,13 +83,15 @@ class ReadAloudBar(ft.Container):
             on_click=lambda e: self._fire(self.on_stop))
         self._label = ft.Text("朗读", size=12, expand=True,
                               color=_DEFAULT_META[1])
+        # 宽度按中文实测：音色下拉 120px 时"内置语音"被截成"内置语"（第二十八轮
+        # 截图），下拉框的箭头和左右内边距各吃掉一大截，四个汉字要 150px 才放得下。
         self._voice = ft.Dropdown(
-            width=120, dense=True, value=BUILTIN_VOICE,
+            width=150, dense=True, value=BUILTIN_VOICE,
             tooltip="音色 / 语音档（在 配置 → 更多工具 → 朗读 里登记）",
             options=[ft.dropdown.Option(BUILTIN_VOICE, "内置语音")],
             on_select=lambda e: self._fire(self.on_voice_changed, e.control.value))
         self._rate = ft.Dropdown(
-            width=96, dense=True, value=DEFAULT_RATE,
+            width=110, dense=True, value=DEFAULT_RATE,
             tooltip="语速（仅系统 TTS 后端生效）",
             options=[ft.dropdown.Option(key, text) for key, text in (
                 ("slow", "慢速"), ("normal", "正常"),

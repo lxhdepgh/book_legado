@@ -209,7 +209,8 @@ def test_progress_follows_the_appended_chapter(rig):
     _scroll(rig, 1500, 2000)         # 可见章节换成第二章
     assert _settled(lambda: rig.controller._chapter_index == 1)
     assert rig.view._title.value == "第二章 靠岸"
-    assert rig.view._status_bar.content.value == "第二章 靠岸 · 2/2 · 100%"
+    assert rig.view._progress_label.value == "2/2 · 第二章 靠岸"
+    assert rig.view._status_bar.content.value == "《书名》 · 共 2 章"
     _scroll(rig, 1600, 2000)         # 再滚一次：0.5s 节流失效后落库
     assert _settled(lambda: _saved_chapter_index(rig) == 1), \
         f"进度还停在第一章：{_saved_chapter_index(rig)}"

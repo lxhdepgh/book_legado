@@ -1,7 +1,7 @@
 ﻿"""ReaderView：阅读器（目录 / 正文排版 / 滚动续读 / 偏好 / 沉浸模式 / 快捷键 / 上下章）。
 
 自旧单体 ``ReadingView`` 的 reader 职责拆出（§7.2）：目录、正文渲染、滚动续读、
-阅读器偏好、沉浸模式（隐藏导航）、快捷键、上一章/下一章。面板（书签
+阅读器偏好、沉浸模式（收起本视图的工具栏与状态栏）、快捷键、上一章/下一章。面板（书签
 :class:`BookmarkPanel`、书内搜索 :class:`ContentSearchBar`）作为覆盖层嵌入。
 
 排版（切段/小标题/行距/缩进/版心/背景）是纯显示层的活：正文原文照旧进缓存，
@@ -82,7 +82,7 @@ async def _await_coroutine(coroutine):
 
 
 class ReaderView(ft.Column):
-    """阅读器：目录页 + 正文页叠放；沉浸模式由 Controller 经 on_section_change 通知外壳。"""
+    """阅读器：目录页 + 正文页叠放；沉浸模式只收放本视图自己的工具栏与状态栏。"""
 
     #: 排版偏好的键名清单。挂在类上给 Controller 用（键表以视图为准），
     #: 控制器 import 本包会撞上 ``views/reading/__init__`` 的反向 import（循环）。
@@ -188,6 +188,25 @@ class ReaderView(ft.Column):
             ft.Icons.CHEVRON_RIGHT, tooltip="下一章", disabled=True,
             on_click=lambda e: self._fire(self.on_next_chapter))
         self._font_size_label = ft.Text(str(self._font_size), size=12)
+        # 沉浸模式**必须有按钮**：正文段是可划词的 selectable Text，点正文的那一下
+        # 被文本控件吃掉（实测：点版心既不切沉浸，还把整段亮到划词条上），
+        # `_reader_document.on_click` 只在「划词可选」关掉时才真的收得到。
+        self._immersive_btn = ft.IconButton(
+            ft.Icons.FULLSCREEN, tooltip="沉浸模式",
+            on_click=lambda e: self._fire(self.on_toggle_immersive))
+        # 朗读入口与「书内搜索」「阅读设置」并排（第二十九轮：用户要求朗读放到
+        # 区域上方、和这两个动作放在一起）。它管**收起/展开**顶部那条朗读面板——
+        # 面板挂在工具栏正下方（见 ``_reader_page``），默认展开；不给一颗收起的键，
+        # 就等于在正文上方永久占一条高度。
+        # 只有一条不让坏：**正在念的时候那一条不许藏着**（桌面模式没有通知栏，
+        # 收起之后屏幕上就没有能按停的地方）。这条规则只写在 :meth:`sync_read_aloud`
+        # 一处：speaking 时它把面板钉成展开，同时把这颗键禁用并写明原因——禁用而不
+        # 说原因，用户只会以为它坏了。
+        self._read_aloud_open = True
+        self._read_aloud_available = False
+        self._read_aloud_btn = ft.IconButton(
+            ft.Icons.GRAPHIC_EQ, tooltip="朗读",
+            on_click=lambda e: self.toggle_read_aloud_panel())
         self._toolbar = ft.Container(
             visible=True, padding=ft.Padding(6, 2, 6, 2),
             content=ft.Row([
@@ -201,8 +220,10 @@ class ReaderView(ft.Column):
                               on_click=lambda e: self._fire(self.on_open_bookmarks)),
                 ft.IconButton(ft.Icons.SEARCH, tooltip="书内搜索",
                               on_click=lambda e: self._fire(self.on_open_search)),
+                self._read_aloud_btn,
                 ft.IconButton(ft.Icons.SETTINGS_OUTLINED, tooltip="阅读设置",
                               on_click=lambda e: self._fire(self.on_open_settings)),
+                self._immersive_btn,
                 self._progress_label,
                 ft.IconButton(ft.Icons.TEXT_DECREASE, tooltip="减小字号",
                               on_click=lambda e: self._fire(
@@ -239,6 +260,9 @@ class ReaderView(ft.Column):
             ], spacing=6))
         # 朗读迷你播放条（设计 §1.1：桌面无通知栏，播放控制全靠这条）。开了一章
         # 才由控制器亮出来——没书的时候它没话可说。
+        # 第二十九轮挪到**工具栏正下方**（用户："朗读功能放到区域上方，和书内
+        # 搜索、设置放在一起"）：它和那两颗按钮是同一块"阅读时手要够到的控制区"，
+        # 沉在窗口底部时它贴着状态栏，离自己的入口有一屏远。
         self.read_aloud = ReadAloudBar()
         # 视频书面板（§1.4）：放工具栏下面而不是底部——正文一直要滚，播放器跟着滚
         # 就没法边看边放；它自己也是"控制器亮了才可见"。
@@ -268,9 +292,9 @@ class ReaderView(ft.Column):
             ], spacing=6))
         self._reader_page = ft.Column(
             expand=True, spacing=0,
-            controls=[self._toolbar, self.video_play, self._reader_scroll,
-                      self.selection_bar, self.repair_offer, self.read_aloud,
-                      self._status_bar])
+            controls=[self._toolbar, self.read_aloud, self.video_play,
+                      self._reader_scroll, self.selection_bar,
+                      self.repair_offer, self._status_bar])
 
         # ------------------------------------------------------------------ #
         # 左侧抽屉：书签 + 书内搜索合在一个面板里（两块同类列表不再互相顶掉）
@@ -300,8 +324,24 @@ class ReaderView(ft.Column):
             visible=False, width=320, bgcolor=ft.Colors.SURFACE,
             content=self._side_tabs)
 
+        # ------------------------------------------------------------------ #
+        # 沉浸模式的出口（右下角浮标）
+        #
+        # 工具栏自己就是被沉浸藏掉的东西，所以"退出沉浸"不能只挂在工具栏那颗按钮
+        # 上——那点正文本来也换不回点击：正文段 selectable，点击被文本控件吃掉。
+        # 浮标常驻在正文之上，只有沉浸模式亮着，非沉浸时整块不可见（不挡阅读）。
+        # ------------------------------------------------------------------ #
+        self._immersive_exit = ft.Container(
+            visible=False, right=18, bottom=76, padding=ft.Padding(2, 0, 2, 0),
+            bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST, border_radius=22,
+            content=ft.IconButton(ft.Icons.FULLSCREEN_EXIT,
+                                  tooltip="退出沉浸模式",
+                                  on_click=lambda e: self._fire(
+                                      self.on_toggle_immersive)))
+
         self._host = ft.Stack(expand=True, controls=[
             self._reader_page, self._detail_page, self._side_host,
+            self._immersive_exit,
         ])
         self.controls = [self._host]
 
@@ -568,8 +608,15 @@ class ReaderView(ft.Column):
 
         同词早退：一次拖拽能发几十条事件，重复写同一条标签既没意义也是白刷。
         选中清空（点一下正文把光标挪走）会把条目收起来。
+
+        **单击不算选词**（第二十八轮实测）：在 selectable 文本上点一下，事件带的是
+        ``cause=TAP`` 和**整段**文本——用户没选任何东西，划词条却亮出来对着整段
+        问要不要查词典。只认拖拽/双击/长按这类真选词。``cause`` 缺省（老版本或
+        别的端）时按原样放行，宁可多亮一条也不把划词功能关掉。
         """
         word = str(getattr(event, "selected_text", "") or "").strip()
+        if word and getattr(event, "cause", None) is ft.TextSelectionChangeCause.TAP:
+            word = ""
         if word == self._selection_word:
             return
         self.set_selection(word)
@@ -697,6 +744,39 @@ class ReaderView(ft.Column):
     def set_nav_enabled(self, prev: bool, next_: bool) -> None:
         self._prev_btn.disabled = not prev
         self._next_btn.disabled = not next_
+
+    # ------------------------------------------------------------------ #
+    # 朗读：工具栏入口 + 顶部那条面板
+    # ------------------------------------------------------------------ #
+    def set_read_aloud_available(self, available: bool) -> None:
+        """控制器写入"这一会儿到底能不能念"（有朗读服务 + 有可念的章）。
+
+        不可用时入口整颗禁用：亮着按不动比不亮更让人以为是坏了。
+        """
+        self._read_aloud_available = bool(available)
+        self.sync_read_aloud()
+
+    def toggle_read_aloud_panel(self) -> None:
+        """收起/展开那一条。**念着的时候收不起来**——规则在 :meth:`sync_read_aloud`。"""
+        self._read_aloud_open = not self._read_aloud_open
+        self.sync_read_aloud()
+
+    def sync_read_aloud(self) -> None:
+        """按"可用性 + 折叠 + 正在念"重算那一条和那颗键；朗读态只认 ``read_aloud.state``。"""
+        speaking = self.read_aloud.state == "speaking"
+        if speaking:
+            # 念着的时候屏幕上必须有一条看得见的路能按停（桌面没有通知栏）：正在念
+            # 就不允许那一条藏着。按钮同一时刻也被禁掉（下面），所以屏幕上不会出现
+            # "看着能按、按下去没反应"的键。
+            self._read_aloud_open = True
+        self.read_aloud.visible = (self._read_aloud_available
+                                   and self._read_aloud_open)
+        btn = self._read_aloud_btn
+        btn.icon = (ft.Icons.GRAPHIC_EQ if self._read_aloud_open
+                    else ft.Icons.GRAPHIC_EQ_OUTLINED)
+        btn.disabled = not self._read_aloud_available or speaking
+        btn.tooltip = ("朗读中：先停止才能收起" if speaking
+                       else ("收起朗读" if self._read_aloud_open else "展开朗读"))
 
     @property
     def preferences(self) -> dict:
@@ -837,7 +917,8 @@ class ReaderView(ft.Column):
             label="段首缩进", value=bool(preferences["indent"]),
             on_change=lambda e: on_change("indent", bool(e.control.value)))
         status = ft.Switch(
-            label="显示底部阅读状态", value=bool(preferences["show_status"]),
+            label="显示底部状态栏（书名 · 作者 · 总章数）",
+            value=bool(preferences["show_status"]),
             on_change=lambda e: on_change("show_status", bool(e.control.value)))
         selection = ft.Switch(
             label="划词可选（选中正文查词典）",
@@ -864,6 +945,16 @@ class ReaderView(ft.Column):
     def show_directory(self, show: bool) -> None:
         """目录页覆盖在正文之上。"""
         self._detail_page.visible = bool(show)
+        self._sync_immersive_exit()
+
+    def _sync_immersive_exit(self) -> None:
+        """浮标只在"沉浸 + 目录没盖上来"时亮着。
+
+        目录页是不透明整页覆盖，它自己带「返回阅读」；浮标压在目录行上是第二个
+        出口，也是挡住章名的多余一圈。
+        """
+        self._immersive_exit.visible = (self._immersive
+                                        and not self._detail_page.visible)
 
     def show_side_panel(self, kind: str = "bookmark") -> None:
         """左侧抽屉：kind in {bookmark, search} 选页签；空串收起。
@@ -877,14 +968,19 @@ class ReaderView(ft.Column):
         self._side_tabs.selected_index = self._side_pages.index(kind)
 
     def set_immersive(self, immersive: bool) -> None:
-        """沉浸模式：隐藏工具栏/状态栏（外壳导航由 on_section_change 通知）。
+        """沉浸模式：收起本视图的工具栏与状态栏，右下角亮出浮标当出口。
 
-        状态栏要同时听两个开关：用户可以在设置里就把阅读状态关掉。
+        状态栏要同时听两个开关：用户可以在设置里就把阅读状态关掉。左侧导航栏
+        不在本视图的控制范围内（外壳的事），所以这里收的只是阅读器自己那两条。
         """
         self._immersive = bool(immersive)
         self._toolbar.visible = not self._immersive
         self._status_bar.visible = (not self._immersive
                                     and bool(self._preferences["show_status"]))
+        self._sync_immersive_exit()
+        # 图标跟着状态走：亮着的那一面就是当前读数（工具栏被藏时由浮标接手）。
+        self._immersive_btn.icon = (ft.Icons.FULLSCREEN_EXIT if self._immersive
+                                    else ft.Icons.FULLSCREEN)
 
     def scroll_by(self, delta: float, duration: int = 120) -> None:
         """正文区平滑滚动（快捷键 page_up/page_down 复用）。"""

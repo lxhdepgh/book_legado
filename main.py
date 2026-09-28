@@ -161,7 +161,10 @@ def _build_hub():
     hub.register(DictService())
     hub.register(FontService())
     hub.register(QrCodeService())
-    hub.register(UpdateService())
+    # 本机版本只有 app.APP_VERSION 一处：不传就用默认空串，更新页既显示"未知"、
+    # 又拿不出比较基准（闸门任何远端版本都放行）。
+    from app import APP_VERSION
+    hub.register(UpdateService(current_version=APP_VERSION))
     hub.register(WebBridgeService())
     # 同一个实例：引擎的 webview/验证码 fetcher 绑的就是它（上面 M2 段），
     # 再 new 一个会让 page_provider 注到另一份上、弹窗那条链又断掉。

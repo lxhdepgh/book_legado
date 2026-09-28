@@ -55,14 +55,22 @@ class UpdateService(Service):
 
     def __init__(self, storage=None, settings=None,
                  http_get_json=None, http_download=None,
-                 current_version: str = "0.0.0") -> None:
+                 current_version: str = "") -> None:
         super().__init__()
         self._storage = storage
         self._settings = settings
         # 网络入口可注入（测试替身，离线）；缺省用 aiohttp 真实请求。
         self._http_get_json = http_get_json
         self._http_download = http_download
-        self._current = str(current_version or "0.0.0")
+        # 空串 = 本机版本未登记。别用 "0.0.0" 当默认：它在 ``_version_tuple`` 里
+        # 退化成 (0,)，等于"任何远端版本都比本机新"，闸门恒放行，界面还显示一个
+        # 不存在的版本号。留空时界面老实显示"未知"。
+        self._current = str(current_version or "")
+
+    @property
+    def current_version(self) -> str:
+        """本机版本（登记不到时为空串，界面据此显示「未知」）。"""
+        return self._current
 
     async def on_start(self) -> None:
         hub = self.hub
@@ -72,7 +80,7 @@ class UpdateService(Service):
         if self._settings is None and hub is not None:
             from app.core.settings import SettingsService
             self._settings = hub.require(SettingsService)
-        logger.info("UpdateService 已启动（当前版本 %s）", self._current)
+        logger.info("UpdateService 已启动（当前版本 %s）", self._current or "未登记")
 
     def _publish(self, event) -> list:
         if self.bus is None:

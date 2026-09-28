@@ -35,7 +35,9 @@ class UpdateController(BaseController):
         self._view.on_download = self.download
         if UpdateAvailableEvent is not None:
             self.subscribe(UpdateAvailableEvent, self._on_available)
-        current = getattr(self._svc, "current_version", "") if self._svc else ""
+        # 直接读服务属性，不 getattr 探测：探测式写法在属性不存在时静默跳过
+        # 这一行，界面就永远停在视图自初始化的"当前版本：未知"（第二十六轮同类实错）。
+        current = self._svc.current_version if self._svc is not None else ""
         if current:
             self._view.set_current_version(str(current))
 

@@ -622,7 +622,7 @@ def build_app_shell(page: ft.Page, hub: ServiceHub, shelf_probe=None) -> ft.Cont
     inject_interaction_loop(hub, ui_loop)
 
     registry = register_all_destinations(default_registry(), hub)
-    host = NavigationHost(page, registry)
+    host = NavigationHost(page, registry, shelf_probe=shelf_probe)
     page.add(host.root)
     # 阅读器快捷键接线（M6 漏接，M7 后补回；分发到当前视图 on_key）
     page.on_keyboard_event = host._on_keyboard_event

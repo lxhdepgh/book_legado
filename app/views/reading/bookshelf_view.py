@@ -37,13 +37,18 @@ class BookshelfView(ft.Column):
         # ------------------------------------------------------------------ #
         self._query = ft.TextField(
             hint_text="搜索书名或作者", prefix_icon=ft.Icons.SEARCH,
-            dense=True, height=42, expand=True,
+            dense=True, height=42, col=4,
             on_change=lambda e: self._emit_filter())
+        # 两个下拉的宽度**由栅格位给**（`width=inf` = 填满所在格），不写死像素：
+        # Dropdown 默认按内容量一次宽，而这一次量在字体晚到的面上（web 首帧）会拿
+        # 回退字体算，实测量出 120px 把"最近阅读"截成"最近阅…"，等 6s 不变、
+        # 任何一次重排（改视口 / 切网格）又自己变回 148px。写死像素则在窄窗
+        # （720px 时 col=3 只有 ~113px）溢出，所以填满格子才是两边都成立的那一个。
         self._group = ft.Dropdown(
-            value="__all__", width=130, dense=True,
+            value="__all__", dense=True, col=2, width=float("inf"),
             options=[ft.dropdown.Option("__all__", "全部")], on_select=lambda e: self._emit_filter())
         self._sort = ft.Dropdown(
-            value="read", width=150, dense=True,
+            value="read", dense=True, col=3, width=float("inf"),
             options=[
                 ft.dropdown.Option("read", "最近阅读"),
                 ft.dropdown.Option("update", "最近更新"),
@@ -58,18 +63,29 @@ class BookshelfView(ft.Column):
         self._import_btn = ft.IconButton(
             ft.Icons.UPLOAD_FILE, tooltip="导入本地书籍（txt / epub / pdf）",
             on_click=lambda e: self._fire(self.on_import_local))
+        # 工具栏**必须一行放完**：ResponsiveRow 的子项 `col` 默认是 12（= 独占一行），
+        # 不写 col 就等于把六个控件摆成六行——实测工具区被撑到 ~330px 高，列表首行
+        # 被推到 y≈371，而真正该给用户看的书反而沉到屏幕下半部。
         self._toolbar = ft.Container(
             padding=ft.Padding(8, 4, 8, 4),
             content=ft.ResponsiveRow([
                 self._query, self._group, self._sort,
-                self._import_btn, self._layout_btn, self._refresh_btn,
-            ], columns=12, spacing=6, run_spacing=4))
+                ft.Container(col=3, content=ft.Row([
+                    self._import_btn, self._layout_btn, self._refresh_btn,
+                ], spacing=0)),
+            ], columns=12, spacing=6, run_spacing=4,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER))
 
         # 最近阅读卡（ProgressSavedEvent 驱动，Controller 调 set_continue_reading）
         self._continue_host = ft.Container(visible=False)
 
-        # 状态行（整书缓存进度/换源结果等，常驻底部）
+        # 状态行（"书架共 N 本"/换源结果等）。放在工具栏**下面**而不是整页最末：
+        # 挂在 Column 末尾时它永远贴着窗口底边，与列表末端之间隔着几百像素空白，
+        # 用户读到的是一行"不知道在说谁"的灰字。空文本时整条收起，不占高度。
         self._status = ft.Text("", size=12, color=ft.Colors.GREY_600)
+        self._status_host = ft.Container(
+            visible=False, padding=ft.Padding(12, 0, 12, 4),
+            content=self._status)
 
         # 在途整书缓存任务（Controller 从 DownloadService 的快照渲染，
         # 切页回来也看得见；每条一行、各自可取消，不是一行"最新进度"）
@@ -83,12 +99,12 @@ class BookshelfView(ft.Column):
 
         self.controls = [
             self._toolbar,
+            self._status_host,
             self._continue_host,
             self._task_host,
             ft.Divider(height=1),
             self._list,
             self._grid,
-            ft.Container(padding=ft.Padding(12, 2, 12, 6), content=self._status),
         ]
         self._layout = "list"
 
@@ -107,6 +123,7 @@ class BookshelfView(ft.Column):
     # ------------------------------------------------------------------ #
     def set_status_text(self, text: str) -> None:
         self._status.value = text or ""
+        self._status_host.visible = bool(text)
 
     def set_cache_tasks(self, tasks: list[dict]) -> None:
         """渲染在途整书缓存任务：``{task_id, name, done, total, progress}``。
@@ -176,6 +193,12 @@ class BookshelfView(ft.Column):
     def _row(self, record: dict) -> ft.Control:
         icon = ft.Icon(ft.Icons.FOLDER_OPEN if record.get("local")
                        else ft.Icons.BOOK)
+        # 副标题两件事：谁写的 + 读到哪儿。后者是架子上最有用的一格，没有就是
+        # 一排只剩书名的清单（进度由控制器投影成 chapter_name，见 _to_render_record）。
+        chapter_name = str(record.get("chapter_name") or "")
+        subtitle = " · ".join(p for p in (
+            str(record.get("author", "") or ""),
+            f"读到 {chapter_name}" if chapter_name else "") if p)
         return ft.ListTile(
             leading=ft.Container(
                 width=44, alignment=ft.Alignment.CENTER,
@@ -183,11 +206,8 @@ class BookshelfView(ft.Column):
                                             fallback=icon)),
             title=ft.Text(record.get("name", ""), max_lines=1,
                           overflow=ft.TextOverflow.ELLIPSIS),
-            subtitle=ft.Text(
-                " · ".join(p for p in (record.get("author", ""),
-                                       record.get("chapter_name", "")) if p),
-                size=11, color=ft.Colors.GREY_500, max_lines=1,
-                overflow=ft.TextOverflow.ELLIPSIS),
+            subtitle=ft.Text(subtitle, size=11, color=ft.Colors.GREY_500,
+                             max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
             on_click=lambda e, r=record: self._fire(self.on_open_book, r),
             on_long_press=lambda e, r=record: self._open_manage(r),
         )
@@ -196,6 +216,9 @@ class BookshelfView(ft.Column):
         icon = ft.Icon(ft.Icons.FOLDER_OPEN if record.get("local")
                        else ft.Icons.BOOK, size=40,
                        color=ft.Colors.ON_SURFACE_VARIANT)
+        # 网格卡也要带作者：以前只有一行书名，切到网格就等于把整排元信息丢掉
+        # （实测截图：三张卡下面是大片空白，信息密度反而不如列表）。没作者时留空
+        # 而不是省掉这一行——卡片高度一致，架子才不会错落。
         return ft.Container(
             border_radius=8, padding=8,
             bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
@@ -207,6 +230,9 @@ class BookshelfView(ft.Column):
                     content=self._cover_control(record, width=110, height=132,
                                                 fallback=icon)),
                 ft.Text(record.get("name", ""), size=12, max_lines=2,
+                        overflow=ft.TextOverflow.ELLIPSIS),
+                ft.Text(str(record.get("author", "") or ""), size=10,
+                        max_lines=1, color=ft.Colors.GREY_500,
                         overflow=ft.TextOverflow.ELLIPSIS),
             ], spacing=4, horizontal_alignment=ft.CrossAxisAlignment.CENTER))
 

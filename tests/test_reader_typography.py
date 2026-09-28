@@ -349,7 +349,8 @@ class SettingsDialogTests(unittest.TestCase):
                          {"正文宽度", "文本对齐", "阅读背景"})
         switches = [c for c in controls if isinstance(c, ft.Switch)]
         self.assertEqual({c.label for c in switches},
-                         {"段首缩进", "显示底部阅读状态", "划词可选（选中正文查词典）"})
+                         {"段首缩进", "显示底部状态栏（书名 · 作者 · 总章数）",
+                          "划词可选（选中正文查词典）"})
 
     def test_every_preference_key_has_a_control_that_can_change_it(self):
         """新增偏好键必须带开关：漏一条就是"这个设置没做"，测试全绿也照不出来。"""

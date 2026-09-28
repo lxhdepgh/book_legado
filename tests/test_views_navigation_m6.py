@@ -462,99 +462,53 @@ class SettingsPlaceholderTests(unittest.TestCase):
         self.assertEqual(DEFAULT_DESTINATION, DEST_FIND_BOOKS)
 
 
+
+class ShelfFirstLandingTests(unittest.TestCase):
+    """进「阅读」优先书架（用户诉求：进阅读是要读书，空架才去逛找书）。"""
+
+    def _host(self, has_books: bool, boom: bool = False) -> NavigationHost:
+        registry, _hub = _populated_registry()
+
+        def probe() -> bool:
+            if boom:
+                raise RuntimeError("库读不动")
+            return has_books
+
+        return NavigationHost(page=None, registry=registry, width=1200.0,
+                              shelf_probe=probe)
+
+    def test_rail_entry_lands_on_bookshelf_when_not_empty(self):
+        host = self._host(has_books=True)
+        self.assertEqual(host.current, DEST_BOOKSHELF)
+        host.show(DEST_SOURCE_LIST)
+        host._on_nav_changed(host._groups.index(GROUP_READING))
+        self.assertEqual(host.current, DEST_BOOKSHELF)
+
+    def test_rail_entry_lands_on_find_books_when_shelf_empty(self):
+        host = self._host(has_books=False)
+        self.assertEqual(host.current, DEST_FIND_BOOKS)
+        host.show(DEST_SOURCE_LIST)
+        host._on_nav_changed(host._groups.index(GROUP_READING))
+        self.assertEqual(host.current, DEST_FIND_BOOKS)
+
+    def test_probe_failure_falls_back_to_find_books(self):
+        """探测抛错不该把导航带崩：按 NAV_META 顺序落找书。"""
+        host = self._host(has_books=True, boom=True)
+        self.assertEqual(host.current, DEST_FIND_BOOKS)
+
+    def test_last_tab_beats_the_shelf_rule(self):
+        """记住的页签优先：用户看过找书，再点入口就该回找书。"""
+        host = self._host(has_books=True)
+        host.show(DEST_FIND_BOOKS)
+        host.show(DEST_SOURCE_LIST)
+        host._on_nav_changed(host._groups.index(GROUP_READING))
+        self.assertEqual(host.current, DEST_FIND_BOOKS)
+
+    def test_without_probe_first_tab_wins(self):
+        registry, _hub = _populated_registry()
+        host = NavigationHost(page=None, registry=registry, width=1200.0)
+        self.assertEqual(host.current, DEST_FIND_BOOKS)
+
+
 if __name__ == "__main__":
     unittest.main()
-
-
-class ShelfFirstLandingTests(unittest.TestCase):
-    """进「阅读」优先书架（用户诉求：进阅读是要读书，空架才去逛找书）。"""
-
-    def _host(self, has_books: bool, boom: bool = False) -> NavigationHost:
-        registry, _hub = _populated_registry()
-
-        def probe() -> bool:
-            if boom:
-                raise RuntimeError("库读不动")
-            return has_books
-
-        return NavigationHost(page=None, registry=registry, width=1200.0,
-                              shelf_probe=probe)
-
-    def test_rail_entry_lands_on_bookshelf_when_not_empty(self):
-        host = self._host(has_books=True)
-        self.assertEqual(host.current, DEST_BOOKSHELF)
-        host.show(DEST_SOURCE_LIST)
-        host._on_nav_changed(host._groups.index(GROUP_READING))
-        self.assertEqual(host.current, DEST_BOOKSHELF)
-
-    def test_rail_entry_lands_on_find_books_when_shelf_empty(self):
-        host = self._host(has_books=False)
-        self.assertEqual(host.current, DEST_FIND_BOOKS)
-        host.show(DEST_SOURCE_LIST)
-        host._on_nav_changed(host._groups.index(GROUP_READING))
-        self.assertEqual(host.current, DEST_FIND_BOOKS)
-
-    def test_probe_failure_falls_back_to_find_books(self):
-        """探测抛错不该把导航带崩：按 NAV_META 顺序落找书。"""
-        host = self._host(has_books=True, boom=True)
-        self.assertEqual(host.current, DEST_FIND_BOOKS)
-
-    def test_last_tab_beats_the_shelf_rule(self):
-        """记住的页签优先：用户看过找书，再点入口就该回找书。"""
-        host = self._host(has_books=True)
-        host.show(DEST_FIND_BOOKS)
-        host.show(DEST_SOURCE_LIST)
-        host._on_nav_changed(host._groups.index(GROUP_READING))
-        self.assertEqual(host.current, DEST_FIND_BOOKS)
-
-    def test_without_probe_first_tab_wins(self):
-        registry, _hub = _populated_registry()
-        host = NavigationHost(page=None, registry=registry, width=1200.0)
-        self.assertEqual(host.current, DEST_FIND_BOOKS)
-
-
-class ShelfFirstLandingTests(unittest.TestCase):
-    """进「阅读」优先书架（用户诉求：进阅读是要读书，空架才去逛找书）。"""
-
-    def _host(self, has_books: bool, boom: bool = False) -> NavigationHost:
-        registry, _hub = _populated_registry()
-
-        def probe() -> bool:
-            if boom:
-                raise RuntimeError("库读不动")
-            return has_books
-
-        return NavigationHost(page=None, registry=registry, width=1200.0,
-                              shelf_probe=probe)
-
-    def test_rail_entry_lands_on_bookshelf_when_not_empty(self):
-        host = self._host(has_books=True)
-        self.assertEqual(host.current, DEST_BOOKSHELF)
-        host.show(DEST_SOURCE_LIST)
-        host._on_nav_changed(host._groups.index(GROUP_READING))
-        self.assertEqual(host.current, DEST_BOOKSHELF)
-
-    def test_rail_entry_lands_on_find_books_when_shelf_empty(self):
-        host = self._host(has_books=False)
-        self.assertEqual(host.current, DEST_FIND_BOOKS)
-        host.show(DEST_SOURCE_LIST)
-        host._on_nav_changed(host._groups.index(GROUP_READING))
-        self.assertEqual(host.current, DEST_FIND_BOOKS)
-
-    def test_probe_failure_falls_back_to_find_books(self):
-        """探测抛错不该把导航带崩：按 NAV_META 顺序落找书。"""
-        host = self._host(has_books=True, boom=True)
-        self.assertEqual(host.current, DEST_FIND_BOOKS)
-
-    def test_last_tab_beats_the_shelf_rule(self):
-        """记住的页签优先：用户看过找书，再点入口就该回找书。"""
-        host = self._host(has_books=True)
-        host.show(DEST_FIND_BOOKS)
-        host.show(DEST_SOURCE_LIST)
-        host._on_nav_changed(host._groups.index(GROUP_READING))
-        self.assertEqual(host.current, DEST_FIND_BOOKS)
-
-    def test_without_probe_first_tab_wins(self):
-        registry, _hub = _populated_registry()
-        host = NavigationHost(page=None, registry=registry, width=1200.0)
-        self.assertEqual(host.current, DEST_FIND_BOOKS)

@@ -128,6 +128,8 @@ class ReaderController(BaseController):
         self._readable: list[dict] = []   # 去掉卷标题后的可读书章
         self._chapter_index = -1
         self._book_url = ""
+        #: 底部状态栏的书名行：《书名》 · 作者（阅读界面里唯一说得出"这是哪本书"的地方）。
+        self._book_label = ""
         #: 在途/已开的书（书源|书名）：连点两次「开始阅读」不该再跑一遍目录加载
         self._opening = ""
         # 跨视图导航槽：NavigationHost.show 装配时绑定（视图间零互引）
@@ -369,6 +371,10 @@ class ReaderController(BaseController):
             logger.debug("阅读器已离开，放弃打开 %s", getattr(record, "name", ""))
             return
         self._book_url = getattr(session, "book_url", "") or ""
+        book_name = str(getattr(record, "name", "") or "")
+        book_author = str(getattr(record, "author", "") or "")
+        self._book_label = " · ".join(p for p in (
+            f"《{book_name}》" if book_name else "", book_author) if p)
         chapters = getattr(session, "chapters", []) or []
         self._set_chapters([
             {"index": int(getattr(c, "index", i) or i),
@@ -589,13 +595,13 @@ class ReaderController(BaseController):
         return None
 
     def _update_chapter_navigation(self) -> None:
-        """工具栏计数 + 状态栏「章名 · 序号/总数 · 百分比」+ 上下章可用性 + 播放条亮灭。"""
+        """工具栏「序号/总数 · 章名」+ 状态栏「《书名》 · 作者 · 共 N 章」+ 上下章可用性 + 朗读可用性。"""
         total = len(self._readable)
         index = self._chapter_index
-        bar = getattr(self._view, "read_aloud", None)
-        if bar is not None:
-            # 没有朗读服务（替身装配/精简启动）就整条不出现：亮着按不动更糟。
-            bar.visible = self._tts is not None and 0 <= index < total
+        # 朗读的**可见性**现在归视图（工具栏那颗能收起），控制器只报"这会儿能不能念"：
+        # 没有朗读服务（替身装配/精简启动）或没有可念的章时，入口整颗禁用。
+        self._view.set_read_aloud_available(
+            self._tts is not None and 0 <= index < total)
         if not total or not 0 <= index < total:
             self._view.set_progress("未选择章节")
             self._view.set_status_bar("")
@@ -603,8 +609,10 @@ class ReaderController(BaseController):
             return
         name = self._readable[index]["name"]
         self._view.set_progress(f"{index + 1}/{total} · {name}")
-        percent = int((index + 1) * 100 / max(1, total))
-        self._view.set_status_bar(f"{name} · {index + 1}/{total} · {percent}%")
+        # 底部状态栏说"这是哪本书"，顶部进度标签说"读到第几章"——以前两条写的是
+        # 同一句话（章名 + 序号 + 百分比），而整屏没有一个地方显示书名。
+        self._view.set_status_bar(" · ".join(
+            p for p in (self._book_label, f"共 {total} 章") if p))
         self._view.set_nav_enabled(prev=self._adjacent_chapter(-1) is not None,
                                    next_=self._adjacent_chapter(1) is not None)
 
@@ -1095,6 +1103,8 @@ class ReaderController(BaseController):
             # 否则"调了语速没反应"又是一次没人解释得了的静默退化。
             bar.set_state(state, chapter=chapter, detail=detail,
                           backend=self._tts_backend_name())
+            # 态同时回流到工具栏那颗入口：念着的时候它要禁用收起（见视图注释）。
+            self._view.sync_read_aloud()
 
     async def _on_read_aloud_state(self, event: ReadAloudStateEvent) -> None:
         """服务态镜像到播放条。

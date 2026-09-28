@@ -831,7 +831,10 @@ class ReaderAutoContinueTests(unittest.TestCase):
         self.assertTrue(self._settled(
             lambda: self.controller._chapter_index == 1))
         self.assertEqual(self.view._title.value, "第二章")
-        self.assertEqual(self.view._status_bar.content.value, "第二章 · 2/3 · 66%")
+        # 位置读数在顶部工具栏（章名 + 序号/总数），底部状态栏只说书级信息——
+        # 这条 rig 没走 open_book，所以书名是空的，只剩「共 N 章」。
+        self.assertEqual(self.view._progress_label.value, "2/3 · 第二章")
+        self.assertEqual(self.view._status_bar.content.value, "共 3 章")
         self._scroll(1900, 2000)         # 第二章读到头 → 接第三章
         self.assertTrue(self._settled(lambda: "/c3" in self.session.viewports))
         self.assertEqual(self._texts()[-1], "第三章正文")

@@ -123,7 +123,12 @@ class BookshelfController(BaseController):
 
     @staticmethod
     def _to_render_record(raw: dict) -> dict:
-        """副本 + ``local`` 标记：视图据此收起换源/整书缓存这两个对本地书无意义的入口。
+        """副本 + ``local`` 标记 + ``chapter_name``（读到第几章），见视图 ``_row``。
+
+        ``local``：视图据此收起换源/整书缓存这两个对本地书无意义的入口。
+        ``chapter_name``：进度在库里从来不是一个裸键——新数据在 ``reading`` 子对象、
+        旧/Legado 数据在 ``durChapterTitle``，归一交给 ``SourceService.reading_state``
+        （书架列表以前只取作者，所以行副标题永远显示不出"读到哪儿"）。
 
         必须复制——``list_bookshelf`` 返回的是 SourceService 内存里的那批 dict，
         直接写键会被 save_bookshelf 落进 bookshelf.json。
@@ -131,6 +136,8 @@ class BookshelfController(BaseController):
         record = dict(raw or {})
         record["local"] = is_local_source_url(
             record.get("source_url") or record.get("origin"))
+        reading = SourceService.reading_state(record) or {}
+        record["chapter_name"] = str(reading.get("chapter_name") or "")
         return record
 
     async def _on_source_changed(self, event: SourceChangedEvent) -> None:
