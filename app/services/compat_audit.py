@@ -450,6 +450,8 @@ def audit_source_corpus(path: str | Path) -> CorpusAudit:
             prepared = re.sub(r"\{\{[\s\S]*?\}\}", "0", script).split("##", 1)[0]
             prepared = LegadoJsRuntime._clean_script(prepared)
             try:
+                # 每段新建一条 Context：崩溃按 runtime 算、不按新建算，
+                # 理由与实测数据见 legado_js._QUICKJS_LOCK 上方注释。
                 quickjs.Context().eval(f"(function(){{\n{prepared}\n}})")
             except Exception as exc:
                 audit.syntax_issues.append(ScriptSyntaxIssue(

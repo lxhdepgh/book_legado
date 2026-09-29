@@ -133,6 +133,11 @@ def _audit_one(data: dict) -> AuditReport:
         quickjs = None  # type: ignore
         LegadoJsRuntime = None  # type: ignore
     if quickjs is not None:
+        # 每次**新建**一条 Context 是刻意的：崩溃按 runtime 算，不按新建算
+        # （实测面见 legado_js._QUICKJS_LOCK 上方注释）。提到模块级共用一条反而是
+        # 那个会带走进程的形状，护栏 QuickJsRuntimeOverlapTests 盯着这两件事。
+        # 换成"收进 dispatcher/锁"也不划算：600 段预编译 108 ms → 541 ms（5.0×），
+        # 换不来任何安全。
         for field_path, script in ca._script_blocks(data, 0):
             prepared = re.sub(r"\{\{[\s\S]*?\}\}", "0", script).split("##", 1)[0]
             prepared = LegadoJsRuntime._clean_script(prepared)  # type: ignore[union-attr]

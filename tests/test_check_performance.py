@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from app.services import block_pages, check_service
 from app.models.book_source import BookSource
-from app.services.engine.legado_js import LegadoJsRuntime
+from app.services.engine.legado_js import JsContext, LegadoJsRuntime
 from app.services.engine.rule_engine import (ExploreCategory, ReaderEngine,
                                       RequestConnectionError,
                                       RequestTimeoutError)
@@ -1032,6 +1032,219 @@ class RuleParsingOffLoopTests(unittest.IsolatedAsyncioTestCase):
             baseline = await Engine().content_document(source, chapter, need_save=False)
         self.assertEqual(document.plain_text, baseline.plain_text)
         self.assertEqual(document.raw_content, baseline.raw_content)
+
+
+class QuickJsRuntimeOverlapTests(unittest.TestCase):
+    """一个 quickjs runtime 在任一时刻只能待在同一条线程里。
+
+    这才是 `LegadoJsRuntime._QUICKJS_LOCK` 守的不变量，也是静态审计那两处裸
+    `quickjs.Context()` 判定为"不必收进锁/dispatcher"的依据。本机实测
+    （python-quickjs 1.19.4，全部离线子进程）：
+
+    - 两条线程**同时**进同一个 Context：6/6 崩，
+      `Assertion failed: !runtime_data->thread_state, file module.c, line 83`，
+      rc=3221226505（0xC0000409 fast-fail，进程当场没了，不是可捕获异常）
+      —— `.probe/qjs_shared_context_cross_thread.py`；
+    - 每线程各自新建 Context 并发创建+求值，同时唯一 QuickJS 线程在跑真规则：
+      4×2000 次 ×3 遍（另加纯 quickjs 面 4×2000×3）0 崩——独立 Context 各带一个
+      JSRuntime，彼此没有共享原生状态 —— `.probe/qjs_concurrent_context.py`；
+    - 同一个 Context **先后**换线程（2000 次交接 / 2000 轮交替）：存活
+      —— `.probe/qjs_context_thread_handover.py`。
+
+    所以闸门钉的是"**重叠**"：既不是"换了线程"，也不是"新建 Context"（合法，且比
+    走 dispatcher 快 5.0 倍——600 段预编译 108 ms vs 541 ms；"只加锁不走 dispatcher"
+    更是双输：108→158 ms，前台最大等待还从 11.8 ms 顶到 34.4 ms，
+    `.probe/audit_js_serialize_cost.py`）。同线程重入是 JS→Python 回调→再 eval
+    的正常形状，归 `JS_REENTRY_LIMIT` 管，不在这里拦。
+    第二条断言"谁建的 Context 谁用到死"（先后换线程也算红）不是安全线而是设计线：
+    上面第 3 条实测说明换线程本身活得下来，但一次交接正是"把 Context 提到模块级
+    缓存给审计线程共用"那个错修法的第一步，等它变成第 1 条就晚了。
+    """
+
+    @staticmethod
+    def _audit_source(index: int) -> dict:
+        return {
+            "bookSourceUrl": f"https://audit{index}.test",
+            "bookSourceName": f"审计并发样本{index}",
+            "ruleSearch": {
+                "bookList": f"<js>var a{index}=1;a{index}</js>",
+                "name": "@js:(function(){return '甲'})()",
+                "bookUrl": "$.url",
+            },
+            "ruleContent": {"content": "@js:(function(){return '正文'})()"},
+        }
+
+    @staticmethod
+    def _runtime_spy():
+        """把 `quickjs.Context` 换成记账代理，返回 (补丁, 记账, 原构造器)。
+
+        `_quickjs.Context` 不是可子类化的 C 类型（实测 `TypeError: type
+        '_quickjs.Context' is not an acceptable base type`），只能整一个转发代理。
+        记账三笔：`created`＝建过多少个 runtime，`active`＝此刻这份 runtime 在
+        哪几条线程里（重叠即红，那是真会带走进程的一种），`users`＝这份 runtime
+        前后被哪些线程碰过（先后换线程实测安全，但意味着有人把 Context 漏出了
+        它自己的线程——生产里没有这种形状，见下）。
+        """
+        import quickjs
+
+        lock = threading.Lock()
+        state = {"created": 0, "calls": 0, "active": {}, "users": {}}
+
+        def enter(key):
+            tid = threading.get_ident()
+            with lock:
+                state["calls"] += 1
+                users = state["active"].setdefault(key, {})
+                for other in users:
+                    if other != tid:
+                        # 先拦再进：真进去就是上面那三种崩法之一，pytest 连进程
+                        # 一起丢，红都报不出来。同线程重入放行。
+                        raise AssertionError(
+                            "同一个 quickjs runtime 被两条线程同时进入："
+                            f"{other} 与 {tid}")
+                users[tid] = users.get(tid, 0) + 1
+                state["users"].setdefault(key, set()).add(tid)
+
+        def leave(key):
+            tid = threading.get_ident()
+            with lock:
+                users = state["active"][key]
+                users[tid] -= 1
+                if users[tid] == 0:
+                    del users[tid]
+                if not users:
+                    state["active"].pop(key, None)
+
+        class Spied:
+            __slots__ = ("_real", "_key")
+
+            def __init__(self, real, key):
+                self._real = real
+                self._key = key
+
+            def __getattr__(self, name):
+                attr = getattr(self._real, name)
+                if not callable(attr):
+                    return attr
+
+                def guarded(*args, **kwargs):
+                    enter(self._key)
+                    try:
+                        return attr(*args, **kwargs)
+                    finally:
+                        leave(self._key)
+                return guarded
+
+        original = quickjs.Context
+
+        def factory(*args, **kwargs):
+            real = original(*args, **kwargs)
+            with lock:
+                state["created"] += 1
+                # 键必须是这份 runtime 自己的序号：`id(real)` 会在对象回收后被复用，
+                # 而审计一次就造上百个短命 Context，复用会把两条无关线程拼成"同一个人"。
+                state["users"].setdefault(state["created"], set()).add(
+                    threading.get_ident())
+                return Spied(real, state["created"])
+
+        return factory, state, original
+
+    def test_audit_and_engine_never_enter_one_runtime_together(self):
+        """检测面形状：4 条审计线程 + 2 条引擎求值线程同时跑，不许有谁撞 runtime。
+
+        审计走 `asyncio.to_thread`（生产里就是检测流水线每源一条），QuickJS 求值
+        走 dispatcher 唯一线程；两侧共用一份 `quickjs.Context` 才是要防的事。
+        """
+        from app.services.sources import compat_audit_service
+
+        factory, state, original = self._runtime_spy()
+        import quickjs
+        runtime = LegadoJsRuntime()
+        source = BookSource(bookSourceName="共享 jsLib", bookSourceUrl="https://jslib.test",
+                            jsLib="var __lib = 1;")
+        errors = []
+        barrier = threading.Barrier(6)
+
+        def audit_worker(index):
+            try:
+                barrier.wait()
+                for _ in range(15):
+                    compat_audit_service._audit_one(self._audit_source(index))
+            except BaseException as exc:  # noqa: BLE001 —— 线程里的红要带回主线程
+                errors.append(exc)
+
+        def engine_worker(offset):
+            try:
+                barrier.wait()
+                for i in range(12):
+                    runtime.evaluate(f"@js:__lib + {offset} + {i}",
+                                     JsContext(source=source))
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = ([threading.Thread(target=audit_worker, args=(n,)) for n in range(4)]
+                   + [threading.Thread(target=engine_worker, args=(n,)) for n in range(2)])
+        quickjs.Context = factory
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            quickjs.Context = original
+
+        self.assertEqual(errors, [], f"并发面撞车：{errors[:3]}")
+        # 反空转①：审计每源 3 段 JS × 4 线程 × 15 轮，替身必须真的全都见过。
+        self.assertGreaterEqual(state["created"], 4 * 15 * 3,
+                                "替身没记到审计新建的 Context，闸门是空转")
+        self.assertGreater(state["calls"], 0, "一次 Context 方法都没被调到")
+        # 设计线：每份 runtime 只该被建它的那条线程用到底（审计没外流、没复用）。
+        handovers = [sorted(str(t) for t in tids)
+                     for tids in state["users"].values() if len(tids) > 1]
+        self.assertEqual(handovers, [],
+                         "同一个 Context 被两条线程用过，共享面漏在锁/dispatcher 之外")
+        # 反空转②：引擎的 jsLib Context 是按 key 缓存复用的，"同一 runtime 反复进"
+        # 这个危险形状必须真的被跑到；runtime 数 == 调用数就说明只测了审计一半。
+        self.assertLess(len(state["users"]), state["calls"],
+                        "引擎缓存的共享 Context 没被复用到，闸门只测了一半")
+
+    def test_the_gate_fires_when_two_threads_really_share_a_runtime(self):
+        """闸门自己也要被验一次：拿真 quickjs 造一次重叠，必须红而不是静默通过。
+
+        不改生产代码制造红——那会顺带把进程崩掉；这里只驱动记账层，让一条线程
+        真的在原生 eval 里停住（纯 JS 长循环，QuickJS 求值期间不攥 GIL，实测旁路
+        心跳最大间隔 2.0 ms，见 `.probe/qjs_gil_held.py`），另一条线程再进同一个
+        runtime。
+        """
+        import quickjs
+
+        factory, state, original = self._runtime_spy()
+        quickjs.Context = factory
+        try:
+            shared = quickjs.Context()
+            caught = []
+            busy = ("(function(){var s=0;for(var i=0;i<12000000;i++){s+=(i*3^7)}"
+                    "return s})()")
+
+            def hog():
+                shared.eval(busy)
+
+            hog_thread = threading.Thread(target=hog)
+            hog_thread.start()
+            deadline = time.perf_counter() + 1.0
+            while time.perf_counter() < deadline and state["calls"] == 0:
+                time.sleep(0.002)
+            self.assertEqual(state["calls"], 1, "长循环没进到记账层里，测试是空的")
+            try:
+                shared.eval("1+1")
+            except AssertionError as exc:
+                caught.append(str(exc))
+            hog_thread.join()
+        finally:
+            quickjs.Context = original
+
+        self.assertEqual(len(caught), 1, f"两条线程同进一个 runtime 却没被拦住：{caught}")
+        self.assertIn("同时进入", caught[0], "拦下它的不是这条闸门（措辞不对）")
 
 
 if __name__ == "__main__":

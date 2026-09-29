@@ -214,8 +214,16 @@ class _QuickJsDispatcher:
 
 class LegadoJsRuntime:
     _PERSIST_LOCK = threading.RLock()
-    # The Windows quickjs extension can access-violate when independent
-    # Context objects are created/evaluated concurrently in different threads.
+    # [quickjs 线程面] 一个 quickjs runtime（= 一个 Context）**同一时刻只能被一条
+    # 线程待在里面**：两条线程同时进同一个 Context 是 `Assertion failed:
+    # !runtime_data->thread_state, module.c:83`，rc=3221226505 直接把进程带走
+    # （本机 python-quickjs 1.19.4 实测 6/6 崩，`.probe/qjs_shared_context_cross_thread.py`）。
+    # 崩溃按 runtime 算，不按"新建"算：每条线程各自 `quickjs.Context()` 并发创建+求值
+    # 是安全的（4×2000 次 ×3 遍 0 崩，`.probe/qjs_concurrent_context.py`），同一个
+    # Context 先后换线程交接也安全（`.probe/qjs_context_thread_handover.py`）——
+    # 所以静态审计在 to_thread 上裸建 Context 不必收进这把锁。
+    # 这把锁守的是 `_shared_js_contexts` 里**按 jsLib 缓存复用**的那批 Context：
+    # 求值虽然都落在 dispatcher 唯一线程上，锁保证的是万一有人从别的线程进来也不会重叠。
     # Network work remains concurrent; only native JS execution is serialized.
     _QUICKJS_LOCK = threading.RLock()
     _QUICKJS_DISPATCHER = _QuickJsDispatcher()
