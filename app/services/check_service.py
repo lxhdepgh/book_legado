@@ -412,6 +412,11 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
             # 缺口判定要走一次 JS 模拟面清单，放线程里跑，别卡住事件循环。
             java_gaps = asyncio.create_task(
                 asyncio.to_thread(_unsupported_java_packages, source))
+            # 每源一条引擎、**一条自己的连接池**，这是量出来的结论，不是没想过共享
+            # （`.probe/engine_reuse_attr.py`）：真实形状下各源是不同主机，共享池一次
+            # 握手都省不下来（8 源 16 次 vs 16 次）；唯一省下来的形状（多条源挤同一
+            # 域名）反而更慢——共享让 limit_per_host 变成跨源排队，14 次拨号降到 8 次
+            # 却把墙钟从 700ms 顶到 746ms。引擎本身构造/关闭合计 ~9ms/8 源。
             engine = LegadoReadingEngine(timeout=timeout,
                                          webview_fetcher=browser_fetcher,
                                          background=True)
