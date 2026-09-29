@@ -1646,7 +1646,8 @@ class LegadoReadingEngine(ReaderEngine):
                 if document_title:
                     chapter.name = document_title
                     await self._save_current_catalog(source)
-            value = self._strict_value(
+            value = await self._parse_off_loop(
+                rule, self._strict_value,
                 root, rule, kind, source, final_url,
                 book=getattr(self, "current_book", None), chapter=chapter,
                 raw_result=text, collect_all=True, unescape_html=False,

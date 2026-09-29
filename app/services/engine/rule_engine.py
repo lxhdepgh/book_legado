@@ -820,6 +820,10 @@ class ReaderEngine:
     _global_rate_lock = threading.Lock()
     # [M1-2.15] SQLite cookies 表全局键（JS 罐整体快照，对标 Legado cookieDao）。
     _COOKIE_STORE_SQLITE_KEY = "legado_cookie_store"
+    #: 这些形状的规则会把求值派给 QuickJS 线程并**原地等**（`{{}}` 的模板体也是
+    #: `@js:` 求值，见 :meth:`_field_value` 的 render_expression；`@webjs:` 不算，
+    #: 它由页面渲染层取值，不走 QuickJS）。
+    _JS_STAGE_MARKERS = ("@js:", "<js>", "{{")
 
     def __init__(self, timeout: float | None = None, state_dir=None,
                  connect_timeout: float | None = None, background: bool = False,
@@ -847,6 +851,46 @@ class ReaderEngine:
         self._source_cookie_jars = {}
         self._sessions = {}
         self.last_response = None
+        # 取值段挪到工作线程之后必须补的锁，见 :meth:`_parse_off_loop`。
+        self._rule_lock = threading.RLock()
+
+    def _rules_text(self, *rules) -> str:
+        """把若干规则串成一条文本，供 :meth:`_rule_parks_on_js` 判定。"""
+        parts = []
+        for item in rules:
+            if isinstance(item, dict):
+                parts.extend(str(value or "") for value in item.values())
+            elif item is not None:
+                parts.append(str(item))
+        return "|".join(parts)
+
+    def _rule_parks_on_js(self, text: str) -> bool:
+        return any(marker in text for marker in self._JS_STAGE_MARKERS)
+
+    async def _parse_off_loop(self, gate: str, parse, *args, **kwargs):
+        """会把调用线程钉在 QuickJS 上的取值段，放到工作线程里跑。
+
+        同步 `js.evaluate()` 是"提交给 legado-quickjs 线程 + 原地等 future"：等的
+        期间**整条服务循环停在那儿**（实测 `.probe/gil_park_probe.py`：循环线程上
+        同步求值 200ms，5ms 心跳被顶开 204ms；同一求值改成 await 或换一条线程，
+        心跳间隙只有 11ms——QuickJS 的原生 eval 期间不攥 GIL）。8 源并发检测里一条
+        `@js:` 正文规则就是 123ms 的循环占用，约占该轮墙钟四分之一
+        （`.probe/sweep_loop_park.py`）。
+
+        两件事必须在场，缺一个这里就不能跳线程：
+        - **锁**：`js_variables`、`java.put` 的书/章变量、`_source_cookie_jars`
+          原来靠"取值段从不让出循环"天然原子；改成多线程后同一条引擎上并发的
+          两个源会互相串味，所以整段取值在一把锁里跑完。
+        - **闸门**：纯选择器规则不跳线程——一次线程 hop 比它省下的等待还贵。
+        """
+        if not self._rule_parks_on_js(gate):
+            return parse(*args, **kwargs)
+
+        def guarded():
+            with self._rule_lock:
+                return parse(*args, **kwargs)
+
+        return await asyncio.to_thread(guarded)
 
     def _cookie_jar_for_source(self, source=None):
         if source is None:
@@ -2077,7 +2121,8 @@ class ReaderEngine:
             except Exception:
                 return []
             return [book] if book.name else []
-        books = self._books_from_nodes(
+        books = await self._parse_off_loop(
+            self._rules_text(rules, list_put), self._books_from_nodes,
             nodes, kind, rules, final_url, source, keyword, page, list_put)
         distinct = []
         seen_urls = set()
@@ -2107,9 +2152,10 @@ class ReaderEngine:
         root = (parse_json_smart(text) if "json" in content_type.lower()
                 else parse_markup(text, content_type))
         kind = "json" if isinstance(root, (dict, list)) else "html"
-        parsed = self._book_from_node(
-            root, kind, getattr(source, "ruleBookInfo", {}) or {}, final_url,
-            source, rule_prefix="ruleBookInfo")
+        rules = getattr(source, "ruleBookInfo", {}) or {}
+        parsed = await self._parse_off_loop(
+            self._rules_text(rules), self._book_from_node,
+            root, kind, rules, final_url, source, rule_prefix="ruleBookInfo")
         parsed.url, parsed.info_html = book_url, text
         return parsed
 
@@ -2170,7 +2216,8 @@ class ReaderEngine:
             except Exception:
                 return []
             return [book] if book.name else []
-        books = self._books_from_nodes(
+        books = await self._parse_off_loop(
+            self._rules_text(rules, list_put), self._books_from_nodes,
             nodes, kind, rules, final_url, source, "", page, list_put,
             rule_prefix=list_scope)
         distinct = []

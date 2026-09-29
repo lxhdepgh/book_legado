@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -906,6 +907,131 @@ class JsoupFastPathTests(unittest.TestCase):
         self.assertEqual([node.name for node in parser.select_jsoup(document, "item")],
                          ["item"],
                          "真 XML 文档上快路径把标签名大小写吞掉了，与 SoupSieve 不同解")
+
+
+class RuleParsingOffLoopTests(unittest.IsolatedAsyncioTestCase):
+    """带 JS 的取值段不许在引擎循环线程上跑。
+
+    同步 `js.evaluate()` 是"提交给 legado-quickjs 线程 + 原地等 future"，等的期间
+    **整条服务循环停在那里**。本机实测（`.probe/gil_park_probe.py`，5ms 心跳）：
+    循环线程上同步求值一次 200ms 把心跳顶开 **204ms**，而同一次求值改成 await 或
+    挪到别的线程只有 **11ms**——QuickJS 的原生 eval 期间不攥 GIL，这段时间本该还给循环。
+    8 源并发检测里一条 `@js:` 正文规则 = 123ms 循环占用
+    （`.probe/sweep_loop_park.py`，改后 0ms）。
+
+    护栏因此钉"**这条取值没在循环线程上发生**"，而不是钉心跳时长（跨机不可复现）。
+    """
+
+    async def asyncSetUp(self):
+        # 引擎构造里有 `aiohttp.CookieJar()`，它要一个正在跑的循环——只能放在 asyncSetUp。
+        self.engine = ReaderEngine()
+        self.loop_ident = threading.get_ident()
+
+    async def _where(self, gate):
+        """跑一次 `_parse_off_loop`，返回它实际落在哪条线程（循环 / 别处）。"""
+        seen = []
+
+        def parse():
+            seen.append(threading.get_ident())
+            return "结果"
+
+        value = await self.engine._parse_off_loop(gate, parse)
+        self.assertEqual(value, "结果", "取值结果被包装层吃掉了")
+        self.assertEqual(len(seen), 1, f"取值没跑或跑了多遍：{seen}")
+        return seen[0]
+
+    async def test_a_js_rule_does_not_run_on_the_loop_thread(self):
+        ident = await self._where("@js:result")
+        self.assertNotEqual(ident, self.loop_ident, "JS 取值仍把引擎循环钉死")
+
+    async def test_a_selector_only_rule_stays_on_the_loop_thread(self):
+        # 反空转：闸门若整体失效（一律跳线程），这条会红——线程 hop 比它省下的等待还贵。
+        ident = await self._where("p@text")
+        self.assertEqual(ident, self.loop_ident, "纯选择器规则不该跳线程")
+
+    async def test_the_gate_recognises_every_shape_that_waits_on_quickjs(self):
+        cases = {
+            "@js:result": True,                 # 显式 JS 段
+            "<js>result</js>": True,            # Legado 的另一种写法
+            "/search?q={{key}}": True,          # 模板体也是 @js: 求值（_field_value:1542）
+            "h1@text@js:result": True,          # 选择器后面接 JS
+            "p@text": False,
+            "$.name": False,
+            "@css:#content@html": False,
+            "h1@text##(\\\\d+)": False,
+            "": False,
+        }
+        for rule, parks in cases.items():
+            with self.subTest(rule=rule):
+                ident = await self._where(rule)
+                off_loop = ident != self.loop_ident
+                self.assertEqual(off_loop, parks,
+                                 f"{'该跳线程却没跳' if parks else '不该跳线程却跳了'}：{rule}")
+
+    async def test_two_js_batches_on_one_engine_do_not_interleave(self):
+        """跳线程必须自带一把引擎锁：共享状态原本靠"取值从不让出循环"天然原子。
+
+        `js_variables`、`java.put` 的书/章变量、`_source_cookie_jars` 都是引擎实例上的
+        普通字典；换源扫描一台引擎服务多个源，两段取值交错就跑就串味。
+        """
+        events = []
+
+        def batch(tag):
+            events.append(("in", tag))
+            time.sleep(0.05)
+            events.append(("out", tag))
+            return tag
+
+        await asyncio.gather(self.engine._parse_off_loop("@js:a", batch, "a"),
+                             self.engine._parse_off_loop("@js:b", batch, "b"))
+        self.assertEqual(len(events), 4, f"有一批没跑：{events}")
+        self.assertEqual(events[1], ("out", events[0][1]),
+                         f"两段取值在共享状态上交错：{events}")
+
+    async def test_a_js_content_rule_is_extracted_off_loop_with_the_same_text(self):
+        """接线证据：真阅读链路里的 `@js:` 正文规则确实走了这条道，且结果一字不变。
+
+        只看 `_parse_off_loop` 自己绿是不够的——机制在、没人调用照样全速 park
+        （见记忆 refactor-regression-orphan-methods）。
+        """
+        from app.services.engine.reading_engine import LegadoReadingEngine, ChapterItem
+
+        rule = "@js:(function(){return '正文段落。';})()"
+        source = SimpleNamespace(bookSourceUrl="https://x",
+                                 ruleContent={"content": rule},
+                                 to_dict=lambda: {"bookSourceUrl": "https://x"})
+
+        class Engine(LegadoReadingEngine):
+            async def _request_value(self, *args, **kwargs):
+                return "<div id='c'>离线样本</div>", "text/html", "https://x/chapter"
+
+        threads = []
+        orig_evaluate = LegadoJsRuntime.evaluate
+
+        def record(self, script, context):
+            threads.append(threading.get_ident())
+            return orig_evaluate(self, script, context)
+
+        chapter = ChapterItem("Chapter", "https://x/chapter")
+        LegadoJsRuntime.evaluate = record
+        try:
+            engine = Engine()
+            document = await engine.content_document(source, chapter, need_save=False)
+        finally:
+            LegadoJsRuntime.evaluate = orig_evaluate
+        self.assertTrue(threads, "这条正文规则压根没求值，测试是空的")
+        self.assertNotIn(self.loop_ident, threads,
+                         "阅读链路的 JS 取值仍在引擎循环上")
+        self.assertIn("正文段落", document.plain_text)
+
+        # 同一引擎退回"不跳线程"的老路，文本必须逐字节一致：跳线程只改调度，不改语义。
+        async def passthrough(self, gate, parse, *args, **kwargs):
+            return parse(*args, **kwargs)
+
+        with patch.object(ReaderEngine, "_parse_off_loop", passthrough):
+            baseline = await Engine().content_document(source, chapter, need_save=False)
+        self.assertEqual(document.plain_text, baseline.plain_text)
+        self.assertEqual(document.raw_content, baseline.raw_content)
 
 
 if __name__ == "__main__":
