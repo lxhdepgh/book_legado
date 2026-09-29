@@ -1247,5 +1247,188 @@ class QuickJsRuntimeOverlapTests(unittest.TestCase):
         self.assertIn("同时进入", caught[0], "拦下它的不是这条闸门（措辞不对）")
 
 
+class SourceBudgetCoversSearchStageTests(unittest.IsolatedAsyncioTestCase):
+    """单源的 45 s 天花板必须**含搜索段**（任务 #76①）。
+
+    改前 `deadline = perf_counter() + SOURCE_CHECK_BUDGET` 写在
+    `_engine_search_check` **之后**，所以搜索段拿的是自己那套 `timeout + 3`，
+    天花板从来管不到它。本机实测（`.probe/check_budget_and_js_gate.py`，127.0.0.1
+    假源，旋钮按同比例缩小：timeout=3、预算 2 s、搜索挂 1.5 s、正文挂 8 s）：
+    起点在搜索之后时单源墙钟 **3743 ms**，超出预算的 1743 ms 恰好就是搜索段自己
+    的 1588 ms；起点前移后 **2754 ms**，剩下的 754 ms 是 `_remaining` 的 1 s 下限，
+    不是漏。同旋钮下的健康源 1803 ms、结论仍 fully_usable（前移不误伤）。
+    """
+
+    async def _run(self, budget: float, search_hang: float) -> tuple:
+        """用真实 `_engine_search_check` 跑一条单源，返回 (墙钟, 结果, 收到的 timeout)。"""
+        received = {}
+        real_search = check_service._engine_search_check
+
+        async def spy_search(source, engine, timeout):
+            received["timeout"] = timeout
+            return await real_search(source, engine, timeout)
+
+        class HangingEngine:
+            def __init__(self, **kwargs):
+                self.js = SimpleNamespace(close=lambda: None)
+                self.aclose = _noop_aclose
+
+            async def search(self, source, keyword):
+                await asyncio.sleep(search_hang)
+                return []
+
+        async def fake_probe(*args, **kwargs):
+            return {"status": "ok", "status_code": 200,
+                    "response_time_ms": 1, "error": None}
+
+        with patch.object(check_service, "_engine_search_check", spy_search), \
+                patch.object(check_service, "_probe_source", fake_probe), \
+                patch.object(check_service, "LegadoReadingEngine", HangingEngine), \
+                patch.object(check_service, "SOURCE_CHECK_BUDGET", budget):
+            started = time.perf_counter()
+            results = await check_service.check_sources(
+                [_source(enabledExplore=False, exploreUrl="")],
+                concurrency=1, timeout=1)
+            elapsed = time.perf_counter() - started
+        return elapsed, results[0], received.get("timeout")
+
+    async def test_search_stage_gets_the_remaining_budget_not_its_own_cap(self):
+        """接线证据：搜索段的 timeout 是 `_remaining(deadline, …)` 算出来的。"""
+        elapsed, result, stage_timeout = await self._run(budget=0.2, search_hang=0.01)
+        # 预算 0.2s 时 `_remaining` 落到 1.0s 下限；关键是它**不再**等于 timeout+3=4。
+        self.assertIsNotNone(stage_timeout, "搜索段没收到预算化的 timeout")
+        self.assertLess(stage_timeout, 1.5,
+                        f"搜索段还在拿自己的 timeout+3（{stage_timeout}），预算脱钩")
+        self.assertEqual(result["search_status"], "no_results",
+                         "搜索段被预算切掉了：紧预算不该改变能跑完的搜索的结论")
+
+    async def test_hanging_search_cannot_outlive_the_source_budget(self):
+        """反空转 + 真墙钟：挂死的搜索被预算切掉，而不是把 4s 全等满。"""
+        elapsed, result, _ = await self._run(budget=1.0, search_hang=30)
+        self.assertEqual(result["search_status"], "timeout",
+                         "搜索黑洞没被判成超时，这格没压到预算")
+        self.assertLess(elapsed, 2.5,
+                        f"单源墙钟 {elapsed:.2f}s 越过了 1s 预算——预算仍不含搜索段")
+
+
+class BareTemplateFastPathTests(unittest.IsolatedAsyncioTestCase):
+    """`{{key}}`/`{{page}}` 不该再发 QuickJS 求值（任务 #76②）。
+
+    取证链（全部 127.0.0.1 离线，`.probe/check_budget_and_js_gate.py` +
+    `.probe/template_bare_var_fastpath.py`，A/B 交替取中位）：
+
+    - 一条规则里**零** `@js:`、只用 `{{key}}/{{page}}` 拼 URL 的源，检测里照旧发
+      7 次求值，其中 2 次就是这两个裸名；
+    - 把这 2 次消掉：单源 253 ms → 242 ms（dispatcher 93.5 → 65.4 ms），整轮 16 条
+      这样的源 concurrency=8 时 1699 ms → 1285 ms（求值 112 → 80）——大头在并发栏，
+      因为 dispatcher 是单线程串行的；
+    - **换一种修法被实测否决**：把它们改判进 js_sem(2) 窄道，同一轮 1285 ms →
+      1518 ms（串行资源没少，只多了排队）。所以 `_source_uses_js` 维持原判，
+      修的是"别再发求值"。
+
+    安全前提：这两个是 Legado 唯一直接从请求上下文绑进 bootstrap 的裸标识符
+    （legado_js.py:966-967 `var key = json.dumps(context.key)`、
+    `var page = int(context.page)`）。JSON 往返对 str 恒等；`key` 不是 str 时
+    JS 会绑成 `null`（渲染成空串），Python 侧是 `"None"`，**不同值**，所以必须回落。
+    """
+
+    async def asyncSetUp(self):
+        self.engine = ReaderEngine()
+        self.source = SimpleNamespace(bookSourceUrl="https://bare.example")
+
+    async def asyncTearDown(self):
+        await self.engine.aclose()
+
+    def _js_counter(self):
+        """数 dispatcher 上的求值；返回 (记账, 撤销)。"""
+        state = {"n": 0, "scripts": []}
+        rt = LegadoJsRuntime
+        orig = rt._evaluate_on_quickjs_thread
+
+        def inner(self, script, context, *a, **kw):
+            state["n"] += 1
+            state["scripts"].append(str(script)[:40])
+            return orig(self, script, context, *a, **kw)
+
+        rt._evaluate_on_quickjs_thread = inner
+        return state, (lambda: setattr(rt, "_evaluate_on_quickjs_thread", orig))
+
+    async def test_bare_key_and_page_render_without_touching_quickjs(self):
+        """钉"没发生"：这两个裸名一次求值都不该发出去。"""
+        state, undo = self._js_counter()
+        try:
+            rendered = await self.engine._render_templates(
+                "/s?q={{key}}&p={{page}}", self.source, "我的", 3)
+        finally:
+            undo()
+        self.assertEqual(rendered, "/s?q=我的&p=3", "替出来的文本变了")
+        self.assertEqual(state["n"], 0,
+                         f"裸变量仍在发求值：{state['scripts']}")
+
+    async def test_non_bare_shapes_still_go_through_quickjs(self):
+        """反空转：快路径不能把整条模板通道关掉——只关那两个裸名。"""
+        state, undo = self._js_counter()
+        try:
+            rendered = await self.engine._render_templates(
+                "/s?a={{page+1}}&b={{'' + key}}", self.source, "k", 1)
+        finally:
+            undo()
+        self.assertGreaterEqual(state["n"], 2,
+                                f"非裸形状被顺手短路了（求值 {state['n']} 次）")
+        self.assertEqual(rendered, "/s?a=2&b=k")
+
+    async def test_fast_path_matches_the_js_answer(self):
+        """逐字对拍：把快路径关掉，两栏必须一模一样。
+
+        这条才是真不变量——它钉的是"bootstrap 的绑定值 == Python 手里的值"，
+        哪天 legado_js 改了 `key`/`page` 的绑法（比如加 trim、换类型），对拍就红。
+        """
+        cases = [("我的", 3), ("", 1), ("a b&c=d", 0), ("书名", -2),
+                 ('x"y\\z', 12), ("\u4e2d\u200b文", 7)]
+        # 存取都要走 __dict__：`ReaderEngine._bare_template_value` 拿到的是**解绑后的
+        # 函数**，把它直接赋回去就变成一个普通方法——下一次 `self._bare_template_value`
+        # 会多带一个 self，生产代码当场 TypeError（第一格绿、后面全红正是这个形状）。
+        descriptor = ReaderEngine.__dict__["_bare_template_value"]
+
+        def forced_js(expression, k, p):   # 关掉快路径 = 走原求值
+            return None
+        for key, page in cases:
+            with self.subTest(key=key, page=page):
+                fast = await self.engine._render_templates(
+                    "/s?q={{key}}&p={{page}}", self.source, key, page)
+                ReaderEngine._bare_template_value = staticmethod(forced_js)
+                try:
+                    slow = await self.engine._render_templates(
+                        "/s?q={{key}}&p={{page}}", self.source, key, page)
+                finally:
+                    ReaderEngine._bare_template_value = descriptor
+                self.assertEqual(fast, slow)
+
+    async def test_non_string_key_falls_back_instead_of_rendering_none(self):
+        """`key=None` 在 JS 里绑成 `null` → 渲染空串；Python 的 `str(None)` 是 "None"。
+
+        这条钉的是回落必须发生：少一次求值不值当用改语义来换。
+        """
+        rendered = await self.engine._render_templates(
+            "/s?q={{key}}", self.source, None, 1)
+        self.assertEqual(rendered, "/s?q=",
+                         "非 str 的 key 没回落到求值路径，替出了 Python 的字面量")
+
+    def test_js_lane_gate_does_not_chase_bare_templates(self):
+        """闸门维持原判：模板源不进 js_sem(2)（改判实测 1.9× 慢）。"""
+        template_only = SimpleNamespace(
+            header="", searchUrl="https://t.example/s?q={{key}}&p={{page}}",
+            exploreUrl="", ruleSearch={"bookList": "ul li"}, ruleExplore={},
+            ruleBookInfo={}, ruleToc={}, ruleContent={})
+        self.assertFalse(check_service._source_uses_js(template_only),
+                         "把模板源改判进窄道是实测否决的修法（1285→1518 ms）")
+        real_js = SimpleNamespace(
+            header="", searchUrl="https://t.example/s?q=@js:key",
+            exploreUrl="", ruleSearch={}, ruleExplore={}, ruleBookInfo={},
+            ruleToc={}, ruleContent={})
+        self.assertTrue(check_service._source_uses_js(real_js),
+                        "闸门本身失效了：真 @js: 源没进窄道")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -40,7 +40,7 @@ READING_CHAIN_CANDIDATES = 3
 # Upper bound for the whole reading chain of one source.  Three candidates at
 # the per-stage timeout each would otherwise hold a worker for minutes.
 READING_CHAIN_BUDGET = 30
-# Hard ceiling for everything one source may spend after its search stage, so a
+# Hard ceiling for everything one source may spend, search stage included, so a
 # single half-dead site cannot extend the tail of a long run.
 SOURCE_CHECK_BUDGET = 45
 # Explore and reading hit the same host the search stage just failed to reach,
@@ -78,6 +78,16 @@ def _error_kind(exc: Exception) -> str:
 
 
 def _source_uses_js(source) -> bool:
+    """Pick the narrow JS lane for sources whose rules call @js: directly.
+
+    Bare ``{{key}}``/``{{page}}`` templates are deliberately **not** markers:
+    they do reach QuickJS, but pulling them into js_sem(2) measured slower for a
+    round of 16 such sources (1285 ms -> 1518 ms, A/B interleaved in `.probe/
+    template_bare_var_fastpath.py`) — the dispatcher is the serial resource
+    either way, so narrowing its admission only adds queueing.  The fix for
+    those evals was to stop making them (see
+    `ReaderEngine._bare_template_value`), not to re-classify the source.
+    """
     values = [
         getattr(source, "header", ""), getattr(source, "searchUrl", ""),
         getattr(source, "exploreUrl", ""),
@@ -435,9 +445,17 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
                              "reading_tried": 0}
                 else:
                     async with limiter:
-                        search, search_books = await _engine_search_check(
-                            source, engine, timeout + 3)
+                        # The ceiling starts here, **before** the search stage, so a
+                        # black-hole search cannot add its own timeout on top of the
+                        # budget.  It must stay inside the limiter: queue wait behind
+                        # js_sem is not this source's fault and must not eat it.
+                        # 本机实测（`.probe/check_budget_and_js_gate.py`，旋钮按同比例
+                        # 缩小：timeout=3、预算 2s、搜索挂 1.5s、正文挂 8s）：起点在搜索
+                        # 之后时单源墙钟 3743 ms（超出恰好等于搜索段的 1588 ms），起点
+                        # 前移后 2754 ms，剩下 0.75 s 是 _remaining 的 1s 下限，不是漏。
                         deadline = time.perf_counter() + SOURCE_CHECK_BUDGET
+                        search, search_books = await _engine_search_check(
+                            source, engine, _remaining(deadline, timeout + 3))
                         tags, tag_timeout, tag_skipped = [], False, False
                         if (getattr(source, "enabledExplore", True) and
                                 str(getattr(source, "exploreUrl", "") or "").strip()):

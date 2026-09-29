@@ -2239,6 +2239,10 @@ class ReaderEngine:
             if not match:
                 break
             expression = match.group(1).strip()
+            bare = self._bare_template_value(expression, key, page)
+            if bare is not None:
+                rendered = rendered[:match.start()] + bare + rendered[match.end():]
+                continue
             result = await self.js.evaluate_async(
                 f"@js:{expression}",
                 JsContext(source=source, host_kind="url", key=key, page=page,
@@ -2249,6 +2253,31 @@ class ReaderEngine:
                         self._template_result_text(result) +
                         rendered[match.end():])
         return rendered
+
+    @staticmethod
+    def _bare_template_value(expression: str, key, page) -> str | None:
+        """``{{key}}``/``{{page}}`` 的完成值，Python 侧已经有——不用过 QuickJS。
+
+        这两个是 Legado 唯一直接从请求上下文绑进 bootstrap 的裸标识符
+        （legado_js.py:966 是 ``var key = json.dumps(context.key)``、
+        ``var page = int(context.page)``），JSON 往返对 str 是恒等的，所以
+        字符串化结果与 JS 侧逐字相同。其余形状（裸 ``{{k}}``、``{{page+1}}``、
+        ``{{java.now()}}``）一律返回 None，照旧发求值；``key`` 不是 str 时也
+        返回 None，因为 JS 会把 None 绑成 ``null``、模板渲染成空串而不是
+        ``"None"``。
+
+        收益是量出来的（``.probe/template_bare_var_fastpath.py``，127.0.0.1 假源，
+        A/B 交替取中位——第一版按先后顺序跑，把进程首次检测的起线程开销算成了快路径
+        的功劳，虚报成 44 %）：一条只写 ``{{key}}``/``{{page}}`` 的源在检测里发 7 次
+        求值，其中 2 次就是这两个裸名；消掉后单源墙钟 253 → 242 ms（dispatcher
+        93.5 → 65.4 ms），整轮 16 条这样的源 concurrency=8 时 1699 → 1285 ms——
+        大头在并发那一栏，因为 dispatcher 是单线程串行的，112 次求值砍到 80 次。
+        """
+        if expression == "page":
+            return str(int(page))
+        if expression == "key" and isinstance(key, str):
+            return key
+        return None
 
     @staticmethod
     def _template_result_text(result) -> str:
