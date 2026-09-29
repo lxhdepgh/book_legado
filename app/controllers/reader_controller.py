@@ -949,7 +949,30 @@ class ReaderController(BaseController):
 
     def jump_to_hit(self, hit: dict, _=None) -> None:
         self._interrupt_read_aloud()
-        self.ui_call(self._open_index(int(hit.get("chapter_index", 0))))
+        self.ui_call(self._jump_to_hit(hit))
+
+    async def _jump_to_hit(self, hit: dict) -> None:
+        """跳到命中段：整篇换成那一章，等版心报上渲染尺寸，再滚到第 n 段。
+
+        ``para_index`` 是**章内**段序号：命中跳转走 :meth:`_open_index` 的整篇替换，
+        屏幕上挂的就是这一章，序号与 :class:`ContentSearchService` 建行时数出来的
+        第几段是同一个数（两边都用 ``app.core.text_layout.paragraph_lines`` 切段）。
+        """
+        index = int(hit.get("chapter_index", 0) or 0)
+        paragraph = int(hit.get("para_index", 0) or 0)
+        await self._open_index(index)
+        if self._view is None or paragraph <= 0:
+            return    # 第 0 段就是章首，整篇替换已经到位
+        # 版心的渲染尺寸是客户端布局完自己报上来的（#86 取证四），刚挂完那一下还是
+        # (0,0)，量不到就只能按章首待着——那是改前的行为，不是更坏的结果。
+        # 补三帧与续读 restore_scroll 那两条同一个理由（:467）。
+        for delay in (0.05, 0.15, 0.30):
+            await asyncio.sleep(delay)
+            if self._view is None:
+                return    # 等的路上切了页
+            if self._view.scroll_to_paragraph(paragraph):
+                return
+        logger.info("段级定位没等到版心尺寸，停在章首：第 %d 段", paragraph)
 
     # ------------------------------------------------------------------ #
     # 朗读（接 ReadAloudService，播放条见 views/reading/read_aloud_bar.py）

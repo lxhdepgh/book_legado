@@ -19,10 +19,12 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 
 import flet as ft
 
+from app.core.text_layout import paragraph_lines
 from app.views.reading.bookmark_panel import BookmarkPanel
 from app.views.reading.content_search_bar import ContentSearchBar
 from app.views.reading.read_aloud_bar import ReadAloudBar
@@ -167,6 +169,11 @@ class ReaderView(ft.Column):
         self._title = ft.Text("正文", size=22, weight=ft.FontWeight.BOLD)
         self._content_host = ft.Column(
             spacing=float(self._preferences["paragraph_spacing"]))
+        # 版心的渲染尺寸是段级定位唯一的锚（#86 取证四：挂完布局就自己报上来，
+        # 不用先滚一次——先滚一次会把续读进度写歪）。
+        self._content_size: tuple[float, float] = (0.0, 0.0)
+        self._content_host.size_change_interval = 100
+        self._content_host.on_size_change = self._on_content_size
         self._reader_document = ft.Container(
             width=float(self._preferences["max_width"]),
             padding=ft.Padding(16, 20, 16, 28),
@@ -529,14 +536,12 @@ class ReaderView(ft.Column):
 
         书源正文经常整章只有一两个 ``<p>``：不切段就是一堵密不透风的墙，章节标题
         也淹没在正文中间。只影响显示，不改数据（原文照旧进缓存）。
+
+        切段本身取自 :func:`app.core.text_layout.paragraph_lines`——书内全文索引按
+        **同一份**切法数段落，命中第 k 段才能滚到屏幕上的第 k 段。
         """
-        normalized = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
-        normalized = normalized.replace("\xa0", " ")
         paragraphs: list[tuple[str, bool]] = []
-        for raw_line in normalized.split("\n"):
-            line = re.sub(r"[ \t\f\v]+", " ", raw_line).strip()
-            if not line:
-                continue
+        for line in paragraph_lines(value):
             is_heading = (len(line) <= 48
                           and bool(_HEADING_PATTERN.match(line)))
             if (indent and not is_heading
@@ -557,6 +562,9 @@ class ReaderView(ft.Column):
         target = self._content_host.controls
         if not append:
             del target[:]
+            # 上一张文档的渲染高就此作废：整篇换章后它还挂在 `_content_size` 上时，
+            # 段级定位会拿旧高度把用户滚到别的段（客户端要重新报一次尺寸）。
+            self._content_size = (0.0, 0.0)
         elif chapter_name:
             # 章节分隔标题不打正文标记：排版重排只认正文段。
             target.extend([
@@ -990,6 +998,55 @@ class ReaderView(ft.Column):
     def restore_scroll(self, offset: float) -> None:
         """续读定位：把正文滚到章内绝对偏移（瞬时，无动画）。"""
         self._run(self._reader_scroll.scroll_to(offset=float(offset), duration=0))
+
+    def _on_content_size(self, event) -> None:
+        self._content_size = (float(getattr(event, "width", 0) or 0.0),
+                              float(getattr(event, "height", 0) or 0.0))
+
+    def paragraph_count(self) -> int:
+        """当前挂载文档里的正文段数（与书内索引的 para_index 同一口径）。"""
+        return sum(1 for control in self._content_host.controls
+                   if getattr(control, "data", None)
+                   in (_TEXT_BLOCK, _HEADING_BLOCK))
+
+    def paragraph_pixel(self, paragraph_index: int) -> float | None:
+        """第 n 段段首在版心里的像素 y；没量到渲染尺寸时返回 None。
+
+        模型（#86 取证五/六，300 段两形状浏览器实测）：每段按
+        ``ceil(段字符数 / 每行字数)`` 算折行数，行数 × 行高 + 段间距，再用客户端
+        报上来的版心渲染高**等比缩放**。缩放是关键——几何行宽（``版心宽 / 字号``）
+        本身有百分之几的偏差，整篇缩一次就把偏差吸收掉了：对话密集的开头
+        （前 100 段每段一二十字）最坏差 **0.1 段**，而按字符占比折算
+        （``ChapterViewport.track`` 那把尺）最坏差 **13.3 段**——差十几段等于没跳。
+        """
+        width, height = self._content_size
+        line_px: list[float] = []
+        for control in self._content_host.controls:
+            if getattr(control, "data", None) not in (_TEXT_BLOCK, _HEADING_BLOCK):
+                continue
+            size = float(getattr(control, "size", 0) or self._font_size)
+            multiplier = float(
+                getattr(getattr(control, "style", None), "height", None)
+                or self._preferences["line_height"])
+            per_line = max(1.0, math.floor(width / size))
+            text = str(getattr(control, "value", "") or "")
+            line_px.append(max(1, math.ceil(len(text) / per_line)) * size * multiplier
+                           + float(self._preferences["paragraph_spacing"]))
+        total = sum(line_px)
+        if height <= 0 or total <= 0:
+            return None
+        index = max(0, min(int(paragraph_index), len(line_px) - 1))
+        # 段首 y = 前面那些段占的高度；版心之上还有章名与内衬，按版心坐标滚会让
+        # 命中段落在屏幕偏下处——偏下看得见，偏上就被顶出屏幕了，所以不做补偿。
+        return height * (sum(line_px[:index]) / total)
+
+    def scroll_to_paragraph(self, paragraph_index: int) -> bool:
+        """滚到第 n 段（瞬时）。渲染尺寸还没报上来时返回 False，调用方自行重试。"""
+        pixel = self.paragraph_pixel(paragraph_index)
+        if pixel is None:
+            return False
+        self.restore_scroll(pixel)
+        return True
 
     @property
     def immersive(self) -> bool:
