@@ -8356,5 +8356,87 @@ class JsReentryGuardTests(unittest.TestCase):
         self.assertEqual(seen, ["内"])
 
 
+class JsDispatcherFairnessTests(unittest.TestCase):
+    """批量求值不许被固定间隔排队；前台必须在一格之内插进去。
+
+    本机实测（`.probe/qjs_fairness_probe.py`：40 次 10ms 后台风暴 + 一次前台插队）：
+    旧的"每个后台任务出队之后再睡满 50ms"下前台等 **58ms**、40 次后台
+    **2727ms**；删掉那条睡之后前台 **6ms**、40 次 **760ms**——前台和吞吐
+    **一起**变好。原因是那条睡拦不住前台：睡的时候 worker 已经不在取队列了，
+    前台任务正躺在队列里等这条线程醒来，睡只会把唯一的串行资源白白闲置。
+    护栏因此钉"没发生"（不再有间隔休眠）与"顺序"（前台在队首），不钉计时。
+    """
+
+    FG = LegadoJsRuntime._FOREGROUND_PRIORITY
+    BG = LegadoJsRuntime._BACKGROUND_PRIORITY
+
+    def setUp(self):
+        from app.services.engine import legado_js as module
+        self.module = module
+        self.dispatcher = LegadoJsRuntime._QUICKJS_DISPATCHER
+
+    def _run_while_queued(self, plan):
+        """先用一条占位任务钉住 worker，把 ``plan`` 全部压进队列后再放行。
+
+        返回**执行顺序**的 tag 列表——这样"谁先跑"是记下来的事实，不靠计时。
+        """
+        order: list = []
+        gate = threading.Event()
+        placeholder = self.dispatcher.submit(lambda: gate.wait(5.0), (), self.FG)
+        deadline = time.monotonic() + 5.0
+        while self.dispatcher._current_future is not placeholder:
+            if time.monotonic() > deadline:
+                gate.set()
+                self.fail("QuickJS 调度线程没取走占位任务，测不了排队顺序")
+            time.sleep(0.002)
+        handles = [(tag, self.dispatcher.submit(
+            lambda t=tag: order.append(t), (), priority))
+            for priority, tag in plan]
+        gate.set()          # 放行：这时 plan 里的任务全都还压在队列里
+        try:
+            for _, future in handles:
+                future.result(timeout=10.0)
+            placeholder.result(timeout=10.0)
+        finally:
+            gate.set()      # 兜底：失败也绝不让占位任务把 worker 永久钉死
+        return order
+
+    def test_a_foreground_job_jumps_the_whole_background_queue(self):
+        # 前台故意**最后**到达：它仍然必须第一个跑
+        plan = [(self.BG, f"后台{i}") for i in range(5)] + [(self.FG, "前台")]
+        order = self._run_while_queued(plan)
+        self.assertEqual(order[0], "前台", f"前台没插到队首：{order}")
+        self.assertEqual(order[1:], [f"后台{i}" for i in range(5)],
+                         f"后台之间要保持到达顺序：{order}")
+
+    def test_background_jobs_are_not_spaced_by_an_interval_sleep(self):
+        """30 条后台任务之间不许出现间隔休眠——那条 50ms 的睡就是检测慢 6.6 倍的原因。"""
+        class _SleepRecorder:
+            def __init__(self, real):
+                object.__setattr__(self, "_real", real)
+                object.__setattr__(self, "calls", [])
+
+            def sleep(self, seconds):
+                self.calls.append(seconds)
+                self._real.sleep(seconds)
+
+            def __getattr__(self, name):
+                return getattr(object.__getattribute__(self, "_real"), name)
+
+        recorder = _SleepRecorder(self.module.time)
+        self.module.time = recorder
+        try:
+            futures = [self.dispatcher.submit(lambda: 1, (), self.BG)
+                       for _ in range(30)]
+            for future in futures:
+                future.result(timeout=10.0)
+        finally:
+            self.module.time = recorder._real
+        # 看门狗每 0.5s 醒一次，那是它自己的节拍；被删掉的那条限速在 (0, 0.05] 区间。
+        offenders = [s for s in recorder.calls if 0 < s <= 0.1]
+        self.assertEqual(offenders, [],
+                         f"后台求值之间又出现了间隔休眠：{offenders[:3]}")
+
+
 if __name__ == "__main__":
     unittest.main()

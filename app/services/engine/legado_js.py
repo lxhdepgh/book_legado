@@ -132,13 +132,12 @@ class _QuickJsDispatcher:
     (``set_running_or_notify_cancel`` reports that).
 
     [M1-2.10] 墙钟看门狗：入队/执行都记墙钟时间。排队超时的任务出队即丢；执行超时的
-    任务无法硬中断 QuickJS，但释放调用方 future 并记 last_error。前台优先级(0) 仍高于
-    后台(1)，后台批量任务加最小间隔限速。
+    任务无法硬中断 QuickJS，但释放调用方 future 并记 last_error。前台优先级(0) 严格
+    先于后台(1)——出队时只要队列里有前台任务，它必然在队首。
     """
 
     QUEUE_TIMEOUT = 30.0       # 排队超过此时长的任务出队即丢
     EXECUTION_TIMEOUT = 30.0   # 执行超过此时长：释放调用方 future（运行中 JS 无法硬中断）
-    BACKGROUND_MIN_INTERVAL = 0.05  # 后台批量任务最小间隔，避免饿死前台阅读链路
 
     def __init__(self):
         self._pending = queue.PriorityQueue()
@@ -147,7 +146,6 @@ class _QuickJsDispatcher:
         self._current_started_at = None
         self._current_future = None
         self.last_error = None
-        self._last_background_start = 0.0
         threading.Thread(target=self._serve, name="legado-quickjs",
                          daemon=True).start()
         threading.Thread(target=self._watchdog, name="legado-quickjs-watchdog",
@@ -172,11 +170,12 @@ class _QuickJsDispatcher:
                 self.last_error = f"JS 任务排队超时 {queue_wait:.1f}s，已丢弃"
                 future.set_exception(TimeoutError(self.last_error))
                 continue
-            # [M1-2.10] 后台批量任务最小间隔限速（前台优先级 0 不受限）。
-            if priority != 0:
-                gap = now - self._last_background_start
-                if gap < self.BACKGROUND_MIN_INTERVAL:
-                    time.sleep(self.BACKGROUND_MIN_INTERVAL - gap)
+            # [M1-2.10] 后台批量任务不再按固定间隔限速。那条 sleep 写在**出队之后**：
+            # 睡的时候前台任务正躺在同一个队列里等这条线程醒来，所以它既没让前台少等
+            # （反而让它多等一个间隔），也只是把唯一的串行资源白白闲置——前台的保护
+            # 本来就由上面 PriorityQueue 的排序给出。实测（.probe/qjs_fairness_probe.py，
+            # 40 次 10ms 后台风暴 + 一次前台插队）：前台等待 58ms → 6ms，后台吞吐
+            # 2727ms → 760ms（68.2 → 19.0 ms/次，而那 19ms 就是求值本身，不再是空转）。
             with self._lock:
                 self._current_started_at = time.monotonic()
                 self._current_future = future
@@ -192,8 +191,6 @@ class _QuickJsDispatcher:
                 with self._lock:
                     self._current_started_at = None
                     self._current_future = None
-                    if priority != 0:
-                        self._last_background_start = time.monotonic()
 
     def _watchdog(self):
         # [M1-2.10] 执行超时看门狗：QuickJS 原生 runtime 绑死单线程、无法硬中断运行中的
