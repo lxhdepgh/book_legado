@@ -20,7 +20,6 @@ import asyncio
 import json
 import logging
 import re
-import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -187,7 +186,6 @@ class CompatAuditService(Service):
         super().__init__()
         self._storage = storage
         self._source_service = source_service
-        self._lock = threading.Lock()
 
     async def on_start(self) -> None:
         if self._storage is None and self.hub is not None:
@@ -214,7 +212,8 @@ class CompatAuditService(Service):
                 if hasattr(source_json, "to_dict") else dict(source_json))
         report = await asyncio.to_thread(_audit_one, data)
         try:
-            self._persist(report)
+            # 落库也离开事件循环：持锁的写实测最长等过 304 ms（见 _persist）。
+            await asyncio.to_thread(self._persist, report)
         except Exception:  # 落库失败不影响审计结论返回
             logger.warning("audit_log 落库失败，已忽略", exc_info=True)
         return report
@@ -226,8 +225,18 @@ class CompatAuditService(Service):
         return self._storage.db if self._storage is not None else None
 
     def _persist(self, report: AuditReport) -> None:
-        conn = self._conn()
-        if conn is None:
+        """经 StorageService.execute（持 _db_lock）写，且必须在非循环线程上。
+
+        裸 ``storage.db.execute()`` 会**丢行**而不是报错：主库以
+        ``isolation_level=None`` 打开，别的线程正握着 ``transaction()`` 时裸写
+        就并进那笔未提交的事务，对方 ROLLBACK 把审计行一起带走，调用方看到的
+        还是成功。本机实测（本地临时库，N=240 并发 8，3 遍取中位，
+        还是成功。本机实测（本地临时库，8 线程 × 240 条 × 3 遍同一张表，
+        ``.probe/audit_log_write_shape.py``）：裸写三遍共活下 610/720 行、每遍至少
+        抛一次 InterfaceError，而「并发事务回滚」那格表里剩 0 行；持锁写 720/720，
+        代价是单条最大 91.5 ms（等锁），所以不能留在事件循环上。
+        """
+        if self._storage is None:
             return
         payload = {
             "missing_java_apis": report.missing_java_apis,
@@ -238,11 +247,10 @@ class CompatAuditService(Service):
             "regex_errors": report.regex_errors,
         }
         ts = datetime.now().isoformat(timespec="seconds")
-        with self._lock:
-            conn.execute(
-                "INSERT INTO audit_log(source_id, missing_apis, ts) VALUES(?,?,?)",
-                (report.source_id,
-                 json.dumps(payload, ensure_ascii=False), ts))
+        self._storage.execute(
+            "INSERT INTO audit_log(source_id, missing_apis, ts) VALUES(?,?,?)",
+            (report.source_id,
+             json.dumps(payload, ensure_ascii=False), ts))
 
     def list_logs(self, source_id: str | None = None, limit: int = 100) -> list[dict]:
         """查询审计历史（视图回溯用；只读）。"""

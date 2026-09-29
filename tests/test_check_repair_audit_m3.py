@@ -301,15 +301,55 @@ class TestRuleRepairService(unittest.IsolatedAsyncioTestCase):
 # 3. CompatAuditService 单源审计 + audit_log 落库
 # --------------------------------------------------------------------------- #
 class _FakeStorage:
-    """带一张 audit_log 表的内存库替身（离线落库测试）。"""
+    """带一张 audit_log 表的内存库替身（离线落库测试）。
+
+    两条面都要有：``.db`` 裸连接（list_logs 读用）、``execute``（写路径，
+    StorageService 的持锁助手）。生产里裸 ``db.execute`` 落在 autocommit 连接上
+    会并进别人的 transaction 一起回滚，见 TestCompatAuditPersistence。
+    """
 
     def __init__(self):
         import sqlite3
-        self.db = sqlite3.connect(":memory:", check_same_thread=False)
+        import threading
+        # isolation_level=None 与生产同：autocommit，显式包事务。裸连接上的
+        # 写会并进别人正开着的那笔事务——这条替身的语义必须照抄，否则护栏
+        # 测的就不是生产的那个形状。
+        self.db = sqlite3.connect(":memory:", check_same_thread=False,
+                                 isolation_level=None)
+        self._db_lock = threading.RLock()
         self.db.execute(
             "CREATE TABLE audit_log ("
             " id INTEGER PRIMARY KEY AUTOINCREMENT,"
             " source_id TEXT, missing_apis TEXT, ts TEXT)")
+        #: 每次 execute() 落在哪条线程上（钉「写不在事件循环」）
+        self.write_threads: list[int] = []
+
+    def execute(self, sql, params=()):
+        """StorageService.execute 的形状：持 _db_lock 再执行。"""
+        import threading
+        self.write_threads.append(threading.get_ident())
+        with self._db_lock:
+            return self.db.execute(sql, params)
+
+    def transaction(self):
+        """StorageService.transaction 的形状：握锁跨 BEGIN/COMMIT/ROLLBACK。"""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _tx():
+            with self._db_lock:
+                self.db.execute("BEGIN IMMEDIATE")
+                try:
+                    yield self.db
+                except Exception:
+                    self.db.execute("ROLLBACK")
+                    raise
+                self.db.execute("COMMIT")
+        return _tx()
+
+    def rows(self) -> list:
+        return self.db.execute(
+            "SELECT source_id, missing_apis, ts FROM audit_log").fetchall()
 
 
 AUDIT_SRC = {
@@ -357,3 +397,89 @@ class TestCompatAuditService(unittest.IsolatedAsyncioTestCase):
                  "ruleContent": {"content": ".main@p@text"}}
         report = await svc.audit_source(clean)
         assert report.clean is True
+
+
+class TestCompatAuditWriteShape(unittest.IsolatedAsyncioTestCase):
+    """audit_log 那条 INSERT 的**落库形状**护栏（§任务 #75，实测出来的两条）。
+
+    生产里这里写的是 ``self._storage.db.execute(...)``——裸连接、不持
+    ``StorageService._db_lock``。本机实测（本地临时库、离线，
+    ``.probe/audit_log_write_shape.py``）这套形状有两件坏事：
+
+    1. **丢行且不报错**。主库以 ``isolation_level=None`` 打开，别的线程正握着
+       ``transaction()``（BEGIN IMMEDIATE 到 COMMIT 全程持锁）时，裸写不抢锁、
+       不报错，直接**并进那笔未提交的事务**；对方一 ROLLBACK，审计行跟着没了，
+       而调用方看到的是成功。同一格实测：回滚后表里剩 **0 行**，走持锁助手则剩
+       1 行（写被挡在事务外面等，量到最长等锁 304 ms）。
+    2. **并发裸写互相踩**。8 线程 × 240 条、3 遍同一张表：每遍至少抛一次
+       ``InterfaceError: bad parameter or other API misuse``，三遍共活下
+       **610/720 行**（丢 110）；持锁写 720/720。
+
+    第 2 件的等锁代价（单条最大 91.5 ms）也解释了为什么写不能在事件循环线程上
+    ——那正是触发点②编辑保存与③检测流水线共用的界面循环。
+    """
+
+    @staticmethod
+    async def _wait(predicate, timeout: float = 5.0) -> bool:
+        """在循环里等谓词——必须 await 着等，死等会把被等的那个任务饿死。"""
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            await asyncio.sleep(0.005)
+        return False
+
+    async def test_audit_row_survives_another_threads_rollback(self):
+        """别人的事务回滚，不能把审计行一起带走（钉"没丢"，不是钉"没报错"）。"""
+        import threading
+
+        storage = _FakeStorage()
+        svc = CompatAuditService(storage=storage)
+        started, release = threading.Event(), threading.Event()
+        aborts = []
+
+        def bulk_writer():
+            # 一次整表镜像的形状：持锁跨 BEGIN..COMMIT，中途作废
+            try:
+                with storage.transaction():
+                    started.set()
+                    if not release.wait(5.0):
+                        raise AssertionError("测试没放行")
+                    raise RuntimeError("这批写作废")
+            except RuntimeError as exc:
+                aborts.append(exc)
+
+        t = threading.Thread(target=bulk_writer, daemon=True)
+        t.start()
+        assert started.wait(5.0), "并发事务没开起来"
+
+        task = asyncio.ensure_future(svc.audit_source(AUDIT_SRC))
+        # 等到写确实**试过了**（替身在抢锁之前记账）——不然就是空转放行：
+        # 事务可能先 COMMIT，丢行的形状就根本没被压到。
+        assert await self._wait(lambda: len(storage.write_threads) == 1), \
+            "审计写没经过 StorageService.execute（持锁助手），闸门空转"
+        release.set()
+        await task
+        t.join(5.0)
+
+        assert len(aborts) == 1, "并发事务没走到作废分支，这格没测到回滚"
+        rows = storage.rows()
+        assert [r[0] for r in rows] == ["https://audit.example"], \
+            f"审计行被别人的事务回滚带走了（剩下 {rows}）"
+
+    async def test_audit_write_does_not_run_on_the_event_loop_thread(self):
+        """落库必须离开事件循环：等锁最长实测 91.5 ms，留在循环上就是界面卡死。"""
+        import threading
+
+        storage = _FakeStorage()
+        svc = CompatAuditService(storage=storage)
+        loop_thread = threading.get_ident()   # 协程体跑在循环线程上
+        await svc.audit_source(AUDIT_SRC)
+
+        # 反空转：写确实发生了（"不在循环上"不能靠"一次都没写"来成立）
+        assert storage.write_threads, "审计写没落库，断言成了空转"
+        assert loop_thread not in storage.write_threads, \
+            "audit_log 的写落在事件循环线程上，等锁时界面会整块冻住"
+        assert len(storage.rows()) == 1
+
