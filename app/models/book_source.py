@@ -35,6 +35,45 @@ RULE_FIELDS = {
                    "postQuoteUrl", "deleteUrl"},
 }
 
+#: 规则字段的**种类**表——静态审计「这一格该按什么语法校验」的唯一来源。
+#:
+#: 合法性看 ``RULE_FIELDS``，种类看这张表，两张都住在模型里：把种类写在审计侧就
+#: 是第二份定义，而它比合法性更容易烂——09-29 第四十七轮实测，审计那三份手写名单
+#: 只覆盖 45 个合法字段名中的 29 个，剩下 16 个**不进任何校验器**，没人记得就没人校验。
+#:
+#: 每个种类都必须带消费点，因为审计报的是「这个源在**本运行时**会不会坏」，
+#: 不是「这个值在 Legado 里像不像规则」：
+#:   rule    —— 本引擎按规则解析：``init`` reading_engine.py:1251 / rule_engine.py:2373、
+#:              ``subContent`` reading_engine.py:1686，其余同现有校验面。
+#:   js      —— 整段当脚本预编译（QuickJS）。
+#:   regex   —— 按 Java 正则编译（``_validate_regex_field``）。
+#:   literal —— 不是规则，原样当值用：``checkKeyWord`` 直接喂进搜索
+#:              （check_service.py:161），语料 230 条里有 4 条会被选择器校验误报
+#:              （例如 "Re:从零开始的异世界生活" 被当成伪类）。
+#:   flag    —— 只看空/非空：``canReName`` reading_engine.py:1322。
+#:   enum    —— 样式标记，未知值走默认渲染，报它没有意义：``imageStyle``
+#:              reading_engine.py:1709；语料取值 FULL/full/0/0.0/TEXT/text/DEFAULT。
+#:   inert   —— **本引擎不消费**，所以不校验：``ruleReview`` 全部 10 条（Legado 自己
+#:              也把 ``BookSource.getReviewRule()`` 与书评编辑面板注释掉了，语料 0 条带值）、
+#:              ``callBackJs``（Legado 的 SourceCallBack 我们没有；语料 3 条里 1 条
+#:              按脚本预编译会报 SyntaxError，那是假警报）。
+RULE_FIELD_KINDS: dict[str, set[str]] = {
+    "rule": {"bookList", "name", "author", "intro", "kind", "lastChapter",
+             "updateTime", "bookUrl", "coverUrl", "wordCount", "tocUrl",
+             "chapterList", "chapterName", "chapterUrl", "isVolume", "isVip",
+             "isPay", "content", "nextContentUrl", "nextTocUrl", "downloadUrls",
+             "title", "init", "subContent"},
+    "js": {"formatJs", "preUpdateJs", "payAction", "imageDecode", "webJs",
+           "loginCheckJs", "coverDecodeJs"},
+    "regex": {"replaceRegex", "sourceRegex", "bookUrlPattern"},
+    "literal": {"checkKeyWord"},
+    "flag": {"canReName"},
+    "enum": {"imageStyle"},
+    "inert": {"callBackJs", "reviewUrl", "avatarRule", "contentRule",
+              "postTimeRule", "reviewQuoteUrl", "voteUpUrl", "voteDownUrl",
+              "postReviewUrl", "postQuoteUrl", "deleteUrl"},
+}
+
 
 def _gson_string(value: Any) -> str | None:
     """Fixed StringJsonDeserializer semantics used by source/rule fields."""

@@ -6,15 +6,19 @@
 ``audit_source_corpus``，2026-09-29 实测确认 app/ 与 tests/ 里零调用方、且与单源镜像
 是两份平行实现（同一套判定写两遍），已删——等价性对照见开发日志第四十五轮。
 
-规则字段的**合法性**不在这里定义：那份表住
-``app/models/book_source.py::RULE_FIELDS``（逐段照 Legado ``data/entities/rule/*.kt``
-写定），因为 ``BookSource.from_dict`` 就是按它丢弃字段的——审计另写一份必然漂移，
-09-29 用旧那份手写的 ``KNOWN_RULE_FIELDS`` 重算过：64 组合法字段冤枉 12 条，
-18 组「顶层字段嵌进规则段」全放过，206 组「模型会丢的字段」放过 146 组。
+规则字段的**合法性**与**种类**都不在这里定义：那两张表住
+``app/models/book_source.py::RULE_FIELDS`` / ``::RULE_FIELD_KINDS``（逐段照 Legado
+``data/entities/rule/*.kt`` 写定），因为 ``BookSource.from_dict`` 就是按前者丢弃字段的——
+审计另写一份必然漂移，09-29 用旧那份手写的 ``KNOWN_RULE_FIELDS`` 重算过：64 组合法字段
+冤枉 12 条，18 组「顶层字段嵌进规则段」全放过，206 组「模型会丢的字段」放过 146 组。
+种类表同理：这里的 ``*_FIELD_NAMES`` 三份名单在 09-29 第四十七轮之前也是手写的，
+漏了 16 个合法字段的校验路由，现在一律从种类表投影。
 """
 from __future__ import annotations
 
 import re
+
+from app.models.book_source import RULE_FIELD_KINDS
 
 
 SUPPORTED_JAVA_APIS = {
@@ -74,18 +78,15 @@ SUPPORTED_OBJECT_APIS = {
                "removeCookie", "cookieToMap", "mapToCookie", "clear"},
 }
 
-RULE_FIELD_NAMES = {
-    "bookList", "name", "author", "intro", "kind", "lastChapter",
-    "updateTime", "bookUrl", "coverUrl", "wordCount", "tocUrl",
-    "chapterList", "chapterName", "chapterUrl", "isVolume", "isVip",
-    "isPay", "content", "nextContentUrl", "nextTocUrl", "downloadUrls",
-    "title",
-}
-SCRIPT_FIELD_NAMES = {
-    "formatJs", "preUpdateJs", "payAction", "imageDecode", "webJs",
-    "loginCheckJs", "coverDecodeJs",
-}
-REGEX_FIELD_NAMES = {"replaceRegex", "sourceRegex", "bookUrlPattern"}
+#: 校验路由**从模型的种类表投影**，这里不再手写名字清单。
+#: 09-29 第四十七轮之前这三份是手写的，结果「哪个字段该按什么语法校验」在两处各写一遍：
+#: 合法表 45 个字段名里只有 29 个进得了校验器，剩下 16 个（含本引擎真的按规则解析的
+#: `init`、`subContent`）静默不校验；而语料里最"危险"的 `checkKeyWord`（230 条中文关键字）
+#: 一旦被顺手塞进选择器校验就会误报 4 条。种类只该有一份定义，就在
+#: ``app/models/book_source.py::RULE_FIELD_KINDS``。
+RULE_FIELD_NAMES = frozenset(RULE_FIELD_KINDS["rule"])
+SCRIPT_FIELD_NAMES = frozenset(RULE_FIELD_KINDS["js"])
+REGEX_FIELD_NAMES = frozenset(RULE_FIELD_KINDS["regex"])
 SUPPORTED_JSOUP_PSEUDOS = {
     "contains", "containsOwn", "eq", "gt", "has", "lt", "matches",
     "matchesOwn", "not", "nth-child", "nth-of-type", "regex",

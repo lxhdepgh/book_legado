@@ -1,6 +1,6 @@
 """审计的字段合法性只有一份定义，且已删的整库入口不会长回来（09-29 第四十五轮，任务 #77/#80/#81/#82）。
 
-钉的四件事，都来自本轮实测：
+钉的五件事，都来自本轮实测：
 
 1. **整库审计没有第二份判定**——``compat_audit.audit_source_corpus`` 在 app/ 与 tests/
    里零调用方，且和逐源编排 ``_audit_one`` 是同一套判定写两遍。两份平行实现就是这次
@@ -28,12 +28,16 @@ import unittest
 
 from app.controllers.source.code_editor_controller import (CodeEditorController,
                                                            _GROUP_LABELS)
-from app.models.book_source import BookSource, RULE_FIELDS
+from app.models.book_source import (BookSource, RULE_FIELDS,
+                                    RULE_FIELD_KINDS)
 from app.services import compat_audit as ca
 from app.services.sources import online_import_service as ois
 from app.services.sources.compat_audit_service import AuditReport, _audit_one
 
 APP = pathlib.Path(__file__).resolve().parents[1] / "app"
+
+#: 种类名的口径**取自模型那张表**：表里新增一类，扫描器立刻跟着认它。
+KIND_NAMES = tuple(RULE_FIELD_KINDS)
 
 #: Legado ``rule/ReviewRule.kt`` 的 10 个字段 + ``ContentRule.kt`` 的副文/回调。
 #: 旧的手写字段表把这 12 条全判成"未知规则字段"——带段评规则的正常源被冤枉。
@@ -88,6 +92,49 @@ def scan_field_tables(source: str, name: str) -> list[str]:
                              for v in node.values)
         if hit >= 1 and literal_values:
             findings.append(f"{name}:{node.lineno} 又写了一份按规则段索引的字段表")
+    return findings
+
+
+def scan_kind_tables(source: str, name: str) -> list[str]:
+    """找出**种类表的字面量写法**——这份定义全库只该在模型里出现一次。
+
+    判定两种形态：
+
+    * **种类表**：一个 dict 字面量，键**全部**是种类名、且至少两个键，值全是集合/字典/
+      列表字面量。阈值为什么取"全部键 + ≥2"而不是照抄 `scan_field_tables` 的
+      "沾一个段名就算"：`"rule"`/`"js"` 这类种类名是常用词，界面标签映射
+      （`{'规则': ...}`、`{'js': '脚本'}`）随时可能撞上其中一个，按 ≥1 会误伤。
+      实测 app/ 全库在这个阈值下**只有** `book_source.py` 的 `RULE_FIELD_KINDS`
+      一处命中，而"再抄一份种类表"的形状必然把多个种类名一起写出来，
+      漏抄一种就与种类表漂移——所以这个阈值钉的是行为，不是旋钮。
+    * **手写的校验路由名单**：赋给 `*_FIELD_NAMES` / `*_FIELD_KINDS` 的字符串字面量
+      集合/列表/元组（≥2 个元素）。本轮删掉的那三份就是这种形状；投影写法
+      `frozenset(RULE_FIELD_KINDS["rule"])` 是 Call，不报。
+    """
+    findings = []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:  # 交给调用侧断言"没有文件解析失败"
+        return findings
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict) and len(node.keys) >= 2:
+            keys = [k.value for k in node.keys if isinstance(k, ast.Constant)]
+            if (len(keys) == len(node.keys) and
+                    all(k in KIND_NAMES for k in keys) and
+                    all(isinstance(v, (ast.Set, ast.Dict, ast.List))
+                        for v in node.values)):
+                findings.append(f"{name}:{node.lineno} 又写了一份规则字段种类表"
+                                f"（{len(keys)} 个种类名）")
+        elif isinstance(node, ast.Assign) and isinstance(
+                node.value, (ast.Set, ast.List, ast.Tuple)):
+            hand = [t.id for t in node.targets if isinstance(t, ast.Name) and
+                    (t.id.endswith("_FIELD_NAMES") or t.id.endswith("_FIELD_KINDS"))]
+            elts = node.value.elts
+            if (hand and len(elts) >= 2 and
+                    all(isinstance(e, ast.Constant) and isinstance(e.value, str)
+                        for e in elts)):
+                findings.append(f"{name}:{node.lineno} 手写了校验路由名单"
+                                f"（{hand[0]}，{len(elts)} 个名字）")
     return findings
 
 
@@ -424,6 +471,132 @@ class SectionListSingleDefinitionTests(unittest.TestCase):
         """段少了中文名 → 那一段的规则在编辑器下拉里根本不出现，用户看不见。"""
         self.assertEqual(list(_GROUP_LABELS), list(SECTION_NAMES),
                          "规则组中文名映射与模型段表不再同集合同序（下拉顺序即这个顺序）")
+
+
+class RuleFieldKindSingleDefinitionTests(unittest.TestCase):
+    """「这个字段该按什么语法校验」也只许一份定义（09-29 第四十七轮，任务 #84）。
+
+    实测口径（`.probe/rule_field_kind_census.py`、`.probe/kind_table_corpus_ab.py`，
+    语料 `resource/` 917 条快照，两臂都调落地版 `_audit_one`）：
+
+    * 改前审计拿**三份手写名单**路由，45 个合法字段名里只有 29 个进得了校验器，
+      剩下 16 个不进任何校验器——其中 `init`（语料 136 条）、`subContent`（2 条）
+      本引擎确实按规则解析（`reading_engine.py:1251`、`rule_engine.py:2373`、
+      `reading_engine.py:1686`），坏了却一句不报。
+    * 反过来，把"谁都不管"的字段一律塞进选择器校验，语料**新增 6 条假警报**：
+      `checkKeyWord` 4 条（230 条中文关键字里 "Re:从零开始的异世界生活" 被当伪类、
+      "御兽之王 | 24新晋…" 被当选择器），`callBackJs` 2 条（那是 JS 不是规则）。
+    * 所以种类表按消费点分七类，校验面 = `rule ∪ js ∪ regex` 的投影；
+      语料 A/B：rule_syntax_errors **29 条 → 29 条（新增 0、消失 0）**，
+      伪类/JS/正则/未知字段四类同样 7/7/1/6 不变——严格化不付噪音代价。
+    """
+
+    #: 本引擎按规则解析、改前却不校验的字段：值坏在这里必须报。
+    NEWLY_COVERED = (
+        ("ruleBookInfo", "init", "@css:div > (", "Invalid character"),
+        ("ruleContent", "subContent", "[id='a'", "Malformed attribute selector"),
+    )
+
+    #: 语料里真实出现过、且"一旦多校验就是假警报"的形状（种类表把它们挡在外面）。
+    MUST_STAY_QUIET = (
+        ("ruleSearch", "checkKeyWord", "Re:从零开始的异世界生活"),
+        ("ruleSearch", "checkKeyWord", "御兽之王 | 24新晋白金作家轻泉流响 | 起点霸榜 | 快节奏爽文"),
+        ("ruleSearch", "checkKeyWord", "小恩 - 体操服 80P"),
+        ("ruleContent", "imageStyle", "0"),
+        ("ruleBookInfo", "canReName", "0"),
+        ("ruleReview", "reviewUrl", ".r@text"),
+        # 语料第 584 条（哔哩哔哩）的真实形状：字符串里写 {{page}\}，
+        # 审计把 {{...}} 掩成 0 时会一路吃掉后面的 }}，把一段好 JS 掩成 SyntaxError。
+        ("ruleContent", "callBackJs",
+         "let bu = String(book.tocUrl);\n"
+         "let u = bu.replace(/pn=\\d+/, 'pn={{page\\}\\}');\n"
+         "let q = {mid: {name: book.name}};\n"
+         "return q && u;"),
+    )
+
+    def test_every_legal_field_declares_exactly_one_kind(self):
+        legal = frozenset().union(*RULE_FIELDS.values())
+        declared = frozenset().union(*RULE_FIELD_KINDS.values())
+        self.assertFalse(legal - declared,
+                         f"这些合法字段没声明种类，等于默认不校验还看不出是漏是选：{sorted(legal - declared)}")
+        top_level = {f.name for f in dataclasses.fields(BookSource)}
+        invented = sorted(n for n in declared - legal if n not in top_level)
+        self.assertFalse(invented, f"种类表里写了自己想出来的字段名：{invented}")
+        for name in legal:
+            kinds = [kind for kind, members in RULE_FIELD_KINDS.items() if name in members]
+            self.assertEqual(len(kinds), 1, f"{name} 同时属于 {kinds} 两类，路由会双重报错")
+
+    def test_audit_routing_is_the_projection_not_a_second_list(self):
+        """路由名单必须是种类表的投影——手写第二份就是本轮修掉的东西。"""
+        self.assertEqual(set(ca.RULE_FIELD_NAMES), set(RULE_FIELD_KINDS["rule"]))
+        self.assertEqual(set(ca.SCRIPT_FIELD_NAMES), set(RULE_FIELD_KINDS["js"]))
+        self.assertEqual(set(ca.REGEX_FIELD_NAMES), set(RULE_FIELD_KINDS["regex"]))
+        quiet = set(RULE_FIELD_KINDS["literal"]) | set(RULE_FIELD_KINDS["flag"]) | \
+            set(RULE_FIELD_KINDS["enum"]) | set(RULE_FIELD_KINDS["inert"])
+        overlap = quiet & (set(ca.RULE_FIELD_NAMES) | set(ca.SCRIPT_FIELD_NAMES)
+                           | set(ca.REGEX_FIELD_NAMES))
+        self.assertFalse(overlap, f"这些字段本引擎不按规则解析，却进了校验器：{sorted(overlap)}")
+
+    def test_broken_rules_in_newly_covered_fields_are_now_reported(self):
+        """反空转：覆盖率真的涨了——坏值埋在 init / subContent 里必须报。"""
+        for section, field, value, needle in self.NEWLY_COVERED:
+            with self.subTest(段=section, 字段=field):
+                report = _audit_one(one(section, field) | {section: {field: value}})
+                self.assertTrue(report.rule_syntax_errors,
+                                f"{section}.{field} 坏了却零报告（改前的形状）")
+                self.assertTrue(any(needle in m for m in report.rule_syntax_errors),
+                                f"报的内容对不上：{report.rule_syntax_errors}")
+                self.assertFalse(report.unknown_fields, f"{field} 是合法字段却报未知")
+
+    def test_fields_the_engine_does_not_parse_as_rules_stay_quiet(self):
+        """另一面：不许靠"多报"通过上一条。语料真值形状必须一句不报。"""
+        for section, field, value in self.MUST_STAY_QUIET:
+            with self.subTest(段=section, 字段=field):
+                report = _audit_one(one(section, field) | {section: {field: value}})
+                self.assertEqual(report.rule_syntax_errors, [],
+                                 f"{section}.{field} 不是规则，不该被选择器校验")
+                self.assertEqual(report.js_syntax_errors, [],
+                                 f"{section}.{field} 本引擎不消费，报 JS 错就是假警报")
+                self.assertTrue(report.clean, f"{report}")
+
+    def test_production_declares_rule_field_kinds_once(self):
+        findings, unreadable, scanned = [], [], 0
+        for path in sorted(APP.rglob("*.py")):
+            try:
+                text = path.read_text(encoding="utf-8-sig")
+            except (UnicodeDecodeError, SyntaxError) as exc:
+                unreadable.append(f"{path.as_posix()}: {exc}")
+                continue
+            scanned += 1
+            findings += scan_kind_tables(text, path.relative_to(APP.parent).as_posix())
+        self.assertFalse(unreadable, f"这些模块没被解析，等于没扫：{unreadable}")
+        self.assertGreater(scanned, 100, f"只扫了 {scanned} 个文件，多半是路径口径错了")
+        self.assertEqual(len(findings), 1,
+                         "规则字段种类表被写成了两份以上（校验路由就会与合法性漂移）：\n"
+                         + "\n".join(findings))
+        self.assertIn("book_source.py", findings[0])
+
+    def test_scanner_flags_a_planted_kind_table(self):
+        """反空转：植入第二份种类表必须扫出来，否则上一条是空转。"""
+        planted = ("MY_FIELD_KINDS = {\n"
+                   "    'rule': {'name', 'author'},\n"
+                   "    'inert': {'reviewUrl'},\n"
+                   "}\n")
+        self.assertTrue(scan_kind_tables(planted, "<植入>"),
+                        "扫描器认不出第二份种类表，那条系统性护栏在空转")
+
+    def test_scanner_does_not_flag_a_call_or_a_label_map(self):
+        """反空转另一面：投影写法（`frozenset(RULE_FIELD_KINDS[...])`）与中文标签都不许报。"""
+        good = ("from app.models.book_source import RULE_FIELD_KINDS\n"
+                "RULE_FIELD_NAMES = frozenset(RULE_FIELD_KINDS['rule'])\n"
+                "KIND_LABELS = {'rule': '规则', 'js': '脚本', 'regex': '正则'}\n")
+        self.assertEqual(scan_kind_tables(good, "<正确写法>"), [])
+
+    def test_scanner_flags_a_planted_routing_list(self):
+        """本轮删掉的就是这份形状：路由名单被手抄回去，扫描器必须看见。"""
+        planted = 'RULE_FIELD_NAMES = {"name", "author", "content", "init"}\n'
+        self.assertTrue(scan_kind_tables(planted, "<植入>"),
+                        "扫描器认不出手抄的校验路由名单，那条系统性护栏在空转")
 
 
 if __name__ == "__main__":
