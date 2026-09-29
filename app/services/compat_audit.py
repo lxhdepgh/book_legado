@@ -1,58 +1,20 @@
-"""Static compatibility audit for a complete Legado book-source corpus."""
+"""Static compatibility audit helpers for Legado book sources.
+
+判定用的清单与校验函数住在这里，**逐源**的编排住
+``app/services/sources/compat_audit_service.py::_audit_one``（导入即审 / 保存即审 /
+检测流水线复跑三个触发点都用它）。曾经这里还有一份"整库一次性审计"
+``audit_source_corpus``，2026-09-29 实测确认 app/ 与 tests/ 里零调用方、且与单源镜像
+是两份平行实现（同一套判定写两遍），已删——等价性对照见开发日志第四十五轮。
+
+规则字段的**合法性**不在这里定义：那份表住
+``app/models/book_source.py::RULE_FIELDS``（逐段照 Legado ``data/entities/rule/*.kt``
+写定），因为 ``BookSource.from_dict`` 就是按它丢弃字段的——审计另写一份必然漂移，
+09-29 用旧那份手写的 ``KNOWN_RULE_FIELDS`` 重算过：64 组合法字段冤枉 12 条，
+18 组「顶层字段嵌进规则段」全放过，206 组「模型会丢的字段」放过 146 组。
+"""
 from __future__ import annotations
 
-import json
 import re
-from dataclasses import dataclass, field
-from pathlib import Path
-
-from app.models.book_source import BookSource
-from app.services.engine.legado_js import LegadoJsRuntime
-
-
-@dataclass(slots=True)
-class ScriptSyntaxIssue:
-    source_index: int
-    source_name: str
-    field: str
-    message: str
-
-
-@dataclass(slots=True)
-class RuleSyntaxIssue:
-    source_index: int
-    source_name: str
-    field: str
-    rule: str
-    message: str
-
-
-@dataclass(slots=True)
-class CorpusAudit:
-    source_count: int = 0
-    model_count: int = 0
-    script_count: int = 0
-    syntax_issues: list[ScriptSyntaxIssue] = field(default_factory=list)
-    rule_count: int = 0
-    rule_syntax_issues: list[RuleSyntaxIssue] = field(default_factory=list)
-    unsupported_java_apis: list[str] = field(default_factory=list)
-    unsupported_java_packages: list[str] = field(default_factory=list)
-    unsupported_object_apis: list[str] = field(default_factory=list)
-    unsupported_jsoup_pseudos: list[str] = field(default_factory=list)
-    regex_count: int = 0
-    regex_syntax_issues: list[RuleSyntaxIssue] = field(default_factory=list)
-    unknown_rule_fields: list[str] = field(default_factory=list)
-
-    @property
-    def successful(self) -> bool:
-        return (self.source_count == self.model_count and not self.syntax_issues and
-                not self.rule_syntax_issues and
-                not self.regex_syntax_issues and
-                not self.unknown_rule_fields and
-                not self.unsupported_java_apis and
-                not self.unsupported_java_packages and
-                not self.unsupported_object_apis and
-                not self.unsupported_jsoup_pseudos)
 
 
 SUPPORTED_JAVA_APIS = {
@@ -124,10 +86,6 @@ SCRIPT_FIELD_NAMES = {
     "loginCheckJs", "coverDecodeJs",
 }
 REGEX_FIELD_NAMES = {"replaceRegex", "sourceRegex", "bookUrlPattern"}
-METADATA_RULE_FIELDS = {"checkKeyWord", "imageStyle"}
-KNOWN_RULE_FIELDS = (RULE_FIELD_NAMES | SCRIPT_FIELD_NAMES |
-                     REGEX_FIELD_NAMES | METADATA_RULE_FIELDS |
-                     {"init", "canReName"})
 SUPPORTED_JSOUP_PSEUDOS = {
     "contains", "containsOwn", "eq", "gt", "has", "lt", "matches",
     "matchesOwn", "not", "nth-child", "nth-of-type", "regex",
@@ -376,84 +334,3 @@ def _script_blocks(value, source_index: int, path=""):
             # loginUi is a JavaScript array/object expression rather than a
             # statement block; wrap it so QuickJS validates object keys too.
             yield path, "void (" + value.strip() + ")"
-
-
-def audit_source_corpus(path: str | Path) -> CorpusAudit:
-    """Load every source and compile every JS stage after Rhino normalization."""
-    try:
-        import quickjs
-    except ImportError as exc:
-        raise RuntimeError("quickjs is required for the Legado corpus audit") from exc
-
-    path = Path(path)
-    raw_sources = json.loads(path.read_text(encoding="utf-8"))
-    models = BookSource.from_json(path)
-    audit = CorpusAudit(source_count=len(raw_sources), model_count=len(models))
-    used_rule_fields = set()
-    for source in raw_sources:
-        if not isinstance(source, dict):
-            continue
-        for section_name in ("ruleSearch", "ruleExplore", "ruleBookInfo",
-                             "ruleToc", "ruleContent", "ruleReview"):
-            section = source.get(section_name)
-            if isinstance(section, dict):
-                used_rule_fields.update(section)
-    audit.unknown_rule_fields = sorted(used_rule_fields - KNOWN_RULE_FIELDS)
-    corpus_text = path.read_text(encoding="utf-8")
-    audit.unsupported_java_packages = scan_missing_java_packages([corpus_text])
-    used_java_apis = set(re.findall(
-        r"(?<!Packages\.)(?<![\w$])java\.([A-Za-z_$][\w$]*)\s*\(", corpus_text))
-    audit.unsupported_java_apis = sorted(used_java_apis - SUPPORTED_JAVA_APIS)
-    unsupported_objects = set()
-    for object_name, supported in SUPPORTED_OBJECT_APIS.items():
-        called = set(re.findall(
-            rf"(?<![\w$]){object_name}\.([A-Za-z_$][\w$]*)\s*\(", corpus_text))
-        unsupported_objects.update(
-            f"{object_name}.{name}" for name in called - supported)
-    # One source intentionally reassigns `chapter` to a string before calling
-    # substring; it is not a method on the Legado chapter object.
-    unsupported_objects.discard("chapter.substring")
-    audit.unsupported_object_apis = sorted(unsupported_objects)
-    used_pseudos = set()
-    for rule in _rule_strings(raw_sources):
-        plain = re.sub(r"<js>[\s\S]*?</js>", "", rule, flags=re.I)
-        plain = re.sub(r"\{\{[\s\S]*?\}\}", "", plain)
-        if plain.lstrip().startswith(("@js:", "//javascript:")):
-            continue
-        plain = re.split(r"@js:", plain, maxsplit=1, flags=re.I)[0]
-        used_pseudos.update(re.findall(r":([A-Za-z-]+)\s*\(", plain))
-    audit.unsupported_jsoup_pseudos = sorted(
-        used_pseudos - SUPPORTED_JSOUP_PSEUDOS)
-    for source_index, source in enumerate(raw_sources):
-        source_name = str(source.get("bookSourceName", ""))
-        for field_path, rule in _rule_entries(source):
-            audit.rule_count += 1
-            try:
-                _validate_rule_syntax(rule)
-            except Exception as exc:
-                audit.rule_syntax_issues.append(RuleSyntaxIssue(
-                    source_index, source_name, field_path, rule,
-                    str(exc).splitlines()[0]))
-        for field_path, value in _rule_entries_by_name(source, REGEX_FIELD_NAMES):
-            if not value.strip():
-                continue
-            audit.regex_count += 1
-            try:
-                _validate_regex_field(field_path, value)
-            except Exception as exc:
-                audit.regex_syntax_issues.append(RuleSyntaxIssue(
-                    source_index, source_name, field_path, value,
-                    str(exc).splitlines()[0]))
-        for field_path, script in _script_blocks(source, source_index):
-            audit.script_count += 1
-            # Nested {{ rules }} are evaluated before the containing JS stage.
-            prepared = re.sub(r"\{\{[\s\S]*?\}\}", "0", script).split("##", 1)[0]
-            prepared = LegadoJsRuntime._clean_script(prepared)
-            try:
-                # 每段新建一条 Context：崩溃按 runtime 算、不按新建算，
-                # 理由与实测数据见 legado_js._QUICKJS_LOCK 上方注释。
-                quickjs.Context().eval(f"(function(){{\n{prepared}\n}})")
-            except Exception as exc:
-                audit.syntax_issues.append(ScriptSyntaxIssue(
-                    source_index, source_name, field_path, str(exc).splitlines()[0]))
-    return audit

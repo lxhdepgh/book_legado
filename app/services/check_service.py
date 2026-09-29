@@ -8,6 +8,7 @@ import time
 
 import aiohttp
 
+from app.models.book_source import RULE_FIELDS
 from app.services.block_pages import SiteBlockedError, block_reason
 from app.services.compat_audit import scan_missing_java_packages, source_texts
 from app.services.headless_browser import BrowserUnavailable, available_fetcher
@@ -87,13 +88,20 @@ def _source_uses_js(source) -> bool:
     either way, so narrowing its admission only adds queueing.  The fix for
     those evals was to stop making them (see
     `ReaderEngine._bare_template_value`), not to re-classify the source.
+
+    The section loop walks the model's ``RULE_FIELDS`` instead of naming the
+    sections here: this used to be a hand-written five-section list with no
+    ``ruleReview`` — a third copy of the same schema knowledge in this repo.
+    Measured on the 917-source snapshot under `resource/` the gap is currently
+    inert (0 sources carry ``ruleReview`` at all), so switching costs no behavior
+    today; it only removes the chance of a future section being classified as
+    JS-free.
     """
     values = [
         getattr(source, "header", ""), getattr(source, "searchUrl", ""),
         getattr(source, "exploreUrl", ""),
     ]
-    for name in ("ruleSearch", "ruleExplore", "ruleBookInfo", "ruleToc",
-                 "ruleContent"):
+    for name in RULE_FIELDS:
         values.extend((getattr(source, name, {}) or {}).values())
     return any(
         marker in str(value or "")

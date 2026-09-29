@@ -23,6 +23,7 @@ import json
 import logging
 
 from app.controllers.base import BaseController
+from app.models.book_source import RULE_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -345,12 +346,16 @@ class CodeEditorController(BaseController):
 
     @staticmethod
     def _pick_rule(source: dict, field: str) -> str:
-        """从书源 dict 取目标字段规则：先顶层，再 Legado 常见嵌套容器。"""
+        """从书源 dict 取目标字段规则：先顶层，再各规则段。
+
+        段清单走模型 ``RULE_FIELDS``（键序 = ``_GROUP_LABELS`` 的显示序）：这里原先
+        手写六段，是同一份 schema 知识的又一处拷贝——加段时漏改这行，「试跑当前规则」
+        会对那一格永远取不到值，而且不报错。
+        """
         direct = source.get(field)
         if isinstance(direct, str) and direct.strip():
             return direct.strip()
-        for container in ("ruleSearch", "ruleExplore", "ruleBookInfo",
-                          "ruleToc", "ruleContent", "ruleReview"):
+        for container in RULE_FIELDS:
             sub = source.get(container)
             if isinstance(sub, dict):
                 value = sub.get(field)

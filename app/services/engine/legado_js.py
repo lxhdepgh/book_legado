@@ -1307,6 +1307,11 @@ class LegadoJsRuntime:
             return String(source.variableComment||'').trim()
               ? String(source.variableComment)+'\\n'+other : other;
           }},
+          // Content equality, mirroring BookSource.kt `fun equal`: it compares
+          // exactly the five rule getters there (search/explore/bookInfo/toc/
+          // content) and NOT ruleReview.  This list is deliberately narrower
+          // than the model RULE_FIELDS -- do not widen it to match, that would
+          // change when Legado considers two sources equal.
           equal: other => {{
             if (!other || typeof other !== 'object') return false;
             const texts=['bookSourceName','bookSourceUrl','bookSourceGroup',

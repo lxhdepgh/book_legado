@@ -11,7 +11,13 @@ from typing import Any
 from urllib.parse import urlparse
 
 
-_RULE_FIELDS = {
+#: 规则段的合法字段表——逐段照 Legado ``data/entities/rule/*.kt`` 的 data class
+#: 构造参数写定（SearchRule/ExploreRule/BookInfoRule/TocRule/ContentRule/ReviewRule，
+#: ExploreRule 与 SearchRule 复用 BookListRule）。
+#: ``from_dict`` 按这张表**丢弃**表外字段，``compat_audit_service._audit_one`` 的
+#: 「未知规则字段」判定的也是这张表（逐段）——合法字段只能有一份定义，两处各写一份时
+#: 漂移会同时冤枉合法源和放过被丢的字段（09-29 第四十五轮实测：冤枉 12、放过 146/206）。
+RULE_FIELDS = {
     "ruleSearch": {"checkKeyWord", "bookList", "name", "author", "intro", "kind",
                    "lastChapter", "updateTime", "bookUrl", "coverUrl", "wordCount"},
     "ruleExplore": {"bookList", "name", "author", "intro", "kind", "lastChapter",
@@ -187,7 +193,7 @@ class BookSource:
         # Legado's rule deserializers accept both a JSON object and a JSON
         # primitive containing the serialized object.  Older/shared sources
         # commonly use the latter form.
-        for name in _RULE_FIELDS:
+        for name in RULE_FIELDS:
             value = kwargs.get(name)
             if isinstance(value, str):
                 try:
@@ -200,7 +206,7 @@ class BookSource:
                 value = decoded
             if isinstance(value, dict):
                 kwargs[name] = {key: _gson_string(item) for key, item in value.items()
-                                if key in _RULE_FIELDS[name]}
+                                if key in RULE_FIELDS[name]}
         return cls(**kwargs)
 
     def to_dict(self) -> dict:
@@ -214,7 +220,7 @@ class BookSource:
             if val is not None:
                 result[f] = ({key: item for key, item in val.items()
                               if item is not None}
-                             if f in _RULE_FIELDS and isinstance(val, dict)
+                             if f in RULE_FIELDS and isinstance(val, dict)
                              else val)
         # 始终输出的关键字段
         # lastUpdateTime 总是写入

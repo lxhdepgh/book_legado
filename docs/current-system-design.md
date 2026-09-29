@@ -977,7 +977,7 @@ M7 清理线**真正删掉的是旧单体 UI**（`app/app.py`、旧平铺 `app/v
 | `source_service.py` | **被继承**：`sources/source_service.py:33` 取作 `_LegacySourceService`，`:46` `class SourceService(_LegacySourceService, Service)`——方法体原样复用，壳只加事件与主库读写 |
 | `check_service.py` | **被直接调用**：`sources/source_check_service.py:29` import 模块本体，`:86` 用 `check_service.check_sources`、`:72` 用 `check_service.CHECK_CONCURRENCY`；`main.py:125` 与 `controllers/source/check_controller.py:23` 也引它 |
 | `rule_repair.py` | `sources/rule_repair_service.py:26` import `RepairReport` / `diagnose_content_rule` |
-| `compat_audit.py` | `sources/compat_audit_service.py:29` import 为 `ca`（`KNOWN_RULE_FIELDS` / `SUPPORTED_JAVA_APIS` / `scan_missing_java_packages`） |
+| `compat_audit.py` | `sources/compat_audit_service.py:24` import 为 `ca`（`SUPPORTED_JAVA_APIS` / `SUPPORTED_OBJECT_APIS` / `SUPPORTED_JSOUP_PSEUDOS` / `scan_missing_java_packages` / `_validate_*` / `_script_blocks`）。规则字段的合法表**不在这里**：`KNOWN_RULE_FIELDS` 已删，改由 `models/book_source.py` 的 `RULE_FIELDS` 逐段判定 |
 | `headless_browser.py` | `tools/browser_service.py:154`（`chromium_installed`）/`:311`（`BROWSER`）/`:321`（`BrowserUnavailable`）懒 import；`check_service.py:13` 亦依赖 |
 | `interactive_browser.py` | `tools/browser_service.py:258`（CDP 投屏会话工厂） |
 | `web_page_renderer.py` | `tools/browser_service.py:337`（`render_webview`：webView / 验证码生产路径）。⚠ **全仓库唯一被授权 `import flet` 的服务层文件**（`:20` flet、`:89` flet_webview），例外与其白名单见 `docs/architecture-rules.md` 红线 1 |

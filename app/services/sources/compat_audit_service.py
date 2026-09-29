@@ -1,16 +1,17 @@
 """CompatAuditService：JS/Java API 支持面静态审计的服务外壳（M3，契约 §6 / 设计 §3.7）。
 
-外壳化 ``app/services/compat_audit.py``（M1 已迁，静态审计能力全保留）：
+协作分工（09-29 第四十五轮起重写，之前这份 docstring 描述的是已删的整库入口）：
 
-- :meth:`audit_source` 对**单个书源**做静态审计，复用 compat_audit 的既有清单与
-  校验函数（``SUPPORTED_JAVA_APIS`` / ``SUPPORTED_OBJECT_APIS`` / ``KNOWN_RULE_FIELDS``
-  / ``SUPPORTED_JSOUP_PSEUDOS`` / ``scan_missing_java_packages`` / ``_validate_*`` /
-  ``_script_blocks``），**不改动** compat_audit.py 一行；
+- ``app/services/compat_audit.py`` 只放**清单与校验函数**（``SUPPORTED_JAVA_APIS`` /
+  ``SUPPORTED_OBJECT_APIS`` / ``SUPPORTED_JSOUP_PSEUDOS`` / ``scan_missing_java_packages``
+  / ``_validate_*`` / ``_script_blocks``）；规则字段的合法表不在那里，见 ``RULE_FIELDS``；
+- :meth:`audit_source` → :func:`_audit_one` 是**唯一的逐源编排**，把上面这组函数
+  拼成一份 ``AuditReport``；
 - 三个触发点：①导入（OnlineImportService / SourceService.import_sources_json）
   ②编辑保存（SourceService.save_source）③检测流水线每源 asyncio.to_thread 复跑
   （SourceCheckService 内调用）；
 - 审计记录落 ``audit_log`` 表（schema v3：id/source_id/missing_apis(JSON)/ts）——
-  这是外壳新增职责；静态审计本身零改动。
+  这是外壳新增职责。
 
 红线：本服务零 flet import；静态审计失败不抛出到调用方（导入即审报 warning 不阻断）。
 """
@@ -25,6 +26,7 @@ from datetime import datetime
 
 from app.core.lifecycle import Service
 from app.core.storage import StorageService
+from app.models.book_source import RULE_FIELDS
 from app.services import compat_audit as ca
 
 logger = logging.getLogger(__name__)
@@ -61,20 +63,22 @@ class AuditReport:
 def _audit_one(data: dict) -> AuditReport:
     """对单个书源 dict 跑静态审计（纯 CPU，设计为 asyncio.to_thread 调用）。
 
-    逻辑逐条镜像 ``compat_audit.audit_source_corpus`` 的单源切片——只是把语料级
-    遍历收敛到一个书源，**复用同一组校验函数与清单**，不复制判定规则本身。
+    这里是唯一的逐源编排：清单与校验一律取自 ``compat_audit``，本函数只负责拼
+    ``AuditReport``——同一套判定写两份（旧的整库入口 ``audit_source_corpus`` 就是这样）
+    必然漂移，删掉的实测过程见开发日志第四十五轮。
     """
     source_id = str(data.get("bookSourceUrl") or "")
     corpus_text = json.dumps(data, ensure_ascii=False)
 
-    # —— 未知规则字段（§3.7：KNOWN_RULE_FIELDS 比对）——
-    used_fields: set[str] = set()
-    for section in ("ruleSearch", "ruleExplore", "ruleBookInfo",
-                    "ruleToc", "ruleContent", "ruleReview"):
-        sec = data.get(section)
-        if isinstance(sec, dict):
-            used_fields.update(sec)
-    unknown_fields = sorted(used_fields - ca.KNOWN_RULE_FIELDS)
+    # —— 未知规则字段（§3.7）——
+    # 合法性只有一份定义：模型 RULE_FIELDS，而且**逐段**比。from_dict 是按段丢弃
+    # 表外字段的，所以「这条规则会被丢」=「本段表里没有它」。跨段取并集会把放错段
+    # 的字段判成合法；改成逐段在真实语料（resource/ 的 917 条快照）上不新增任何警告，
+    # 也就是说放错段这种写法在现实里就没出现过。
+    unknown_fields = sorted({
+        field for section, legal in RULE_FIELDS.items()
+        if isinstance(data.get(section), dict)
+        for field in data[section] if field not in legal})
 
     # —— 缺失的 Java API 调用（java.X( 与 Packages.<path> 两路合并）——
     missing_packages = ca.scan_missing_java_packages([corpus_text])
@@ -91,7 +95,7 @@ def _audit_one(data: dict) -> AuditReport:
             rf"(?<![\w$]){object_name}\.([A-Za-z_$][\w$]*)\s*\(", corpus_text))
         unsupported_objects.update(
             f"{object_name}.{name}" for name in called - supported)
-    unsupported_objects.discard("chapter.substring")  # 语料特例，同 corpus 版
+    unsupported_objects.discard("chapter.substring")  # 语料特例：chapter 已被重赋值为字符串
     missing_object_apis = sorted(unsupported_objects)
 
     # —— 未支持的 jsoup 伪类 ——
@@ -146,8 +150,9 @@ def _audit_one(data: dict) -> AuditReport:
                 js_errors.append(f"{field_path}: {str(exc).splitlines()[0]}")
 
     suggestions = _suggest(
-        unknown_fields, unsupported_pseudos, missing_java_apis,
-        missing_object_apis, js_errors, regex_errors)
+        unknown_fields=unknown_fields, unsupported_pseudos=unsupported_pseudos,
+        missing_java_apis=missing_java_apis, missing_object_apis=missing_object_apis,
+        js_errors=js_errors, regex_errors=regex_errors, rule_errors=rule_errors)
     return AuditReport(
         source_id=source_id,
         missing_java_apis=missing_java_apis,
@@ -161,16 +166,28 @@ def _audit_one(data: dict) -> AuditReport:
     )
 
 
-def _suggest(*buckets) -> list[str]:
-    """按缺口类别给一句处置建议（导入即审随 warning 报出，不阻断）。"""
+def _suggest(*, unknown_fields=(), unsupported_pseudos=(), missing_java_apis=(),
+             missing_object_apis=(), js_errors=(), regex_errors=(),
+             rule_errors=()) -> list[str]:
+    """按缺口类别给一句处置建议（导入即审随 warning 报出，不阻断）。
+
+    一律用**具名**参数：这里原先收位置元组、按下标判空，调用点换过一次参数顺序
+    就整条错位——实测「未知规则字段」报成"Java/对象 API 未实现"、「缺对象方法」报成
+    "含未支持的 jsoup 伪类"，而选择器语法错一句建议都没有。错位比缺文案更坏，
+    因为文案看起来是专业的。
+    """
     suggestions: list[str] = []
-    if buckets[0] or buckets[1] or buckets[2]:
+    if missing_java_apis or missing_object_apis:
         suggestions.append("用到的 Java/对象 API 在本运行时未实现，对应脚本阶段运行期会失败")
-    if buckets[3]:
+    if unsupported_pseudos:
         suggestions.append("含未支持的 jsoup 伪类，相关选择器可能解析为空")
-    if buckets[4]:
+    if unknown_fields:
+        suggestions.append("含 Legado 规则 schema 之外的字段，导入时会被丢弃、对应规则不生效")
+    if rule_errors:
+        suggestions.append("存在选择器语法错误，对应规则解析不出内容")
+    if js_errors:
         suggestions.append("存在 JS 语法错误，脚本阶段无法预编译")
-    if buckets[5]:
+    if regex_errors:
         suggestions.append("存在正则语法错误，替换/匹配规则可能不生效")
     return suggestions
 

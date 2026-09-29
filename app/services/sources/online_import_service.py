@@ -52,14 +52,13 @@ _KIND_PENDING = {
 }
 
 #: 审计报告里需要汇总成 warning 的字段（对齐契约 §6 AuditReport 字段名）。
+#: 这份表必须与 ``AuditReport`` 的字段**逐个对齐**：旧表里挂着 7 个"兼容旧 CorpusAudit"
+#: 的名字，而整库入口删掉后 ``getattr(report, name)`` 对它们永远是 None（白写），
+#: 真实字段 ``rule_syntax_errors`` 反倒没列进来——选择器语法错在导入面一条 warning 都不出。
 _AUDIT_WARNING_FIELDS = (
     "missing_java_apis", "missing_object_apis", "unknown_fields",
     "unsupported_pseudos", "js_syntax_errors", "regex_errors",
-    # 兼容旧 CorpusAudit 的字段名（兼容层兜底读取）。
-    "unsupported_java_apis", "unsupported_java_packages",
-    "unsupported_object_apis", "unsupported_jsoup_pseudos",
-    "syntax_issues", "rule_syntax_issues", "regex_syntax_issues",
-    "unknown_rule_fields",
+    "rule_syntax_errors",
 )
 
 

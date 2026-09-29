@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.services import block_pages, check_service
-from app.models.book_source import BookSource
+from app.models.book_source import BookSource, RULE_FIELDS
 from app.services.engine.legado_js import JsContext, LegadoJsRuntime
 from app.services.engine.rule_engine import (ExploreCategory, ReaderEngine,
                                       RequestConnectionError,
@@ -1428,6 +1428,33 @@ class BareTemplateFastPathTests(unittest.IsolatedAsyncioTestCase):
             ruleToc={}, ruleContent={})
         self.assertTrue(check_service._source_uses_js(real_js),
                         "闸门本身失效了：真 @js: 源没进窄道")
+
+    def test_js_lane_gate_walks_the_model_section_table(self):
+        """闸门不另写段清单：每个 RULE_FIELDS 段里的 JS 标记都得看得见。
+
+        `check_service` 原先手写五段、少了 `ruleReview`——同一个 schema 知识在仓库里的
+        第三份拷贝（另两份：模型 `RULE_FIELDS`、审计）。语料实测这条目前无后果
+        （`resource/` 的 917 条快照里 0 条带 `ruleReview`），所以这里钉的是"别再退回
+        手写清单"：漏一段 → 那一格的子用例红。
+        """
+        markers = ("@js:x", "<js>x</js>", "{{java.log(1)}}", "{{source.x}}", "webView")
+        for section in RULE_FIELDS:
+            for marker in markers:
+                with self.subTest(section=section, marker=marker[:12]):
+                    fields = {name: {} for name in RULE_FIELDS}
+                    fields[section] = {"content": marker}
+                    source = SimpleNamespace(header="", searchUrl="", exploreUrl="",
+                                             **fields)
+                    self.assertTrue(check_service._source_uses_js(source),
+                                    f"{section} 里的 {marker[:12]} 没被闸门看到")
+
+    def test_js_lane_gate_still_silent_on_marker_free_sections(self):
+        """反空转：上面的循环不能靠"段里有东西就算 JS 源"过关。"""
+        fields = {name: {"content": "text@text"} for name in RULE_FIELDS}
+        source = SimpleNamespace(header="User-Agent: x", searchUrl="/s?key={{key}}",
+                                 exploreUrl="分类::/l", **fields)
+        self.assertFalse(check_service._source_uses_js(source),
+                         "全段无标记却被判成 JS 源：闸门的判据被放宽成了存在性")
 
 
 if __name__ == "__main__":
