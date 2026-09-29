@@ -386,14 +386,18 @@ class ReaderController(BaseController):
         self._view.set_title(getattr(record, "name", "") or "正文")
         # 排版偏好是进程级的，attach 时已经读回来（见 _load_preferences），
         # 每开一本书再读一遍只会让首屏多等两次设置表查询。
-        # 新书也从第一章开读；有进度则回到上次章节 + 章内偏移。
+        # 新书也从第一章开读；有进度则回到上次章节 + 章内位置。
+        # 段序号优先（#88）：像素属于存档时那一套装尺，字号/行距/版心变过就不指原来那段。
         pos = getattr(session, "position", None)
         index = int(getattr(pos, "chapter_index", 0) or 0) if pos is not None else 0
         offset = float(getattr(pos, "chapter_offset", 0.0) or 0.0) \
             if pos is not None else 0.0
-        await self._open_index(index, restore_offset=offset)
+        paragraph = getattr(pos, "chapter_paragraph", None) if pos is not None else None
+        await self._open_index(index, restore_offset=offset,
+                               restore_paragraph=paragraph)
 
-    async def _open_index(self, index: int, restore_offset: float = 0.0) -> None:
+    async def _open_index(self, index: int, restore_offset: float = 0.0,
+                          restore_paragraph: int | None = None) -> None:
         """整篇换成第 index 章（点目录 / 上下章 / 跳书签 / 跳搜索结果）。"""
         if not self._readable:
             return
@@ -401,18 +405,24 @@ class ReaderController(BaseController):
         chapter = self._readable[index]
         # 服务层 ChapterItem 对象由 open_book 会话持有；这里按 url 找回。
         await self._run_chapter(chapter, self._chapter_by_url(chapter["url"]),
-                                append=False, restore_offset=restore_offset)
+                                append=False, restore_offset=restore_offset,
+                                restore_paragraph=restore_paragraph)
 
     async def _run_chapter(self, chapter: dict, raw, append: bool,
-                           restore_offset: float = 0.0) -> None:
+                           restore_offset: float = 0.0,
+                           restore_paragraph: int | None = None) -> None:
         """加载并挂出一章：``append`` 决定是接到文末还是整篇替换。
 
         两条路径的分工照旧（旧 ``ReadingView._run_content``）：
 
         - 替换 = 连续阅读重新起头：撤掉已挂章节的视口、正文从章首（或上次
-          偏移）开始、自动续读重新布防；
+          位置）开始、自动续读重新布防；
         - 追加 = 读到底接下一章：只在文末补"分隔线 + 章名 + 正文"，登记该章
           在整篇文档里的起始偏移，滚动位置一点都不动——动了一下就是"跳回顶部"。
+
+        ``restore_paragraph`` 是章内段序号（v8 起的新存档），``restore_offset`` 是
+        它对应的裸像素老口径：段序号在，屏幕就回到原来那一段；只有像素的老记录
+        按像素回（换了字号会偏，见 :meth:`_restore_reading_position`）。
         """
         index = self._readable_index(chapter["url"])
         if index < 0 or self._view is None:
@@ -433,6 +443,9 @@ class ReaderController(BaseController):
             if self._view is None:
                 # 正文读回来的路上切了页：控件没地方挂，进度也不该记
                 return
+            # 这一章的第一段在**整篇文档**里的段序号：追加时就是已经挂在屏幕上的那些
+            # 段数，整篇替换时文档只剩它。落库的段序号要减掉这个起点（#88 取证二）。
+            paragraph_start = 0 if not append else self._view.paragraph_count()
             self._view.render_plan(plan, append=append,
                                    chapter_name=chapter["name"])
             if not append:
@@ -457,21 +470,21 @@ class ReaderController(BaseController):
                     chapter["url"], self._pending_document_offset)
             self._mount_chapter(raw, start, text_length, reset=not append,
                                 font_size=self._current_font_size(),
-                                offset=0.0 if append else restore_offset)
+                                offset=0.0 if append else restore_offset,
+                                paragraph_start=paragraph_start,
+                                paragraph=None if append else restore_paragraph)
             self._continuous_loaded.add(chapter["url"])
             if not append:
                 self._chapter_index = index
                 self._view.set_title(chapter["name"])
                 self._update_chapter_navigation()
                 self._auto_scroll_armed = True
-                if restore_offset > 0:
-                    # 桌面端可能先确认控件更新、后才测量新段落：只滚一次会被当时
-                    # 还是 0 的滚动高度夹回顶部（表现为"续读位置丢了"）。补两帧。
-                    for delay in (0.05, 0.15):
-                        await asyncio.sleep(delay)
-                        if self._view is None:
-                            return    # 补帧的路上切了页：控件已经不在了
-                        self._view.restore_scroll(restore_offset)
+                if restore_paragraph or restore_offset > 0:
+                    # 第 0 段只带像素：那 200px 本来就落在第一段里，按段回位反倒把人
+                    # 从第一段中间弹回章首（#87 同一口径）。
+                    if not await self._restore_reading_position(
+                            restore_paragraph, restore_offset):
+                        return    # 补帧的路上切了页：控件已经不在了
             # 这一章已经挂上屏幕：后台把后面几章拉回来（不等网络，只起一轮）。
             # 读到底才现取下一章，在弱网上就是一次可感知的停顿。
             if raw is not None:
@@ -485,6 +498,30 @@ class ReaderController(BaseController):
             self._reading_loading = False
             self._restoring_scroll = False
             self.flush()
+
+    async def _restore_reading_position(self, paragraph, offset: float) -> bool:
+        """把续读位置落到屏幕上：有章内段序号就按段回位，老记录只有裸像素。
+
+        段序号是跨装尺的不变量，像素不是——存档之后改过字号/行距/版心，同一个像素
+        压着的已经是别的段（#88 取证一：中位差 22 段、最大 73 段）。
+
+        刚挂完正文那一下量不到版心尺寸（尺寸是客户端布局完自己报上来的，#86 取证四），
+        :meth:`ReaderView.anchor_paragraph` 于是把回位挂到尺寸事件上。补两帧管的是另一
+        件事：桌面端可能先确认控件更新、后才测量新段落，只下发一次会被当时还是 0 的
+        滚动高度夹回顶部（表现为"续读位置丢了"）。
+
+        返回 False 只有一种情况：补帧的路上页面切走了，控件已经不在了。
+        """
+        anchored = paragraph if paragraph and paragraph > 0 else None
+        for delay in (0.0, 0.05, 0.15):
+            await asyncio.sleep(delay)
+            if self._view is None:
+                return False
+            if anchored is not None:
+                self._view.anchor_paragraph(anchored)
+            else:
+                self._view.restore_scroll(offset)
+        return True
 
     # ------------------------------------------------------------------ #
     # 章节读不出来 → 正文规则自愈入口（§3.2：只给候选，写回要用户确认）
@@ -548,11 +585,16 @@ class ReaderController(BaseController):
         return picked
 
     def _mount_chapter(self, raw, document_start: float, text_length: int,
-                       reset: bool, font_size: int, offset: float) -> None:
+                       reset: bool, font_size: int, offset: float,
+                       paragraph_start: int = 0, paragraph=None) -> None:
         """把一章登记进阅读会话的视口表（滚动 track 全靠它）。
 
         ``raw`` 可能为 None（服务层还没建会话，例如离线替身）：那时只能显示
         正文，定位与续读自动降级，不为它造半个假章节对象。
+
+        ``paragraph_start`` 是本章第一段在整篇文档里的段序号；``paragraph`` 是这次
+        续读回到的**章内**段序号——不带上它，用户一滚都不滚就退出时，落库会把已经
+        存好的段序号抹成未知（#88）。
         """
         session = getattr(self._reading, "current_session", None)
         if raw is None or session is None or not hasattr(session, "mount"):
@@ -566,8 +608,8 @@ class ReaderController(BaseController):
                          getattr(session, "book_url", ""),
                          getattr(session, "chapters", []),
                          getattr(session, "position", None))
-        session.mount(raw, document_start, text_length)
-        session.enter(raw, font_size, offset=offset)
+        session.mount(raw, document_start, text_length, paragraph_start)
+        session.enter(raw, font_size, offset=offset, paragraph=paragraph)
 
     def _readable_index(self, url: str) -> int:
         for i, c in enumerate(self._readable):
@@ -843,9 +885,13 @@ class ReaderController(BaseController):
             return
         self._pending_document_offset = max(0.0, pixels)
         if session is not None and hasattr(session, "track"):
+            # 段序号与像素一起交给会话：像素属于当前这套装尺，段序号才是下次重开还
+            # 认得回来的那个数（#88）。量不到尺寸时 paragraph_at_pixel 返回 None，
+            # 落库就是"段序号未知"，重开退回像素——不拿猜出来的段号糊弄过去。
             position, visible = session.track(
                 self._pending_document_offset, max(0.0, maximum),
-                self._current_font_size())
+                self._current_font_size(),
+                self._view.paragraph_at_pixel(pixels))
             self._follow_visible_chapter(visible)
         # _save_position 是 async wrapper（throttle 感知 fn 签名）：必须经
         # ui_call 派发，直接同步调用只会得到永不执行的协程。

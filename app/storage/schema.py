@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 
 # 当前 schema 版本：新增表/列时在此追加迁移函数并 +1
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def _migrate_v1(conn: sqlite3.Connection) -> None:
@@ -365,7 +365,23 @@ def _migrate_v7(conn: sqlite3.Connection) -> None:
             "play_chapter_index INTEGER NOT NULL DEFAULT 0")
 
 
+def _migrate_v8(conn: sqlite3.Connection) -> None:
+    """v8：``books.chapter_paragraph`` —— 续读位置存**章内段序号**，不再只存裸像素。
+
+    ``scroll_offset`` 是像素，而像素属于当时那一套装尺（字号/行距/版心/缩进）。换装尺
+    重开一本书，同一个像素压着的已经不是原来那一段：#88 现场取证（同一篇 300 段对话体，
+    存档 16 号、重开 20 号）中位差 **22 段**、最大 **73 段**，同套装尺重开才是 0 段。
+    段序号与装尺无关，所以它才是那个能跨会话用的不变量（就地重排的 #87 已经先用过它）。
+
+    列**可空**：NULL = 这条记录是加列之前存的，只能按老办法回像素。不做回填——回填要把
+    像素反查成段号，而反查需要当时的版心高，那一栏没存过，猜出来的只会是个像模像样的错值。
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(books)")}
+    if "chapter_paragraph" not in cols:
+        conn.execute("ALTER TABLE books ADD COLUMN chapter_paragraph INTEGER")
+
+
 # 逐版本迁移函数表：版本号 -> (conn) -> None
 MIGRATIONS: dict[int, object] = {
     1: _migrate_v1, 2: _migrate_v2, 3: _migrate_v3, 4: _migrate_v4,
-    5: _migrate_v5, 6: _migrate_v6, 7: _migrate_v7}
+    5: _migrate_v5, 6: _migrate_v6, 7: _migrate_v7, 8: _migrate_v8}

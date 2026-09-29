@@ -1168,6 +1168,25 @@ class ReaderView(ft.Column):
         self.restore_scroll(pixel)
         return True
 
+    def anchor_paragraph(self, paragraph_index: int) -> bool:
+        """把屏幕钉在第 n 段上：量得到尺寸就立刻滚，量不到就挂单等尺寸事件。
+
+        续读回位等的是**新版心的渲染高**，那是客户端布局完自己报上来的（#86 取证四）——
+        刚挂完正文那一下还是 ``(0, 0)``，此时任何像素数都是猜的。挂单与就地重排的回位
+        共用一条机制（:meth:`_correct_relocation`）：等的是同一件事，轮询和超时都替代
+        不了这个事件。
+
+        第 0 段不挂单：它的段顶本来就是 0，那点像素在新装尺下仍落在第一段里，
+        滚去 0 反倒把人从第一段中间弹回章首（与 #87 同一口径）。
+        """
+        index = int(paragraph_index)
+        if index <= 0:
+            return False
+        if self.paragraph_pixel(index) is not None:
+            return self.scroll_to_paragraph(index)
+        self._relocate_pending = (index, 0.0, self.paragraph_count())
+        return False
+
     @property
     def immersive(self) -> bool:
         return self._immersive

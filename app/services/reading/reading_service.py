@@ -137,9 +137,19 @@ def _switch_failure_reason(exc: Exception) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 连续滚动定位模型（自 old_code/app/services/reading_progress.py 原样迁入，零逻辑改动）。
-# 仅删除依赖 bookshelf.json 的 ReadingProgressStore（M2 进度改走 SQLite books 表）。
+# 连续滚动定位模型（自 old_code/app/services/reading_progress.py 迁入）。
+# 仅删除依赖 bookshelf.json 的 ReadingProgressStore（M2 进度改走 SQLite books 表）；
+# #88 在此基础上加了章内段序号（chapter_paragraph / ChapterViewport.paragraph_start）。
 # --------------------------------------------------------------------------- #
+def _paragraph_or_none(value) -> int | None:
+    """段序号只在"存了且非负"时才算数：其余一律 None（= 未知，回退裸像素）。"""
+    try:
+        index = int(value)
+    except (TypeError, ValueError):
+        return None
+    return index if index >= 0 else None
+
+
 @dataclass(frozen=True)
 class ReadingPosition:
     source_url: str
@@ -150,6 +160,9 @@ class ReadingPosition:
     chapter_offset: float = 0.0
     chapter_ratio: float = 0.0
     character_offset: int = 0
+    #: 章内自然段序号——跨装尺唯一不变的那个数（#88）。None = 这条记录没存过段号
+    #: （v8 之前的老库、或旧 bookshelf.json 迁进来的进度），续读只能退回裸像素。
+    chapter_paragraph: int | None = None
     font_size: int = 16
     updated_at: int = 0
 
@@ -165,6 +178,7 @@ class ReadingPosition:
             chapter_ratio=max(0.0, min(
                 1.0, float(value.get("scroll_ratio", 0) or 0))),
             character_offset=max(0, int(value.get("chapter_pos", 0) or 0)),
+            chapter_paragraph=_paragraph_or_none(value.get("chapter_paragraph")),
             font_size=max(1, int(value.get("font_size", 16) or 16)),
             updated_at=int(value.get("last_read_at", 0) or 0),
         )
@@ -177,6 +191,7 @@ class ReadingPosition:
             "scroll_offset": self.chapter_offset,
             "scroll_ratio": self.chapter_ratio,
             "chapter_pos": self.character_offset,
+            "chapter_paragraph": self.chapter_paragraph,
             "font_size": self.font_size,
             "last_read_at": self.updated_at,
         }
@@ -187,6 +202,9 @@ class ChapterViewport:
     chapter: object
     document_start: float
     text_length: int
+    #: 这一章的第一段在**整篇文档**里的段序号（连续阅读时前面还挂着别的章）。
+    #: 落库的段序号必须是章内的，所以像素段号要减掉这个起点（#88）。
+    paragraph_start: int = 0
 
 
 class ReadingSession:
@@ -209,13 +227,15 @@ class ReadingSession:
                     ReadingPosition.from_reading(source_url, book_url, reading))
         self.reset(source_url, book_url, chapters, position)
 
-    def mount(self, chapter, document_start, text_length):
+    def mount(self, chapter, document_start, text_length, paragraph_start=0):
         self.viewports[str(chapter.url)] = ChapterViewport(
             chapter=chapter,
             document_start=max(0.0, float(document_start or 0)),
-            text_length=max(0, int(text_length or 0)))
+            text_length=max(0, int(text_length or 0)),
+            paragraph_start=max(0, int(paragraph_start or 0)))
 
-    def track(self, document_offset, document_extent, font_size):
+    def track(self, document_offset, document_extent, font_size,
+              paragraph_index=None):
         self.document_extent = max(0.0, float(document_extent or 0))
         offset = max(0.0, float(document_offset or 0))
         ordered = sorted(
@@ -235,6 +255,11 @@ class ReadingSession:
         local_offset = max(0.0, offset - selected.document_start)
         ratio = min(1.0, local_offset / extent) if extent else 0.0
         chapter = selected.chapter
+        # 视图给的是**整篇**段号：连续阅读时前面还挂着别的章，起点要减掉才是本章内的
+        # 段号（不减，重开时这个数会指到别人的章里去，#88 取证二）。
+        local_paragraph = _paragraph_or_none(paragraph_index)
+        if local_paragraph is not None:
+            local_paragraph = max(0, local_paragraph - selected.paragraph_start)
         self.position = ReadingPosition(
             source_url=self.source_url, book_url=self.book_url,
             chapter_url=str(chapter.url or ""),
@@ -242,11 +267,12 @@ class ReadingSession:
             chapter_index=int(chapter.index or 0),
             chapter_offset=local_offset, chapter_ratio=ratio,
             character_offset=int(selected.text_length * ratio),
+            chapter_paragraph=local_paragraph,
             font_size=int(font_size), updated_at=int(time.time()))
         return self.position, chapter
 
     def enter(self, chapter, font_size, offset=0.0, ratio=0.0,
-              character_offset=0):
+              character_offset=0, paragraph=None):
         self.position = ReadingPosition(
             source_url=self.source_url, book_url=self.book_url,
             chapter_url=str(chapter.url or ""),
@@ -255,6 +281,7 @@ class ReadingSession:
             chapter_offset=max(0.0, float(offset or 0)),
             chapter_ratio=max(0.0, min(1.0, float(ratio or 0))),
             character_offset=max(0, int(character_offset or 0)),
+            chapter_paragraph=_paragraph_or_none(paragraph),
             font_size=int(font_size), updated_at=int(time.time()))
         return self.position
 
@@ -690,14 +717,16 @@ class ReadingService(Service):
             conn.execute(
                 "INSERT INTO books(book_url, source_url, name, author, kind,"
                 " cover_url, chapter_index, scroll_offset, scroll_ratio,"
-                " chapter_pos, font_size, updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
+                " chapter_pos, chapter_paragraph, font_size, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(book_url) DO UPDATE SET "
                 " source_url=excluded.source_url, name=excluded.name,"
                 " author=excluded.author, kind=excluded.kind,"
                 " cover_url=excluded.cover_url, chapter_index=excluded.chapter_index,"
                 " scroll_offset=excluded.scroll_offset, scroll_ratio=excluded.scroll_ratio,"
-                " chapter_pos=excluded.chapter_pos, font_size=excluded.font_size,"
+                " chapter_pos=excluded.chapter_pos,"
+                " chapter_paragraph=excluded.chapter_paragraph,"
+                " font_size=excluded.font_size,"
                 " updated_at=excluded.updated_at",
                 (book_url, source_url,
                  getattr(book, "name", "") or "",
@@ -708,6 +737,7 @@ class ReadingService(Service):
                  float(position.chapter_offset),
                  float(position.chapter_ratio),
                  int(position.character_offset),
+                 position.chapter_paragraph,
                  int(position.font_size), now))
         self._publish(ProgressSavedEvent(
             book_url=book_url, chapter_index=int(chapter_index),
@@ -721,7 +751,8 @@ class ReadingService(Service):
             return None
         row = conn.execute(
             "SELECT source_url, book_url, chapter_index, scroll_offset,"
-            " scroll_ratio, chapter_pos, font_size, updated_at"
+            " scroll_ratio, chapter_pos, font_size, updated_at,"
+            " chapter_paragraph"
             " FROM books WHERE book_url=?", (book_url,)).fetchone()
         if row is None:
             return None
@@ -732,7 +763,8 @@ class ReadingService(Service):
             chapter_ratio=float(row[4] or 0.0),
             character_offset=int(row[5] or 0),
             font_size=int(row[6] or 16),
-            updated_at=int(row[7] or 0))
+            updated_at=int(row[7] or 0),
+            chapter_paragraph=_paragraph_or_none(row[8]))
 
     # ------------------------------------------------------------------ #
     # 阅读器布局偏好（并入 SettingsService，§3.9）

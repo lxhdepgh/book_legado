@@ -220,9 +220,11 @@ def test_storage_schema_version_and_cookies(tmp_path, monkeypatch):
     try:
         conn = storage.db
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        # v7（阅读器视频面板）：books 补 play_chapter_index，播放进度与阅读进度
-        # 分列存放；user_version 升到 7。
-        assert version == SCHEMA_VERSION == 7
+        # v8（#88 续读位置）：books 补 chapter_paragraph（章内段序号，可空），
+        # v7 补的是 play_chapter_index（播放进度与阅读进度分列）；user_version 升到 8。
+        assert version == SCHEMA_VERSION == 8
+        assert "chapter_paragraph" in {
+            row[1] for row in conn.execute("PRAGMA table_info(books)")}
 
         # cookies 表读写
         conn.execute(
