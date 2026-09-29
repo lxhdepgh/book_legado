@@ -27,14 +27,13 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 import threading
 import time
 from typing import Any, Awaitable, Callable
 
 from app.core.events import (RssRefreshedEvent, RssRefreshProgressEvent)
 from app.core.lifecycle import Service
-from app.core.storage import StorageService
+from app.core.storage import LockedConnection, StorageService
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +78,7 @@ class RssService(Service):
                             "网络抓取依赖注入 fetcher")
         logger.info("RssService 已启动")
 
-    def _conn(self) -> sqlite3.Connection | None:
+    def _conn(self) -> LockedConnection | None:
         return self._storage.db if self._storage is not None else None
 
     # ------------------------------------------------------------------ #

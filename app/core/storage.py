@@ -2,7 +2,9 @@
 
 - 主库 ``legado.db`` 落在 :class:`~app.services.app_paths.AppPaths.data`，
   Python 标准库 sqlite3 独占访问；连接跨线程使用（EngineHub 在别的 loop 上
-  读写），故 ``check_same_thread=False`` 并以一把互斥锁串行化使用；
+  读写），故 ``check_same_thread=False`` 并以一把互斥锁串行化使用。锁不靠调用方
+  自觉：``db`` 交出去的是 :class:`LockedConnection`（每条语句自持锁），裸连接只
+  经 :attr:`StorageService.raw` 拿，且只用于生命周期与测试内省；
 - schema 版本化：``PRAGMA user_version`` + 逐版本迁移函数表，v1 建
   ``settings`` / ``cookies`` 两张表；schema 定义与迁移函数见
   ``app/storage/schema.py``（§9.1 权威位置）；
@@ -36,6 +38,66 @@ _MIGRATED_FLAG = "m6.legacy_migrated"
 # 逐版本迁移函数表定义在 app/storage/schema.py（§9.1），此处直接消费。
 
 
+class LockedConnection:
+    """``StorageService.db`` 交出去的唯一句柄：每条语句自己持主库锁。
+
+    为什么堵在这里，而不是把那 54 条调用点逐个改成 ``storage.execute()``（12 个
+    模块、28 写 + 24 读 + 1 DDL + 1 条动词拼在变量里，``.probe/scan_raw_db_writes.py``
+    数的）：病灶不是"少写了两个字母"，是**一条跨线程共享的 autocommit 连接**。
+    裸句柄落在别人 ``transaction()`` 里时不报错，而是静默并进那笔未提交的事务，
+    对方 ROLLBACK 就把它一起带走——实测书签 INSERT / 设置 UPSERT / 阅读进度 UPSERT
+    三种形状都是 0.0~0.1 ms 返回、回滚之后计数 0，调用方看到的还是成功；两条线程
+    同时裸写还会互踩 ``InterfaceError``（8 线程 × 240 条 × 3 遍只活下 199~202 行、
+    抛 38~41 次，``.probe/raw_db_handle_cost.py``）。逐点改写挡不住下一个写这类
+    代码的人，堵住分配口才挡得住。
+
+    面只有一点点大，是数出来的（``.probe/attr_inventory_raw_db.py``）：这 54 条在
+    连接上只碰 ``.execute``（40 条住在 ``async def``、14 条住在 ``def``），没有
+    ``cursor()``/``executescript()``/``with conn:``/``row_factory``。所以这里只放
+    **语句**，别的一律 ``AttributeError``——宁可让新用法在这里撞墙、显式去拿
+    :attr:`StorageService.raw`，也不要它绕过锁。
+
+    锁为什么盖到 ``execute()`` 就够（不用再包 fetch）：实测 SELECT 的读快照在
+    ``execute()`` 里就定了，行是之后才 materialize（20000 行 execute 0.1~0.2 ms /
+    fetchall 7.0~15.9 ms），而 execute 之后再提交的行，这个游标看不见（20000 行，
+    不是 20001）。所以拿到锁里的那次 execute，就等于拿到了"别人事务之外"的快照。
+
+    代价量过，两条都不成立所以都没做（``.probe/raw_db_handle_cost.py``）：无争用时
+    锁根本量不出成本——同一条 INSERT 裸写 3190.4~3293.3 µs/条、走锁 3039.5~3185.9
+    µs/条，三遍差值 −4.5~−232.9 µs（走锁那侧一次都没慢过，分母是逐条 fsync 的
+    3.2 ms 本身）；也不需要顺手把 40 条住在 ``async def`` 里的写挪出界面循环——
+    收进锁之后最坏要等的就是别人那条整表镜像，实测 1000 源 ``save()`` 持锁
+    15.8~29.3 ms、600 书架 ``save_bookshelf()`` 8.4~15.6 ms。
+    """
+
+    __slots__ = ("_service",)
+
+    def __init__(self, service: "StorageService") -> None:
+        self._service = service
+
+    def execute(self, sql: str, params=()):
+        return self._service.execute(sql, params)
+
+    def executemany(self, sql: str, seq):
+        return self._service.executemany(sql, seq)
+
+    @property
+    def in_transaction(self) -> bool:
+        """当前连接是否已在事务里（持锁读，避免读到别人半途的状态）。"""
+        with self._service._db_lock:
+            return self._service._conn.in_transaction
+
+    def transaction(self):
+        """一批语句占住同一把锁（委托给 :meth:`StorageService.transaction`）。"""
+        return self._service.transaction()
+
+    def __getattr__(self, name: str):
+        raise AttributeError(
+            f"主库共享连接只能经持锁句柄使用（execute/executemany/transaction/"
+            f"in_transaction），{name!r} 不在其上；确需裸连接（生命周期、测试内省）"
+            f"请用 StorageService.raw")
+
+
 class StorageService(Service):
     """主库与缓存目录的唯一分配方（§6.2 三类介质中的前两类）。"""
 
@@ -48,13 +110,26 @@ class StorageService(Service):
         self._conn: sqlite3.Connection | None = None
         # RLock：migrate() 外层持锁后，各介质导入助手仍可重入同一把锁。
         self._db_lock = threading.RLock()
+        self._guarded: LockedConnection | None = None
 
     # ------------------------------------------------------------------ #
     # 访问面
     # ------------------------------------------------------------------ #
     @property
-    def db(self) -> sqlite3.Connection | None:
-        """已打开的主库连接（未启动为 None）。"""
+    def db(self) -> LockedConnection | None:
+        """已打开的主库句柄（未启动为 None）；**每条语句自持 ``_db_lock``**。"""
+        if self._conn is None:
+            return None
+        if self._guarded is None:
+            self._guarded = LockedConnection(self)
+        return self._guarded
+
+    @property
+    def raw(self) -> sqlite3.Connection | None:
+        """真连接：只给生命周期（close）与测试内省（trace callback）用。
+
+        生产写路径**不该**出现在这里——见 :class:`LockedConnection`。
+        """
         return self._conn
 
     @property
@@ -86,13 +161,23 @@ class StorageService(Service):
 
         连接以 ``isolation_level=None``（autocommit）打开，故显式包事务。
         批量写（DELETE+INSERT 整表镜像）经此原子化：中途异常回滚，不留空表。
+
+        同一线程重入（``_db_lock`` 是 RLock）时**加入**外层那笔而不是再 BEGIN：
+        换源扫描在一条事务里批量落种子，种子库 ``SearchBookStore._batch`` 走的正是
+        这里，抢先 BEGIN 会撞上 ``Transaction already open``。检查放在锁内是必须的
+        ——只有持锁者才可能开着事务，锁外的 ``in_transaction`` 读的是别人半途的状态。
         """
         assert self._conn is not None, "StorageService 未启动"
         with self._db_lock:
+            if self._conn.in_transaction:
+                yield self._conn
+                return
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 yield self._conn
-            except Exception:
+            except BaseException:
+                # BaseException 而不是 Exception：中断/生成器被丢弃时也必须收尾，
+                # 否则锁放手了、事务还开着，后面所有人的写都会接进这笔残局。
                 self._conn.execute("ROLLBACK")
                 raise
             self._conn.execute("COMMIT")
@@ -371,8 +456,8 @@ def default_storage() -> StorageService | None:
     return _STORAGE
 
 
-def storage_db() -> sqlite3.Connection | None:
-    """当前主库连接；未启动返回 None（引擎模块据此回退旧文件路径）。"""
+def storage_db() -> "LockedConnection | None":
+    """当前主库句柄（持锁，非裸连接）；未启动返回 None（引擎模块据此回退旧文件路径）。"""
     return _STORAGE.db if _STORAGE is not None else None
 
 

@@ -508,7 +508,8 @@ def test_search_store_seeds_expire_on_start(env):
     store.insert([BookItem(name="旧书", author="甲", url="old-1", origin="src-1")])
     env.storage.db.execute(
         "UPDATE search_books SET saved_at=0 WHERE book_url='old-1'")
-    env.storage.db.commit()
+    # 不 commit：主库是 isolation_level=None（autocommit），这条 UPDATE 已经落盘；
+    # 而裸 commit() 落在别人未提交的事务上会替别人提交半成品。
     assert store.get("old-1") is not None
 
     svc = ReadingService(rule_engine=_StubEngine(), storage=env.storage,

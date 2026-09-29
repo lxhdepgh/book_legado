@@ -12,7 +12,7 @@ import logging
 import sqlite3
 
 from app.core.lifecycle import Service
-from app.core.storage import StorageService
+from app.core.storage import LockedConnection, StorageService
 from app.services.reading_cache import ReadingCache
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ class ContentSearchService(Service):
             self._cache = ReadingCache(self._storage.paths.cache)
         self._ensure_fts_table()
 
-    def _conn(self) -> sqlite3.Connection | None:
+    def _conn(self) -> LockedConnection | None:
         return self._storage.db if self._storage is not None else None
 
     def _ensure_fts_table(self) -> None:

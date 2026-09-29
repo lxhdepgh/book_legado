@@ -6,13 +6,12 @@
 from __future__ import annotations
 
 import logging
-import sqlite3
 import threading
 import time
 
 from app.core.events import BookmarkChangedEvent
 from app.core.lifecycle import Service
-from app.core.storage import StorageService
+from app.core.storage import LockedConnection, StorageService
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +38,7 @@ class BookmarkService(Service):
             return []
         return self.bus.publish(event)
 
-    def _conn(self) -> sqlite3.Connection | None:
+    def _conn(self) -> LockedConnection | None:
         return self._storage.db if self._storage is not None else None
 
     # ------------------------------------------------------------------ #

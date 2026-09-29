@@ -24,13 +24,12 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 import threading
 import time
 
 from app.core.events import ReplaceRulesChangedEvent
 from app.core.lifecycle import Service
-from app.core.storage import StorageService
+from app.core.storage import LockedConnection, StorageService
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +72,7 @@ class ReplaceRuleService(Service):
         from app.services.engine import reading_engine as _re
         _re.set_global_replace_rules_provider(None)
 
-    def _conn(self) -> sqlite3.Connection | None:
+    def _conn(self) -> LockedConnection | None:
         return self._storage.db if self._storage is not None else None
 
     def _global_on(self) -> bool:

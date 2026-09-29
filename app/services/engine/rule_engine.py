@@ -1016,7 +1016,9 @@ class ReaderEngine:
                         "INSERT OR REPLACE INTO cookies(key, jar, updated_at)"
                         " VALUES(?,?,?)",
                         (ReaderEngine._COOKIE_STORE_SQLITE_KEY, jar_json, time.time()))
-                    db.commit()
+                    # 这里不 commit()：主库以 isolation_level=None 打开，语句本身
+                    # 就是原子的；而裸 commit() 落在别人未提交的事务上是**替别人提交**
+                    # ——把别人写到一半的批次当成完整一笔落下去。
             except Exception:
                 pass
             return

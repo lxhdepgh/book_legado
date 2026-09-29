@@ -114,7 +114,7 @@ def _make_bulk_media(data: Path, n: int = 40) -> None:
 def _traced(storage) -> list[str]:
     """收集后续在该连接上执行过的语句动词（executemany 会逐行触发，实测 50 行=50 次）。"""
     verbs: list[str] = []
-    storage.db.set_trace_callback(
+    storage.raw.set_trace_callback(
         lambda sql: verbs.append(sql.strip().split(None, 1)[0].upper()))
     return verbs
 
@@ -297,14 +297,14 @@ def test_search_book_store_insert_is_a_single_transaction(migrated_storage):
     """
     storage, _, _ = migrated_storage
     statements: list[str] = []
-    storage.db.set_trace_callback(
+    storage.raw.set_trace_callback(
         lambda sql: statements.append(sql.strip().split(None, 1)[0].upper()))
     try:
         SearchBookStore(conn=storage.db).insert(
             [BookItem(name=f"事务书{i}", author="甲", url=f"tx/{i}", origin="o")
              for i in range(50)])
     finally:
-        storage.db.set_trace_callback(None)
+        storage.raw.set_trace_callback(None)
 
     assert statements.count("BEGIN") == 1, f"整批没包进一条事务：{statements[:4]}"
     assert statements.count("COMMIT") == 1
@@ -427,7 +427,7 @@ def test_migrate_writes_one_transaction_per_legacy_table(fresh_storage):
     try:
         report = storage.migrate()
     finally:
-        storage.db.set_trace_callback(None)
+        storage.raw.set_trace_callback(None)
 
     assert (report["book_sources"], report["bookshelf"], report["search_books"]) \
         == (40, 40, 40)

@@ -20,14 +20,13 @@ from __future__ import annotations
 
 import logging
 import shutil
-import sqlite3
 import sys
 import threading
 import time
 from pathlib import Path
 
 from app.core.lifecycle import Service
-from app.core.storage import StorageService
+from app.core.storage import LockedConnection, StorageService
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +63,7 @@ class FontService(Service):
             except Exception:
                 self._settings = None
 
-    def _conn(self) -> sqlite3.Connection | None:
+    def _conn(self) -> LockedConnection | None:
         return self._storage.db if self._storage is not None else None
 
     # ------------------------------------------------------------------ #

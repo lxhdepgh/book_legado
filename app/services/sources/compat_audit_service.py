@@ -227,14 +227,15 @@ class CompatAuditService(Service):
     def _persist(self, report: AuditReport) -> None:
         """经 StorageService.execute（持 _db_lock）写，且必须在非循环线程上。
 
-        裸 ``storage.db.execute()`` 会**丢行**而不是报错：主库以
-        ``isolation_level=None`` 打开，别的线程正握着 ``transaction()`` 时裸写
-        就并进那笔未提交的事务，对方 ROLLBACK 把审计行一起带走，调用方看到的
-        还是成功。本机实测（本地临时库，N=240 并发 8，3 遍取中位，
-        还是成功。本机实测（本地临时库，8 线程 × 240 条 × 3 遍同一张表，
-        ``.probe/audit_log_write_shape.py``）：裸写三遍共活下 610/720 行、每遍至少
-        抛一次 InterfaceError，而「并发事务回滚」那格表里剩 0 行；持锁写 720/720，
-        代价是单条最大 91.5 ms（等锁），所以不能留在事件循环上。
+        裸写会**丢行**而不是报错：主库以 ``isolation_level=None`` 打开，别的线程正
+        握着 ``transaction()`` 时裸写就并进那笔未提交的事务，对方 ROLLBACK 把审计行
+        一起带走，调用方看到的还是成功。本机实测（本地临时库，坏形状经
+        ``StorageService.raw`` 复现，``.probe/audit_log_write_shape.py``，
+        N=240 / 8 线程 / 3 遍）：裸写活下 602/720 行、每遍至少抛一次
+        ``InterfaceError``；「另一线程事务开着 300 ms 后回滚」那格里裸写 0 ms 返回、
+        表里 0 行，持锁写等满 305 ms、行活下来——**等锁等的就是别人那笔事务的全长**，
+        所以这一句绝不能留在界面循环上。持锁写 720/720 零异常，代价 3608.5 µs/条
+        （分母是逐条 fsync；一轮检测攒成一条事务是 20.6 µs/条，见第四十二轮的 #75）。
         """
         if self._storage is None:
             return

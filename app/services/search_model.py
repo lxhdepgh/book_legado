@@ -78,9 +78,17 @@ class SearchBookStore:
         主库连接是 autocommit（``isolation_level=None``），逐行 INSERT 就是逐行
         建 journal 再 fsync：实测 400 行 1141ms，包成一条事务 11.6ms（**98×**），
         而换源扫描每个源都要落一次种子——那是整轮里最大的一块。
-        调用方可能已经开着事务（``StorageService.transaction()``），那时只加入、
-        不抢先提交，也不替别人回滚。
+
+        注入的是主库时（``LockedConnection``）整批交给 ``transaction()``：BEGIN 到
+        COMMIT 期间占住主库 ``_db_lock``，别人的写插不进这笔事务，也就不会被这里
+        可能的 ROLLBACK 一起带走（第四十二轮量过的丢行形状）。已在别人事务里时
+        ``transaction()`` 只加入，不抢先收尾。文件模式仍是自建连接的 BEGIN。
         """
+        from app.core.storage import LockedConnection
+        if isinstance(db, LockedConnection):
+            with db.transaction():
+                yield
+            return
         if db.in_transaction:
             yield
             return
