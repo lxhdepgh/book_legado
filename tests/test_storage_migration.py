@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.core.storage import StorageService
+from app.core.storage import StorageService, _MIGRATED_FLAG
 from app.services.app_paths import AppPaths
 from app.services.engine.rule_engine import BookItem
 from app.services.search_model import SearchBookStore
@@ -83,6 +83,40 @@ def _make_old_media(data: Path) -> None:
          0, int(time.time() * 1000), payload))
     old.commit()
     old.close()
+
+
+def _make_bulk_media(data: Path, n: int = 40) -> None:
+    """四类旧介质（批量三类 + appearance），用来数「一批提交了几次」。"""
+    (data / "appearance.json").write_text(
+        json.dumps({"skin_id": "ink_gray"}, ensure_ascii=False), encoding="utf-8")
+    (data / "bookSource.json").write_text(json.dumps([
+        {"bookSourceUrl": f"https://bulk{i}.example.com",
+         "bookSourceName": f"批量源{i}", "bookSourceGroup": "批量",
+         "enabled": True, "customOrder": i}
+        for i in range(n)], ensure_ascii=False), encoding="utf-8")
+    (data / "bookshelf.json").write_text(json.dumps([
+        {"bookUrl": f"https://bulk0.example.com/b{i}", "name": f"批量书{i}",
+         "author": "批量作者", "reading": {"chapter_index": i}}
+        for i in range(n)], ensure_ascii=False), encoding="utf-8")
+    old = sqlite3.connect(str(data / "search-books.sqlite3"))
+    old.execute("CREATE TABLE search_books(book_url TEXT PRIMARY KEY, name TEXT,"
+                " author TEXT, origin TEXT, origin_order INTEGER,"
+                " saved_at INTEGER, payload TEXT)")
+    old.executemany("INSERT INTO search_books VALUES(?,?,?,?,?,?,?)", [
+        (f"https://bulk{i % 8}.example.com/s{i}", f"批量结果{i}", "批量作者",
+         f"https://bulk{i % 8}.example.com", i, 1_700_000_000_000 + i,
+         json.dumps({"kind": "批量", "origin_name": f"批量源{i % 8}"}))
+        for i in range(n)])
+    old.commit()
+    old.close()
+
+
+def _traced(storage) -> list[str]:
+    """收集后续在该连接上执行过的语句动词（executemany 会逐行触发，实测 50 行=50 次）。"""
+    verbs: list[str] = []
+    storage.db.set_trace_callback(
+        lambda sql: verbs.append(sql.strip().split(None, 1)[0].upper()))
+    return verbs
 
 
 @pytest.fixture()
@@ -352,3 +386,85 @@ def test_bookshelf_roundtrip_via_db(migrated_storage):
         assert row is not None and row[0] == "新书" and row[1] == 1
     finally:
         asyncio.run(svc.on_stop())
+
+
+# --------------------------------------------------------------------- #
+# 9. 批量导入的事务粒度：一次启动 = 每表一次 fsync，而不是每行一次
+# --------------------------------------------------------------------- #
+@pytest.fixture()
+def fresh_storage():
+    """空 data 启动（migrate 见不到介质）→ 铺上批量旧介质并撤掉幂等标记。
+
+    这就是"首次启动"的等价现场：schema 已就绪、库里没有旧数据、标记已清。
+    """
+    root = Path(tempfile.mkdtemp(prefix="m6bulk_"))
+    paths = AppPaths(data=root / "data", cache=root / "cache")
+    paths.data.mkdir(parents=True, exist_ok=True)
+    storage = StorageService(paths=paths)
+    asyncio.run(storage.start())
+    try:
+        storage.db.execute("DELETE FROM settings WHERE key=?", (_MIGRATED_FLAG,))
+        _make_bulk_media(paths.data)
+        yield storage, root, paths
+    finally:
+        asyncio.run(storage.stop())
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_migrate_writes_one_transaction_per_legacy_table(fresh_storage):
+    """三类批量介质各包一条事务；autocommit 连接上逐行提交就是逐行 fsync。
+
+    实测本机（合成 3300 行旧介质）：逐行提交时三段合计 **12247.7ms**
+    （book_sources 3.28 / bookshelf 3.87 / search_books 3.85 ms/行），
+    换成每表一条事务后合计 **45.8ms**，StorageService.on_start 墙钟
+    12360.7ms → **150.1ms**。与第三十五轮 SearchBookStore.insert 的 98× 同型。
+    护栏钉**语句序列**不钉计时：executemany 逐行触发 INSERT（40 行=40 次）而
+    BEGIN 每表只有 1 次；退化成裸 executemany 时 BEGIN 直接变 0，
+    而计时在任何机器上都不可复现。appearance 是单行写，按设计不单独开事务。
+    """
+    storage, _, _ = fresh_storage
+    verbs = _traced(storage)
+    try:
+        report = storage.migrate()
+    finally:
+        storage.db.set_trace_callback(None)
+
+    assert (report["book_sources"], report["bookshelf"], report["search_books"]) \
+        == (40, 40, 40)
+    assert verbs.count("INSERT") == 120 + 2, \
+        "行数不对，事务数就没意义（120 数据行 + appearance + 幂等标记）"
+    assert verbs.count("BEGIN") == 3, f"每表一条事务破了：{verbs}"
+    assert verbs.count("COMMIT") == 3
+    assert verbs.count("ROLLBACK") == 0
+    for table in ("book_sources", "bookshelf", "search_books"):
+        assert storage.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 40
+
+
+def test_migrate_batch_failure_rolls_back_the_whole_table(fresh_storage):
+    """半表落盘比整表失败更糟：首启被打断后，已导入的那半会被当成已有数据。
+
+    修前（逐行提交）坏行之前几行已经各自 fsync 进库，而异常照样冲出 migrate()
+    中断启动、旧文件也不改名——坏消息一半、好消息一半。现在整表回滚，
+    旧介质原名保留（不生成 ``.legacy-bak``），修好后重跑能从头导入。
+    """
+    storage, _, paths = fresh_storage
+    (paths.data / "bookSource.json").write_text(json.dumps([
+        {"bookSourceUrl": "https://good1.example.com", "bookSourceName": "好源一"},
+        {"bookSourceUrl": "https://bad.example.com", "bookSourceName": "坏源"},
+        {"bookSourceUrl": "https://good2.example.com", "bookSourceName": "好源二"},
+    ], ensure_ascii=False), encoding="utf-8")
+    storage.db.execute(
+        "CREATE TRIGGER block_bad_source BEFORE INSERT ON book_sources "
+        "WHEN NEW.name='坏源' BEGIN SELECT RAISE(ABORT, '测试拦截'); END")
+
+    with pytest.raises(sqlite3.Error):
+        storage.migrate()
+
+    assert storage.db.execute(
+        "SELECT COUNT(*) FROM book_sources").fetchone()[0] == 0, "坏行之前的源留下了"
+    assert storage.db.in_transaction is False, "失败后事务没关，后续写会接进这条残局"
+    assert (paths.data / "bookSource.json").exists()
+    assert not (paths.data / "bookSource.json.legacy-bak").exists()
+    # 幂等标记没写 → 修好后重跑仍会尝试导入
+    assert storage.db.execute(
+        "SELECT 1 FROM settings WHERE key=?", (_MIGRATED_FLAG,)).fetchone() is None
