@@ -4,10 +4,12 @@
   **不进版本化迁移**（虚表随索引重建，契约 §9 末段）；
 - 索引只进主库（红线 8，无散落文件），文本来源复用 reader-cache 已缓存章节；
 - 未缓存章节不建索引（rebuild 时跳过，调用方应提示"先缓存"）；
+- 建索引的触发点是书内搜索第一次用（:meth:`ensure_index`），不是整书缓存收尾；
 - 命中返回 chapter_index + 偏移，供阅读器跳转。
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 
@@ -61,36 +63,79 @@ class ContentSearchService(Service):
 
     # ------------------------------------------------------------------ #
     async def rebuild_index(self, book_url: str, source_url: str = "") -> int:
-        """对已缓存章节重建索引，写入行数；未缓存章节跳过。"""
+        """对已缓存章节重建索引，写入行数；未缓存章节跳过。
+
+        这段必须离开调用循环跑：主库连接是 autocommit，在协程里逐块 INSERT 就是
+        逐块建 journal 再 fsync。本机 200 章 × 8 块（1600 行）两臂对照
+        （``.probe/fts_rebuild_freeze_attr.py``）：改前那种"就在循环上逐条写"
+        4965 ms（≈3103 µs/行），其间该醒 993 拍的 5 ms 心跳**一拍都没醒**；现在这条
+        （线程池 + 一条事务 + executemany）74 ms（≈46 µs/行），心跳照常在跳。
+        形状照 ``search_model`` 里 ``asyncio.to_thread(self.store.insert, items)``
+        那条既有先例。
+        """
+        return await asyncio.to_thread(self._rebuild_sync, book_url, source_url)
+
+    def _rebuild_sync(self, book_url: str, source_url: str) -> int:
         book_url = str(book_url or "")
         conn = self._conn()
         if conn is None or not self._fts_available or not book_url:
             return 0
-        # 先清掉该书旧索引（虚表无 TRUNCATE 优化，DELETE 重建）。
-        conn.execute(f"DELETE FROM {_FTS_TABLE} WHERE book_url=?", (book_url,))
-        if not source_url or self._cache is None:
-            return 0
-        chapters = self._cache.load_catalog(source_url, book_url) or []
-        written = 0
-        for chapter in chapters:
-            if getattr(chapter, "is_volume", False) or not getattr(chapter, "url", ""):
-                continue
-            document = self._cache.load_content(source_url, book_url, chapter.url)
-            if document is None:  # 未缓存章节不建索引
-                continue
-            running = 0
-            for block in document.blocks:
-                if block.kind != "text" or not isinstance(block.value, str):
+        rows: list[tuple] = []
+        if source_url and self._cache is not None:
+            for chapter in self._cache.load_catalog(source_url, book_url) or []:
+                if getattr(chapter, "is_volume", False) or not getattr(chapter, "url", ""):
                     continue
-                text = block.value
-                conn.execute(
+                document = self._cache.load_content(source_url, book_url, chapter.url)
+                if document is None:  # 未缓存章节不建索引
+                    continue
+                running = 0
+                for block in document.blocks:
+                    if block.kind != "text" or not isinstance(block.value, str):
+                        continue
+                    rows.append((book_url, int(getattr(chapter, "index", 0) or 0),
+                                 float(running), block.value))
+                    running += len(block.value)
+        # 清旧索引与写新索引是**一笔**：中途失败不会留下"半本书"的索引，
+        # 而 transaction() 在别人事务里只加入、不会把别人夹在中间的写一起回滚。
+        with conn.transaction():
+            conn.execute(f"DELETE FROM {_FTS_TABLE} WHERE book_url=?", (book_url,))
+            if rows:
+                conn.executemany(
                     f"INSERT INTO {_FTS_TABLE}"
-                    "(book_url, chapter_index, offset, text) VALUES(?,?,?,?)",
-                    (book_url, int(getattr(chapter, "index", 0) or 0),
-                     float(running), text))
-                running += len(text)
-                written += 1
-        return written
+                    "(book_url, chapter_index, offset, text) VALUES(?,?,?,?)", rows)
+        return len(rows)
+
+    async def ensure_index(self, book_url: str, source_url: str = "") -> int:
+        """缓存里已有的章节都得在索引里；缺了才重建，返回写入行数。
+
+        判据只有一条：**已缓存的章节数 > 索引覆盖的章节数**。反向不一致（缓存被
+        限额清理掉、索引还留着）不触发重建——那几条命中跳过去只是重新取一次正文，
+        不是查不到东西。
+        """
+        book_url = str(book_url or "")
+        conn = self._conn()
+        if conn is None or not self._fts_available or not book_url:
+            return 0
+        if self._cache is None or not source_url:
+            # 没有缓存可依据就不建：rebuild 会先删旧索引，此时重建等于把这本书的
+            # 索引清成 0 行——"少几章"比"整本查不到"好得多。
+            return 0
+        cached = await asyncio.to_thread(
+            self._cache.cache_counts, source_url, book_url)
+        indexed = await asyncio.to_thread(self._indexed_chapters, conn, book_url)
+        # 只在"缓存比索引多"时重建。反向不一致（缓存被限额清理掉、索引还留着）不
+        # 重建也不清：rebuild 先删后写，缓存空了就等于把整本索引清成 0 行，而留着
+        # 的几条命中跳过去只是重新取一次正文。
+        if cached[0] <= indexed:
+            return 0
+        return await self.rebuild_index(book_url, source_url)
+
+    @staticmethod
+    def _indexed_chapters(conn, book_url: str) -> int:
+        row = conn.execute(
+            f"SELECT COUNT(DISTINCT chapter_index) FROM {_FTS_TABLE} "
+            f"WHERE book_url=?", (book_url,)).fetchone()
+        return int(row[0]) if row is not None else 0
 
     async def search(self, book_url: str, keyword: str) -> list[dict]:
         """检索某书，返回命中列表：chapter_index / offset / 摘要。"""

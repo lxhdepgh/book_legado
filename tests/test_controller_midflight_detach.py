@@ -104,7 +104,8 @@ def _reader_view():
     controller._view = view
     controller._reading = reading
     controller._bookmarks = SimpleNamespace(list_bookmarks=Value([]))
-    controller._content_search = SimpleNamespace(search=Value([]))
+    controller._content_search = SimpleNamespace(
+        search=Value([]), ensure_index=Value(0))
     controller._tts = None
     controller._media = None
     controller._book_url = "http://127.0.0.1:1/book/1"

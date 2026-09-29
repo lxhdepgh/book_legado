@@ -68,6 +68,15 @@ class LockedConnection:
     3.2 ms 本身）；也不需要顺手把 40 条住在 ``async def`` 里的写挪出界面循环——
     收进锁之后最坏要等的就是别人那条整表镜像，实测 1000 源 ``save()`` 持锁
     15.8~29.3 ms、600 书架 ``save_bookshelf()`` 8.4~15.6 ms。
+
+    第四十八轮在今天的树上重量了同一件事（``.probe/ui_write_stall_attr.py``，
+    99 处主库语句 / 66 条写，其中 25 条住在 ``async def`` 里 = 就在界面循环上）：
+    界面循环上一次单条写自持锁中位 3.37 ms / 最坏 7.80 ms；排在四种真实持有者后面
+    最坏 25.59 ms（1000 源镜像，它自己持锁中位 15.08 / 最坏 21.84 ms）。首启
+    ``migrate()`` 外层持锁 35.7 ms，但结构上撞不上界面循环——``main.py`` 先
+    ``asyncio.run(hub.start_all())`` 再 ``ft.run``。结论不变：**单条写不搬**。
+    搬的只有那一条批量写（书内 FTS 索引逐块 INSERT），见
+    ``ContentSearchService._rebuild_sync``。
     """
 
     __slots__ = ("_service",)

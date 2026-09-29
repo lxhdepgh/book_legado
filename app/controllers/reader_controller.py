@@ -936,6 +936,12 @@ class ReaderController(BaseController):
         self.ui_call(self._run_content_search(keyword))
 
     async def _run_content_search(self, keyword: str) -> None:
+        # 索引由书内搜索第一次用时建：ContentSearchService.rebuild_index 在生产里
+        # 原本没有任何调用方（服务面齐全、界面永远"无命中"）。ensure_index 按
+        # "已缓存章数 > 索引覆盖章数"补齐，所以整书缓存收尾不必再挂一个钩子。
+        session = getattr(self._reading, "current_session", None)
+        source_url = str(getattr(session, "source_url", "") or "")
+        await self._content_search.ensure_index(self._book_url, source_url)
         hits = await self._content_search.search(self._book_url, keyword)
         if self._view is None:
             return    # 全书扫一遍要几秒，这期间切页是常规操作不是意外

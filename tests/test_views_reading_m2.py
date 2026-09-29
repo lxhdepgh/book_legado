@@ -106,7 +106,7 @@ def _stub_services():
     )
     content_search = SimpleNamespace(
         search=AsyncMock(return_value=[]),
-        rebuild_index=AsyncMock(return_value=0),
+        ensure_index=AsyncMock(return_value=0),
     )
     download = SimpleNamespace(
         enqueue=lambda *a, **k: "task-1",

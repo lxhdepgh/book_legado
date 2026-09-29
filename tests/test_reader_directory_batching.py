@@ -315,7 +315,7 @@ def _controller_rig(total: int = 60, index: int = 3):
         BookmarkService: SimpleNamespace(
             list_bookmarks=AsyncMock(return_value=[])),
         ContentSearchService: SimpleNamespace(
-            rebuild_index=AsyncMock(return_value=0)),
+            ensure_index=AsyncMock(return_value=0)),
     }[stype])
     view = ReaderView()
     controller = ReaderController(hub)

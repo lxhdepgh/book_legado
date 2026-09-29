@@ -131,7 +131,7 @@ def _rig(dictionary=_NoDict, *, preferences=None):
             list_bookmarks=_returns([]), add_bookmark=_returns(1),
             remove_bookmark=_returns(True)),
         ContentSearchService: SimpleNamespace(
-            search=_returns([]), rebuild_index=_returns(0)),
+            search=_returns([]), ensure_index=_returns(0)),
     }
     if dictionary is not _NoDict:
         services[DictService] = dictionary

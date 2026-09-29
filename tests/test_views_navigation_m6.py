@@ -116,7 +116,7 @@ def _stub_hub() -> _FakeHub:
     )
     content_search = SimpleNamespace(
         search=AsyncMock(return_value=[]),
-        rebuild_index=AsyncMock(return_value=0),
+        ensure_index=AsyncMock(return_value=0),
     )
     download = SimpleNamespace(
         enqueue=lambda *a, **k: "task-1",

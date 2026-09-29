@@ -70,7 +70,7 @@ def _rig(preferences=None):
             remove_bookmark=AsyncMock(return_value=True)),
         ContentSearchService: SimpleNamespace(
             search=AsyncMock(return_value=[]),
-            rebuild_index=AsyncMock(return_value=0)),
+            ensure_index=AsyncMock(return_value=0)),
     }))
     controller.attach(view)
     return view, controller, reading
