@@ -223,6 +223,8 @@ class LegadoJsRuntime:
     _QUICKJS_LOCK = threading.RLock()
     _QUICKJS_DISPATCHER = _QuickJsDispatcher()
     _QUICKJS_THREAD = threading.local()
+    #: JS→Python 回调→JS 的重入层数上限（为什么必须有，见 _evaluate_serialized）。
+    JS_REENTRY_LIMIT = 16
     _FOREGROUND_PRIORITY = 0
     _BACKGROUND_PRIORITY = 1
     _MEMORY_CACHE_LIMIT = 50 * 1024 * 1024
@@ -574,8 +576,29 @@ class LegadoJsRuntime:
             self._QUICKJS_THREAD.active = False
 
     def _evaluate_serialized(self, script: str, context: JsContext):
-        with self._QUICKJS_LOCK:
-            return self._evaluate_locked(script, context)
+        # QuickJS 的重入是**同一条原生栈**上再 eval 一层：JS 调 Python 回调
+        # （__get_string / __css_query 这类），回调里又求值一条 @js: 规则。
+        # 没有这层上限时，唯一拦住它的是 CPython 的 recursionlimit——本机实测
+        # 到 ~165 层抛 RecursionError（可捕获）才挡住；把那个上限抬高（深层
+        # HTML 树是最常见的理由）就变成 STATUS_STACK_OVERFLOW，整个进程没了，
+        # 实测给那条线程 16MB 栈也一样崩。
+        # 所以边界必须是我们自己画的，不能借来的。合法源用不到几层：真实测试面
+        # 616 次求值里最深只有 2 层（613 次是 1 层，3 次是 2 层）。
+        depth = getattr(self._QUICKJS_THREAD, "depth", 0) + 1
+        if depth > self.JS_REENTRY_LIMIT:
+            # 这条 raise 从 QuickJS 的 C eval 里穿出去，会被压成
+            # "InternalError: Python call failed"，原因就丢了——和 _bridge_call
+            # 处理回调异常同一件事，先把它记进 bridge_error 供外层拼回。
+            detail = (f"JS 规则重入超过 {self.JS_REENTRY_LIMIT} 层"
+                      f"（{context.rule_name or '<匿名规则>'}）：这条源在自己调用自己")
+            self._thread_state.bridge_error = f"JsBridgeError: {detail}"
+            raise JsBridgeError(detail)
+        self._QUICKJS_THREAD.depth = depth
+        try:
+            with self._QUICKJS_LOCK:
+                return self._evaluate_locked(script, context)
+        finally:
+            self._QUICKJS_THREAD.depth = depth - 1
 
     def _evaluate_locked(self, script: str, context: JsContext):
         try:
@@ -638,6 +661,12 @@ class LegadoJsRuntime:
             # Python callables.  set_max_stack_size over the default crashes
             # the process with an access violation on deep recursion, while
             # the default raises a catchable StackOverflow.
+            # 注意这条检查只覆盖**一次 eval 内部**的递归（实测默认栈下深度 800
+            # 层纯 JS 递归是 catchable StackOverflow）。JS→Python 回调→再 eval 的
+            # **重入**不在它范围内：默认栈下重入到 800 层直接 access violation
+            # 带走进程，且复用同一 Context 与每层新建 Context 一样崩——崩点由原生
+            # 栈本身决定。那一段由 JS_REENTRY_LIMIT 在 Python 侧拦，
+            # 见 _evaluate_serialized。
             ctx.set_memory_limit(128 * 1024 * 1024)
             if js_lib:
                 self._shared_js_contexts[js_lib_key] = ctx

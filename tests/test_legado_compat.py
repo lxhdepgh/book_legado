@@ -8270,5 +8270,91 @@ class FixUrlTests(unittest.TestCase):
                          "https://localhost:8080/search")
 
 
+class JsReentryGuardTests(unittest.TestCase):
+    """``@js:`` 的自调用必须由**我们自己的**层数上限拦住，不能靠栈帮忙。
+
+    本机实测（离线子进程，`rc=3221225725` = STATUS_STACK_OVERFLOW）：
+    JS→Python 回调→再 eval 的重入链在默认线程栈上打到约 800 层就是原生崩溃，
+    整个桌面进程没了；**复用同一个 Context 和每层新建 Context 一样崩**，
+    所以决定生死的是原生栈本身，**给那条线程 16MB 栈也救不回来**。
+    生产里之所以没崩，是因为 CPython 的 ``recursionlimit=1000`` 在约 165 层先抛了
+    可捕获的 RecursionError——那是借来的护栏：谁把递归上限抬高（深层 HTML 树是最
+    常见的理由），崩溃就回来了。这三条把它换成自己画的界。
+    """
+
+    @staticmethod
+    def _spiral(runtime, counter):
+        """一条自己调自己的 ``@js:``：__get_string 的回调里再求值一条 @js:。"""
+        def get_string(rule):
+            counter["levels"] += 1
+            return str(runtime.evaluate(
+                "@js:__get_string('x')",
+                JsContext(source=None, get_string=get_string)))
+        return get_string
+
+    def test_self_recursive_rule_is_cut_by_our_limit_not_the_stack(self):
+        runtime = LegadoJsRuntime()
+        counter = {"levels": 0}
+        with self.assertRaises(JsBridgeError) as caught:
+            runtime.evaluate("@js:__get_string('x')",
+                             JsContext(source=None,
+                                       get_string=self._spiral(runtime, counter)))
+        text = str(caught.exception)
+        # 闸门独有措辞：报的必须是"重入太深"，不是 QuickJS 那句通用的
+        # "InternalError: Python call failed"——后者会把原因吞在 C 边界里。
+        self.assertIn("重入", text)
+        self.assertIn(f"超过 {LegadoJsRuntime.JS_REENTRY_LIMIT} 层", text)
+        # 拦住它的是我们的上限（16 层），不是 recursionlimit（约 165 层才到）。
+        self.assertEqual(counter["levels"], LegadoJsRuntime.JS_REENTRY_LIMIT)
+        # 上限的**取值**也是被测的：低于借来的护栏（约 165 层），才有资格说
+        # "我们先到"；把数调大就等于把崩溃还回去，这条会红。
+        self.assertLess(LegadoJsRuntime.JS_REENTRY_LIMIT, 165)
+
+    def test_two_level_reentry_is_still_allowed(self):
+        # 真实测试面 616 次求值里最深只有 2 层，上限不能顺手杀掉正常写法。
+        runtime = LegadoJsRuntime()
+        seen = []
+
+        def inner(rule):
+            seen.append(str(rule))
+            return "内层值"
+
+        def outer(rule):
+            return str(runtime.evaluate("@js:__get_string('内')",
+                                         JsContext(source=None, get_string=inner)))
+
+        got = runtime.evaluate("@js:__get_string('外')",
+                               JsContext(source=None, get_string=outer))
+        self.assertEqual(got, "内层值")
+        self.assertEqual(seen, ["内"])
+
+    def test_the_depth_counter_does_not_leak_after_a_refusal(self):
+        # 拒绝过一次之后，同一运行时必须还能正常求值、还能合法重入：
+        # 计数器要是留在高位，一条坏源就能把后面所有源永久毒死。
+        runtime = LegadoJsRuntime()
+        counter = {"levels": 0}
+        with self.assertRaises(JsBridgeError):
+            runtime.evaluate("@js:__get_string('x')",
+                             JsContext(source=None,
+                                       get_string=self._spiral(runtime, counter)))
+
+        self.assertEqual(runtime.evaluate("@js:6*7", JsContext(source=None)), 42)
+
+        seen = []
+
+        def inner(rule):
+            seen.append(str(rule))
+            return "内层值"
+
+        def outer(rule):
+            return str(runtime.evaluate("@js:__get_string('内')",
+                                         JsContext(source=None, get_string=inner)))
+
+        self.assertEqual(
+            runtime.evaluate("@js:__get_string('外')",
+                             JsContext(source=None, get_string=outer)), "内层值")
+        self.assertEqual(seen, ["内"])
+
+
 if __name__ == "__main__":
     unittest.main()
