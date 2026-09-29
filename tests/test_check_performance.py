@@ -1,4 +1,6 @@
+import ast
 import asyncio
+import pathlib
 import threading
 import time
 import unittest
@@ -11,6 +13,8 @@ from app.services.engine.legado_js import JsContext, LegadoJsRuntime
 from app.services.engine.rule_engine import (ExploreCategory, ReaderEngine,
                                       RequestConnectionError,
                                       RequestTimeoutError)
+
+APP_ROOT = pathlib.Path(__file__).resolve().parents[1] / "app"
 
 
 def _source(**overrides):
@@ -1455,6 +1459,262 @@ class BareTemplateFastPathTests(unittest.IsolatedAsyncioTestCase):
                                  exploreUrl="分类::/l", **fields)
         self.assertFalse(check_service._source_uses_js(source),
                          "全段无标记却被判成 JS 源：闸门的判据被放宽成了存在性")
+
+
+class HeaderMapFastPathTests(unittest.IsolatedAsyncioTestCase):
+    """静态 header 声明不再为 `source.getHeaderMap(true)` 发求值（任务 #79）。
+
+    取证链（全部 127.0.0.1 离线，`.probe/header_map_fastpath.py`，09-29 复测；
+    "改前"一臂是把 `_static_header_map` 短路成 None，等价于 HEAD——求值分支一字未动）：
+
+    - 这条求值**每个 HTTP 请求都发一次**（`rule_engine` 重试循环里），一条静态
+      header 源的一轮检测实测 5 次 / 44-49 ms 的 dispatcher 串行占用；
+    - 换成 Python 直算：16 条静态源一轮 concurrency=8 的中位墙钟两遍实测
+      762 → 455 ms、746 → 460 ms（−38~40%，每遍三轮换向），求值 80 → 0 次；
+    - 语料口径（`resource/` 917 条快照，`.probe/header_shape_census.py`）：无 header
+      55.1% + 静态 JSON 且值全为字符串 36.9% + 非 JSON 静态串 3.5% + JSON 非对象
+      0.1% = **95.5% 落在直算面**，动态声明（`@js:`/`<js>`）4.5%，含非字符串值的
+      header **0 条**。
+    """
+
+    #: 直算与求值必须逐字相同的形状，加上必须回落的形状（回落格也进来对拍）。
+    SHAPES = {
+        "空": "",
+        "静态 JSON": '{"Referer":"https://m.example"}',
+        "不是 JSON": "Referer: https://m.example",
+        "JSON 数组": "[1,2]",
+        "JSON null": "null",
+        "空对象": "{}",
+        "带 UA": '{"User-Agent":"mine/1.0"}',
+        "带小写 user-agent": '{"user-agent":"lower/1"}',
+        "两个键": '{"Referer":"https://r","Accept":"*/*"}',
+        "值为数字（该回落）": '{"retry":3}',
+        "值为布尔（该回落）": '{"ok":true}',
+        "值为 null（该回落）": '{"x":null}',
+        "动态 @js:（该回落）": '@js:JSON.stringify({Referer:"from-js"})',
+        "动态 <js>（该回落）": '<js>JSON.stringify({Referer:"from-tag"})</js>',
+        "前导空格 @js:（该回落）": '   @js:JSON.stringify({a:1})',
+    }
+
+    async def asyncSetUp(self):
+        self.engine = ReaderEngine()
+
+    async def asyncTearDown(self):
+        await self.engine.aclose()
+
+    def _source(self, header):
+        return BookSource.from_dict({
+            "bookSourceName": "h", "bookSourceUrl": "http://127.0.0.1:1/h",
+            "header": header})
+
+    def _js_counter(self):
+        """数 `_evaluate_on_quickjs_thread`；返回 (记账, 撤销)。"""
+        state = {"n": 0, "scripts": []}
+        rt = LegadoJsRuntime
+        orig = rt._evaluate_on_quickjs_thread
+
+        def inner(self, script, context, *a, **kw):
+            state["n"] += 1
+            state["scripts"].append(str(script)[:48])
+            return orig(self, script, context, *a, **kw)
+
+        rt._evaluate_on_quickjs_thread = inner
+        return state, (lambda: setattr(rt, "_evaluate_on_quickjs_thread", orig))
+
+    def _without_fast_path(self):
+        """把快路径关掉 = 走原求值；返回恢复闭包（必须还原**描述符**）。"""
+        descriptor = ReaderEngine.__dict__["_static_header_map"]
+        ReaderEngine._static_header_map = lambda self, source: None
+        return lambda: setattr(ReaderEngine, "_static_header_map", descriptor)
+
+    async def test_static_shapes_take_no_quickjs_eval(self):
+        """钉"没发生"：静态声明的三种形状一次求值都不发。"""
+        for label in ("空", "静态 JSON", "不是 JSON", "带 UA", "JSON 数组"):
+            with self.subTest(形状=label):
+                state, undo = self._js_counter()
+                try:
+                    await self.engine._resolved_source_headers(
+                        self._source(self.SHAPES[label]), "http://127.0.0.1:1/h")
+                finally:
+                    undo()
+                self.assertEqual(state["n"], 0,
+                                 f"{label} 还在发求值：{state['scripts']}")
+
+    async def test_dynamic_header_still_evaluates(self):
+        """反空转：上一条不能靠"整条通道被关掉"过关——动态声明必须仍去求值。"""
+        for label in ("动态 @js:（该回落）", "动态 <js>（该回落）"):
+            with self.subTest(形状=label):
+                state, undo = self._js_counter()
+                try:
+                    headers = await self.engine._resolved_source_headers(
+                        self._source(self.SHAPES[label]), "http://127.0.0.1:1/h")
+                finally:
+                    undo()
+                self.assertGreaterEqual(state["n"], 1, f"{label} 没去求值")
+                self.assertIn("Referer", headers)
+
+    async def test_fast_path_matches_the_js_answer_shape_by_shape(self):
+        """逐形状对拍：快路径的答案必须和关掉它的求值一字不差。"""
+        for label, header in self.SHAPES.items():
+            with self.subTest(形状=label):
+                source = self._source(header)
+                fast = await self.engine._resolved_source_headers(
+                    source, "http://127.0.0.1:1/h")
+                undo = self._without_fast_path()
+                try:
+                    slow = await self.engine._resolved_source_headers(
+                        source, "http://127.0.0.1:1/h")
+                finally:
+                    undo()
+                self.assertEqual(fast, slow)
+
+    async def test_login_header_overlays_in_the_js_order(self):
+        """Legado 的叠放顺序：静态 → 缺 UA 补默认 → 登录头盖在上面。"""
+        self.engine.js_variables["source:loginHeader"] = \
+            '{"Authorization":"Bearer x","User-Agent":"login/2"}'
+        source = self._source('{"Referer":"https://r"}')
+        state, undo = self._js_counter()
+        try:
+            fast = await self.engine._resolved_source_headers(source, "")
+        finally:
+            undo()
+        self.assertEqual(state["n"], 0, f"登录头形状回落了：{state['scripts']}")
+        self.assertEqual(fast["Authorization"], "Bearer x")
+        self.assertEqual(fast["User-Agent"], "login/2", "登录头没盖在默认 UA 之上")
+        undo_fast = self._without_fast_path()
+        try:
+            slow = await self.engine._resolved_source_headers(source, "")
+        finally:
+            undo_fast()
+        self.assertEqual(fast, slow)
+
+    async def test_unparsable_login_header_falls_back(self):
+        """登录头是垃圾/数组时不许猜语义：回落到求值，且答案与求值相同。"""
+        for login in ("not-json", "[1]", '{"n":5}'):
+            with self.subTest(登录头=login):
+                self.engine.js_variables["source:loginHeader"] = login
+                source = self._source('{"Referer":"https://r"}')
+                self.assertIsNone(self.engine._static_header_map(source),
+                                  "登录头不可解析却被直算了，语义是猜的")
+                fast = await self.engine._resolved_source_headers(source, "")
+                undo = self._without_fast_path()
+                try:
+                    slow = await self.engine._resolved_source_headers(source, "")
+                finally:
+                    undo()
+                self.assertEqual(fast, slow)
+
+    async def test_each_call_hands_out_an_independent_map(self):
+        """请求路径会 `pop("proxy")`：直算返回的不能是共享/缓存的同一份 dict。"""
+        source = self._source('{"proxy":"http://p:1","Referer":"https://r"}')
+        first = await self.engine._resolved_source_headers(source, "")
+        first.pop("proxy")
+        second = await self.engine._resolved_source_headers(source, "")
+        self.assertIn("proxy", second, "直算把共享字典交出去了，一次 pop 影响后面所有请求")
+
+
+#: "怎么把 `source.header` 变成请求头"这件事在 Python 侧只许有一处直算实现；
+#: JS 桥那处是把同一份声明喂给 `__staticSourceHeaders`，属于求值那侧的入口，
+#: 不是第二种意见。两处都点名，扫描器一瞎就红（同 #83 的 N4 写法）。
+HEADER_PARSE_ALLOWLIST = {
+    ("app/services/engine/rule_engine.py", "_static_header_map"),
+    ("app/services/engine/legado_js.py", "_evaluate_locked"),
+}
+
+
+def scan_header_parsers(source: str, name: str) -> list[tuple[str, str]]:
+    """找出**既**读 `X.header` / `getattr(X, "header")` / `X.get("header")`
+    **又**对它 `json.loads` 的函数——也就是"再写一份 headerMap 解析"的形态。"""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        reads = parses = False
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Call):
+                continue
+            func = inner.func
+            key = inner.args[1] if (isinstance(func, ast.Name) and func.id == "getattr"
+                                    and len(inner.args) >= 2) else \
+                inner.args[0] if (isinstance(func, ast.Attribute) and func.attr == "get"
+                                  and inner.args) else None
+            if isinstance(key, ast.Constant) and key.value == "header":
+                reads = True
+            elif isinstance(func, ast.Attribute) and func.attr == "header":
+                reads = True
+            if isinstance(func, ast.Attribute) and func.attr == "loads" and \
+                    isinstance(func.value, ast.Name) and func.value.id == "json":
+                parses = True
+        if reads and parses:
+            findings.append((name, node.name))
+    return findings
+
+
+def production_header_parsers() -> list[tuple[str, str]]:
+    findings = []
+    for path in sorted(APP_ROOT.rglob("*.py")):
+        rel = path.relative_to(APP_ROOT.parent).as_posix()
+        findings.extend(scan_header_parsers(path.read_text(encoding="utf-8-sig"), rel))
+    return findings
+
+
+class SourceHeaderSingleDefinitionTests(unittest.TestCase):
+    """本轮落地直算时顺手清掉的那份死拷贝，以及它凭什么不会再长回来。"""
+
+    def test_dead_python_side_header_parser_is_gone(self):
+        """`ReaderEngine._source_headers` 是换求值那天留下的尾巴。
+
+        `git log -S"self._source_headers("`：5e6e1c1（2026-08-11）把
+        `_resolved_source_headers` 换成 QuickJS 求值，旧实现留在原地，此后 app/ 与
+        tests/ 零调用方。它和直算版还是
+        **不一样**的语义（对所有值 `str()`、不看 `@js:`、不补 UA、不叠登录头），
+        留着就是"再写一份 headerMap"时的第二个候选答案。
+        """
+        self.assertFalse(hasattr(ReaderEngine, "_source_headers"),
+                         "死的第二份 header 解析长回来了：它会把 @js: 声明静默解析成空")
+
+    def test_production_parses_source_header_in_exactly_the_allowlisted_places(self):
+        self.assertEqual(sorted(production_header_parsers()),
+                         sorted(HEADER_PARSE_ALLOWLIST),
+                         "解析 source.header 的地方变了：新增的第二份要么并进直算、"
+                         "要么点名进白名单并说清为什么")
+
+    def test_scanner_flags_a_planted_copy(self):
+        """反空转 ①：扫描器必须真能认出第二种写法。"""
+        planted = (
+            "import json\n\n\n"
+            "def other_header_map(source):\n"
+            "    raw = getattr(source, 'header', '') or ''\n"
+            "    try:\n"
+            "        return json.loads(raw) if raw else {}\n"
+            "    except json.JSONDecodeError:\n"
+            "        return {}\n")
+        self.assertEqual(scan_header_parsers(planted, "planted.py"),
+                         [("planted.py", "other_header_map")],
+                         "扫描器认不出典型的第二份实现，那条系统性护栏是空转的")
+
+    def test_scanner_stays_quiet_on_marker_checks_and_other_headers(self):
+        """反空转 ②：不许把"只看 header 里有没有 @js:"或"解析别处的请求头 JSON"报成拷贝。
+
+        `check_service._source_uses_js` 读 header 但不解析；TTS 控制器解析的是自己的
+        设置字段（键名叫 `headers`）。这两类都不是第二种 headerMap 意见。
+        """
+        marker_only = (
+            "def uses_js(source):\n"
+            "    values = [getattr(source, 'header', '')]\n"
+            "    return any('@js:' in str(v) for v in values)\n")
+        other_json = (
+            "import json\n\n\n"
+            "def parse_tts_settings(fields):\n"
+            "    raw = str(fields.get('headers') or '')\n"
+            "    return json.loads(raw) if raw else {}\n")
+        for text in (marker_only, other_json):
+            self.assertEqual(scan_header_parsers(text, "quiet.py"), [],
+                             "扫描器把不解析 header 的探测误报成了第二份实现")
 
 
 if __name__ == "__main__":

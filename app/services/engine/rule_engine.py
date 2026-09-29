@@ -1119,17 +1119,6 @@ class ReaderEngine:
                 state["active"] = max(0, int(state.get("active", 0)) - 1)
 
     @staticmethod
-    def _source_headers(source) -> dict:
-        raw = getattr(source, "header", "") or ""
-        if isinstance(raw, dict):
-            return {str(k): str(v) for k, v in raw.items()}
-        try:
-            value = json.loads(raw) if raw.strip() else {}
-            return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
-        except (json.JSONDecodeError, AttributeError):
-            return {}
-
-    @staticmethod
     def _normalize_proxy(proxy: object) -> str:
         """Parse the fixed getProxyClient proxy grammar.
 
@@ -1152,10 +1141,68 @@ class ReaderEngine:
         transport_scheme = "http" if scheme == "http" else scheme
         return f"{transport_scheme}://{auth}{host}:{port}"
 
+    #: Legado 的 `source.getHeaderMap(true)`：先解析 `source.header`，缺 UA 补默认，
+    #: 最后叠登录头。声明里没脚本时这三步全是纯数据搬运，不必发求值——所以照搬形状。
+    _DYNAMIC_HEADER = re.compile(r"^\s*(?:@js:|<js>)", re.IGNORECASE)
+
+    def _static_header_map(self, source) -> dict | None:
+        """能直算就算完，返回 None 表示"这条例程必须回 QuickJS"。
+
+        回落的三种情形都有代价意识：动态声明（`@js:`/`<js>`）、值里出现非字符串（JS 的
+        `String(true)` 是 `"true"`，Python 是 `"True"`，不猜）、登录头不是可解析的对象。
+        语料实测（`resource/` 917 条快照，`.probe/header_shape_census.py`，09-29）：
+        95.5% 的源落在直算面内、只有 4.5% 是动态声明、含非字符串值的 header **0 条**，
+        所以这三条回落在当前语料上几乎不花钱。
+
+        这里**不看** `JsContext.request_headers`：Legado 侧 `__staticSourceHeaders`
+        会被请求头覆盖，而本函数的唯一调用方（下面的 `_resolved_source_headers`）从不传
+        request_headers。哪天有调用方传了，就必须在这里一起判掉。
+        """
+        raw = getattr(source, "header", "") or ""
+        if isinstance(raw, dict):
+            parsed = raw
+        elif isinstance(raw, str):
+            if self._DYNAMIC_HEADER.match(raw):
+                return None
+            try:
+                value = json.loads(raw) if raw.strip() else {}
+            except json.JSONDecodeError:
+                value = {}
+            parsed = value if isinstance(value, dict) else {}
+        else:
+            return None
+        if not all(isinstance(v, str) for v in parsed.values()):
+            return None
+        headers = {str(k): v for k, v in parsed.items()}
+        if not any(str(k).lower() == "user-agent" for k in headers):
+            headers["User-Agent"] = str(
+                self.js.default_headers.get("User-Agent", ""))
+        login = self.js_variables.get("source:loginHeader")
+        if login not in (None, ""):
+            if isinstance(login, str):
+                try:
+                    login = json.loads(login)
+                except json.JSONDecodeError:
+                    return None
+            if not isinstance(login, dict) or \
+                    not all(isinstance(v, str) for v in login.values()):
+                return None
+            headers.update({str(k): v for k, v in login.items()})
+        return headers
+
     async def _resolved_source_headers(self, source, base_url="") -> dict:
         # AnalyzeUrl initializes with source.getHeaderMap(true), not a direct
         # parse of source.header.  This also evaluates dynamic declarations,
         # supplies the default UA and overlays cached login headers.
+        #
+        # 静态声明走上面的直算：这条**每个 HTTP 请求**都跑一次，实测（09-29，127.0.0.1
+        # 假源，`.probe/header_map_fastpath.py`）一条静态 header 源的一轮检测发 5 次求值、
+        # dispatcher 串行占 44-49 ms；16 条源一轮 concurrency=8 的墙钟中位
+        # 762→455 ms、复跑一遍 746→460 ms（−38~40%，求值 80 → 0 次）。dispatcher 是
+        # 单线程的，省下的求值就是整轮墙钟。
+        fast = self._static_header_map(source)
+        if fast is not None:
+            return fast
         value = await self.js.evaluate_async(
             "@js:source.getHeaderMap(true)",
             JsContext(source=source, base_url=str(
