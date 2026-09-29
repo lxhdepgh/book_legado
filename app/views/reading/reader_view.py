@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
+from bisect import bisect_right
 
 import flet as ft
 
@@ -57,6 +58,10 @@ DEFAULT_PREFERENCES: dict = {
 }
 #: 版心宽度只认这三档（旧实现同规则：手改设置表的怪值一律退回"宽"）。
 _WIDTH_CHOICES = {620.0, 700.0, 760.0}
+#: 会把已挂出的正文**重排**的偏好键：这些变了，裸像素就不再指向原来那一段（#87）。
+#: 其余键（背景、状态栏、划词开关）只改颜色与可见性，像素位置原样不动。
+_REFLOW_KEYS = ("font_size", "line_height", "paragraph_spacing", "max_width",
+                "indent", "text_align", "font_family")
 #: 阅读背景 → (正文底色, 正文颜色)。夜间/墨水屏不是好不好看，是室外能不能读。
 _BACKGROUND_PALETTE: dict[str, tuple[str | None, str | None]] = {
     "follow": (None, None),
@@ -172,6 +177,12 @@ class ReaderView(ft.Column):
         # 版心的渲染尺寸是段级定位唯一的锚（#86 取证四：挂完布局就自己报上来，
         # 不用先滚一次——先滚一次会把续读进度写歪）。
         self._content_size: tuple[float, float] = (0.0, 0.0)
+        # 正文区当前像素与"重排后回位"的挂单：像素在两套装尺之间不是不变量，
+        # 重排前先把它换算成段号，客户端报来新的版心高后再按新尺子滚回去
+        # （#87 取证一：16→20 号字号原地重排，像素不动等于把用户扔退 49 段）。
+        self._last_scroll_pixels = 0.0
+        #: ``(段号, 重排前的版心高, 重排前的段数)``；高一变就回位一次并清空。
+        self._relocate_pending: tuple[int, float, int] | None = None
         self._content_host.size_change_interval = 100
         self._content_host.on_size_change = self._on_content_size
         self._reader_document = ft.Container(
@@ -182,7 +193,7 @@ class ReaderView(ft.Column):
                               spacing=12))
         self._reader_scroll = ft.Column(
             expand=True, scroll=ft.ScrollMode.AUTO, scroll_interval=200,
-            on_scroll=lambda e: self._fire(self.on_save_scroll, e),
+            on_scroll=self._on_document_scroll,
             controls=[ft.Row([self._reader_document],
                              alignment=ft.MainAxisAlignment.CENTER)])
         self._progress_label = ft.Text(
@@ -565,6 +576,9 @@ class ReaderView(ft.Column):
             # 上一张文档的渲染高就此作废：整篇换章后它还挂在 `_content_size` 上时，
             # 段级定位会拿旧高度把用户滚到别的段（客户端要重新报一次尺寸）。
             self._content_size = (0.0, 0.0)
+            # 像素与回位挂单同属上一张文档，留着会让下一次重排按旧书的段号回位。
+            self._last_scroll_pixels = 0.0
+            self._relocate_pending = None
         elif chapter_name:
             # 章节分隔标题不打正文标记：排版重排只认正文段。
             target.extend([
@@ -799,9 +813,25 @@ class ReaderView(ft.Column):
 
         每个值都夹回可用区间：这些数字来自设置表，手改过的怪值（行距 0、宽度
         负数）会把正文挤成一条线，而不只是"难看一点"。
+
+        重排会改动每段的高度，而滚动位置是按像素存的——像素不动等于把人挪段。
+        所以重排前先在旧尺子下把像素换算成段号，等客户端报来新的版心高再滚回那
+        一段（#87 取证一：300 段对话体从 16 号换 20 号，不补偿实测退 49 段）。
         """
         merged = dict(self._preferences)
         merged.update(preferences or {})
+        # 换算必须在旧装尺还挂着的时候做：新字号一写进 `_preferences`，
+        # `paragraph_at_pixel` 量的就是那把还没生效的新尺子了。
+        if self._relocate_pending is not None:
+            # 上一次重排还没兑现（新的版心高没报上来）：`_last_scroll_pixels` 还是
+            # 那套更旧的尺子下的数，再换算一次就是把两套装尺混搭。段号才是不变量。
+            anchor = self._relocate_pending[0]
+        elif self._last_scroll_pixels > 0:
+            anchor = self.paragraph_at_pixel(self._last_scroll_pixels)
+        else:
+            anchor = None
+        reflowed = any(merged.get(key) != self._preferences.get(key)
+                       for key in _REFLOW_KEYS)
         merged["font_size"] = self._clamped_int(
             merged.get("font_size"), _MIN_FONT_SIZE, _MAX_FONT_SIZE,
             DEFAULT_PREFERENCES["font_size"])
@@ -843,6 +873,11 @@ class ReaderView(ft.Column):
 
         alignment = (ft.TextAlign.JUSTIFY if merged["text_align"] == "justify"
                      else ft.TextAlign.START)
+        # 第 0 段不挂单：它的段顶本来就是 0，那点像素重排后仍在那一段里，
+        # 滚去 0 反倒把人从第一段中间弹回章首。
+        pending_anchor = anchor if (reflowed and anchor) else None
+        baseline = float(self._content_size[1])
+        paragraphs = self.paragraph_count()
         for control in self._content_host.controls:
             role = getattr(control, "data", None)
             if role not in {_TEXT_BLOCK, _HEADING_BLOCK}:
@@ -862,6 +897,11 @@ class ReaderView(ft.Column):
                     control.value = "　　" + raw
                 elif not merged["indent"]:
                     control.value = raw
+        # 挂单交给尺寸事件兑现（`_on_content_size`）：新装尺下的版心高没报上来之前，
+        # 任何一次滚动都是拿旧高度乘新段高，那是个看着合理、实则偏移的数。
+        self._relocate_pending = (
+            (int(pending_anchor), baseline, paragraphs)
+            if pending_anchor is not None else None)
         return dict(merged)
 
     @staticmethod
@@ -997,17 +1037,99 @@ class ReaderView(ft.Column):
 
     def restore_scroll(self, offset: float) -> None:
         """续读定位：把正文滚到章内绝对偏移（瞬时，无动画）。"""
+        try:
+            self._last_scroll_pixels = max(0.0, float(offset))
+        except (TypeError, ValueError):
+            pass
         self._run(self._reader_scroll.scroll_to(offset=float(offset), duration=0))
 
     def _on_content_size(self, event) -> None:
         self._content_size = (float(getattr(event, "width", 0) or 0.0),
                               float(getattr(event, "height", 0) or 0.0))
+        self._correct_relocation()
+
+    def _correct_relocation(self) -> None:
+        """就地重排后回到原来那一段：新版心高报上来，按新尺子滚一次。
+
+        挂单只在**版心高真的变了**时才兑现——重排完高度没变（例如同行数的对齐方式）
+        就说明屏幕上那段本来就没动，多滚一次反倒会把位置写歪。段数对不上说明文档
+        在等尺寸的这几百毫秒里被追加过（自动续读），此时用户要看的已经不是那段。
+        """
+        pending = self._relocate_pending
+        if pending is None:
+            return
+        anchor, baseline, paragraphs = pending
+        height = float(self._content_size[1])
+        if height <= 0 or height == baseline:
+            return
+        self._relocate_pending = None
+        if self.paragraph_count() != paragraphs:
+            return
+        self.scroll_to_paragraph(anchor)
+
+    def _on_document_scroll(self, event) -> None:
+        """先记下正文像素，再转给 Controller 落库。
+
+        记下的是**当前这套装尺下**的像素：就地重排（改字号/版心）时它是唯一能把
+        屏幕位置换算回段号的凭据（#87）。
+        """
+        pixels = getattr(event, "pixels", None)
+        if pixels is not None:
+            try:
+                self._last_scroll_pixels = max(0.0, float(pixels))
+            except (TypeError, ValueError):
+                pass
+        self._fire(self.on_save_scroll, event)
 
     def paragraph_count(self) -> int:
         """当前挂载文档里的正文段数（与书内索引的 para_index 同一口径）。"""
         return sum(1 for control in self._content_host.controls
                    if getattr(control, "data", None)
                    in (_TEXT_BLOCK, _HEADING_BLOCK))
+
+    def _paragraph_units(self) -> list[float]:
+        """每段在当前装尺下的模型高度（px），与挂载顺序一一对应。
+
+        正函数（:meth:`paragraph_pixel`）与反函数（:meth:`paragraph_at_pixel`）共用
+        这一份，两套装尺之间换算才不会各算各的。宽度取客户端报来的版心渲染宽，
+        还没量到时返回空表——宁可不换算，也不拿猜出来的宽度算出个像模像样的错值。
+        """
+        width = float(self._content_size[0])
+        if width <= 0:
+            return []
+        units: list[float] = []
+        for control in self._content_host.controls:
+            if getattr(control, "data", None) not in (_TEXT_BLOCK, _HEADING_BLOCK):
+                continue
+            size = float(getattr(control, "size", 0) or self._font_size)
+            multiplier = float(
+                getattr(getattr(control, "style", None), "height", None)
+                or self._preferences["line_height"])
+            per_line = max(1.0, math.floor(width / size))
+            text = str(getattr(control, "value", "") or "")
+            units.append(max(1, math.ceil(len(text) / per_line)) * size * multiplier
+                         + float(self._preferences["paragraph_spacing"]))
+        return units
+
+    def _paragraph_tops(self) -> list[float]:
+        """每段段顶的像素 y（第 0 段是 0）；量不到装尺时返回空表。
+
+        正反两个方向都从这张表出发：段顶是 ``高度 ×（前缀和 / 总高）``，而 Python
+        的 ``sum()`` 对浮点走的是补偿求和，和自己一项项累加**差最后一两个 bit**——
+        两个方向各算各的前缀和，段顶像素就会掉进上一段的带里，反查回 239 段这种
+        "差一段"看着无害，重排几次越走越偏（#87）。
+        """
+        height = float(self._content_size[1])
+        units = self._paragraph_units()
+        total = sum(units)
+        if height <= 0 or total <= 0:
+            return []
+        tops: list[float] = []
+        walked = 0.0
+        for unit in units:
+            tops.append(height * (walked / total))
+            walked += unit
+        return tops
 
     def paragraph_pixel(self, paragraph_index: int) -> float | None:
         """第 n 段段首在版心里的像素 y；没量到渲染尺寸时返回 None。
@@ -1018,27 +1140,25 @@ class ReaderView(ft.Column):
         本身有百分之几的偏差，整篇缩一次就把偏差吸收掉了：对话密集的开头
         （前 100 段每段一二十字）最坏差 **0.1 段**，而按字符占比折算
         （``ChapterViewport.track`` 那把尺）最坏差 **13.3 段**——差十几段等于没跳。
+
+        段首 y = 前面那些段占的高度；版心之上还有章名与内衬，按版心坐标滚会让
+        命中段落在屏幕偏下处——偏下看得见，偏上就被顶出屏幕了，所以不做补偿。
         """
-        width, height = self._content_size
-        line_px: list[float] = []
-        for control in self._content_host.controls:
-            if getattr(control, "data", None) not in (_TEXT_BLOCK, _HEADING_BLOCK):
-                continue
-            size = float(getattr(control, "size", 0) or self._font_size)
-            multiplier = float(
-                getattr(getattr(control, "style", None), "height", None)
-                or self._preferences["line_height"])
-            per_line = max(1.0, math.floor(width / size))
-            text = str(getattr(control, "value", "") or "")
-            line_px.append(max(1, math.ceil(len(text) / per_line)) * size * multiplier
-                           + float(self._preferences["paragraph_spacing"]))
-        total = sum(line_px)
-        if height <= 0 or total <= 0:
+        tops = self._paragraph_tops()
+        if not tops:
             return None
-        index = max(0, min(int(paragraph_index), len(line_px) - 1))
-        # 段首 y = 前面那些段占的高度；版心之上还有章名与内衬，按版心坐标滚会让
-        # 命中段落在屏幕偏下处——偏下看得见，偏上就被顶出屏幕了，所以不做补偿。
-        return height * (sum(line_px[:index]) / total)
+        return tops[max(0, min(int(paragraph_index), len(tops) - 1))]
+
+    def paragraph_at_pixel(self, pixel: float) -> int | None:
+        """:meth:`paragraph_pixel` 的反函数：这个像素此刻压在第几段上。
+
+        就地重排换的是尺子，不是位置：重排前先把裸像素换算成段号（段号才是那个
+        不变量），重排后再用 :meth:`paragraph_pixel` 按新尺子滚回去（#87）。
+        """
+        tops = self._paragraph_tops()
+        if not tops:
+            return None
+        return max(0, bisect_right(tops, float(pixel)) - 1)
 
     def scroll_to_paragraph(self, paragraph_index: int) -> bool:
         """滚到第 n 段（瞬时）。渲染尺寸还没报上来时返回 False，调用方自行重试。"""
