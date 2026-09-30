@@ -455,6 +455,10 @@ class LegadoJsRuntime:
         self.timeout = timeout
         self.cookies = CookieJar()
         self._session_persistent_shadow = {}
+        #: cookie 罐的版本号：**只在** :meth:`_persist_cookie_state` 里、且只有罐真的
+        #: 变了才 +1。写侧（rule_engine._persist_source_cookie_jar）拿它当脏闸门，
+        #: 免得每个 HTTP 响应都重写整罐（实测每响应 3.6~13.1 ms，随整库规模线性涨）。
+        self.cookie_revision = 0
         self.opener = build_opener(HTTPCookieProcessor(self.cookies),
                                    HTTPSHandler(context=_unverified_ssl_context()))
         # [M1-2.20] 硬编码 UA 收敛为全局偏好（SettingsService.userAgent），
@@ -585,7 +589,7 @@ class LegadoJsRuntime:
             if item is not None:
                 ordered.append(item)
         persistent = ordered + list(by_key.values())
-        self.persistent_state["cookies"] = [{
+        rebuilt = [{
             "name": item.name, "value": item.value,
             "domain": item.domain,
             "domainSpecified": item.domain_specified,
@@ -594,6 +598,15 @@ class LegadoJsRuntime:
             "secure": item.secure, "expires": item.expires,
             "rest": dict(item._rest or {}),
         } for item in persistent]
+        # 脏闸门：罐真的没变就一次 I/O 都不排（整份 JSON 原子写 + 上层 SQLite）。
+        # 每次 HTTP 响应都重写整罐是"检测越跑越慢"的 headliner：单价实测
+        # 3.6 ms（16 条罐）→ 13.1 ms（2048 条罐），而且跑在引擎循环线程上。
+        # 版本号只在这里 +1，写侧（rule_engine._persist_source_cookie_jar）按它决定
+        # 要不要落库——所以这里**必须**在 bump 之前比旧值。
+        if rebuilt == self.persistent_state.get("cookies"):
+            return
+        self.persistent_state["cookies"] = rebuilt
+        self.cookie_revision += 1
         self._save_persistent_state()
 
     def persistent_cookie_snapshot(self) -> str | None:

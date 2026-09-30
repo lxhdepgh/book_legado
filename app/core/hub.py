@@ -137,6 +137,91 @@ class ServiceHub:
             except Exception:
                 logger.exception("EngineHub loop 收尾异常")
 
+    def _dependent_closure(self, stype: type[Service]) -> set[type[Service]]:
+        """目标服务 + 它的**全部下游消费者**（传递闭包）。
+
+        重启为什么必须连带下游：`require()` 给的永远是同一个实例（:meth:`require`），
+        总控也不会在 stop 之后重建它。所以只把被重启的那个服务停到 DISPOSED、
+        消费者却一动不动，等于让一堆服务继续拿着一条已经退役的依赖跑——
+        现象是"重启了存储，书架照样读写"，直到下一次进程退出。
+        """
+        edges: dict[type[Service], list[type[Service]]] = defaultdict(list)
+        for consumer, svc in self._services.items():
+            for dep in svc.dependencies:
+                if dep in self._services:
+                    edges[dep].append(consumer)
+        seen: set[type[Service]] = {stype}
+        stack = [stype]
+        while stack:
+            for nxt in edges[stack.pop()]:
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return seen
+
+    def _upstream_retired(self, stype: type[Service]) -> set[type[Service]]:
+        """目标服务**已经退役（DISPOSED）的上游依赖**（传递闭包）。
+
+        只收 DISPOSED，不收 SUSPENDED：挂起是人有意按下去的（释放浏览器这类重资源），
+        重启一个消费者不该擅自把它挂起的依赖也拉起来。DISPOSED 不一样——被重启的服务
+        在 `on_start` 里就要用依赖（`require()` 拿到的永远是同一个死实例），
+        不把它一起复活的重启等于当场把那一行做成"运行中但降级"。
+        """
+        found: set[type[Service]] = set()
+        stack = [stype]
+        while stack:
+            for dep in self._services[stack.pop()].dependencies:
+                svc = self._services.get(dep)
+                if svc is None or dep in found:
+                    continue
+                if svc.status.state is ServiceState.DISPOSED:
+                    found.add(dep)
+                    stack.append(dep)
+        return found
+
+    def restartable(self, service_id: str) -> bool:
+        """这一行能不能单行重启：查不到实例的行（总控自身）与 EngineHub 都不行。
+
+        EngineHub 的守护 loop 正是**执行这次重启的那个协程所在的 loop**——停它等于
+        把自己脚下那块拆掉，收尾顺序只有进程退出时的 :meth:`shutdown` 那条路能保证。
+        """
+        svc = self.service_by_id(service_id)
+        return svc is not None and svc is not self._engine
+
+    async def restart_service(self, service_id: str) -> list[str]:
+        """重启单个服务：连带它的**下游消费者**与**已退役的上游依赖**。
+
+        返回本轮真正处理过的服务名（按依赖序），空列表表示这一行不可重启
+        （:meth:`restartable`）。
+
+        顺序不能反：停的时候要先把消费者拆干净再动依赖（否则消费者在依赖已经
+        关掉的连接上继续跑），起的时候必须先起依赖。这与 :meth:`start_all` /
+        :meth:`stop_all` 用的是同一张拓扑序，只是取其中的连通子图。
+
+        单个服务失败不阻断其余（§4.4 异常策略照搬 start_all）：失败的那一行会经
+        状态迁移事件在仪表盘上显示成 SUSPENDED + last_error，由人决定要不要
+        再点一次。
+        """
+        if not self.restartable(service_id):
+            return []
+        target = self.service_by_id(service_id)
+        affected = (self._dependent_closure(type(target))
+                    | self._upstream_retired(type(target)))
+        order = [t for t in self._topo_order() if t in affected]
+        for stype in reversed(order):
+            svc = self._services[stype]
+            try:
+                await svc.stop()
+            except Exception:
+                logger.exception("重启时停止服务 %s 异常，继续下游", svc.name)
+        for stype in order:
+            svc = self._services[stype]
+            try:
+                await svc.start()
+            except Exception:
+                logger.exception("重启时启动服务 %s 异常，继续其余", svc.name)
+        return [self._services[t].name for t in order]
+
     # ------------------------------------------------------------------ #
     # 状态可见性
     # ------------------------------------------------------------------ #

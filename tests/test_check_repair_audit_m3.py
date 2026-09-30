@@ -43,8 +43,12 @@ class RecordingBus:
 
 
 async def fake_checker(sources, concurrency=8, timeout=12, on_result=None,
-                       auto_disable=False):
-    """离线检测替身：不发网络，按序号造结果并逐条回调 on_result。"""
+                       auto_disable=False, depth="full"):
+    """离线检测替身：不发网络，按序号造结果并逐条回调 on_result。
+
+    ``depth`` 是 check_sources 的真实形参（分级检测），替身照收——服务那侧
+    是否把深度转下去，由 test_check_depth_tiering 钉住。
+    """
     results = []
     for i, s in enumerate(sources, 1):
         state = "blocked" if i == 1 else "fully_usable"
@@ -160,6 +164,33 @@ class TestCheckServiceLifecycle(unittest.IsolatedAsyncioTestCase):
         assert summary[0]["check_state"] == "blocked"
         assert summary[1]["check_state"] == "fully_usable"
 
+    async def test_event_carries_the_planned_denominator(self):
+        """发布方把 done/total 挂上事件：视图自己数完成的条数只会得出 12/12。
+
+        流水线那边本来就有这两个数（``on_result(result, done, total)``），钉的是
+        "每一个事件都带着**计划规模**当分母"，而不是"最后一条等于总数"。
+        """
+        bus = RecordingBus()
+        srcs = [BookSource.from_dict({**REPAIR_SOURCE,
+                                      "bookSourceUrl": f"https://s{i}.example.com"})
+                for i in range(5)]
+        svc = SourceCheckService(checker=fake_checker)
+        svc.bus = bus
+        await svc._run_checks(srcs)
+        events = [e for e in bus.events if isinstance(e, CheckFinishedEvent)]
+        assert len(events) == 5
+        assert [e.total for e in events] == [5] * 5, "分母该是计划规模，每条都带"
+        assert [e.done for e in events] == [1, 2, 3, 4, 5]
+
+    async def test_single_source_event_says_the_plan_size(self):
+        """单源检测：total=1、done=1（分母不是 0，界面不用猜）。"""
+        bus = RecordingBus()
+        svc = SourceCheckService(checker=fake_checker)
+        svc.bus = bus
+        await svc.check_source(REPAIR_SOURCE)
+        ev = bus.events[0]
+        assert (ev.done, ev.total) == (1, 1)
+
     async def test_blocked_verdict_flows_into_event(self):
         bus = RecordingBus()
         svc = SourceCheckService(checker=fake_checker)
@@ -200,9 +231,134 @@ class TestCheckServiceLifecycle(unittest.IsolatedAsyncioTestCase):
                                  compat_audit=FakeCompat())
         svc.bus = RecordingBus()
         await svc.check_source(REPAIR_SOURCE)
-        # 复跑审计是 fire-and-forget 任务，让它跑一个调度节拍
-        await asyncio.sleep(0)
+        # 收尾（_drain_audits）就在这一轮里等完，不再留没人等的后台尾巴
         assert recorded == ["https://www.po5.net"]
+
+
+# --------------------------------------------------------------------------- #
+# 1b. 触发点③的扇出上限（越跑越慢的第二笔账：整罐 cookie 之外就是这里）
+# --------------------------------------------------------------------------- #
+def _fanout_sources(n: int) -> list[BookSource]:
+    return [BookSource.from_dict({**REPAIR_SOURCE,
+                                  "bookSourceUrl": f"https://s{i}.example.com"})
+            for i in range(n)]
+
+
+async def _fanout_checker(sources, concurrency=8, timeout=12, on_result=None,
+                          auto_disable=False, depth="full"):
+    """逐源回调的检测替身：每源之间让出一次，好把审计的并发形状照出来。"""
+    results = []
+    for i, source in enumerate(sources, 1):
+        payload = {"idx": i, "name": source.bookSourceName,
+                   "raw_url": source.bookSourceUrl, "check_state": "fully_usable",
+                   "usable": True, "status": "ok"}
+        results.append(payload)
+        if on_result:
+            on_result(payload, i, len(sources))
+        await asyncio.sleep(0)      # 把刚 create_task 的审计放上线
+    return results
+
+
+class _CountingCompat:
+    """记账替身（子类约束见记忆 `guard-tests-assert-absence`：这里必须是同形状协程）。
+
+    `audit_source` 里 await 一段假 CPU——真实审计是 ~12 ms 的纯 Python 遍历加两条
+    `to_thread`；扇出有没有被限住，就看同时有几条卡在这个 await 上。
+    """
+
+    def __init__(self, hold: float = 0.02) -> None:
+        self.running = 0
+        self.peak = 0
+        self.calls: list[str] = []
+        self.hold = hold
+
+    async def audit_source(self, data):
+        self.running += 1
+        self.peak = max(self.peak, self.running)
+        try:
+            await asyncio.sleep(self.hold)
+            self.calls.append(str(data.get("bookSourceUrl")))
+        finally:
+            self.running -= 1
+
+
+class TestAuditFanOutBound(unittest.IsolatedAsyncioTestCase):
+    N = 24
+
+    async def _service(self, compat):
+        return SourceCheckService(checker=_fanout_checker, compat_audit=compat)
+
+    async def test_fan_out_never_exceeds_the_declared_cap(self):
+        """护栏钉"没发生"：并发从未越过 AUDIT_CONCURRENCY。"""
+        from app.services.sources import source_check_service as shell
+        compat = _CountingCompat()
+        svc = await self._service(compat)
+        await svc._run_checks(_fanout_sources(self.N))
+        self.assertLessEqual(compat.peak, shell.AUDIT_CONCURRENCY,
+                             f"审计并发冲到 {compat.peak}，上限写的是 {shell.AUDIT_CONCURRENCY}")
+        self.assertEqual(len(compat.calls), self.N, "有审计被限丢了")
+
+    async def test_the_cap_actually_lets_that_many_through(self):
+        """反证：上限不是"永远只跑一条"——照出的并发必须真的等于上限。
+
+        上一栏只写 `peak <= 2` 的话，把上限改成 1、或让闸门永远只放一条，都能蒙过去。
+        """
+        from app.services.sources import source_check_service as shell
+        compat = _CountingCompat()
+        svc = await self._service(compat)
+        await svc._run_checks(_fanout_sources(self.N))
+        self.assertEqual(compat.peak, shell.AUDIT_CONCURRENCY)
+
+    async def test_no_audit_is_still_running_when_the_run_returns(self):
+        """收尾：`_run_checks` 返回时不该还有在跑的审计（占的是下一条检测的线程池）。"""
+        compat = _CountingCompat(hold=0.03)
+        svc = await self._service(compat)
+        await svc._run_checks(_fanout_sources(self.N))
+        self.assertEqual(compat.running, 0)
+        self.assertEqual(len(svc._audit_tasks), 0,
+                         "任务引用没被回收（done 回调没接上？）")
+
+    async def test_each_run_builds_its_own_gate(self):
+        """信号量必须每轮新建：它第一次 await 就认死当前循环，跨轮/跨循环复用会抛
+        "bound to a different event loop"（服务重启、单测每条各起一条循环都会换循环）。
+        """
+        compat = _CountingCompat(hold=0.001)
+        svc = await self._service(compat)
+        await svc._run_checks(_fanout_sources(4))
+        first = svc._audit_sem
+        self.assertIsNotNone(first, "这一轮根本没建闸门")
+        await svc._run_checks(_fanout_sources(4))
+        self.assertIsNot(svc._audit_sem, first, "第二轮还在拿第一轮那把信号量")
+        self.assertEqual(len(compat.calls), 8, "换闸门后审计断了一半")
+
+    async def test_cancelling_the_run_also_stops_the_audit_tail(self):
+        """停检测就得把排出去的审计一起收掉，不留"服务停了后台还在写 audit_log"。"""
+        hold = asyncio.Event()
+
+        async def stopping_checker(sources, concurrency=8, timeout=12,
+                                   on_result=None, auto_disable=False,
+                                   depth="full"):
+            for i, source in enumerate(sources, 1):
+                payload = {"idx": i, "name": source.bookSourceName,
+                           "raw_url": source.bookSourceUrl,
+                           "check_state": "fully_usable", "usable": True, "status": "ok"}
+                if on_result:
+                    on_result(payload, i, len(sources))
+                await hold.wait()          # 第一条结果出来后整条流水线钉住
+            return []
+
+        compat = _CountingCompat(hold=0.02)
+        svc = SourceCheckService(checker=stopping_checker, compat_audit=compat)
+        task = asyncio.create_task(svc._run_checks(_fanout_sources(6)))
+        await asyncio.sleep(0.005)         # 让审计任务排上去（并发正好等于上限）
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        for _ in range(5):
+            await asyncio.sleep(0)         # 被取消的审计要跑完自己的 finally
+        self.assertEqual(compat.running, 0, "取消后还有审计在跑")
+        self.assertEqual(compat.calls, [], "取消后还有审计落到底（写进了 audit_log）")
+        self.assertTrue(all(t.done() for t in svc._audit_tasks))
 
 
 # --------------------------------------------------------------------------- #

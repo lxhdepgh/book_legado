@@ -40,13 +40,22 @@ class CheckView(ft.Column):
         super().__init__(spacing=10, expand=True)
 
         # -- 回调槽（Controller 填充） --
-        self.on_start = None          # () -> None
+        self.on_start = None          # (depth: str) -> None
         self.on_stop = None           # () -> None
 
         self._title = ft.Text("书源检测", size=24, weight=ft.FontWeight.BOLD)
+        # 分级检测：验到列表还是验到正文。正文链路是唯一会翻倍的段（3 候选 ×
+        # detail/catalog/content），实测占两段规则耗时 74.7%（.probe/check_tier_depth.py），
+        # 全库先跑"快速"这一档，再对活着的源补验正文，比一次跑完便宜得多。
+        self._depth = ft.Dropdown(
+            value="full", dense=True, width=190,
+            options=[ft.dropdown.Option("full", "完整：验到正文"),
+                     ft.dropdown.Option("list", "快速：只验列表")],
+            on_select=lambda e: setattr(self, "depth", getattr(e, "value", "full")))
+        self.depth = "full"
         self._start_btn = ft.FilledButton(
             "开始检测", icon=ft.Icons.PLAY_ARROW,
-            on_click=lambda e: self._fire(self.on_start))
+            on_click=lambda e: self._fire(self.on_start, self.depth))
         self._stop_btn = ft.OutlinedButton(
             "停止", icon=ft.Icons.STOP, disabled=True,
             on_click=lambda e: self._fire(self.on_stop))
@@ -59,7 +68,7 @@ class CheckView(ft.Column):
 
         self.controls = [
             self._title,
-            ft.Row([self._start_btn, self._stop_btn], spacing=8),
+            ft.Row([self._start_btn, self._stop_btn, self._depth], spacing=8),
             self._progress,
             self._summary,
             ft.Divider(height=1),
@@ -100,8 +109,17 @@ class CheckView(ft.Column):
         """检测运行态：开始按钮禁用/停止按钮启用。"""
         self._start_btn.disabled = running
         self._stop_btn.disabled = not running
+        # 深度在跑起来就改不了了（这一轮已经按启动时的深度派出去了），禁用别给人
+        # 一种"改了会立刻生效"的错觉。
+        self._depth.disabled = running
         if text:
             self._summary.value = text
+
+    def set_depth(self, depth: str) -> None:
+        """回放上一轮/别人启动那轮用的深度，界面下拉跟着回到同一档。"""
+        value = depth if depth in {"full", "list"} else "full"
+        self._depth.value = value
+        self.depth = value
 
     def set_progress(self, done: int, total: int) -> None:
         self._progress.value = done / max(total, 1)

@@ -101,6 +101,136 @@ def test_hub_topo_start_stop_order():
 
 
 # --------------------------------------------------------------------- #
+# 1b. 单服务重启（仪表盘「重启」按钮的编排面）
+# --------------------------------------------------------------------- #
+class _TopC(Service):
+    name = "TopC"
+    dependencies = (_TopB,)
+
+
+class _Side(Service):
+    name = "Side"
+    dependencies = ()
+
+
+def _spy(svc: Service, calls: list[str]) -> Service:
+    """把 on_start/on_stop 换成记账（真实服务重启要碰数据库/浏览器，测试不碰）。"""
+
+    async def _start():
+        calls.append(f"start:{svc.name}")
+
+    async def _stop():
+        calls.append(f"stop:{svc.name}")
+
+    svc.on_start = _start  # type: ignore[method-assign]
+    svc.on_stop = _stop    # type: ignore[method-assign]
+    return svc
+
+
+def _restart_hub(services: list[Service]) -> ServiceHub:
+    """按**乱序**注册（消费者先注册），保证结论只能来自拓扑排序而不是注册序。"""
+    engine = engine_hub()
+    hub = ServiceHub(bus=EventBus(engine=engine), engine=engine)
+    for svc in reversed(services):
+        hub.register(svc)
+    return hub
+
+
+def test_restart_covers_downstream_in_topo_order():
+    """重启 A 必须连带下游 B、C：停逆序（C→B→A），起正序（A→B→C）。
+
+    `require()` 给的永远是同一个实例、总控也不重建，所以只把 A 停到 DISPOSED、
+    B/C 照原样跑 = 一群服务拿着已经退役的依赖继续干活。
+    """
+    calls: list[str] = []
+    a, b, c, side = (_spy(_TopA(), calls), _spy(_TopB(), calls),
+                    _spy(_TopC(), calls), _spy(_Side(), calls))
+    hub = _restart_hub([a, b, c, side])
+    calls.clear()
+
+    names = asyncio.run(hub.restart_service("TopA"))
+
+    assert names == ["TopA", "TopB", "TopC"], f"重启范围/顺序错: {names}"
+    assert calls == ["stop:TopC", "stop:TopB", "stop:TopA",
+                     "start:TopA", "start:TopB", "start:TopC"], calls
+    assert "stop:Side" not in calls and "start:Side" not in calls, \
+        "与重启目标无关的服务被惊动了"
+    states = {s.service_id: s.state for s in hub.status_report()}
+    assert states["TopC"] is ServiceState.RUNNING
+
+
+def test_restart_revives_retired_upstream_but_not_suspended_one():
+    """依赖已经退役就一起复活；人**有意挂起**的依赖不许擅自拉起。"""
+    calls: list[str] = []
+    a, b = _spy(_TopA(), calls), _spy(_TopB(), calls)
+    hub = _restart_hub([a, b])
+
+    asyncio.run(hub.stop_all())         # 两行都 DISPOSED
+    calls.clear()
+    names = asyncio.run(hub.restart_service("TopB"))
+    assert names == ["TopA", "TopB"], f"退役的上游没被一起复活: {names}"
+    # 已经 DISPOSED 的服务，stop() 是空转（基类守卫直接 return），所以这里
+    # 只有 start 记账——别把它当成"没停"。
+    assert calls == ["start:TopA", "start:TopB"], calls
+    states = {s.service_id: s.state for s in hub.status_report()}
+    assert states["TopA"] is ServiceState.RUNNING
+
+    calls.clear()
+    asyncio.run(a.suspend())            # 人按下去的挂起
+    calls.clear()
+    names = asyncio.run(hub.restart_service("TopB"))
+    assert names == ["TopB"], f"SUSPENDED 的上游被擅自拉起了: {names}"
+    assert calls == ["stop:TopB", "start:TopB"], calls
+    states = {s.service_id: s.state for s in hub.status_report()}
+    assert states["TopA"] is ServiceState.SUSPENDED
+
+
+def test_restart_of_uncontrollable_id_dispatches_nothing():
+    """护栏钉"没发生"：不可重启的行不许动任何服务。
+
+    两类：总控自身那一行（查不到实例），以及 **EngineHub**——它查得到实例，
+    但执行这次重启的协程正跑在它那条守护 loop 上，停它等于把自己脚下那块拆掉。
+    旧实现只防了前者，绕开 UI 直接调编排入口就能把后者按下去。
+    """
+    calls: list[str] = []
+    a = _spy(_TopA(), calls)
+    engine = EngineHub(name="legado-restart-guard-test")
+    hub = ServiceHub(bus=EventBus(engine=engine), engine=engine)
+    hub.register(engine)
+    hub.register(a)
+    calls.clear()
+
+    assert hub.restartable("ServiceHub") is False
+    assert hub.restartable("EngineHub") is False
+    assert hub.restartable("TopA") is True
+    assert asyncio.run(hub.restart_service("ServiceHub")) == []
+    assert asyncio.run(hub.restart_service("EngineHub")) == []
+    assert asyncio.run(hub.restart_service("并不存在")) == []
+    assert calls == [], f"不可控行了却动了服务: {calls}"
+    assert engine.status.state is ServiceState.INIT, "EngineHub 被按停了"
+    engine.shutdown()
+
+
+def test_restart_keeps_going_when_one_service_fails():
+    """单个服务起不来不阻断整串（与 start_all 同一异常策略 §4.4）。"""
+    calls: list[str] = []
+    a, b = _spy(_TopA(), calls), _spy(_TopB(), calls)
+
+    async def broken():
+        raise RuntimeError("资源没起来")
+
+    a.on_start = broken  # type: ignore[method-assign]
+    hub = _restart_hub([a, b])
+
+    names = asyncio.run(hub.restart_service("TopA"))
+    assert names == ["TopA", "TopB"]
+    states = {s.service_id: s.state for s in hub.status_report()}
+    assert states["TopA"] is ServiceState.SUSPENDED, "启动失败应停在 SUSPENDED"
+    assert states["TopB"] is ServiceState.RUNNING, f"上游失败拖死了下游: {states}"
+    assert a.status.last_error and "资源没起来" in a.status.last_error
+
+
+# --------------------------------------------------------------------- #
 # 2. EventBus 订阅 / 发布 / 退订 / 异常隔离
 # --------------------------------------------------------------------- #
 def test_eventbus_pub_sub_unsubscribe():

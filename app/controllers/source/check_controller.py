@@ -32,9 +32,10 @@ def _summary_line(snap: dict) -> str:
         return "检测已停止"
     summary = snap.get("summary")
     if isinstance(summary, dict):
+        depth = "（快速检测，未验正文）" if snap.get("depth") == "list" else ""
         return (f"检测完成：可用 {summary.get('usable', 0)}/"
                 f"{summary.get('total', 0)}，"
-                f"阻断 {summary.get('blocked', 0)}")
+                f"阻断 {summary.get('blocked', 0)}{depth}")
     return ""
 
 
@@ -47,6 +48,7 @@ class CheckController(BaseController):
         self._check = self._safe_service(SourceCheckService)
         self._seen: set[str] = set()
         self._total = 0
+        self._depth = "full"
         self._running = False
         self._view.on_start = self.start
         self._view.on_stop = self.stop
@@ -67,7 +69,7 @@ class CheckController(BaseController):
     # ------------------------------------------------------------------ #
     # 启动 / 停止
     # ------------------------------------------------------------------ #
-    def start(self, _=None) -> None:
+    def start(self, depth: str = "full") -> None:
         if self._check is None:
             self._view.set_summary("SourceCheckService 未就绪（并行集成中）")
             return
@@ -76,6 +78,7 @@ class CheckController(BaseController):
             return
         self._seen.clear()
         self._total = 0
+        self._depth = depth
         self._running = True
         self._view.set_running(True, "检测已启动…")
         self.ui_call(self._run())
@@ -83,7 +86,7 @@ class CheckController(BaseController):
     async def _run(self) -> None:
         """跑完这一轮再按服务快照重画：收尾那一行不该只给启动它的视图看到。"""
         try:
-            await self._check.check_all()
+            await self._check.check_all(depth=self._depth)
         except asyncio.CancelledError:
             logger.info("检测已按请求停止")
         except Exception as exc:
@@ -157,6 +160,10 @@ class CheckController(BaseController):
         """快照 → 界面（幂等：``render_result`` 按 source_id 覆盖同名行）。"""
         results = list(snap.get("results") or [])
         self._total = int(snap.get("total") or 0)
+        # 下拉回到这一轮**实际用的**深度：别人（上一份视图）启动的那轮可能是快速。
+        self._depth = snap.get("depth") or self._depth
+        if hasattr(self._view, "set_depth"):
+            self._view.set_depth(self._depth)
         self._seen = {str(entry.get("source_id") or "") for entry in results}
         for entry in results:
             self._view.render_result(entry.get("source_id", ""),
@@ -179,11 +186,15 @@ class CheckController(BaseController):
         self._view.render_result(event.source_id, event.state_class, event.summary)
         if event.source_id:
             self._seen.add(event.source_id)
+        # 分母只能由发布方给（事件里的 total = 本轮计划规模）：本视图启动的那一轮
+        # 不会走 `_render` 回放，`self._total` 一直是 0，进度就只能显示 12/12。
+        if event.total:
+            self._total = int(event.total)
         self._update_progress()
 
     def _update_progress(self) -> None:
-        """总进度用本轮快照的 total（不再从 0-1 比例反推）。"""
+        """总进度用本轮的计划规模；没拿到分母就不动进度条（不再用完成数冒充）。"""
         done = len(self._seen)
-        if not done:
+        if not done or not self._total:
             return
-        self._view.set_progress(done, self._total or done)
+        self._view.set_progress(done, self._total)

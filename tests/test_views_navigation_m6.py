@@ -91,6 +91,17 @@ class _FakeHub:
                 return inst
         return None
 
+    def restartable(self, service_id: str) -> bool:
+        """与真 ServiceHub 同表面：查得到实例的行才可重启。
+
+        仪表盘画每一行都要问一次（重启按钮的可用性），替身缺这个符号就会
+        AttributeError——替身必须跟着真实表面走，不然测出来的红是探针自造的。
+        """
+        return self.service_by_id(service_id) is not None
+
+    async def restart_service(self, service_id: str) -> list[str]:
+        return [service_id] if self.restartable(service_id) else []
+
 
 def _stub_hub() -> _FakeHub:
     """阅读域服务替身（async 方法用 AsyncMock 记录调用，attach 不联网）。"""

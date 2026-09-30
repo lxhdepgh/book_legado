@@ -50,6 +50,17 @@ HOST_UNREACHABLE_KINDS = {"network_error", "timeout", "js_error", "rate_limited"
 # Book-level flukes (paywalled or promotional entries) should not condemn the
 # whole source, so the chain retries with the next candidate on these errors.
 RETRYABLE_CHAIN_ERRORS = {"正文解析结果为空", "目录中没有可读取章节"}
+#: 检测深度。``full`` 一路验到正文；``list`` 验到列表链路就收（九态结论停在
+#: search_only / explore_only / list_usable 那一层，不会把"没验过"说成"验过不行"）。
+#: 分级的价值量在 `.probe/check_tier_depth.py`（16/24 条健康源、127.0.0.1 假源）：
+#: 阅读链占两段规则耗时 74.7%，每源 5 次 HTTP 里 3 次是它发的；两档深度交替跑
+#: 24 源/轮 × 5 轮：full 638 ms vs list 284 ms（省 55.6% 墙钟、60% 请求）。
+#: 为什么主站连通**不能**当门：真库 917 条快照里 61 条（6.7%）的 searchUrl 与
+#: bookSourceUrl 不同主机、13 条的 bookSourceUrl 连 http(s) 都不是；同探针实测
+#: "主站拒连 + 搜索正文全通"的源现在判 fully_usable，加硬门就把它打死。
+CHECK_DEPTH_FULL = "full"
+CHECK_DEPTH_LIST = "list"
+CHECK_DEPTHS = {CHECK_DEPTH_FULL, CHECK_DEPTH_LIST}
 
 
 def _error_text(exc: Exception, limit: int = 180) -> str:
@@ -299,14 +310,32 @@ def _browser_only_stages(source) -> set:
     return stages
 
 
+def _chain_stub(reason: str) -> dict:
+    """阅读链**没试**时的结果（reason 说明为什么没试）。
+
+    九态分类把 reading_status == skip 当成"这一段没验证过"，结论停在列表
+    已经证明的那一级；但 blocked 与快速检测两种"没试"的原因不同，界面上得能分开，
+    否则用户看见的都是同一句"仅搜索可用"，不知道有一条是被主站拦了、有一条是
+    本轮压根没验正文。
+    """
+    return {"reading_status": "skip", "reading_stage": "none",
+            "reading_error": None, "chapter_count": None,
+            "sample_book": None, "sample_chapter": None,
+            "sample_chapter_urls": [], "reading_tried": 0,
+            "reading_check_skipped": reason}
+
+
 async def _reading_chain_check(source, engine, candidates, timeout,
                                budget=READING_CHAIN_BUDGET) -> dict:
     result = {"reading_status": "skip", "reading_stage": "none",
               "reading_error": None, "chapter_count": None,
               "sample_book": None, "sample_chapter": None,
-              "sample_chapter_urls": [], "reading_tried": 0}
+              "sample_chapter_urls": [], "reading_tried": 0,
+              "reading_check_skipped": None}
     books = [item for item in candidates if getattr(item, "url", "")]
     if not books:
+        # 没候选不代表正文链路坏了，只代表前面的段没给出可点的书。
+        result["reading_check_skipped"] = "no_candidates"
         return result
     browser_stages = _browser_only_stages(source)
     has_browser = getattr(engine, "webview_fetcher", None) is not None
@@ -407,7 +436,12 @@ def _classify_result(result: dict) -> str:
 
 
 async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
-                        on_result=None, auto_disable=False):
+                        on_result=None, auto_disable=False,
+                        depth=CHECK_DEPTH_FULL):
+    depth = str(depth or CHECK_DEPTH_FULL).strip().lower()
+    if depth not in CHECK_DEPTHS:
+        raise ValueError(f"未知的检测深度：{depth!r}（可用：{sorted(CHECK_DEPTHS)}）")
+    list_depth = depth == CHECK_DEPTH_LIST
     worker_limit = max(1, min(int(concurrency), CHECK_MAX_CONCURRENCY))
     network_sem = asyncio.Semaphore(worker_limit)
     engine_sem = asyncio.Semaphore(worker_limit)
@@ -447,10 +481,7 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
                         "search_keyword": "", "search_method": "rule-engine",
                         "search_error": None}, []
                     tags, tag_timeout, tag_skipped = [], False, True
-                    chain = {"reading_status": "skip", "reading_stage": "none",
-                             "reading_error": None, "chapter_count": None,
-                             "sample_book": None, "sample_chapter": None,
-                             "reading_tried": 0}
+                    chain = _chain_stub("probe_blocked")
                 else:
                     async with limiter:
                         # The ceiling starts here, **before** the search stage, so a
@@ -490,9 +521,14 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
                             candidates.extend(tag.pop("books", []))
                             for page in tag.get("page_results", []):
                                 page.pop("books", None)
-                        chain = await _reading_chain_check(
-                            source, engine, candidates, READING_CHAIN_TIMEOUT,
-                            budget=_remaining(deadline, READING_CHAIN_BUDGET))
+                        # 快速深度到这一段就收：阅读链是唯一会翻倍的段（最多 3 个
+                        # 候选 × detail/catalog/content），实测占两段规则耗时 74.7%。
+                        chain = (_chain_stub(CHECK_DEPTH_LIST) if list_depth else
+                                 await _reading_chain_check(
+                                     source, engine, candidates,
+                                     READING_CHAIN_TIMEOUT,
+                                     budget=_remaining(deadline,
+                                                       READING_CHAIN_BUDGET)))
                     probe = await _await_probe(probe_task, timeout)
                 result = {"idx": index, "name": source.bookSourceName,
                           "raw_url": source.bookSourceUrl, **probe,
@@ -518,7 +554,9 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
                     getattr(source, "enabled", False)):
                 source.enabled = False
                 result["auto_disabled"] = True
-                result["disable_reason"] = "搜索、发现与阅读链路均明确不可用"
+                result["disable_reason"] = (
+                    "搜索与发现链路均明确不可用" if list_depth else
+                    "搜索、发现与阅读链路均明确不可用")
             return result
 
         queue = asyncio.Queue()
@@ -542,6 +580,7 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
                         "tag_invalid": 0, "usable": False,
                         "check_state": "unknown", "reading_status": "skip",
                         "reading_stage": "none", "reading_error": None,
+                        "reading_check_skipped": "stage_error",
                         "auto_disabled": False, "tag_check_timeout": False,
                         "tag_check_skipped": False,
                         "unsupported_java_packages": await asyncio.to_thread(

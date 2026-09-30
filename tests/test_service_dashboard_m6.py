@@ -7,8 +7,8 @@
    Container 里 Flutter 不渲染 → 整页灰底），并挂 detach 钩子；
 2. 快照渲染：服务名 / 所属域 / 中文状态标签 / 进度条与百分比 / 最近错误 / 行数；
 3. 总览行：总数与各态计数，RUNNING 带 error 记为"降级"；
-4. 控制按钮：suspend/resume/stop 经 submit 派发；hub 自身行（service_by_id=None）
-   三按钮全禁且不派发；
+4. 控制按钮：suspend/resume/stop 经 submit 派发，restart 派**总控的一次编排协程**；
+   hub 自身行（service_by_id=None）四按钮全禁且不派发；DISPOSED 行只放开重启；
 5. 事件流：订阅/退订对称、环形缓冲 50 上限、状态事件入流并刷新快照；
 6. 心跳：快照签名未变不重表，变了才重读；无运行循环时不起心跳；
 7. 渲染路径对未知状态取值不抛异常。
@@ -63,6 +63,11 @@ class _StubService:
         self.actions.append("stop")
 
 
+async def _ready(value):
+    """替身用的"已就绪"协程：真 restart_service 是 async def，派发方拿到的是协程对象。"""
+    return value
+
+
 class _FakeHub:
     """stub ServiceHub：status_report 返回注入快照并计数，service_by_id 按表查。"""
 
@@ -71,6 +76,8 @@ class _FakeHub:
         self._statuses = statuses
         self._services = services  # service_id -> _StubService
         self.report_calls = 0
+        #: 重启编排的记账（真实实现是 ServiceHub.restart_service）
+        self.restart_calls: list[str] = []
 
     def status_report(self) -> list[ServiceStatus]:
         self.report_calls += 1
@@ -78,6 +85,17 @@ class _FakeHub:
 
     def service_by_id(self, service_id: str):
         return self._services.get(service_id)
+
+    def restartable(self, service_id: str) -> bool:
+        return self.service_by_id(service_id) is not None
+
+    def restart_service(self, service_id: str):
+        """真实现是 ``async def``；替身把记账放在**同步段**、返回一条待跑的协程。
+
+        这样"已经派出去了但还没跑完"的在途形状也测得到（派发方只拿到协程对象）。
+        """
+        self.restart_calls.append(service_id)
+        return _ready([service_id] if self.restartable(service_id) else [])
 
 
 class _StubPage:
@@ -288,7 +306,7 @@ class ControlDispatchTests(unittest.TestCase):
         self.assertEqual(hub._services["BrowserService"].actions, ["stop"])
 
     def test_buttons_disabled_by_state(self):
-        """状态机裁决：hub 自身行全禁；RUNNING 挂起/停止可点、恢复禁；SUSPENDED 反向。"""
+        """状态机裁决：hub 自身行全禁；RUNNING 挂起/停止/重启可点、恢复禁；SUSPENDED 反向。"""
         hub = _make_hub()
         view = build_dashboard(_StubPage(), hub)
         rows = view.service_table.rows
@@ -297,10 +315,83 @@ class ControlDispatchTests(unittest.TestCase):
                         "ServiceHub 自身行无对应实例，启停按钮应全部禁用")
         book_buttons = _cells(rows[1])[6].controls
         self.assertEqual([b.disabled for b in book_buttons],
-                         [False, True, False], "RUNNING：挂起可点、恢复禁、停止可点")
+                         [False, True, False, False],
+                         "RUNNING：挂起可点、恢复禁、停止可点、重启可点")
         browser_buttons = _cells(rows[3])[6].controls
         self.assertEqual([b.disabled for b in browser_buttons],
-                         [True, False, False], "SUSPENDED：挂起禁、恢复可点、停止可点")
+                         [True, False, False, False],
+                         "SUSPENDED：挂起禁、恢复可点、停止可点、重启可点")
+
+    def test_disposed_row_only_restart_is_clickable(self):
+        """DISPOSED（已退役）那一行只有「重启」可点——这就是就地拉回来的唯一出口。"""
+        statuses = [ServiceStatus(service_id="DeadService",
+                                  state=ServiceState.DISPOSED)]
+        hub = _FakeHub(statuses, {"DeadService": _StubService("DeadService")})
+        view = build_dashboard(_StubPage(), hub)
+        buttons = _cells(view.service_table.rows[0])[6].controls
+        self.assertEqual([b.disabled for b in buttons], [True, True, True, False],
+                         "退役行应只放开重启")
+
+    def test_restart_dispatches_one_hub_orchestration(self):
+        """重启派的是**总控的一次编排协程**，不是服务自己的方法，也不能拆成两次派发。
+
+        分成 stop()+start() 两次 submit 之间，引擎循环可以插进别的协程，那就出现
+        "依赖已经停了、消费者还照原样跑"的中间态；下游连带也归总控算，视图不知道拓扑。
+        """
+        hub = _make_hub()
+        submits: list = []
+
+        def record_submit(coro):
+            submits.append(coro)
+            return None          # 与 _default_submit 同形：真实实现返 future
+
+        view, ctrl = _view_stub(hub, submit=record_submit)
+        ctrl.attach(view)
+        ctrl.control("BookService", "restart")
+
+        self.assertEqual(len(submits), 1, f"重启必须只派发一次：{len(submits)}")
+        for coro in submits:
+            coro.close()         # 只记录不跑：协程对象别在测试里留未消费警告
+        self.assertEqual(hub.restart_calls, ["BookService"])
+        self.assertEqual(hub._services["BookService"].actions, [],
+                         "重启不该走服务自己的方法面")
+
+    def test_restart_is_not_dispatched_for_uncontrollable_row(self):
+        """总控自身行（service_by_id=None）不产生任何重启派发——重启 EngineHub 会把
+        正在执行这次重启的守护 loop 自己拆掉。"""
+        hub = _make_hub()
+        view, ctrl = _view_stub(hub)
+        ctrl.attach(view)
+        ctrl.control("ServiceHub", "restart")
+        self.assertEqual(hub.restart_calls, [])
+
+    def test_restart_in_flight_blocks_second_click(self):
+        """一轮重启没跑完之前，同一行不能再点第二次（别把一串服务停两遍）。"""
+        hub = _make_hub()
+        held: list = []
+
+        class _PendingFuture:
+            def add_done_callback(self, fn):
+                held.append(fn)
+
+        def submit(coro):
+            coro.close()          # 只派不跑：真实实现是 run_coroutine_threadsafe
+            return _PendingFuture()
+
+        view, ctrl = _view_stub(hub, submit=submit)
+        ctrl.attach(view)
+        ctrl.control("BookService", "restart")
+        self.assertEqual(hub.restart_calls, ["BookService"])
+        ctrl.control("BookService", "restart")
+        self.assertEqual(hub.restart_calls, ["BookService"], "在途中又被派了一遍")
+        self.assertEqual(len(held), 1, "收尾必须挂 done 回调，不然在途标记永远不清")
+        # 收尾回调只做两件事：清标记 + 把重画编回界面循环（后者走 ui_call，
+        # 无头环境里没有界面循环，这里直接验清标记那一步）。
+        ctrl._restart_done("BookService")
+        self.assertNotIn("BookService", ctrl._restarting)
+        ctrl.control("BookService", "restart")
+        self.assertEqual(hub.restart_calls, ["BookService", "BookService"],
+                         "收尾之后应允许再来一轮")
 
     def test_refresh_button_slot_bound(self):
         """手动刷新按钮的槽位由控制器填（视图不持服务）。"""

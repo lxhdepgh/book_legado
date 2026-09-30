@@ -149,11 +149,18 @@ class CheckFinishedEvent(AppEvent):
     发布方：SourceCheckService（每源检测完成发一条）；订阅方：CheckView。
     ``state_class`` 为九态分类结论（fully_usable/list_usable/…/blocked/unusable）；
     ``summary`` 为单行人类可读摘要（连通/搜索/标签/阅读抽检结论拼接）。
+
+    ``done``/``total`` 是**本轮计划规模**给的进度分母：订阅方一度只能拿到逐源结果，
+    于是"已完成的条数"被当成分母，界面显示成 ``12/12``（应当是 ``12/936``）。
+    流水线那边这两个数本来就有（``on_result(result, done, total)``），只是没往事件上挂。
+    单源检测与旧订阅方不看进度时留 0，表示"这条没说分母"。
     """
 
     source_id: str
     state_class: str
     summary: str
+    done: int = 0
+    total: int = 0
     timestamp: float = field(default_factory=time.time)
 
 

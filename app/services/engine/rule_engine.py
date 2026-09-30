@@ -849,6 +849,9 @@ class ReaderEngine:
         self.headers = {"User-Agent": _global_user_agent()}
         self.cookie_jar = aiohttp.CookieJar(unsafe=True)
         self._source_cookie_jars = {}
+        #: 上一次把 cookie 罐落库时罐的版本号，见 :meth:`_persist_source_cookie_jar`
+        #: 的脏闸门。用 None 起头：那一条**没写过**，第一个响应必须真写一次。
+        self._cookie_persist_revision: int | None = None
         self._sessions = {}
         self.last_response = None
         # 取值段挪到工作线程之后必须补的锁，见 :meth:`_parse_off_loop`。
@@ -1005,10 +1008,19 @@ class ReaderEngine:
         except Exception:
             db = None
         if db is not None:
+            # 脏闸门：这一响应没动罐就整段跳过（JSON 原子写 + 整罐 json.dumps +
+            # 一条抢 _db_lock 的 INSERT OR REPLACE 全都不排）。这一段原本无条件跑在
+            # **引擎循环线程**上，单价随整库 cookie 罐规模线性涨——实测 3.6 ms（16 条）
+            # → 13.1 ms（2048 条），是"检测越跑越慢"里唯一每响应都付的那一笔。
+            if int(getattr(self.js, "cookie_revision", 0)) == self._cookie_persist_revision:
+                return
             try:
                 persist = getattr(self.js, "_persist_cookie_state", None)
                 if callable(persist):
                     persist()  # JSON 持久层（读侧回退）
+                # 版本号在 persist 之后取：上面那次补写自己也可能把罐改动一次，
+                # 取改完的值才不会出现"写完立刻又觉得脏"的自激。
+                revision = int(getattr(self.js, "cookie_revision", 0))
                 snap = getattr(self.js, "persistent_cookie_snapshot", None)
                 jar_json = snap() if callable(snap) else None
                 if jar_json is not None:
@@ -1019,6 +1031,7 @@ class ReaderEngine:
                     # 这里不 commit()：主库以 isolation_level=None 打开，语句本身
                     # 就是原子的；而裸 commit() 落在别人未提交的事务上是**替别人提交**
                     # ——把别人写到一半的批次当成完整一笔落下去。
+                    self._cookie_persist_revision = revision
             except Exception:
                 pass
             return

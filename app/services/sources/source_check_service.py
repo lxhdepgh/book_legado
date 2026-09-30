@@ -56,7 +56,27 @@ def _summary(result: dict) -> str:
     name = result.get("name") or result.get("raw_url") or "(未命名)"
     err = (result.get("reading_error") or result.get("error")
            or result.get("search_error") or "").strip()
-    return f"{name}：{state}（{err}）" if err else f"{name}：{state}"
+    line = f"{name}：{state}（{err}）" if err else f"{name}：{state}"
+    # "没试正文"和"试了失败"在九态里都落进列表那一级，界面上必须点出来是哪种，
+    # 否则快速检测的结论看起来像源本身有毛病。
+    if result.get("reading_check_skipped") == check_service.CHECK_DEPTH_LIST:
+        line += "（本轮快速检测，未验正文）"
+    return line
+
+
+#: 触发点③（每源检测完复跑一次静态审计）的并发上限。审计单条只有 ~12.9 ms 的 CPU，
+#: 但它是**每条两笔 `asyncio.to_thread`**甩进默认线程池（本机 cpu=20 → 24 条），而
+#: 检测自己要的 `to_thread`（`_unsupported_java_packages`、`_parse_off_loop`）用的是
+#: **同一个池**。不设上限的实测形状（240 条真库快照、每源 20 ms 假 IO、三臂交替，
+#: `.probe/check_slowdown_audit_fanout.py`）：
+#:   峰值同时在跑的审计 206 条 vs 限死后 2 条；整轮墙钟（含收尾）不跑审计 8167 ms /
+#:   无上限 16186 ms / 上限 2 13596 ms；检测自己那条 to_thread 的 max 从 13257.7 ms
+#:   回到 8528.2 ms（不跑审计是 8029.0 ms）——限并发买的是"检测自己的线程步回到没审计
+#:   那一档"，代价是收尾那一截有界（`AUDIT_DRAIN_BUDGET`）。取 2 与 JS 检测段
+#:   （`JS_CHECK_CONCURRENCY`）同量级。
+AUDIT_CONCURRENCY = 2
+#: 收尾等多久。审计是 best-effort：超预算就把没跑完的取消，不拖检测的结束。
+AUDIT_DRAIN_BUDGET = 5.0
 
 
 class SourceCheckService(Service):
@@ -85,6 +105,9 @@ class SourceCheckService(Service):
         # 底层检测函数可注入（测试替身）；默认走 M2 冻结的 check_sources。
         self._checker = checker or check_service.check_sources
         self._task: asyncio.Task | None = None
+        #: 本轮排出去的审计任务：留引用（不留会被 GC 悄悄回收）、收尾等它们
+        self._audit_tasks: set[asyncio.Task] = set()
+        self._audit_sem: asyncio.Semaphore | None = None
         #: 本轮批量检测的回放快照（见 :meth:`run_snapshot`）
         self._run: dict | None = None
         self._run_done: asyncio.Event | None = None
@@ -126,14 +149,20 @@ class SourceCheckService(Service):
     # ------------------------------------------------------------------ #
     # 对外入口（契约 §4）
     # ------------------------------------------------------------------ #
-    async def check_source(self, source_json) -> dict:
+    async def check_source(self, source_json,
+                           depth: str = check_service.CHECK_DEPTH_FULL) -> dict:
         """检测单个书源（dict 或 BookSource），返回该源结果 dict。"""
         source = _normalize(source_json)
-        results = await self._run_checks([source])
+        results = await self._run_checks([source], depth=depth)
         return results[0] if results else {}
 
-    async def check_all(self, groups=None) -> dict:
+    async def check_all(self, groups=None,
+                        depth: str = check_service.CHECK_DEPTH_FULL) -> dict:
         """批量检测；``groups`` 给定时只检测这些分组。返回汇总 dict。
+
+        ``depth`` 是分级检测的深度：``full`` 一路验到正文，``list`` 验到列表链路就
+        收（阅读链是唯一会翻倍的段，实测占两段规则耗时 74.7%，见
+        :data:`check_service.CHECK_DEPTH_LIST`）。
 
         已有批量在跑时**不再派第二遍全量联网**（两份流水线同时打站点对既浪费
         又容易被封），而是接到那一轮的收尾上。
@@ -143,9 +172,9 @@ class SourceCheckService(Service):
             snap = await self.await_run_finished()
             return snap.get("summary") or {}
         sources = self._collect_sources(groups)
-        run = self._begin_run(len(sources))
+        run = self._begin_run(len(sources), depth)
         try:
-            results = await self._run_checks(sources, run)
+            results = await self._run_checks(sources, run, depth)
             run["summary"] = {
                 "total": len(results),
                 "finished": len(results),
@@ -158,10 +187,10 @@ class SourceCheckService(Service):
             self._end_run(run)   # 标记写完才放行等待收尾的视图
         return run["summary"]
 
-    def _begin_run(self, total: int) -> dict:
+    def _begin_run(self, total: int, depth: str = check_service.CHECK_DEPTH_FULL) -> dict:
         """开一轮可回放快照（必须在引擎循环上调，见 :meth:`_run_checks`）。"""
         run = {"total": total, "running": True, "cancelled": False,
-               "summary": None, "results": []}
+               "summary": None, "results": [], "depth": depth}
         self._run = run
         self._run_done = asyncio.Event()
         return run
@@ -189,10 +218,12 @@ class SourceCheckService(Service):
         run = self._run
         if run is None:
             return {"running": False, "cancelled": False, "total": 0,
+                    "depth": check_service.CHECK_DEPTH_FULL,
                     "summary": None, "results": []}
         return {"running": bool(run["running"]),
                 "cancelled": bool(run["cancelled"]),
                 "total": int(run["total"]),
+                "depth": run.get("depth", check_service.CHECK_DEPTH_FULL),
                 "summary": run["summary"],
                 "results": list(run["results"])}
 
@@ -218,7 +249,8 @@ class SourceCheckService(Service):
         return sources
 
     async def _run_checks(self, sources: list[BookSource],
-                          run: dict | None = None) -> list[dict]:
+                          run: dict | None = None,
+                          depth: str = check_service.CHECK_DEPTH_FULL) -> list[dict]:
         """跑一轮流水线；``run`` 给了就把逐源结果同步记进回放快照。
 
         快照必须在**引擎循环**上读写（协程方法经 EngineProxy 派发）：界面线程
@@ -229,17 +261,21 @@ class SourceCheckService(Service):
             return []
         total = len(sources)
         self.status.progress = 0.0
+        # 每轮换一把新信号量：Semaphore 第一次 await 就认死当前循环，跨循环复用会抛
+        # "bound to a different event loop"（服务重启、单测每条各起一条循环都会换）。
+        self._audit_sem = asyncio.Semaphore(AUDIT_CONCURRENCY)
 
         def on_result(result: dict, done: int, t: int) -> None:
             # 进度写 status.progress（§4.5 状态可见）
             self.status.progress = (done / t) if t else 1.0
-            self._publish_finished(result, run)
+            self._publish_finished(result, run, done, t)
             self._maybe_audit(result, sources)
 
         async def runner():
             return await self._checker(
                 sources, concurrency=self._concurrency, timeout=self._timeout,
-                on_result=on_result, auto_disable=self._auto_disable)
+                on_result=on_result, auto_disable=self._auto_disable,
+                depth=depth)
 
         self._task = asyncio.create_task(runner())
         try:
@@ -247,13 +283,24 @@ class SourceCheckService(Service):
         except asyncio.CancelledError:
             if run is not None:
                 run["cancelled"] = True
+            self._cancel_audits()
             raise
         finally:
             self._task = None
+        # 审计的尾巴要在进度到 100% 之后立刻收掉：留着不等人，占的是下一条检测、
+        # 阅读页都要用的默认线程池（见 AUDIT_CONCURRENCY 上方的实测）。
+        await self._drain_audits()
         self.status.progress = 1.0 if total else None
         return results
 
-    def _publish_finished(self, result: dict, run: dict | None = None) -> None:
+    def _cancel_audits(self) -> None:
+        """把这一轮还没跑完的审计全部取消（检测被停/被取消时不留后台尾巴）。"""
+        for task in list(self._audit_tasks):
+            if not task.done():
+                task.cancel()
+
+    def _publish_finished(self, result: dict, run: dict | None = None,
+                          done: int = 0, total: int = 0) -> None:
         entry = {"source_id": str(result.get("raw_url") or ""),
                  "state_class": str(result.get("check_state") or "unknown"),
                  "summary": _summary(result)}
@@ -261,10 +308,18 @@ class SourceCheckService(Service):
             run["results"].append(entry)   # 切页期间没人接事件，靠这份回放
         if self.bus is None:
             return
-        self.bus.publish(CheckFinishedEvent(**entry))
+        # 分母跟着事件走：订阅方自己数完成的条数，只会得出 12/12（症状见事件文档）
+        self.bus.publish(CheckFinishedEvent(**entry, done=int(done), total=int(total)))
 
     def _maybe_audit(self, result: dict, sources: list[BookSource]) -> None:
-        """触发点③：检测流水线每源复跑静态审计（best-effort，不阻断检测）。"""
+        """触发点③：检测流水线每源复跑静态审计（best-effort，不阻断检测）。
+
+        限并发（:data:`AUDIT_CONCURRENCY`）并留任务引用：审计本身只有十几毫秒 CPU，
+        但它往默认线程池一次甩两笔 `to_thread`，不设上限时检测自己那步要排在
+        200 多条审计后面（实测见 :data:`AUDIT_CONCURRENCY` 上方注释）。
+        任务引用必须留在 `self._audit_tasks` 里——`create_task` 的返回值不被持有
+        时，事件循环只握弱引用，跑到一半的任务可能被 GC 掉。
+        """
         if self._compat is None or not hasattr(self._compat, "audit_source"):
             return
         idx = result.get("idx")
@@ -276,7 +331,26 @@ class SourceCheckService(Service):
             data = source.to_dict()
         except Exception:
             return
-        asyncio.create_task(self._audit_safe(data))
+        task = asyncio.create_task(self._audit_gated(data))
+        self._audit_tasks.add(task)
+        task.add_done_callback(self._audit_tasks.discard)
+
+    async def _drain_audits(self) -> None:
+        """等本轮排出去的审计收尾，超预算就取消剩下的（别拖检测结束）。"""
+        pending = {t for t in self._audit_tasks if not t.done()}
+        if not pending:
+            return
+        _done, still = await asyncio.wait(pending, timeout=AUDIT_DRAIN_BUDGET)
+        for task in still:
+            task.cancel()
+        if still:
+            logger.info("检测收尾：%s 条审计没跑完（预算 %s s），已取消",
+                        len(still), AUDIT_DRAIN_BUDGET)
+            await asyncio.gather(*still, return_exceptions=True)
+
+    async def _audit_gated(self, data: dict) -> None:
+        async with self._audit_sem:
+            await self._audit_safe(data)
 
     async def _audit_safe(self, data: dict) -> None:
         try:

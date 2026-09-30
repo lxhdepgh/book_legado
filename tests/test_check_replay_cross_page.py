@@ -35,8 +35,10 @@ class _FakeService:
         await self.done.wait()
         return self.snapshot
 
-    async def check_all(self, groups=None) -> dict:
-        self.checks.append(groups)
+    async def check_all(self, groups=None, depth="full") -> dict:
+        # depth 是真服务的形参；替身漏收会静默 TypeError，被 _run 的 except 吞掉，
+        # 于是"界面有没有把深度转下去"这条线在测试里根本没人看（见 test_check_depth_tiering）。
+        self.checks.append((groups, depth))
         return {"total": 0, "usable": 0, "blocked": 0}
 
     def cancel(self) -> None:
@@ -168,6 +170,33 @@ class CheckReplayTests(unittest.IsolatedAsyncioTestCase):
             source_id="s4", state_class="unknown", summary="s4"))
         self.assertEqual(view.progress[-1], (4, 4))
         replay.cancel()
+
+    async def test_a_round_started_here_takes_its_denominator_from_the_event(self):
+        """本页签自己点「开始」的那一轮不会走回放：分母只能来自事件里的 total。
+
+        症状就是这个：视图没有快照分母，就把"已完成条数"当分母，进度显示成 12/12。
+        这里计划 50 条、只回 3 条，分母必须还是 50。
+        """
+        controller, view, scheduled = _attach(_FakeService(_IDLE))
+        await scheduled[0]                      # 空快照：不写 self._total
+        controller.start()
+        await scheduled[1]                      # 替身 check_all 立即返回
+        for i in range(3):
+            await controller._on_check_finished(CheckFinishedEvent(
+                source_id=f"s{i}", state_class="unknown", summary=f"s{i}",
+                done=i + 1, total=50))
+        self.assertEqual(view.progress[-1], (3, 50),
+                         f"分母被完成数冒充了：{view.progress[-1]}")
+
+    async def test_no_denominator_means_no_progress_bar_write(self) -> None:
+        """没分母就不动进度条——宁可停在上一秒的 3/50，也不画一个自证的 3/3。"""
+        controller, view, scheduled = _attach(_FakeService(_IDLE))
+        await scheduled[0]
+        before = len(view.progress)
+        await controller._on_check_finished(CheckFinishedEvent(
+            source_id="s1", state_class="unknown", summary="s1"))
+        self.assertEqual(len(view.progress), before,
+                         "事件没说分母，进度条不该被写一次假的")
 
     async def test_never_checked_page_renders_nothing(self) -> None:
         """没检测过的空快照不该回放：初始的「尚未检测」不能被刷成结束态。"""

@@ -100,14 +100,18 @@ def _domain_of(svc: Any) -> str:
 def _control_enabled(state: ServiceState, action: str) -> bool:
     """按状态机裁决单行按钮是否可用（只读快照语义，过渡态不响应）。
 
-    - RUNNING：可挂起、可停止；
-    - SUSPENDED：可恢复、可停止；
-    - 其余（REGISTERED/INIT/STARTING/STOPPING/DISPOSED）：全部禁用。
+    - RUNNING：可挂起、可停止、可重启；
+    - SUSPENDED：可恢复、可停止、可重启；
+    - DISPOSED：**只有重启可点**——这正是"停掉了想就地拉回来"的唯一出口，
+      不必退出应用重来；
+    - 其余（REGISTERED/INIT/STARTING/STOPPING）：全部禁用，过渡态不抢跑。
     """
     if state == ServiceState.RUNNING:
-        return action in ("suspend", "stop")
+        return action in ("suspend", "stop", "restart")
     if state == ServiceState.SUSPENDED:
-        return action in ("resume", "stop")
+        return action in ("resume", "stop", "restart")
+    if state == ServiceState.DISPOSED:
+        return action == "restart"
     return False
 
 
@@ -129,6 +133,10 @@ class DashboardController(BaseController):
         self.events: deque = deque(maxlen=_MAX_EVENTS)
         self._ticker: asyncio.Task | None = None
         self._signature: tuple | None = None
+        #: 正在重启的服务 id：重启是"停一串再起一串"，中间态由状态机自己发事件，
+        #: 但回调排在界面队列尾部可能晚于下一次点击——先按行禁掉，别让人把同一串
+        #: 服务停两遍。
+        self._restarting: set[str] = set()
 
     # ------------------------------------------------------------------ #
     # 生命周期（§7.4 attach/detach 对称）
@@ -221,12 +229,21 @@ class DashboardController(BaseController):
         for action, icon, tip in (
                 ("suspend", ft.Icons.PAUSE, "挂起（释放重资源）"),
                 ("resume", ft.Icons.PLAY_ARROW, "恢复"),
-                ("stop", ft.Icons.STOP, "停止")):
+                ("stop", ft.Icons.STOP, "停止"),
+                ("restart", ft.Icons.REPLAY,
+                 "重启（连带依赖它的服务一起停掉再按依赖序起回）")):
+            enabled = controllable and _control_enabled(st.state, action)
+            if action == "restart":
+                # 能不能单行重启由总控裁定（EngineHub 那一行查得到实例却不许点：
+                # 执行这次重启的协程正跑在它那条 loop 上）。
+                enabled = (bool(self._hub.restartable(st.service_id))
+                           and _control_enabled(st.state, action)
+                           and st.service_id not in self._restarting)
             buttons.append(ft.IconButton(
                 icon=icon, tooltip=tip, icon_size=16,
                 data=(action, st.service_id),
                 on_click=self._on_control_click,
-                disabled=not (controllable and _control_enabled(st.state, action))))
+                disabled=not enabled))
         progress = ft.Row(spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER,
                           controls=[
                               ft.ProgressBar(width=60, height=8, bar_height=4,
@@ -254,7 +271,16 @@ class DashboardController(BaseController):
         self.control(service_id, action)
 
     def control(self, service_id: str, action: str) -> None:
-        """对单行服务发起 suspend/resume/stop；服务不存在或派发失败均静默兜底。"""
+        """对单行服务发起 suspend/resume/stop/restart；服务不存在或派发失败均静默兜底。
+
+        restart 派的是 **总控的编排协程** :meth:`ServiceHub.restart_service`，不是
+        服务自己的方法：重启一个服务必须连带它的下游消费者，而这串"先停后起"要跑在
+        **同一次 submit 里**——分成两次 submit 之间，引擎循环完全可能插进别的协程，
+        于是出现"依赖已经停了、消费者还照原样跑"的中间态。
+        """
+        if action == "restart":
+            self._restart(service_id)
+            return
         svc = self._hub.service_by_id(service_id)
         if svc is None:
             return
@@ -265,6 +291,33 @@ class DashboardController(BaseController):
             self._submit(method())  # method() 产出协程对象，由派发器排进 EngineHub
         except Exception:  # 派发异常不冒泡到 Flet 事件回调
             pass
+
+    def _restart(self, service_id: str) -> None:
+        # 不可重启的行（总控自身、EngineHub）不派发也不标在途，与按钮口径一致。
+        if service_id in self._restarting or not self._hub.restartable(service_id):
+            return
+        self._restarting.add(service_id)
+        try:
+            future = self._submit(self._hub.restart_service(service_id))
+        except Exception:
+            self._restarting.discard(service_id)
+            return
+        if not hasattr(future, "add_done_callback"):
+            # 测试注入的替身派发器可以只记协程、返 None：那就没什么可挂的，就地放开
+            # 在途标记，否则会永久把那一行钉死。
+            self._restarting.discard(service_id)
+            return
+        future.add_done_callback(
+            lambda _f, sid=service_id: self._restart_done(sid))
+
+    def _restart_done(self, service_id: str) -> None:
+        """回调跑在**引擎循环**上：清标记（纯数据）留在这里，重画必须编回界面循环。"""
+        self._restarting.discard(service_id)
+        self.ui_call(self._redraw())
+
+    async def _redraw(self) -> None:
+        if self._view is not None:
+            self.refresh()
 
     @staticmethod
     def _default_submit(coro):
@@ -328,8 +381,9 @@ class DashboardView(ft.Column):
 
         self.controls = [
             ft.Text("服务仪表盘", size=26, weight=ft.FontWeight.BOLD),
-            ft.Text("进程内全部服务的实时状态。挂起会释放该服务的重资源（如浏览器），"
-                    "停止后本页不会自动重启，重启应用即恢复。",
+            ft.Text("进程内全部服务的实时状态。挂起会释放该服务的重资源（如浏览器）；"
+                    "停止即退役（DISPOSED），要就地拉回来点「重启」——它会连带依赖该"
+                    "服务的所有下游一起停、再按依赖序起回，不必退出应用重来。",
                     size=13, color=ft.Colors.GREY_600),
             ft.Row([
                 self._summary,
