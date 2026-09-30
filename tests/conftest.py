@@ -11,4 +11,11 @@ collect_ignore 全解除——历史上因依赖未迁移服务/视图而忽略�
 此后不再有阶段性忽略清单；全量 pytest 即回归全集。
 """
 
+import os
+
 collect_ignore: list[str] = []
+
+# QuickJS 求值的遗言日志默认落在数据目录（生产要它有证据）。测试不许往那里写：
+# 一次全量回归会把现场那份 4 MiB 改名成 *.prev 再覆盖，正好毁掉开发者手上
+# 唯一一份崩溃证据。这里按进程置灰，需要日志的用例自己 patch 环境变量。
+os.environ.setdefault("LEGADO_JS_JOURNAL", "0")

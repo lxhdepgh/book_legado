@@ -50,7 +50,12 @@ class CheckController(BaseController):
         self._running = False
         self._view.on_start = self.start
         self._view.on_stop = self.stop
-        self.subscribe(CheckFinishedEvent, self._on_check_finished)
+        # 逐源结果一条都不许丢（一源一条 CheckFinishedEvent），所以这里合并的是
+        # **下发**不是处理器：整页 diff 实测随行数线性变贵 ≈0.024 ms/行
+        # （docs/known-issues/004 的 900 行实测表），全库扫描时 0.5s 窗口把它压成
+        # 每秒最多两次。
+        self.subscribe(CheckFinishedEvent, self._on_check_finished,
+                       flush_interval=0.5)
         self.ui_call(self._restore())
 
     def _safe_service(self, stype):

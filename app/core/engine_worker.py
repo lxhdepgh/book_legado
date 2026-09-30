@@ -23,9 +23,58 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import inspect
+import logging
 import threading
+import weakref
 
 from app.core.lifecycle import Service
+
+logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# 循环异常归属：本进程同时有两条 asyncio 循环，报错必须先说清是谁家的
+# --------------------------------------------------------------------------- #
+#: 装过归属处理器的循环（弱引用：循环对象回收即 forget，id 复用不会误判成"已装"）
+_ATTRIBUTED: "weakref.WeakSet[asyncio.AbstractEventLoop]" = weakref.WeakSet()
+
+
+def install_loop_attribution(loop: asyncio.AbstractEventLoop, tag: str) -> None:
+    """给一条循环装"报错先自报家门"的异常处理器——只加身份，不改行为。
+
+    为什么现在需要：现场那串 ``Exception in callback
+    _ProactorBasePipeTransport._call_connection_lost(ConnectionResetError())``
+    （10054）只写了回调名，没写是**哪条循环**家的 socket。本进程同时有两条
+    asyncio 循环（界面循环在 Flet 线程、服务协程在 ``legado-engines`` 线程），
+    归到谁家决定下一步查 flet 的 websocket 还是查 aiohttp 会话的归属
+    （``docs/known-issues/004`` 待修清单第 3 条：离线用生产同构形状复现过，
+    本机 0 条循环级异常记录，所以只能等现场，而现场必须一眼能读）。
+
+    这里**不做任何过滤**：打完身份就原样交给 ``default_exception_handler``，
+    一条记录都不许少——判明归属之前把噪声按白名单滤掉，等于把唯一的线索抹了。
+
+    重复调用安全（WeakSet 记账），两条循环各自只装一次。
+    """
+    if loop in _ATTRIBUTED:
+        return
+    _ATTRIBUTED.add(loop)
+
+    def handler(target: asyncio.AbstractEventLoop, context: dict) -> None:
+        exc = context.get("exception")
+        message = context.get("message", "")
+        if exc is not None:
+            # 异常本体也写进消息一行：现场是翻控制台找线索，只挂 exc_info 的话
+            # grep 一句 "10054" 什么都读不出来。
+            logger.error("循环[%s]线程=%s loop=%#x 报告异常：%s：%r",
+                         tag, threading.current_thread().name,
+                         id(target), message, exc, exc_info=exc)
+        else:
+            logger.error("循环[%s]线程=%s loop=%#x 报告：%s",
+                         tag, threading.current_thread().name,
+                         id(target), message)
+        target.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
 
 
 class EngineHub(Service):
@@ -59,6 +108,7 @@ class EngineHub(Service):
     def _serve(self) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        install_loop_attribution(loop, "engine")
         self._loop = loop
         self._ready.set()
         loop.run_forever()
@@ -123,6 +173,8 @@ def set_ui_loop(loop: asyncio.AbstractEventLoop | None) -> None:
     """登记界面循环（由 ``build_app_shell`` 在 Flet 回调内调用一次）。"""
     global _UI_LOOP
     _UI_LOOP = loop
+    if loop is not None:
+        install_loop_attribution(loop, "ui")
 
 
 def ui_loop() -> asyncio.AbstractEventLoop | None:

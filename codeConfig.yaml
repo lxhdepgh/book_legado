@@ -64,7 +64,7 @@ knowledge_base:
   # ---- 2.3 开发日志：每次会话开始前的"续接点" ----
   dev_logs:
     root: "docs/dev-logs/"           # 日志目录（按日期命名，如 2026-09-01.md）
-    current: "docs/dev-logs/2026-09-25.md"  # 指向【最新】日志文件
+    current: "docs/dev-logs/2026-09-30.md"  # 指向【最新】日志文件
     required: true
     note: >
       智能体每次会话开始前必须读取 current 指向的日志，

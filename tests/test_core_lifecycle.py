@@ -24,8 +24,9 @@ import pytest
 import app as app_pkg
 
 from app.core.bus import EventBus
-from app.core.engine_worker import (EngineHub, engine_hub, set_ui_loop,
-                                    ui_loop)
+from app.core.engine_worker import (EngineHub, engine_hub, install_loop_attribution,
+                                    set_ui_loop, ui_loop)
+import app.core.engine_worker as engine_worker
 from app.core.events import AppEvent, ServiceStateChangedEvent, SettingsChangedEvent
 from app.core.hub import ServiceHub
 from app.core.lifecycle import Service, ServiceState
@@ -397,6 +398,236 @@ def test_controller_drops_events_after_the_ui_loop_is_closed():
     finally:
         set_ui_loop(saved)
         controller.detach()
+
+
+class _CountingPage:
+    """只数 `page.update()` 次数的假页（合并下发看的就是这一个数）。"""
+
+    def __init__(self):
+        self.updates = 0
+
+    def update(self) -> None:
+        self.updates += 1
+
+
+class _CountingView:
+    def __init__(self):
+        self.page = _CountingPage()
+
+
+class _FlushProbe(BaseController):
+    """订阅一条事件、处理器只记账的探针；flush_interval 由用例决定。"""
+
+    def __init__(self, bus, flush_interval=None):
+        super().__init__(hub=SimpleNamespace(bus=bus), bus=bus)
+        self._flush_interval = flush_interval
+        self.rendered: list[str] = []
+
+    def on_attach(self) -> None:
+        self.subscribe(ServiceStateChangedEvent, self._handler,
+                       flush_interval=self._flush_interval)
+
+    async def _handler(self, event) -> None:
+        self.rendered.append(event.service_id)
+
+
+class _LiveUiLoop:
+    """把一条真循环跑在旁路线程上并登记成界面循环（收尾还原）。"""
+
+    def __enter__(self):
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever,
+                                       name="ui-loop-stub", daemon=True)
+        self.thread.start()
+        self.saved = ui_loop()
+        set_ui_loop(self.loop)
+        return self.loop
+
+    def __exit__(self, *exc_info):
+        set_ui_loop(self.saved)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=5)
+        self.loop.close()
+        return False
+
+
+def test_flush_interval_delivers_every_event_but_updates_once():
+    """`flush_interval` 合并的是**下发**，不是事件：20 条结果一条都不许丢。
+
+    检测面每源一条 ``CheckFinishedEvent``（``app/core/events.py:146``）。当时评估过
+    直接 :meth:`BaseController.throttle` 那个处理器，那是错的——合并处理器就等于把
+    中间那些源的结果行整条抹掉。整页 diff 实测随行数线性变贵（≈0.024 ms/行，
+    900 行一轮 = 900 次下发、占用界面循环 10.6 s，见
+    ``docs/known-issues/004_long_scan_page_frozen_and_quickjs_abort.md`` 的取证表），
+    要压的是下发次数，不是渲染次数。
+    """
+    with _LiveUiLoop() as loop:
+        bus = _StubBus()
+        controller = _FlushProbe(bus, flush_interval=0.2)
+        view = _CountingView()
+        controller.attach(view)
+        handler = bus.handlers[ServiceStateChangedEvent]
+        try:
+            for index in range(20):
+                fut = asyncio.run_coroutine_threadsafe(
+                    handler(ServiceStateChangedEvent(service_id=f"s{index}",
+                                                     state="running")), loop)
+                fut.result(timeout=5)
+            assert len(controller.rendered) == 20, \
+                f"合并下发把结果行也一起合掉了：{len(controller.rendered)}/20"
+            # leading：窗口第一次立刻下发；此后 19 条只改控件树，不再各下发一次
+            assert view.page.updates == 1, \
+                f"0.2s 窗口内应当只下发一次，实际 {view.page.updates} 次"
+            time.sleep(0.45)            # 窗口末尾的补发
+            assert view.page.updates == 2, \
+                f"trailing 补发没跑，最后几条改动停在客户端之外：{view.page.updates}"
+        finally:
+            controller.detach()
+
+
+def test_flush_interval_none_keeps_updating_per_event():
+    """对照：不传 `flush_interval` 就是原行为——每条事件都当场下发一次。
+
+    没有这条对照，上一条用例可能只是"flush 整个没跑"，那才是界面永远不动的 bug。
+    """
+    with _LiveUiLoop() as loop:
+        bus = _StubBus()
+        controller = _FlushProbe(bus, flush_interval=None)
+        view = _CountingView()
+        controller.attach(view)
+        handler = bus.handlers[ServiceStateChangedEvent]
+        try:
+            for index in range(5):
+                asyncio.run_coroutine_threadsafe(
+                    handler(ServiceStateChangedEvent(service_id=f"s{index}",
+                                                     state="running")),
+                    loop).result(timeout=5)
+            assert [view.page.updates] == [5], \
+                f"默认路径该逐条下发，实际 {view.page.updates} 次"
+        finally:
+            controller.detach()
+
+
+def test_detach_cancels_the_pending_coalesced_flush():
+    """切页时窗口里挂着的补发必须撤掉，不然它往下一份视图上刷一次没主的 update。"""
+    with _LiveUiLoop() as loop:
+        bus = _StubBus()
+        controller = _FlushProbe(bus, flush_interval=0.2)
+        view = _CountingView()
+        controller.attach(view)
+        handler = bus.handlers[ServiceStateChangedEvent]
+        asyncio.run_coroutine_threadsafe(
+            handler(ServiceStateChangedEvent(service_id="s0", state="running")),
+            loop).result(timeout=5)          # leading，立刻下发
+        asyncio.run_coroutine_threadsafe(
+            handler(ServiceStateChangedEvent(service_id="s1", state="running")),
+            loop).result(timeout=5)          # 落在窗口里，挂上补发
+        assert view.page.updates == 1
+        controller.detach()
+        time.sleep(0.45)
+        assert view.page.updates == 1, \
+            f"detach 之后还补发了一次下发：{view.page.updates}"
+
+
+# --------------------------------------------------------------------- #
+# 循环异常归属（docs/known-issues/004 待修清单第 3 条：10054 归谁家）
+# --------------------------------------------------------------------- #
+def _probe_exception(target: asyncio.AbstractEventLoop, context: dict) -> str:
+    """在这条循环上走一次异常处理器，返回它打出来的那行日志。"""
+    records: list[str] = []
+
+    class _Catch(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record.getMessage())
+
+    handler = _Catch()
+    log = logging.getLogger("app.core.engine_worker")
+    log.addHandler(handler)
+    try:
+        target.call_exception_handler(context)
+    finally:
+        log.removeHandler(handler)
+    return records[0] if records else ""
+
+
+def test_attribution_names_the_loop_and_keeps_the_original_record():
+    """装了归属处理器之后：日志里有 tag/线程名，而 asyncio 原本那条记录一条不少。
+
+    现场那 6 行 ``Exception in callback _ProactorBasePipeTransport
+    ._call_connection_lost(...)`` 只写了回调名，读不出是**谁家**的 socket——本进程
+    同时有界面循环与 ``legado-engines`` 两条，归错家下一步就查错子系统。
+    这一条同时钉"不许过滤"：判明归属之前把噪声吞掉，等于把唯一线索抹了。
+    """
+    loop = asyncio.new_event_loop()
+    delegated: list[dict] = []
+    try:
+        install_loop_attribution(loop, "engine")
+        # 实例属性顶掉内置默认处理器：只盯"有没有转出去"，不真往 stderr 打
+        loop.default_exception_handler = delegated.append
+        line = _probe_exception(loop, {
+            "message": "Exception in callback _ProactorBasePipeTransport._call_connection_lost()",
+            "exception": ConnectionResetError(10054, "远程主机强迫关闭了一个现有的连接")})
+    finally:
+        loop.close()
+    assert "循环[engine]" in line, f"归属日志连是谁家的循环都没写：{line!r}"
+    assert "线程=" in line and "loop=0x" in line, f"归属日志缺线程名/loop id：{line!r}"
+    assert "10054" in line, f"归属日志里读不出原异常：{line!r}"
+    assert delegated, "归属处理器把原始那条记录吞了——现场再也看不到回调异常"
+
+
+def test_attribution_reports_a_context_without_an_exception_object():
+    """现场 6 行里有几行末尾是 `None`（context 不带 exception）——那种也要落一条。"""
+    loop = asyncio.new_event_loop()
+    try:
+        install_loop_attribution(loop, "ui")
+        loop.default_exception_handler = lambda context: None
+        line = _probe_exception(loop, {"message": "Exception in callback x: None"})
+    finally:
+        loop.close()
+    assert "循环[ui]" in line, f"没有 exception 对象的 context 被跳过：{line!r}"
+
+
+def test_attribution_is_installed_once_per_loop():
+    """重复登记不许装两层：那会把每条噪声打成两遍，现场更难读。"""
+    loop = asyncio.new_event_loop()
+    try:
+        install_loop_attribution(loop, "ui")
+        first = loop.get_exception_handler()
+        install_loop_attribution(loop, "ui")
+        assert loop.get_exception_handler() is first, "同一循环被装了两层归属处理器"
+    finally:
+        loop.close()
+
+
+def test_both_production_loops_carry_their_own_identity():
+    """接线核验：引擎循环与界面循环**各自**报得出自己是谁（线程名要真是它自己的）。
+
+    只测 :func:`install_loop_attribution` 本身不够——归属只在真循环上、真线程里
+    打出来才有意义，接错线（比如界面循环没装）照样全绿（记忆
+    `refactor-regression-orphan-methods`）。
+    """
+    hub = EngineHub(name="attribution-probe-engine")
+    ui = asyncio.new_event_loop()
+    saved_ui = ui_loop()
+    try:
+        hub.loop()                       # 首次使用即拉起守护线程
+        set_ui_loop(ui)
+        # 引擎侧：必须在那条循环自己的线程上打，才验得出"线程名=循环所属线程"
+        async def probe_on_engine() -> str:
+            return _probe_exception(asyncio.get_running_loop(),
+                                    {"message": "engine 侧探针"})
+
+        engine_line = hub.submit(probe_on_engine()).result(timeout=10)
+        ui_line = _probe_exception(ui, {"message": "ui 侧探针"})
+        assert "循环[engine]" in engine_line and "attribution-probe-engine" in engine_line, \
+            f"引擎循环没装归属或线程名不是它自己的：{engine_line!r}"
+        assert "循环[ui]" in ui_line and "attribution-probe-engine" not in ui_line, \
+            f"界面循环没装归属：{ui_line!r}"
+        assert "MainThread" in ui_line, f"界面侧线程名读不出是谁的线程：{ui_line!r}"
+    finally:
+        set_ui_loop(saved_ui)
+        hub.shutdown()
+        ui.close()
 
 
 def test_controller_still_marshals_to_a_live_ui_loop():

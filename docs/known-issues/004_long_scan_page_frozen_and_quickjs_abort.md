@@ -1,0 +1,519 @@
+# 004 长检测后窗口停在 loading + `module.c:99` 原生 abort：真因已定位并改掉（离线），A 链早已否证
+
+- 记录日期：2026-09-30
+- 状态：**症状 B 的真因已定位、已按证据改掉（离线验证），现场待重跑确认**。
+  第五十二轮只取证不改；第五十三轮把待修清单里 1/2/3 三项落地（遗言日志、下发合并 + dict 去重、
+  两条循环的异常归属）；第五十四轮第一次拿到现场崩溃的遗言日志（13010 条），
+  并按上游 `module.c` 源码更正 `:99` 的语义；
+  **第五十五轮把这条崩溃离线复现出来了**（第一次尝试就复现），最小化到一句转换，
+  读上游 C 源码定性为 **`Object.json()` 不建调用帧**，改掉之后现场那条源的真链路重放
+  从"第 1 轮即崩"变成 5/5 活。机制、证据与护栏见下面"§B 的真因"一节。
+  症状 A 的否证结论不变：下面两项改动是**降本与可观测**，不是"治好了停在 loading"，
+  写注释时不许把它们写成病因。
+- 影响面：书源检测（全库联网扫描，数百至上千条源）；顺带波及所有走
+  `BaseController.flush()` 整页下发的常驻大列表（换源扫描、书内索引行）
+- 取证详情：`docs/dev-logs/2026-09-30.md` 第五十二～五十五轮（探针与输出全在 `.probe/`）；
+  现场那份环形文件已改名留底
+  `%LOCALAPPDATA%\LegadoBookSourceCheck\diagnostics\crash-20260930-131140.journal`
+
+## 症状
+
+启动命令 `python main.py`（conda 环境 `legodo_booksource_check`），检测跑一段时间后：
+
+1. **窗口还在，但主题变成一个 loading**——不是窗口消失（开发者口径）；
+2. 控制台先刷 6 行（部分参数是 `None`）：
+
+   ```
+   Exception in callback _ProactorBasePipeTransport._call_connection_lost(ConnectionResetError())
+   ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接。
+   ```
+
+3. 最后一行是 C 运行时断言的原生 abort，**Python 侧不可捕获**：
+
+   ```
+   Assertion failed: runtime_data->thread_state, file module.c, line 99
+   ```
+
+## 为什么必须拆成两条链再查
+
+桌面端是 `FLET_APP`：**Python 进程是服务端，窗口是独立的客户端进程**，客户端靠一条
+websocket 收补丁（`session.patch_control`）。于是"停在 loading"有两种成因相反的症状：
+
+| 链 | 机制 | 要修的东西 |
+| --- | --- | --- |
+| A 界面循环被压住 | 服务端活着，但事件循环长时间顾不上 socket → 客户端超时断开、不再渲染 | 循环上的占用 |
+| B 服务端进程被打断 | `module.c:99` 的原生 abort 当场带走进程 → 窗口只剩最后一帧 | 崩溃本身 |
+
+## §A 的结论：不是原因（当场量到否证）
+
+`.probe/check_ui_flush_cost_attr.py`（真 `CheckView` + 真 Flet 会话 + Playwright 真客户端
+在线，按生产速率 ~8 源/秒喂 `render_result`，每行后跑一次与 `flush()` 同一支的
+无参 `page.update()` = 整棵控件树 diff；循环上挂 5 ms 心跳；钩
+`Session._Session__get_update_control_patch` / `_Session__send_message` 数出 patch 操作数
+与下发字节——不数就是空测量，因为 `patch_control` 里 `if len(patch) > 1` 才发消息）：
+
+| 行数 | render(ms) | 整页 update(ms) | patch 操作数 | 本次下发(B) |
+| --- | --- | --- | --- | --- |
+| 1 | 4.92 | 1.55 | 2 | 4466 |
+| 300 | 0.19 | 7.81 | 2 | 4486 |
+| 900 | 0.32 | 21.69 | 2 | 4486 |
+
+900 行合计墙钟 114.4 s；整页下发合计占用界面循环 **10616 ms = 墙钟 9.3%**；心跳 8304 拍
+**最大间隙 37.1 ms**；**客户端全程没掉线**；累计下发 3950 KB（≈ 每条 4.5 KB，**增量**，
+不是每次重发整棵树）。下发确实随行数线性变贵（≈ 0.024 ms/行），但这个量级解释不了
+"页面再也不渲染"。
+
+顺带查出两个真缺陷（**是"值得做"，不是"病因"**，改的时候别按病因写注释）：
+
+- `CheckController` 是唯一没走 `BaseController.throttle`（`app/controllers/base.py:231`）
+  的进度型控制器（`find_books:78`、`bookshelf:84`、`reader:220` 都走了），
+  每完成一源就渲染 + 下发一次（`app/controllers/source/check_controller.py:171-184`）；
+- `CheckView.render_result` 的去重是**全行线性扫描**
+  （`app/views/source/check_view.py:88`，`for index, existing in enumerate(self._rows.controls)`）。
+
+两条在第五十三轮各按自己的形状收掉（下发合并 + dict 索引，见待修清单 2）。
+
+## §B：`:99` 不是 `:83` 的另一种写法（第五十四轮按上游源码更正语义）
+
+本机 `_quickjs.cp312-win_amd64.pyd` 里全库只有一处 `module.c`（偏移 671234），两条断言串
+**紧挨着**，后面紧跟 quickjs 运行时统计字段（`malloc_size / memory_used_size / atom_count`），
+说明两者在同一对相邻函数里。
+
+第五十四轮把 python-quickjs **1.19.4 的 sdist 从 PyPI 拉下来实读**（仓库里没有
+`reference/` 目录，早前记的那条路径是过期的；源码落在 `D:/tmp/qjs1194/quickjs-1.19.4/module.c`），
+四个 GIL 记账函数与断言行号是：
+
+| 行 | 函数里的断言 | 语义 |
+| --- | --- | --- |
+| `:81` `prepare_call_js` → `:83` `assert(!thread_state)` | 进原生段**之前** | "里面不许已有人"——槽位非空就是两条线程同时进同一个 Context |
+| `:90` `end_call_js` → `:92` `assert(thread_state)` | 出原生段**之后** | 槽位必须是自己刚进去时那位 |
+| **`:98` `prepare_call_python` → `:99` `assert(thread_state)`** | **JS 回头调 Python 那一刻** | **槽位必须非空**，即"必须正处在这条 Context 的原生段里面" |
+| `:105` `end_call_python` → `:106` `assert(!thread_state)` | 桥回调返回后 | 回调期间槽位必须已让空 |
+
+所以 `:99` 响的是 **JS→Python 回调这一层**，不是求值进出层；**本文第五十二轮把它写成
+"出原生段时 thread_state 已空"是错的**，那句其实描述的是 `:92`/`:106` 那一族。
+`prepare_call_python` 全库只有一个调用点：`js_python_function_call`（`:419`），也就是
+`ctx.add_callable` 绑进去的那 109 个桥函数被 JS 调用时。`thread_state` 是
+**每条 `_quickjs.Context` 一份**的记账位（`RuntimeData` 就是 Context 对象本体，
+`:27` 那行 `PyThreadState *thread_state`，注释写着"Used when releasing the GIL"）。
+
+于是"`:99` 为什么会空"只有几条路，全部指向**别的什么东西在这条 eval 还没结束时动了这条
+Context**：
+
+1. 另一条线程在**同一个 Context** 上走完 `end_call_js`（`:90`）——它会把槽位读走并置
+   `NULL`（`:94`），正在里面跑的那条随后一回调用桥就撞 `:99`。`_quickjs` 一共四个
+   原生入口会这样配对：`runtime_eval`(`:507`)、`runtime_module`(`:533`)、
+   `object_call`(`:257`)、`runtime_execute_pending_job`(`:536`)；
+2. 可调用对象的释放路径 `js_python_function_finalizer`（`:382`，函数体 `:385-408`）——上游自己写着
+   `NOTE: This may be called from e.g. runtime_dealloc, but also from e.g. JS_Eval …
+   TODO: integrate better with (prepare|end)_call_(python|js)`（`:388`），它在 `Py_XDECREF(node->obj)`
+   前后直接翻 `thread_state`；这条路要么由 GC 回收环触发（`runtime_clear` `:371`），
+   要么在 eval 里释放旧绑定时触发；
+3. 求值线程自己在没进原生段的状态下调了桥函数（`object_call` 从 Python 侧调 JS 函数
+   再回到 Python 那一族）。
+
+**下一节的现场证据把 #1 的"两条线程"形状削掉了一半**：13010 次求值全在一条线程上。
+
+## 现场那一崩长什么样（第五十四轮第一次拿到遗言日志）
+
+开发者按 `python main.py` 跑全库扫描，控制台出 `Assertion failed: runtime_data->thread_state,
+file module.c, line 99` 后 **Python 进程停了、窗口还在、中间提示 working**——这正是
+"Flet 服务端死了、客户端停在最后一帧"（`FLET_APP` 下窗口是独立进程，靠 websocket 收补丁）。
+那份环形文件已改名留底：`diagnostics/crash-20260930-131140.journal`。用
+`crash_journal_records(path, limit=…)` 读回，**下面的数字全是从那份文件当场重测的**：
+
+| 项 | 实测值 |
+| --- | --- |
+| 记录条数 | 13010（末条 `#13010` 就是崩那一次进） |
+| 时间跨度 | 929.6 s = **15.49 分钟** |
+| 进程 | 全部 `pid=74352`（**单进程**） |
+| 线程 | `th=legado-quickjs` **13010/13010**（ dispatcher 唯一那条） |
+| `depth` | 恒为 1（**没有任何一次重入**） |
+| 涉及 Context 数 | 7811 条不同 `runtime=`；`fresh=1` 7811 / `fresh=0` 5199 |
+| 复用最多的一条 | `runtime=1481` 被进了 **5112** 次（`jslib=218e9b14`） |
+| 最长空档 | `#10391` 前 149 973 ms（网络等待，不是原生段卡住） |
+
+崩前 5 条原文（`rule=` 空是那条源把规则写在 `@js:` 内联里、没有规则名）：
+
+```
+#13006 ts=1790743814.421 pid=74352 th=legado-quickjs depth=1 runtime=7810 fresh=1 jslib=ed015ff2 bytes=1424 rule= url=https://manwaza.cc#大改
+#13007 ts=1790743814.566 pid=74352 th=legado-quickjs depth=1 runtime=7811 fresh=1 jslib=d41d8cd9 bytes=376 rule= url=https://xiaoshuo.uc.cn
+#13008 ts=1790743814.642 pid=74352 th=legado-quickjs depth=1 runtime=7810 fresh=0 jslib=ed015ff2 bytes=1379 rule=ruleBookInfo.intro url=https://manwaza.cc#大改
+#13009 ts=1790743814.666 pid=74352 th=legado-quickjs depth=1 runtime=7810 fresh=0 jslib=ed015ff2 bytes=142 rule=ruleBookInfo.tocUrl url=https://manwaza.cc#大改
+#13010 ts=1790743814.683 pid=74352 th=legado-quickjs depth=1 runtime=7810 fresh=0 jslib=ed015ff2 bytes=172 rule= url=https://manwaza.cc#大改
+```
+
+读得出的三件事：
+
+1. **崩在第 4 次进同一条共享 Context**。`runtime=7810`（`jslib=ed015ff2`）在
+   `#13006` 新建、`#13008`/`#13009` 复用，`#13010` 距上一条只有 **17 ms**，中间还夹着
+   一条别的源（`#13007`）；
+2. **单线程、无重入**（`depth` 恒 1）。所以 `:99` 这次**不是**"`:83` 那一族的变体"，
+   也不是重入把配对搞失衡——上面 #1 那条"另一条线程在同一个 Context 上 `end_call_js`"
+   在**求值这条路上没有证据**（求值全在一条线程），但 journal 当时**只记录求值**，
+   记不到"别的线程在销毁 Context / 在 GC 里收桥闭包"。这正是第五十四轮补配对与
+   `thid=` 的理由；
+3. 崩的那一次 `bytes=172`、`rule=` 空——**有名字的规则**在尾部排行是
+   `ruleToc.chapterUrl` 8272 次 / `ruleExplore.bookUrl` 1009 次 / `ruleSearch.coverUrl` 552 次，
+   所以现场不是某条特殊规则，是"内联 `@js:` + 复用共享 Context"这个通用形状。
+
+## §B 的真因：`Object.json()` 进 JS 时不带调用帧（第五十五轮，已改掉）
+
+上面 #3 那条"求值线程自己在没进原生段的状态下碰了这条 Context"就是答案，只是形态比猜的更窄：
+**不是另一条线程，是同一条线程用了一条不建帧的原生入口**。
+
+上游会 `prepare_call_js`(:81) 建帧的入口只有三类——`Context.eval` / `Context.module`
+（同一支 `runtime_eval_internal`:502，:507 建帧）、`Object()`（:257）、
+`execute_pending_job`（:533）；而本引擎在求值收尾时用
+**`Object.json()`(:143)** 把规则返回值转成 JSON——它是裸的 `JS_JSONStringify`，**不建帧**
+（`Context.get`:566 / `Context.set`:580 同族，函数体里既没 `prepare_call_js` 也没放 GIL；
+本引擎一处没用）。于是被序列化的对象一旦属性读取
+落到"JS 回头调 Python 桥函数"（`prepare_call_python`:98 → `assert(thread_state)`:99），
+槽位是 NULL → 当场 abort，Python 侧不可捕获。本引擎的元素句柄正是 Proxy，陷阱里逐个调
+`__dom_*`，所以**"规则返回元素句柄"这一形状天然满足触发条件**。
+
+### 取证顺序（三步都按"先离线复现"走）
+
+1. **复现**：`.probe/qjs_manwaza_chapterlist_attr.py`——现场那条源（`manwaza.cc#大改`）的规则
+   原文从本地 `legado.db` 只读捞出，子进程里跑**真检测链路**（`check_service.check_sources`）
+   + `127.0.0.1` 假源，零联网。**第一次尝试就打出 rc=3221226505**。
+2. **最小化**：`.probe/qjs_manwaza_minimize_attr.py`（每臂 2 个子进程）——
+   baseline 2/2 崩；`drop_toast` / `drop_setcontent` / `drop_getelements` / `drop_hexdecode` /
+   `only_last` 全 0/2；`no_jslib` 2/2 崩；`no_template` 2/2 崩；`plain_intro` 0/2。
+   也就是 `ruleToc.chapterList` 那 172 字符里**四句都摘不得**，而"共享 Context""jsLib
+   被 Python 侧调用""简介带 `<useweb>`"都不是必要条件——这把第五十四轮照现场造的那两个
+   方向（重绑风暴、跨线程 GC）从根上问歪了。
+3. **回调层记账**：`.probe/qjs_manwaza_bridge_trace_attr.py`——把 `quickjs.Context` 换成
+   转发代理（C 类型不可子类化，只能代理），`add_callable` 包一层记录器、每行**不经缓冲**
+   直接 `os.write`（0xC0000409 绕过 flush）。崩那一刻的位置正好在
+   `JSON.stringify({source,book,chapter})` 那次桥回调之后——第一次把矛头指到 stringify。
+
+### 机制：五臂隔离（`.probe/qjs_jsonstringify_no_frame_attr.py`，每臂 3 个子进程）
+
+| 臂 | 写法 | 读数 | 桥函数被调 |
+| --- | --- | --- | --- |
+| `json_method` | `value.json()` | **3/3 崩**（rc=3221226505，`Assertion failed: runtime_data->thread_state, file module.c, line 99`） | — |
+| `eval_stringify` | 同一个对象在 `ctx.eval` 里 `JSON.stringify` | 3/3 活 | 2 次/次 |
+| `object_call` | 把 stringify 包成 JS 函数从 Python 调（`Object()`:257） | 3/3 活 | 1 次/次 |
+| `control_plain` | 无陷阱的普通对象走 `.json()` | 3/3 活 | 0 次/次 |
+| `ctx_get` | `Context.get(...)` | 3/3 活，但**桥函数 0 次** | 0 次/次 |
+
+最后一臂**不能**读成"`ctx.get` 安全"——它压根没走到机制（桥函数一次都没被调），
+它只说明那一臂的构造没触发属性读取陷阱。`control_plain` 同理是"必要条件对照"：
+没有陷阱对象时 `.json()` 不崩，所以病因是**不建帧 × 被序列化对象回调用桥**这两件事的积。
+
+### 生产路径：六臂前后（`.probe/qjs_element_json_frame_attr.py`，每臂 3 个子进程）
+
+"改前"不是猜的旧行为，是把 `_eval_with_stringify_frame` 返回处**临时装回** `value.json()`
+（`.probe/_mut55_pre_arms_attr.py`，整文件备份写回 + 字节一致断言）后重跑同一支探针：
+
+| 臂（规则末句的形状） | 改前 | 改后 |
+| --- | --- | --- |
+| `elements_after_setcontent`（返回元素句柄数组） | **3/3 崩** | 3/3 活 |
+| `elements_from_result`（不 setContent，直接从 result 取元素） | **3/3 崩** | 3/3 活 |
+| `elements_nested_object`（`({rows: java.getElements(...)})`，句柄藏在对象里） | **3/3 崩** | 3/3 活 |
+| `one_element`（返回单个句柄） | **3/3 崩** | 3/3 活 |
+| `plain_object`（`({a:1,b:[1,2]})`） | 3/3 活 | 3/3 活 |
+| `plain_count`（只回 `.length`，没有值要转换） | 3/3 活 | 3/3 活 |
+
+同一条源的真链路重放：装回旧写法 → **第 1 轮即崩**；当前代码 → **5/5 活**
+（`qjs_manwaza_chapterlist_attr.py 5`）。不联网、不走 aiohttp 之外的真实站点。
+
+### 改法：JS 值的转换一律走"带帧的 stringify"
+
+`app/services/engine/legado_js.py`：
+
+- 新增 `_eval_with_stringify_frame(ctx, program, context)`：先用同一个 Context
+  `ctx.eval(_JS_STRINGIFY_PROGRAM)` 取回一段**闭包硬化**的转换函数
+  （`(function(stringify){return function(v){return stringify(v);};})(JSON.stringify)`——
+  建帧发生在规则跑**之前**，所以规则里 `var JSON = …` 改写不了它，与上游
+  `JS_JSONStringify` 语义等价），再跑规则程序，返回值一律经 `_json_of` 转换；
+- 新增 `_json_of(value)`：只走线程局部帧里那一段函数（走 `Object()` → `object_call`:257 →
+  `prepare_call_js`:81 那条**带帧**的路），**没有帧就抛一条可捕获的 `JsBridgeError`**，
+  绝不退回 `value.json()`；
+- 帧按线程记（`_JS_STRINGIFY_FRAME = threading.local()`），进出成对：嵌套求值退出时
+  **还回外层那一份**而不是置 `None`——嵌套 runtime 的 Context 已经 `close()`，
+  外层继续用它就是 use-after-free，比原来那个 abort 更难查；
+- 原先四处裸转换全部改掉：`_evaluate_locked` 的返回、`_external_rule_root`、
+  `_byte_values`、以及 `_bridge_call` 之外两处 `native = json.loads(...)`。
+  现在引擎里 `.json()` 只剩注释与 docstring 里的字面引用（AST 审计用例钉着）。
+
+### 成本（A/B 交替，按记忆 `ab-bench-must-interleave`）
+
+`.probe/qjs_stringify_frame_cost_attr.py`（2000 次 × 9 轮，奇偶轮换先后，取中位数）：
+
+| 形状 | µs/次 | 说明 |
+| --- | --- | --- |
+| `old`（跑规则 + `value.json()`） | 38.77 | 改前 |
+| `new`（建帧 + 跑规则 + 走帧转换） | 47.15 | 改后 |
+| `program_only`（只跑规则） | 18.92 | 减法基准 |
+| `frame_only`（只建帧那一句） | 7.06 | 新增的唯一一句 |
+
+即每次求值多 **8.37 µs**。放到分母里：`.probe/qjs_engine_eval_cost_attr.py`
+（300 次 × 7 轮交替）量到一次**真引擎求值**是 9 094.6 µs（普通对象）/10 642.1 µs（元素句柄），
+所以多出来的这 8.4 µs ≈ **一次求值的 0.09%**。
+
+### 还留着的两个口子（本轮没堵）
+
+- 上游**不建帧的原生入口其实有三个**：`Object.json`(:143，本轮修掉的那条)、
+  `Context.get`(:566)、`Context.set`(:580)——后两个函数体里既没有 `prepare_call_js` 也没有放
+  GIL；再往外数还有 `Context.parse_json`(:551)，它放了 GIL（`Py_BEGIN_ALLOW_THREADS`:557）
+  却**同样不建帧**。今天引擎三处都没用（全库 grep 无调用点），
+  但下一个用它们的人照样会撞 `:99`；
+- **`object_call` 仍是遗言日志的盲区**：日志只覆盖 `ctx.eval`（`ev=E/X/!/C`），
+  本轮新加的转换走的就是 `object_call`，它不在记里。现场若再崩在这类入口上，
+  journal 依旧只会显示"最后一条 `ev=E` 已经闭合"。
+
+
+
+## 已否证的候选形状（全部 0 崩，子进程隔离）
+
+**为什么这八臂一条都没抓到真因**：它们全在"另一条线程动了这条 Context"这个方向上造形状，
+而真因是**同一条线程用了一条不建帧的原生入口**（见上一节）。这八臂的否证仍然有效——
+它们各自排除的那个假设（跨线程销毁、异常跨界、泄漏、重入、收尾竞态、重绑风暴、跨线程 GC）
+都不是病因，只是别把它们当成"`:99` 已经查尽"。
+
+判定一律分三档：`崩`（rc≠0 或 stderr 有 `Assertion failed`）/ `干净` / `探针报错`
+（rc=1 且 stderr 是 Python 异常 = 探针自己没跑起来，**不许**混进"崩"）。
+
+| # | 候选形状 | 样本 | 探针 → 输出 | 结果 |
+| --- | --- | --- | --- | --- |
+| 1 | Context 在非归属线程销毁（同线程/异线程/未用过就丢/逃逸的值/循环引用靠 GC） | 5 形状 | `qjs_free_thread_attr.py` → `out_qjs_free_thread.txt` | 全活 |
+| 2 | Python 异常跨 QuickJS 的 C 边界（回调 raise、嵌套求值 raise、raise 后丢帧、值活得比 Context 久、内存上限、JS 栈溢出、200 轮风暴） | 11 形状 | `qjs_raise_across_bridge.py` → `out_qjs_raise.txt` | 全活 |
+| 3 | 每源一条 runtime + jsLib 求值累积 | 400 轮 | `qjs_context_leak_attr.py` → `out_qjs_leak.txt` | Context 恒 1、Runtime 恒 1、RSS 37.8→48.4 MB 后平台波动不涨 |
+| 4 | 求值进行中释放 runtime | after/during 各 5 子进程 × 4 轮 | `qjs_free_during_eval_attr.py` → `out_qjs_free_during.txt` | 崩 0 |
+| 5 | 同一个 Context 在 JS→Python 回调里**重入**（生产 `legado_js.py:548` 的内联重入分支仍用同一个 `self`，会从 `_shared_js_contexts[js_lib_key]` 取到同一个缓存 Context 再 eval 一层） | 1/2/4/8/16 层各 5×300，另加最里层抛异常 + 新建 Context 对照 | `qjs_same_context_reentry_attr.py` → `out_qjs_reentry.txt` | `same_inline_*` / `fresh_*` 各 5/5 存活 |
+| 6 | 解释器收尾时守护 JS 线程还在原生 eval 里（`legado-quickjs` 与看门狗都是 daemon，`legado_js.py:149-152`） | 3 形状 × 10 子进程，求值标定 400 ms | `qjs_shutdown_race_attr.py` → `out_qjs_shutdown.txt` | 崩 0 / 干净 10 / 未接上 0 |
+| 7 | **一条共享 Context 上反复重绑 109 个桥函数**（生产 `_evaluate_locked` 每次求值都重绑；现场那条 `runtime=1481` 被进 5112 次） | 三臂 × 8000 轮 × 109 = **872 000 次重绑**：`accumulate`（重绑+eval，生产形状）/`bindonce`（只绑一次）/`rebindonly`（只重绑不 eval） | `qjs_shared_context_rebind_attr.py 8000 109` | 三臂 rc=0 全活（`accumulate` 1.2 s、`bindonce` 0.7 s、`rebindonly` 0.5 s） |
+| 8 | **循环 GC 在另一条线程上回收"捕获了 Context 所有者的桥闭包"**（109 个 lambda 捕获 `self`、`self._shared_js_contexts` 又持 Context → 引用环，只有循环 GC 能收；而 CPython 的 GC 会在任何正在分配的线程上触发） | 四臂 × 40 轮，每轮绑 109 个环闭包 + eval（40 万次 JS 循环）：`gcaway`（B 线程纯 Python churn 逼 GC 落在 B）/`gconA`（无 B）/`plain`（绑不捕获所有者的 lambda，抽掉"环"）/`nogc`（`gc.disable()`，抽掉"GC"） | `qjs_gc_cross_thread_attr.py 40` | 四臂 rc=0 全活 |
+
+第 7、8 是**现场证据出来后照着它造的**：现场那条 Context 复用 5112 次、每次重绑 109 个
+桥函数，而 `module.c:385-408` 那段释放路径正是"重绑/GC 会走的地方"。两条都没把进程带走。
+第五十四轮由这两条读数推出来的那句结论——"**剩下活着的假设只有一个**：某条 journal 看不见
+的线程在这条 eval 还没结束时碰了这条 Context"——**已被第五十五轮否证**：真因是同一条线程
+用了不建帧的 `Object.json()`（见上文"§B 的真因"），既不需要第二条线程，也不需要销毁/GC。
+这八臂否证的是"跨线程"这一**家族**，不是"不建帧入口"这一条路；后者只有照机制造的臂才量得到。
+
+另两条继续成立、本轮未推翻：**quickjs 求值期间放 GIL**（`qjs_gil_held.py`：198 ms 求值期间
+旁路心跳最大间隔 2.0 ms），所以"一条长 eval 把界面循环饿死"也不成立。
+
+## 10054 归因：未定
+
+`.probe/connection_reset_who_attr.py` → `out_rst_who.txt`：本地**裸 TCP** 假源（不走
+aiohttp.web，免得它先把异常吞成 `Error handling request`）对 `/rst` 写半个响应头后
+`SO_LINGER=(1,0)`+`close()`；客户端用生产同构形状（专属线程的 asyncio 循环 +
+aiohttp `ClientSession`，即 `check_service` 的 probe/search 那条路），循环上挂
+`set_exception_handler`。**本机 0 条循环级异常记录**——aiohttp 把被截断的响应当读完
+就返回了，`_call_connection_lost` 没进异常处理器。
+
+所以既不能断言"10054 是扫描噪声"，也不能断言"Flet 客户端掉过线"。
+**第五十三轮已在两条真循环上装好只加身份的异常处理器**（`install_loop_attribution`，
+见待修清单 3），下一次现场那 6 行会带着 `循环[engine]` / `循环[ui]` 与线程名出来，
+归谁一家眼就能判；本轮不做过滤，判出来之前滤一条都是抹线索。
+
+## 待修清单（按证据强度排）
+
+1. ~~**致命那条没定位，离线不可复现**~~ —— **第五十三轮已装取证手段**，
+   **第五十五轮已离线复现并定位真因、已改**（`Object.json()` 不建帧，见上"§B 的真因"）。
+   下面这段是当时那套手段的记录。
+   `_evaluate_locked` 进原生 eval 之前落一条**遗言日志**
+   （`app/services/engine/legado_js.py` 的 `_CrashJournal` / `crash_journal()` /
+   `_journal_eval()`）：4 MiB 定长环形文件（16384 条 × 256 B），字段是
+   `ts pid th depth runtime fresh jslib bytes rule url`，默认落在
+   `%LOCALAPPDATA%\LegadoBookSourceCheck\diagnostics\quickjs-eval.journal`，
+   `LEGADO_JS_JOURNAL=0|off|no` 关、给路径则改写该路径。
+   **落点在进原生码之前**，因为 0xC0000409 那条路绕过 Python 异常、信号处理器、
+   atexit 与 `faulthandler`（实测见下）。不每行 msync：mmap 纯写 0.38 µs，
+   追加+flush 1.74 µs，每行 msync 23.47 µs，而一段真规则中位 49.78 µs
+   （`.probe/js_crash_journal_probe.py` → `out_journal_cost.txt`，7 轮交替）；
+   整条 `_journal_eval` 3.69 µs（`out_journal_field_ab.txt`），放到真求值路径上
+   开/关两臂交替实测 **−0.24%（−21 µs / 8.9 ms），落在噪声里**
+   （`out_journal_ab_cost.txt`，5 轮 × 300 次）。
+   存活实测（每形状 3 个子进程，`out_journal_fastfail.txt`）：
+   `ring_nosync` rc 全是 3221226505、盘上遗言 100/100 条；`plain_buffered` 0 条；
+   `faulthandler` 栈 0/3 且文件 0 字节，而同一个 faulthandler 接线在 0xC0000005
+   对照臂下落栈 3/3、309 字节——所以那个 0/3 不是探针假阴性。
+   `_QuickJsDispatcher` 的"在飞任务"不需要另记：日志里的 `runtime`/`th`/`depth`
+   就是最后一条进去没出来的那段。
+   **下一轮要做的**：现场再崩时读这份文件，`tail` 出崩前那一段的 `rule=`/`url=`。
+   —— **第五十四轮已做到**（见上"现场那一崩长什么样"），并把日志从"只记进"补成
+   **一进一出成对**，加了 `thid=`（数字线程 id，线程名会重名而 id 不会）与
+   `ev=!` 撞车记录。现在的四种记录（`_CrashJournal` 的 docstring 同步了）：
+
+   | 记录 | 谁写 | 字段 | 用途 |
+   | --- | --- | --- | --- |
+   | `ev=E` | `_journal_eval`，紧贴 `ctx.eval` 之前 | `ts pid th thid depth runtime fresh jslib bytes rule url`，行首 `#序号` 是这份环里的全局序号 | 崩前最后一条 `E` = 崩在哪一次进 |
+   | `ev=X` | `_journal_leave`，`_evaluate_locked` 的 `finally` 第一句 | `ref=` **指回自己那条 `E` 的序号**、`took=`(ms)、`out=` `ok` 或 `err` | 没有对应 `X` 的 `E` 就是"没回来"的那一次 |
+   | `ev=!` | `_journal_eval` 里发现这条 `runtime` 已在飞、而**在飞的那位线程 id 不是自己** | `thid other_thid other_seq runtime` | 现场证据专用：`ev=X` 全齐却崩了，而盘上有一条 `ev=!` → 就是两条线程进同一条 Context |
+   | `ev=C` | `close()` 第一句 `_journal_close` | `thid inst=0x… shared=<共享 Context 条数>` | 谁在哪条线程上销毁实例——`:385-408` 那条释放路径的嫌疑人 |
+
+   在飞表 `_JOURNAL_INFLIGHT`（`ctx 构造序号 → (线程 id, 进记录序号, 上一层同款)`）是
+   进程级字典，`_journal_leave` 负责还回上一层 / 弹出，所以嵌套求值（`depth>1`）也能配对。
+   正常**永远不该出现 `ev=!`**（求值都排在 dispatcher 唯一线程上），出现就是现场证据。
+
+   **读法**：`crash_journal_inflight(path)` 回"进了原生码却没出来"的那几条 `ev=E`
+   （靠 `ref=` 判配对，不看尾巴——尾巴可能只是被环形容量挤掉的顺序假象），`path` 要显式
+   给崩溃那份留底文件；老格式（第五十三轮那种没有 `ev=` 的记录）按 `E` 处理，所以在
+   `crash-20260930-131140.journal` 上它会回"最后 8 条都没出来"，那是**格式换代**不是新线索。
+
+   容量因此从 4 MiB 提到 **8 MiB / 32768 条**（`_JOURNAL_SIZE`）：现场 15.49 分钟就写了
+   13010 条，成对之后同样时长要写 ~26000 条，4 MiB 会在 8 分钟左右把开头挤掉。
+   **配对的代价实测量不出来**：`.probe/qjs_journal_pair_cost_attr.py` 三臂
+   （关日志 / 只记进 / 进出成对）× 10 轮 × 600 次真求值交替跑，两次独立读数
+   ——配对相对只记进 **+11.57 µs/次（+0.13%）** 与 **−23.54 µs/次（−0.25%）**，相对关日志
+   **+34.22 µs（+0.37%）** 与 **+2.31 µs（+0.02%）**，三臂 `min~max` 全程互相压着，
+   所以结论是"**在噪声里**"，不是某个百分比。早前 5 轮 × 300 次那次读的 +2.03% 已被这两次
+   否证（样本不足），不许再引用。
+2. ~~`CheckController` 补合并 + `CheckView.render_result` 改 dict 索引~~ ——
+   **第五十三轮已改**。`BaseController.subscribe(..., flush_interval=0.5)` 合并的是
+   **下发**不是事件（`app/controllers/base.py` 的 `_coalesced_flush`）：处理器照旧
+   一条不漏，只把 `page.update()` 按 0.5 s leading+trailing 窗口压成每秒至多两次。
+   当时评估过直接套 `throttle` 到处理器上，那是错的——`CheckFinishedEvent` 一源一条，
+   合并处理器等于把中间那些源的结果行抹掉。`render_result` 的去重改成
+   `self._row_at: dict[str, int]`（原来 `enumerate(self._rows.controls)` 全行扫，
+   900 源一轮就是 ~40 万次 getattr）。
+3. ~~**10054 归因**：在两条循环上装只加标识、不改行为的 `set_exception_handler`~~ ——
+   **第五十三轮已装**：`install_loop_attribution(loop, tag)` 在
+   `EngineHub._serve`（tag=`engine`）与 `set_ui_loop`（tag=`ui`）各接一次，
+   日志形如 `循环[engine]线程=legado-engines loop=0x… 报告异常：<message>：<exc>`，
+   打完身份**原样转给** `default_exception_handler`（一条记录都不许少）。
+   白名单过滤按清单原计划**继续等归因结果再做**，本轮不过滤任何噪声。
+4. `BaseController.flush()` 整页 diff 是既定形状（要覆盖 page 级覆盖层/对话框，
+   `app/controllers/base.py:211`）。900 行 = 21.7 ms 可接受；一旦出现更大的常驻列表
+   （换源扫描、书内索引行），用同一支探针**重量**。
+5. 本轮全部结论只是**离线形状 + 生产同构循环**，不代表真源组合：917 条真实源的联网
+   扫描受杀软约束不能批量跑（记忆 `legado-live-scan-av-block`）。第五十三轮的改动
+   同样全部离线验证（真 quickjs + 子进程 + 假源级离线），**没有**跑过真源。
+   第五十五轮也一样：现场那条源的规则原文是从本地 `legado.db` 捞的，跑的是真检测链路 +
+   `127.0.0.1` 假源，**没有联网**；"改后现场不再崩"这一步要等开发者真跑一次全库扫描。
+6. **日志的盲区换成 `object_call` 了**：`ev=E/X/!/C` 记的全是 `ctx.eval` 与实例 close，
+   而第五十五轮新加的转换（以及所有 JS 函数从 Python 被调的那一族）走的是
+   `object_call`(:257)，**不在记里**。第五十四轮推的那个"补 Context 建/销各落一条"
+   （`module.c:382` 那条释放路径）优先级降下来——真因不在那条路上；
+   但如果现场再崩而 `ev=X` 全齐、也没有 `ev=!`，第一个该怀疑的就是这条没记账的入口。
+7. **拦住崩**（未开工）：把 QuickJS 放子进程，崩只带走 worker 不带走服务端——
+   真因这一类已经改掉，但**未知形状**仍只有这条路能兜；第五十五轮的改动**不是**它，
+   写注释时不许混。
+8. `Context.get`:566 / `Context.set`:580 / `Context.parse_json`:551 与本轮修掉的
+   `Object.json`:143 是同一族
+   **不建帧**的原生入口，今天引擎一处没用（全库 grep 无调用点）。要堵的话，
+   最省的形状是往 `test_no_bare_object_json_conversion_is_left_in_the_engine`
+   那条 AST 审计里**一并扫 `ctx.get(`/`ctx.set(`**，而不是等下一个人踩。
+
+## 探针/工具坑（三条同属"探针自己没测到"被当成"被测对象没问题"）
+
+- **界面探针不能 `page.route("**/*.woff2", 本地 CJK 字体)`**：它把 Flutter web 引擎自己的
+  kit 字体一并顶掉 → 客户端会话握不完手 → 服务端 `main` 永远不被调用 → 表现是**零输出**，
+  看着既像"没跑起来"又像"跑了没问题"。要中文字形只能 route 具体字体 URL。
+  隔离对照：`_mini2.py font`（`out_mini_font.txt`，只有 goto ok）vs
+  `nofont`（`out_mini_nofont.txt`，立刻出 `[main]`/`[walk]`）。
+- **空重叠窗口**：收尾竞态探针第一版每次 eval 只有几毫秒，主线程置 STOP 后 worker 立刻
+  出来，"8/8 干净"量的是**没发生的事**。必须先把求值标定到 400 ms，并在**进原生 eval 前**
+  置位、返回前读回，只有接上的样本才算数。
+- **假对照组**：重入探针的"新建 Context"对照组一开始没在 inner Context 上注册回调，JS 直接
+  `ReferenceError` 被分类成探针报错（0/5 存活）；补上 `add_callable` 后 5/5 活，才可比。
+- **手搓 Win32 结构**：`qjs_context_leak_attr.py` 第一版 RSS 恒 0.0 MB——ctypes 的
+  `PROCESS_MEMORY_COUNTERS` 多写了 `WorkingSetSizeEx`（那是 `_EX` 结构的字段），`cb` 对不上
+  → 调用静默失败。改用 psutil。
+- `ft.run` 永不返回，探针收尾要 `os._exit(0)`；`| head -N` 会吃掉不退出程序的全部输出，
+  改成重定向到文件再读。
+
+### 第五十五轮新增的坑（五条，四条还是"探针自己没测到"家族）
+
+- **探针把自己的输入毁了**：桥记账探针把记录路径当参数 `sys.argv[2]`，而子进程里那句
+  `os.open(fd, O_WRONLY|O_CREAT|O_TRUNC)` 打的就是**同一个参数位**——于是
+  `.probe/_manwaza_source.json`（从 `legado.db` 捞出来的那份现场规则）被清成 0 字节，
+  下一支探针 rc=1 报 `JSONDecodeError`，看着像"复现失败"其实是**样本没了**。
+  留底数据必须只读打开（`file:...?mode=ro&immutable=1`），并且记账文件的 fd 与样本文件
+  不能是同一个 argv 位。
+- **`python -c` 下 argv 全体左移一位**（`sys.argv[0] == '-c'`）：子脚本按 `argv[1]` 读探针
+  传的第 1 个真参数，写 `argv[2]` 就读到空——症状是"探针跑起来了但拿不到样本"。
+- **判定档把"探针报错"记成崩**：`rc != 0` 不等于"被测形状把进程带走了"。第一版因此把
+  `JSONDecodeError`（rc=1）统计成崩溃样本，"复现成功"是假的。现在分三档，
+  只有 rc∈{3221226505, 0xC0000409} 或 stderr 有 `Assertion failed` 才算崩。
+- **记账行里嵌真换行**：桥函数的返回值 `repr` 带规则原文的换行，一条记录被打成四行，
+  父进程按 `split()[1]` 取序号直接 IndexError。写行前把空白压平（与遗言日志同一支做法），
+  读侧再按"首字段是数字"过滤。
+- **`java.getElements()` 返回的是 Legado 的 `Elements`（array-like），没有 `.map`**：
+  六臂探针第一版"取文本"那一臂写成 `.map(e => e.text())`，`TypeError: not a function`
+  被分类成"探针报错"——白搭一臂。要构造"句柄藏在对象里再整体转换"就写
+  `({rows: java.getElements(...)})`。
+
+## 第五十三轮落地的改动与护栏
+
+| 改动 | 落点 | 护栏（红=改动失效） |
+| --- | --- | --- |
+| 遗言日志 | `app/services/engine/legado_js.py`：`_CrashJournal`、`crash_journal()`、`LegadoJsRuntime._journal_eval()`，调用点紧贴 `ctx.eval` 之前；第五十四轮补 `_journal_leave()`（`finally` 第一句）、`_journal_close()`（`close()` 第一句）、`_JOURNAL_INFLIGHT` 在飞表、`crash_journal_inflight()` 读回 | `tests/test_check_performance.py::QuickJsCrashJournalTests`（**11 条**：每 eval 一进一出成对且带
+rule/url、求值失败照旧落出记录、**桥回调里真按 0xC0000409 死掉时盘上留一条没闭合的 `ev=E`**、
+**外线程撞进同一条 Context 当场落 `ev=!`**、**在飞表求值完必清空**、**老格式记录按"没出来"算**、
+子进程 fast-fail 后遗言还在盘上、日志坏了求值照跑且不再逐条重付、`=0` 一个字节不落、
+按源码位置钉"落在 eval 之前"、环形覆盖保持写入序） |
+| 下发合并 | `BaseController.subscribe(..., flush_interval=…)` + `_coalesced_flush`；`CheckController.on_attach` 用 0.5 s | `tests/test_core_lifecycle.py`：20 条事件全渲染但只下发 1 次 + 窗口末尾补发 1 次；不传参时逐条下发（对照）；`detach` 撤掉悬挂补发 |
+| dict 去重 | `CheckView._row_at` | `tests/test_views_source_m3.py::CheckViewRenderTests::test_repeat_result_replaces_in_place_without_losing_rows` |
+| 循环异常归属 | `app/core/engine_worker.py`：`install_loop_attribution`，接在 `EngineHub._serve`（`engine`）与 `set_ui_loop`（`ui`） | `tests/test_core_lifecycle.py`：tag/线程名/loop id 都打出来、原始那条记录照旧转给 `default_exception_handler`、不带 exception 的 context 也要落一条、同一循环只装一层、两条真循环各自报得出自己的线程名（接线核验） |
+
+变异核验（护栏不许空转，逐条把改动改坏后跑对应用例）：摘掉 `_journal_eval` 调用点
+→ 4 红（每 eval 一条、fast-fail 存活、坏日志不带崩求值、按源码位置钉落点）；不挂 trailing 补发 → 红；窗口内连处理器一起合掉 → 红；
+`render_result` 不再维护 `_row_at` → 红；`_serve` 或 `set_ui_loop` 不装归属、
+归属处理器不转默认处理器 → 各红。
+
+**第五十四轮对新记录形状补做的四次变异**（将生产文件先备份到 `D:/tmp/btj/`，逐条改坏跑
+`-k QuickJsCrashJournal`，跑完还原并逐字节比对 `还原一致: True`）：
+
+| 变异 | 后果 |
+| --- | --- |
+| `finally` 里不调 `_journal_leave` | **4 红**（成对、失败也落出记录、回调崩只剩一条 `E`、在飞表清空） |
+| 把 `ev=!` 那个分支短路掉 | 1 红（外线程撞车那条） |
+| 读回器把老格式当"已闭合" | 1 红（老格式兼容那条） |
+| `ev=E` 丢掉 `thid=` 字段 | 1 红（撞车记录要断言 `thid=` 属于后来那条线程） |
+
+全量回归（第五十四轮）：**1553 passed + 147 subtests**（113.24 s，
+`--basetemp=D:/tmp/bt_j`）。
+
+顺带一条测试侧约束：`tests/conftest.py` 里 `LEGADO_JS_JOURNAL` 缺省置 `0`。日志默认
+落在数据目录，一次全量回归会把开发者手上唯一那份崩溃证据改名成 `*.prev` 再覆盖掉。
+
+## 第五十五轮落地的改动与护栏
+
+| 改动 | 落点 | 护栏（红=改动失效） |
+| --- | --- | --- |
+| JS 值的 JSON 转换一律走**带帧的 stringify** | `app/services/engine/legado_js.py`：`_JS_STRINGIFY_FRAME`（线程局部）、`_JS_STRINGIFY_PROGRAM`（闭包硬化的转换函数）、`LegadoJsRuntime._eval_with_stringify_frame()`（建帧→跑规则→转换→还帧）、`LegadoJsRuntime._json_of()`（无帧抛 `JsBridgeError`，不退回 `.json()`）；四处调用点改为 `_json_of` | `tests/test_check_performance.py::QuickJsStringifyFrameTests`（**5 条**：①**子进程**跑末句返回元素句柄的规则——断言 rc=0 **且** 8 条元素真转换出来 **且** 桥回调里那次转换跑成 `str`；②记账式假对象：有帧时 `calls == ["frame"]`（一次都不碰 `Object.json()`）、无帧时抛 `JsBridgeError` 且 `calls == []`；③帧进出成对：抛异常要弹干净、嵌套要把**外层那一份**还回来；④AST 审计引擎里不许再有 `X.json()` 调用点；⑤规则改写 `JSON` 之后转换仍走建帧时那一份） |
+
+变异核验（`.probe/_mut55_frame.py`，7 条逐条改坏 → 跑对应 node id → 整文件写回 + 字节一致断言；
+判据"执行 ≥1 条且失败 ≥1 条"）：
+
+| 变异 | 执行/失败 | 抓到它的护栏 |
+| --- | --- | --- |
+| M1 无帧时退回 `return value.json()` | 2/2 | ②（`calls` 里冒出 `object_json`）+ ④（AST） |
+| M2 求值返回处又用 `value.json()` | 2/2 | ①（子进程**当场量到 rc=3221226505 + `Assertion failed ... line 99`**，见 `.probe/_mut55_why_m2.py`）+ ④ |
+| M3 `finally` 里不还原帧（改成 `pass`） | 1/1 | ③ |
+| M4 还原时置 `None`（不还外层那一份） | 1/1 | ③ |
+| M5 根本不建帧 | 1/1 | ①（求值整条抛 `JsBridgeError`） |
+| M6 不做闭包硬化（函数体里现读全局 `JSON`） | 1/1 | ⑤ |
+| M7 桥回调里两处转换退回 `native.json()` | 1/1 | ④（AST 一次扫出两行） |
+
+七条都有红，护栏不空转；跑完**还原逐字节一致**，还原后再跑一遍五条全绿（`执行 5 条 / 失败 0 条`）。
+
+**一条真回归，是全量跑抓出来的**：`QuickJsCrashJournalTests.test_hook_is_placed_before_the_native_call`
+按源码位置钉"遗言日志落在原生 eval 之前"，它读的是 `_evaluate_locked` 里的 `.eval(` ——
+本轮把原生 eval 搬进了 `_eval_with_stringify_frame`，于是那句在**空文本**上比大小，直接红。
+这正是记忆 `refactor-regression-orphan-methods` 的形状：改动把一段代码搬走，
+护栏的锚点还在老地方，测试全绿时读的是空气。现已改成读**两段**：
+`_evaluate_locked` 里钉"日志句在那句调用之前"（并断言调用点恰好一处），
+`_eval_with_stringify_frame` 里钉"里面真有两次原生 eval（建帧 + 跑规则）"，
+栽样本（把日志句摘掉再拼到方法末尾）照旧会被扫出来。
+
+全量回归（第五十五轮）：见 `docs/dev-logs/2026-09-30.md` 第五十五轮——数字当场读，不在这抄两份。
+
+## 相关
+
+- python-quickjs 1.19.4 上游 C 源码：仓库里**没有** `reference/` 目录（早前的路径记录已过期），
+  第五十四轮从 PyPI 拉 sdist 读，落在 `D:/tmp/qjs1194/quickjs-1.19.4/module.c`。
+  本文所有 `module.c:NNN` 引用都按这份文件行号。
+- 记忆 `quickjs-native-crash-risk`（本文件记的两型都在那里：`:83` 那一型是两条线程同时进
+  同一个 Context（6/6 崩，护栏在 `tests/test_check_performance.py::QuickJsRuntimeOverlapTests`）；
+  `:99` 那一型是**同一条线程用了不建帧的原生入口**（`Object.json()`），
+  护栏在 `QuickJsStringifyFrameTests`）
+- 记忆 `legado-live-scan-av-block`、`guard-tests-assert-absence`、
+  `ab-bench-must-interleave`、`docs-numbers-must-be-measured`
+- `docs/dev-logs/2026-09-29.md` 第四十一轮（同一文件的上一轮取证）

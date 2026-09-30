@@ -160,6 +160,23 @@ class CheckViewRenderTests(unittest.TestCase):
         view.render_result("https://a/", "unusable", "搜索失败")
         self.assertEqual(len(view._rows.controls), 1)
 
+    def test_repeat_result_replaces_in_place_without_losing_rows(self):
+        """去重改用 source_id 索引以后，"覆盖第 2 行"不能变成"覆盖错行"或掉行。
+
+        全库扫描是几百到上千行、每行都可能重测（快照重放也走这条），所以这条
+        钉三件事：行数不涨、位置不动、内容确实是那一条被换掉。
+        """
+        view = CheckView()
+        for source_id in ("https://a/", "https://b/", "https://c/"):
+            view.render_result(source_id, "unknown", "首测")
+        view.render_result("https://b/", "fully_usable", "重测")
+        self.assertEqual([row.key for row in view._rows.controls],
+                         ["https://a/", "https://b/", "https://c/"])
+        self.assertEqual(view._rows.controls[1].subtitle.value, "完整可用 · 重测")
+        self.assertEqual(view._rows.controls[0].subtitle.value, "待确认 · 首测")
+        # 索引表必须与行表一致：漏一条就是下一次重测跑到错误的下标上
+        self.assertEqual(len(view._row_at), len(view._rows.controls))
+
     def test_state_labels_nine_states(self):
         from app.views.source.check_view import CHECK_STATE_LABELS
         self.assertIn("fully_usable", CHECK_STATE_LABELS)

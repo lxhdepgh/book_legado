@@ -25,6 +25,11 @@
 
 高频事件（下载进度 / 搜索结果流）用 :meth:`throttle` 做 0.5s 合并：窗口内先放行
 第一次、只保留最后一次参数在窗口末尾补一发（trailing），否则进度条会停在半路。
+
+**但合并处理器会丢事件**——``CheckFinishedEvent`` 一源一条，合并就等于把中间那些
+源的结果行直接抹掉。这类"每条都必须落图、只是不必每条都下发一次"的场合用
+:meth:`subscribe` 的 ``flush_interval``：处理器一条不漏，只把 :meth:`flush` 那次
+整页 diff 按同样的 leading+trailing 窗口合并。
 """
 from __future__ import annotations
 
@@ -63,6 +68,7 @@ class BaseController:
         self._view: Any = None
         self._subs: list[Callable[[], None]] = []
         self._throttle_state: dict[int, dict[str, Any]] = {}
+        self._flush_state: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------ #
     # 生命周期（§7.4：attach/detach 对称）
@@ -90,6 +96,11 @@ class BaseController:
             except Exception:  # 退订幂等，个别失败不阻断其余
                 pass
         self._subs.clear()
+        # 合并下发的窗口跟着页一起丢：留着会在下一份视图上补刷一次没主的 update
+        for state in self._flush_state.values():
+            if state.get("timer") is not None:
+                state["timer"].cancel()
+        self._flush_state.clear()
         self._view = None
 
     # 子类扩展点
@@ -102,20 +113,26 @@ class BaseController:
     # ------------------------------------------------------------------ #
     # 事件订阅（统一登记 + 编组回界面循环 + 收尾 flush）
     # ------------------------------------------------------------------ #
-    def subscribe(self, event_type: type[AppEvent], handler) -> Callable[[], None]:
+    def subscribe(self, event_type: type[AppEvent], handler,
+                  flush_interval: float | None = None) -> Callable[[], None]:
         """订阅某类事件，句柄登记后随 detach 自动退订。
 
         处理器由 EventBus 在 EngineHub 循环上调用；这里包一层把它编组回界面
         循环再执行，执行完 flush 视图，保证"事件到了界面也动了"。
+
+        ``flush_interval`` 给一个秒数，就把收尾那次整页下发按同样窗口合并（leading
+        + trailing）：处理器**每条都跑**，只让 ``page.update()`` 至多每窗口一次。
+        这是给"一源一条结果"那种不许丢事件的流用的——合并处理器会真丢行，合并下发
+        不会。不给就等于逐条下发（原行为）。
         """
         if self._bus is None:
             return lambda: None
         unsubscribe = self._bus.subscribe(
-            event_type, self._marshal(handler))
+            event_type, self._marshal(handler, flush_interval))
         self._subs.append(unsubscribe)
         return unsubscribe
 
-    def _marshal(self, handler) -> Callable:
+    def _marshal(self, handler, flush_interval: float | None = None) -> Callable:
         """把总线处理器包装成"在界面循环上执行 + 收尾 flush"的协程。"""
 
         async def on_ui(event) -> None:
@@ -134,9 +151,41 @@ class BaseController:
                     await asyncio.wrap_future(
                         asyncio.run_coroutine_threadsafe(handler(event), loop))
             finally:
-                self.flush()
+                if flush_interval is None:
+                    self.flush()
+                else:
+                    self._coalesced_flush(flush_interval)
 
         return on_ui
+
+    def _coalesced_flush(self, interval: float) -> None:
+        """窗口内第一次立刻下发，其余只挂一次窗口末尾的补发。
+
+        trailing 非有不可：``page.update()`` 是整页 diff，最后一次改动若赶不上
+        补发，界面就停在倒数第二个状态（检测最后几源刷不出来）。
+        """
+        state = self._flush_state.setdefault("flush", {"last": 0.0, "timer": None})
+        now = time.monotonic()
+        if now - state["last"] >= interval:
+            state["last"] = now
+            self.flush()
+            return
+        if state["timer"] is not None:
+            return          # 已经挂过补发：整页 diff 会把这一段所有改动一起带下去
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            state["last"] = now
+            self.flush()    # 没有循环可挂延时器：就地下发，绝不把改动攒到没人补
+            return
+
+        def fire() -> None:
+            state["timer"] = None
+            state["last"] = time.monotonic()
+            self.flush()
+
+        state["timer"] = loop.call_later(
+            max(0.0, interval - (now - state["last"])), fire)
 
     # ------------------------------------------------------------------ #
     # 界面编排派发（§9.2）

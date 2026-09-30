@@ -53,6 +53,9 @@ class CheckView(ft.Column):
         self._progress = ft.ProgressBar(value=0)
         self._summary = ft.Text("尚未检测", size=12, color=ft.Colors.GREY_600)
         self._rows = ft.ListView(expand=True, spacing=4)
+        #: source_id → 行下标。全库扫描几百到上千行，每来一条结果都从头扫一遍
+        #: 列表就是 O(n²)（1000 源 ≈ 50 万次 getattr），而这条路径每源都跑。
+        self._row_at: dict[str, int] = {}
 
         self.controls = [
             self._title,
@@ -84,13 +87,13 @@ class CheckView(ft.Column):
             subtitle=ft.Text(f"{label} · {summary or ''}", size=12,
                              color=ft.Colors.GREY_700),
         )
-        # 同源重测：覆盖旧行
-        for index, existing in enumerate(list(self._rows.controls)):
-            if getattr(existing, "key", None) == source_id:
-                self._rows.controls[index] = row
-                row.key = source_id
-                return
+        # 同源重测：覆盖旧行（下标来自 _row_at，不再逐行找）
+        index = self._row_at.get(source_id)
         row.key = source_id
+        if index is not None:
+            self._rows.controls[index] = row
+            return
+        self._row_at[source_id] = len(self._rows.controls)
         self._rows.controls.append(row)
 
     def set_running(self, running: bool, text: str = "") -> None:

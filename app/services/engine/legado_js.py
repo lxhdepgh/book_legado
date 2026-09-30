@@ -12,6 +12,7 @@ import ipaddress
 import gzip
 import itertools
 import json
+import mmap
 import os
 import queue
 import random
@@ -121,6 +122,214 @@ class JsContext:
     rule_name: str = ""
 
 
+#: 遗言日志的形状：8 MiB 定长环形文件 = 32768 条 256 B 记录。
+#: 为什么从 4 MiB 加倍：进出成对之后一次求值占**两条**记录，历史长度不能缩水——
+#: 现场一轮全库扫描 15.5 分钟就写了 13010 条进（crash-20260930-131140.journal），
+#: 32768 条 = 16384 次求值的进出对 ≈ 19 分钟，够罩住一整轮。
+_JOURNAL_SIZE = 8 * 1024 * 1024
+_JOURNAL_RECORD = 256
+_JOURNAL_LOCK = threading.Lock()
+_JOURNAL: "_CrashJournal | None" = None
+_JOURNAL_UNAVAILABLE = False
+#: 正在原生码里面的那条 Context：ctx 构造序号 → (线程 id, 进记录的序号, 上一层的同款)。
+#: 只给诊断用；键的存在性就是"这条 Context 里还有人"，换线程撞上时落一条 ``ev=!``。
+_JOURNAL_INFLIGHT: dict[int, tuple[int, int, "tuple | None"]] = {}
+
+#: 本线程正在求值的那个 Context 的 stringify 函数（由 `_eval_with_stringify_frame`
+#: 进出成对地压/弹，嵌套求值换的是自己那一份）。为什么按线程记而不是记在实例上：
+#: 用到它的三处里有两处是 static/class method（`_byte_values`、`_external_rule_root`），
+#: 它们只有值没有实例，而"哪个 Context 在飞"本来就是线程级事实。
+_JS_STRINGIFY_FRAME = threading.local()
+
+#: 把 JS 值转成 JSON 文本用的那一段——**必须**包在函数里从 Python 调，
+#: 因为 `Object()` 走 `object_call`（上游 module.c:257）会先 `prepare_call_js` 建帧；
+#: 换成 `value.json()` 就是裸 `JS_JSONStringify`（:143，不建帧），详见 `_json_of`。
+#: 外面再套一层闭包是必要的：`JSON` 是个可写的全局属性，社区源里真有人
+#: `var JSON = …`/改写它，而我们这次转换必须和 `JS_JSONStringify` 一样不受影响——
+#: 建帧发生在规则跑**之前**，取到的就是引擎realm自己那一份 `JSON.stringify`。
+_JS_STRINGIFY_PROGRAM = ("(function(stringify){return function(v){return stringify(v);};"
+                         "})(JSON.stringify)")
+
+
+#: 遗言日志的字段压平：把任意空白换成空格，一条记录恒为一行。
+#: 预编译正则这一臂最快：0.68~0.72 µs/次，现编译正则 0.93 µs，``str.translate``
+#: 查表 1.84 µs（`.probe/out_journal_field_ab.txt`，四臂轮流先跑 7 轮 × 30000 次；
+#: 这条每进一次 eval 要跑两遍）。两臂固定顺序时曾把先后读出过两次相反的结果，
+#: 所以那份对照按轮把起点挪一格。
+_JOURNAL_BLANK = re.compile(r"\s+")
+
+
+def _journal_field(value, limit: int) -> str:
+    """把遗言日志的一个字段压成单行定长片段（换行/制表会毁掉按行取证的形状）。"""
+    return _JOURNAL_BLANK.sub(" ", str(value or "")).strip()[:limit]
+
+
+class _CrashJournal:
+    """进原生 QuickJS 求值前后各落一条定长记录——给"进程当场没了"留下的遗言。
+
+    为什么必须写在**进原生码之前**：现场那种崩溃是 python-quickjs 的原生断言
+    （``Assertion failed: runtime_data->thread_state, file module.c, line 99``），
+    退出码 3221226505 = 0xC0000409，走的是 ``__fastfail``。实测
+    （``.probe/js_crash_journal_probe.py`` → ``out_journal_fastfail.txt``，每形状
+    3 个子进程）这条路径**绕过** Python 异常、信号处理器与 atexit
+    （atexit/SIGABRT 跑过 0/3），``faulthandler`` 也不落栈（0/3、文件 0 字节；
+    同一接线在 0xC0000005 访问违例下落了 3/3，所以那不是探针的假阴性）。
+    也就是说：进程一旦那么死，只有**已经写进盘**的内容还在。
+
+    为什么是 mmap 环而不是 ``write()+flush()``：纯写一条 0.38 µs，而同一形状的
+    追加+flush 要 1.74 µs、每行 msync 要 23.5 µs，一段真规则求值中位 49.8 µs
+    （``out_journal_cost.txt``，7 轮交替）。整条 `_journal_eval`（查单例 + 拼 9 个
+    字段 + 写 mmap）实测 3.69 µs（``out_journal_field_ab.txt``）；放到真求值路径上
+    开/关两臂交替实测是 **量不出来**——8.9 ms 一条完整规则，差值 −21 µs = −0.24%，
+    落在噪声里（``out_journal_ab_cost.txt``，5 轮交替 × 300 次）。按住 journal 对象
+    不 close 的生产形状下，100/100 条记录在 __fastfail 之后仍能从盘上读回来——脏页的
+    写回由内核在进程结束时做，不需要我们在热路径上 msync。
+
+    写满回头覆盖，所以文件里永远只有最近 32768 条；新建时把上一份改名成
+    ``*.prev``——刚崩那份证据不能被下一轮扫描覆盖掉。
+
+    记录种类（第一字段 ``ev=``）：``E`` 进原生 eval、``X`` 出来了（带耗时与成败）、
+    ``!`` **另一条线程进到了同一条还在里的 Context**（这就是 :99/:83 那一族的现场
+    证据，正常情况下永远不会出现）、``C`` 一个运行时实例被关掉。一次求值占 ``E``+``X``
+    两条，配对靠 ``seq=``；只有 ``E`` 没有 ``X`` 的那条就是崩在里面那一次，
+    读回工具见 :func:`crash_journal_inflight`。
+    """
+
+    def __init__(self, path: Path, size: int = _JOURNAL_SIZE,
+                 record: int = _JOURNAL_RECORD):
+        self.path = path
+        self.record = record
+        self.size = size
+        self.capacity = size // record
+        self._offset = 0
+        self._sequence = itertools.count(1)
+        self._blank = b"\x00" * record
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            try:
+                path.replace(path.with_name(f"{path.stem}.prev{path.suffix}"))
+            except OSError:
+                # 上一份还被别的进程（读遗言的探针/工具）持着：留着旧文件不动，
+                # 本轮照样开新的——宁缺一份归档，也不把求值带崩。
+                pass
+        self._file = open(path, "w+b")
+        self._file.truncate(size)
+        self._map = mmap.mmap(self._file.fileno(), size)
+
+    def write(self, fields: str) -> int:
+        """落一条记录，回它的序号。任何写盘问题都只关掉日志本身，绝不让求值跟着失败。"""
+        number = next(self._sequence)
+        line = f"#{number} {fields}"[:self.record - 1]
+        raw = (line.encode("utf-8", "replace") + self._blank)[:self.record - 1] + b"\n"
+        start = self._offset * self.record
+        self._offset = (self._offset + 1) % self.capacity
+        try:
+            self._map[start:start + self.record] = raw
+        except (ValueError, OSError):
+            # 标记失效后 `crash_journal()` 一律返回 None，之后的每次求值连拼字符串
+            # 都不做——坏掉的日志不该一直收求值的钱。
+            global _JOURNAL_UNAVAILABLE
+            _JOURNAL_UNAVAILABLE = True
+        return number
+
+    def records(self, limit: int = 40) -> list[str]:
+        """按写入顺序回读最近的若干条（环里不认 offset，靠 ``#序号`` 排序）。"""
+        found = []
+        for index in range(self.capacity):
+            chunk = self._map[index * self.record:(index + 1) * self.record]
+            chunk = chunk.strip(b"\x00\n ")
+            if chunk:
+                found.append(chunk.decode("utf-8", "replace"))
+        found.sort(key=lambda text: int(text[1:].split(" ", 1)[0]))
+        return found[-limit:]
+
+
+def _journal_default_path() -> Path:
+    """遗言日志的默认落点：数据目录下的 diagnostics/quickjs-eval.journal。"""
+    from app.services.app_paths import default_app_paths
+
+    return default_app_paths().data / "diagnostics" / "quickjs-eval.journal"
+
+
+def crash_journal() -> "_CrashJournal | None":
+    """进程级遗言日志单例；关闭或建不出来时返回 None（调用点每条都要过这里）。
+
+    ``LEGADO_JS_JOURNAL`` 三种取值：``0``/``off``/``no`` 关掉；给一个路径就写到那个
+    路径（测试与探针用）；不设则用 :func:`_journal_default_path`。
+    """
+    global _JOURNAL, _JOURNAL_UNAVAILABLE
+    if _JOURNAL_UNAVAILABLE:
+        return None
+    if _JOURNAL is not None:
+        return _JOURNAL
+    with _JOURNAL_LOCK:
+        if _JOURNAL_UNAVAILABLE:
+            return None
+        if _JOURNAL is not None:
+            return _JOURNAL
+        setting = str(os.environ.get("LEGADO_JS_JOURNAL") or "").strip()
+        if setting.lower() in ("0", "off", "no"):
+            _JOURNAL_UNAVAILABLE = True
+            return None
+        try:
+            _JOURNAL = _CrashJournal(Path(setting) if setting
+                                     else _journal_default_path())
+        except (OSError, ValueError):
+            _JOURNAL_UNAVAILABLE = True
+        return _JOURNAL
+
+
+def crash_journal_records(path: str | Path | None = None,
+                          limit: int = 40) -> list[str]:
+    """读回某份遗言日志最近的若干条；文件不在或读不动就是空表。"""
+    target = Path(path) if path else _journal_default_path()
+    try:
+        with open(target, "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return []
+    found = []
+    for start in range(0, len(raw), _JOURNAL_RECORD):
+        chunk = raw[start:start + _JOURNAL_RECORD].strip(b"\x00\n ")
+        if chunk:
+            found.append(chunk.decode("utf-8", "replace"))
+    try:
+        found.sort(key=lambda text: int(text[1:].split(" ", 1)[0]))
+    except ValueError:
+        pass          # 序号读不出来的残行按原顺序给出去，别把取证工具卡死
+    return found[-limit:]
+
+
+def crash_journal_inflight(path: str | Path | None = None,
+                           limit: int = 8) -> list[str]:
+    """回"进了原生码却没出来"的那几条 ``ev=E`` 记录——崩在哪一条规则，读这个。
+
+    配对靠 ``X`` 记录里的 ``ref=``（它指回自己那条 ``E`` 的序号）：没有对应 ``X``
+    的 ``E`` 就是没回来的那一次。现场那种 0xC0000409 绕过 Python 异常与 atexit，
+    进程死了什么日志都不落，唯一还在的就是这份已经写进盘的环——所以判"没出来"
+    只能靠成对，不能靠尾巴（尾巴可能只是被 32768 条之外的老记录挤掉的顺序假象）。
+    """
+    lines = crash_journal_records(path=path, limit=_JOURNAL_SIZE // _JOURNAL_RECORD)
+    closed: set[str] = set()
+    opened: list[tuple[str, str]] = []
+    for line in lines:
+        kind = _journal_kind(line)
+        if kind == "X":
+            reference = re.search(r"\bref=(\d+)", line)
+            if reference:
+                closed.add(reference.group(1))
+        elif kind == "E":
+            number = line[1:].split(" ", 1)[0]
+            opened.append((number, line))
+    return [line for number, line in opened if number not in closed][-limit:]
+
+
+def _journal_kind(line: str) -> str:
+    """取一条记录的种类字段 ``ev=``；老格式（第五十三轮那种单条记录）按 ``E`` 算。"""
+    found = re.search(r"\bev=(\S)", line)
+    return found.group(1) if found else "E"
+
+
 class _QuickJsDispatcher:
     """Run every native QuickJS call on one thread, interactive work first.
 
@@ -228,6 +437,10 @@ class LegadoJsRuntime:
     _QUICKJS_LOCK = threading.RLock()
     _QUICKJS_DISPATCHER = _QuickJsDispatcher()
     _QUICKJS_THREAD = threading.local()
+    #: 每条 QuickJS runtime（Context）的构造序号，遗言日志用它认"哪一条 runtime"。
+    #: 不用 ``id(ctx)``：短命 Context 回收后 id 会被复用，把两条无关的 runtime 拼成
+    #: 同一条——2026-09-29 第四十一轮的护栏就踩过这个坑（见该轮日志第四节）。
+    _CONTEXT_SERIAL = itertools.count(1)
     #: JS→Python 回调→JS 的重入层数上限（为什么必须有，见 _evaluate_serialized）。
     JS_REENTRY_LIMIT = 16
     _FOREGROUND_PRIORITY = 0
@@ -294,6 +507,7 @@ class LegadoJsRuntime:
         # snapshot is insufficient because function closures, object identity
         # and non-enumerable state must survive later rule evaluations.
         self._shared_js_contexts = {}
+        self._shared_js_runtimes = {}
         self._js_lib_code_cache = {}
         self._thread_state = threading.local()
         self.browser_fetcher = None
@@ -492,8 +706,26 @@ class LegadoJsRuntime:
             self.persistent_state.setdefault("fileCache", {}).pop(str(key), None)
             self._save_persistent_state()
 
+    def _journal_close(self) -> None:
+        """落一条 ``ev=C``：这个运行时实例被谁、在哪条线程上关掉，手上几条共享 Context。
+
+        为什么单记这一条：`:99` 那一族缺的是"谁在 eval 还没结束时动了这条 Context"，
+        而销毁 Context 就是最像"动"的那一下——python-quickjs 自己的注释都写着
+        释放可调用对象"may be called from e.g. runtime_dealloc"。`close()` 不在求值
+        热路径上（每实例一次），这条不要钱。
+        """
+        journal = crash_journal()
+        if journal is None:
+            return
+        journal.write(
+            f"ev=C ts={time.time():.3f} pid={os.getpid()}"
+            f" th={_journal_field(threading.current_thread().name, 24)}"
+            f" thid={threading.get_ident()}"
+            f" inst={id(self):#x} shared={len(self._shared_js_contexts)}")
+
     def close(self):
         """Release references retained by urllib handlers after a JS check."""
+        self._journal_close()
         try:
             self.cookies.clear()
         except KeyError:
@@ -605,6 +837,56 @@ class LegadoJsRuntime:
         finally:
             self._QUICKJS_THREAD.depth = depth - 1
 
+    def _journal_eval(self, context: JsContext, source_key: str, js_lib_key: str,
+                      runtime_id: int, script_size: int, fresh: bool):
+        """把"正要进原生 eval"的那一条写进遗言日志，回一个交给 `_journal_leave` 的把手。
+
+        进出成对是这一轮补的：只记进不记出，"哪一次没回来"就只能看环里最后一条，
+        而环是定长覆盖写的，尾巴到底是不是最后一次并不可信。配上对还白送一个东西——
+        同一次求值的耗时；现场那条共享 Context 被进了 5112 次，慢在哪一层只有成对才看得见。
+        """
+        journal = crash_journal()
+        if journal is None:
+            return None
+        thread_id = threading.get_ident()
+        # 撞车记录：**另一条线程**已经在这条 Context 的原生码里面。按架构这不该发生
+        # （所有原生调用都排在 dispatcher 唯一线程上），而 module.c:83/:99 那一族要的
+        # 恰恰就是它，所以真出现时必须当场落盘——而且要在进之前落，崩了它也还在盘上。
+        inside = _JOURNAL_INFLIGHT.get(runtime_id)
+        if inside is not None and inside[0] != thread_id:
+            journal.write(
+                f"ev=! ts={time.time():.3f} pid={os.getpid()}"
+                f" th={_journal_field(threading.current_thread().name, 24)}"
+                f" thid={thread_id} runtime={runtime_id}"
+                f" other_thid={inside[0]} other_seq={inside[1]}")
+        number = journal.write(
+            f"ev=E ts={time.time():.3f} pid={os.getpid()}"
+            f" th={_journal_field(threading.current_thread().name, 24)} thid={thread_id}"
+            f" depth={getattr(self._QUICKJS_THREAD, 'depth', 0)}"
+            f" runtime={runtime_id} fresh={int(fresh)} jslib={js_lib_key[:8]}"
+            f" bytes={script_size}"
+            f" rule={_journal_field(context.rule_name, 40)}"
+            f" url={_journal_field(source_key, 90)}")
+        _JOURNAL_INFLIGHT[runtime_id] = (thread_id, number, inside)
+        return (journal, number, runtime_id, thread_id, time.monotonic(), inside)
+
+    def _journal_leave(self, handle) -> None:
+        """出记录：把在飞表还回上一层，再落一条 ``ref=`` 指回自己那条进记录。"""
+        if handle is None:
+            return
+        journal, number, runtime_id, thread_id, started, outer = handle
+        if outer is None:
+            _JOURNAL_INFLIGHT.pop(runtime_id, None)
+        else:
+            _JOURNAL_INFLIGHT[runtime_id] = outer
+        unwinding = sys.exc_info()[0] is not None
+        journal.write(
+            f"ev=X ts={time.time():.3f} pid={os.getpid()}"
+            f" th={_journal_field(threading.current_thread().name, 24)} thid={thread_id}"
+            f" runtime={runtime_id} ref={number}"
+            f" took={(time.monotonic() - started) * 1000:.1f}"
+            f" out={'err' if unwinding else 'ok'}")
+
     def _evaluate_locked(self, script: str, context: JsContext):
         try:
             import quickjs
@@ -658,6 +940,7 @@ class LegadoJsRuntime:
         ctx = self._shared_js_contexts.get(js_lib_key) if js_lib else None
         is_new_shared_context = ctx is None
         if ctx is None:
+            ctx_serial = next(self._CONTEXT_SERIAL)
             ctx = quickjs.Context()
             # Only the memory cap is safe to set.  set_time_limit looks like
             # the obvious guard against runaway scripts, but the binding then
@@ -675,6 +958,9 @@ class LegadoJsRuntime:
             ctx.set_memory_limit(128 * 1024 * 1024)
             if js_lib:
                 self._shared_js_contexts[js_lib_key] = ctx
+                self._shared_js_runtimes[js_lib_key] = ctx_serial
+        else:
+            ctx_serial = self._shared_js_runtimes.get(js_lib_key, 0)
         self._thread_state.bridge_error = ""
         def network_call(method, *args):
             return method(*args, cookie_enabled, source_key)
@@ -3791,6 +4077,14 @@ class LegadoJsRuntime:
             bootstrap = bootstrap.replace(
                 "        var __global = globalThis;",
                 "        var __global = this; var globalThis = __global;")
+        # 遗言日志：贴着进原生码那一句落一条。崩在 QuickJS 里面时 Python 侧什么都
+        # 留不下（原因见 _CrashJournal 的注释），所以这条记录必须落在进原生码**之前**，
+        # 且落在所有准备工作之后——中间只剩下面 try 里的程序拼装。原生 eval 本身在
+        # 第五十五轮搬进了 `_eval_with_stringify_frame`（带帧的 stringify），所以这里
+        # 的"进原生码"是那句调用。
+        # 把手交给下面 finally 里的出记录，两条配成一对。
+        journal_entry = self._journal_eval(context, source_key, js_lib_key, ctx_serial,
+                                          len(clean), is_new_shared_context)
         try:
             # Rhino returns undefined for a declaration-only rule.  Isolate
             # that narrow case so bootstrap statement completions cannot leak
@@ -3805,10 +4099,9 @@ class LegadoJsRuntime:
                                 json.dumps(clean, ensure_ascii=False) + ")})(" +
                                 ("null" if source_is_null else "source") + ")")
                 library_program = js_lib if is_new_shared_context else ""
-                value = ctx.eval(
-                    bootstrap + "\n;delete __global.globalThis;\n" +
-                    library_program + "\n;__initUrlHeaderMap();\n" +
-                    rule_program)
+                program = (bootstrap + "\n;delete __global.globalThis;\n" +
+                           library_program + "\n;__initUrlHeaderMap();\n" +
+                           rule_program)
             else:
                 declaration_only = bool(re.fullmatch(
                     r"\s*(?:(?:var|let|const)\s+[^;]+;|"
@@ -3820,13 +4113,9 @@ class LegadoJsRuntime:
                 else:
                     rule_program = (";eval(" + json.dumps(clean, ensure_ascii=False) + ")"
                                     if declaration_only else clean)
-                value = ctx.eval(bootstrap + "\n;delete __global.globalThis;\n" +
-                                 ";__initUrlHeaderMap();\n" + rule_program)
-            self._sync_context_objects(ctx, context)
-            self._sync_rule_variables(context)
-            if hasattr(value, "json"):
-                return json.loads(value.json())
-            return value
+                program = (bootstrap + "\n;delete __global.globalThis;\n" +
+                           ";__initUrlHeaderMap();\n" + rule_program)
+            return self._eval_with_stringify_frame(ctx, program, context)
         except Exception as exc:
             bridge_error = str(getattr(self._thread_state, "bridge_error", "") or "")
             detail = str(exc)
@@ -3849,6 +4138,7 @@ class LegadoJsRuntime:
                 detail = f"{detail.rstrip()}\nBridge: {bridge_error}"
             raise JsBridgeError(detail) from exc
         finally:
+            self._journal_leave(journal_entry)
             # Do not let an exception traceback release the native Context on
             # the caller's thread; QuickJS requires destruction on its owner.
             if not js_lib:
@@ -3862,11 +4152,58 @@ class LegadoJsRuntime:
             self._thread_state.bridge_error = f"{type(exc).__name__}: {exc}"
             raise
 
+    def _eval_with_stringify_frame(self, ctx, program: str, context: JsContext):
+        """跑一段规则程序，期间"把 JS 值转成 JSON"必须有调用帧（见 `_json_of`）。
+
+        帧是一段 JS 函数，由同一个 Context 求出来，进出成对地压进
+        `_JS_STRINGIFY_FRAME`：桥回调里再嵌套一层求值时，各层用各层的 Context，
+        退回去要把外层那一份还回来——直接覆盖会让外层的转换指向已经 close() 的
+        嵌套 Context，那是 use-after-free，比原来那个 abort 更难查。
+        """
+        stringify = ctx.eval(_JS_STRINGIFY_PROGRAM)
+        outer = getattr(_JS_STRINGIFY_FRAME, "stringify", None)
+        _JS_STRINGIFY_FRAME.stringify = stringify
+        try:
+            value = ctx.eval(program)
+            self._sync_context_objects(ctx, context)
+            self._sync_rule_variables(context)
+            if hasattr(value, "json"):
+                return json.loads(self._json_of(value))
+            return value
+        finally:
+            _JS_STRINGIFY_FRAME.stringify = outer
+
+    @staticmethod
+    def _json_of(value):
+        """把 JS 值转成 JSON 文本。**不许**改成直接调 `value.json()`。
+
+        上游 `_quickjs` 只有四个动 `thread_state` 的地方（本机 sdist
+        `D:/tmp/qjs1194/quickjs-1.19.4/module.c`）：`Context.eval`(:507) 和
+        `Object()`(:257) 都先 `prepare_call_js`(:81) 建帧，而
+        `Object.json()`(:143) 是**裸的** `JS_JSONStringify` —— 它进 JS 的时候
+        `thread_state` 还是 NULL。被序列化的对象只要属性读取落到"JS 回头调 Python
+        桥函数"（本引擎的元素句柄就是 Proxy，陷阱里叫 `__dom_*`），
+        `prepare_call_python` 的 `assert(runtime_data->thread_state)`(:99) 就当场
+        abort 整个进程：0xC0000409，绕过 Python 异常、信号处理器与 atexit。
+        2026-09-30 现场那一次崩的就是这里，机制与复现见
+        `docs/known-issues/004_long_scan_page_frozen_and_quickjs_abort.md`。
+        换成调用 Context 自己的 stringify 函数就走 :257 那条带帧的路，桥函数照常回调。
+        跨 Context 的值由上游抛 ValueError（它拒绝混用两个 Context 的对象）——
+        那是可捕获的错误，不是崩。
+        """
+        if not hasattr(value, "json"):
+            return value
+        stringify = getattr(_JS_STRINGIFY_FRAME, "stringify", None)
+        if stringify is None:
+            raise JsBridgeError(
+                "拿到 JS 对象但当前线程没有 stringify 帧：请在一次求值之内转换它")
+        return stringify(value)
+
     @staticmethod
     def _external_rule_root(content):
         from app.services.engine.legado_rule_parser import parse_json_smart, parse_markup
         if hasattr(content, "json"):
-            content = content.json()
+            content = LegadoJsRuntime._json_of(content)
         if isinstance(content, (dict, list)):
             return content, "json"
         text = str(content if content is not None else "")
@@ -3970,7 +4307,7 @@ class LegadoJsRuntime:
         native = content
         if hasattr(native, "json"):
             try:
-                native = json.loads(native.json())
+                native = json.loads(self._json_of(native))
             except (TypeError, ValueError, json.JSONDecodeError):
                 native = None
         if isinstance(native, dict):
@@ -4001,7 +4338,7 @@ class LegadoJsRuntime:
         native = content
         if hasattr(native, "json"):
             try:
-                native = json.loads(native.json())
+                native = json.loads(self._json_of(native))
             except (TypeError, ValueError, json.JSONDecodeError):
                 native = None
         if isinstance(native, dict):
@@ -4501,7 +4838,7 @@ class LegadoJsRuntime:
     @staticmethod
     def _byte_values(value) -> bytes:
         if hasattr(value, "json"):
-            value = value.json()
+            value = LegadoJsRuntime._json_of(value)
         if isinstance(value, str):
             try:
                 value = json.loads(value)

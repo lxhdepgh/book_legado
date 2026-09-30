@@ -1,6 +1,11 @@
 import ast
 import asyncio
+import os
 import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -1715,6 +1720,559 @@ class SourceHeaderSingleDefinitionTests(unittest.TestCase):
         for text in (marker_only, other_json):
             self.assertEqual(scan_header_parsers(text, "quiet.py"), [],
                              "扫描器把不解析 header 的探测误报成了第二份实现")
+
+
+class QuickJsCrashJournalTests(unittest.TestCase):
+    """遗言日志：进原生 eval 之前那一条必须落盘，且崩了以后还读得回来。
+
+    这条护栏守的不是性能而是取证（``docs/known-issues/004_long_scan_page_frozen_and_quickjs_abort.md``
+    待修清单第 1 条）。现场那条 ``Assertion failed: runtime_data->thread_state,
+    file module.c, line 99`` 是 0xC0000409 fast-fail，Python 侧不可捕获，atexit
+    与 ``faulthandler`` 都不落（``.probe/js_crash_journal_probe.py`` →
+    ``out_journal_fastfail.txt``：ring_nosync 3/3 存活、faulthandler 0/3 且文件
+    0 字节，而同一个 faulthandler 接线在 0xC0000005 下 3/3 落栈，所以那个 0/3
+    不是探针假阴性）。所以日志只有同时满足四件事才算有用，四件各钉一条：
+    ①记录落在**进原生码之前**（落在之后就是崩时最想读的那条恰好没写）；
+    ②内容在进程当场没了之后还在盘上；
+    ③日志自己坏了绝不把求值带崩（它挂在每段规则的热路径上）；
+    ④一进一出**成对**——"哪一次求值没回来"要判得出来，另一条线程进到还开着的同一条
+      Context 要当场落 ``ev=!``（``:83``/``:99`` 这一族要的就是"同一 Context 两条线程"）。
+    """
+
+    def setUp(self):
+        import app.services.engine.legado_js as module
+
+        self.module = module
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="journal-test-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self._saved = (module._JOURNAL, module._JOURNAL_UNAVAILABLE)
+        module._JOURNAL, module._JOURNAL_UNAVAILABLE = None, False
+        self._env = patch.dict(os.environ, {"LEGADO_JS_JOURNAL":
+                                            str(self.root / "eval.journal")})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        # 只关本用例建出来的那份（不关就删不掉临时目录）；进程原有的单例原样放回。
+        current = self.module._JOURNAL
+        self.module._JOURNAL, self.module._JOURNAL_UNAVAILABLE = self._saved
+        self.module._JOURNAL_INFLIGHT.clear()
+        if current is None:
+            return
+        try:
+            current._map.close()
+            current._file.close()
+        except Exception:  # noqa: BLE001 —— 收尾关不上不影响红绿
+            pass
+
+    def _journal(self):
+        return self.module.crash_journal()
+
+    def _source(self):
+        return {"bookSourceUrl": "https://journal.test",
+                "bookSourceName": "遗言日志样本",
+                "jsLib": "var __journal_lib = 1;"}
+
+    def test_native_eval_writes_a_paired_record_carrying_rule_and_source(self):
+        """①＋②：一段规则一进一出两条记录，带上"哪条源的哪一段"，且配得上对。
+
+        第五十三轮只有一次求值一条"进"记录；崩了以后只能看环里最后一条，而那是定长
+        覆盖写的环，尾巴到底是不是最后一次并不可信。补上"出"记录之后，"哪一条没回来"
+        变成可判的（见 :func:`crash_journal_inflight`），还白送一次求值的耗时。
+        """
+        runtime = LegadoJsRuntime()
+        for _ in range(3):
+            runtime.evaluate("@js:__journal_lib+1",
+                             JsContext(source=self._source(),
+                                       rule_name="ruleBookInfo.name"))
+        records = self.module.crash_journal_records(self.root / "eval.journal",
+                                                   limit=100)
+        enters = [text for text in records if "ev=E" in text]
+        leaves = [text for text in records if "ev=X" in text]
+        self.assertEqual(len(enters), 3, f"一次 eval 一条进记录断了：{enters}")
+        self.assertEqual(len(leaves), 3, f"进了三条、只出来 {len(leaves)} 条：{leaves}")
+        for record in enters:
+            self.assertIn("rule=ruleBookInfo.name", record)
+            self.assertIn("url=https://journal.test", record)
+            self.assertIn("pid=", record)
+            self.assertIn("thid=", record)
+        for record in leaves:
+            self.assertIn("thid=", record)
+            self.assertIn("out=ok", record)
+        # 配对必须真配得上：每条出记录的 ref= 恰好盖住一条进记录的序号，一进一出。
+        self.assertEqual(sorted(int(text.split("ref=")[1].split()[0]) for text in leaves),
+                         sorted(int(text[1:].split(" ", 1)[0]) for text in enters),
+                         f"进出记录配不上对，读遗言时判不出谁没回来：{records}")
+        # 反空转：真求值走 dispatcher 唯一线程，记录里的线程名必须是那条线程，
+        # 而不是测试调用它的这条——否则说明这条护栏测的是别的路径。
+        self.assertIn("th=legado-quickjs", enters[-1])
+        # runtime 序号要能认出"这三段进的是同一个原生 runtime"：同 jsLib 复用
+        # 同一 Context，第 1 条 fresh=1、后 2 条 fresh=0，三条 runtime 相同。
+        # 现场读遗言时全靠这一列区分"两条线程同时进一份 runtime"那种崩法。
+        self.assertIn("fresh=1", enters[0])
+        self.assertNotIn("fresh=1", enters[1])
+        self.assertNotIn("fresh=1", enters[2])
+        serials = {record.split("runtime=")[1].split()[0] for record in enters}
+        self.assertEqual(len(serials), 1, f"runtime 序号在记录里对不上：{enters}")
+
+    def test_a_failed_eval_still_writes_its_leave_record(self):
+        """出记录落在 finally 里：规则抛错也要出来，否则每次业务异常都假报"没回来"。
+
+        这条不是形式主义——`crash_journal_inflight()` 把"只有进没有出"当成崩在里面，
+        要是异常路径不落出记录，读工具就会把一堆普通报错说成原生崩。
+        """
+        runtime = LegadoJsRuntime()
+        with self.assertRaises(Exception):
+            runtime.evaluate("@js:(function(){throw new Error('炸')})()",
+                             JsContext(source=self._source(),
+                                       rule_name="ruleBookInfo.name"))
+        records = self.module.crash_journal_records(self.root / "eval.journal",
+                                                   limit=100)
+        self.assertTrue([text for text in records if "ev=X" in text and "out=err" in text],
+                        f"抛错的求值没落出记录：{records}")
+        self.assertEqual(self.module.crash_journal_inflight(
+            self.root / "eval.journal"), [], "普通报错被读成了崩在里面")
+
+    def test_a_crash_inside_a_bridge_callback_leaves_one_unclosed_enter(self):
+        """②＋④：崩在 JS→Python 回调里面时，遗言还剩"那条没回来的进记录"，读得出来是谁。
+
+        这就是现场那种死法（`Assertion failed: runtime_data->thread_state,
+        file module.c, line 99` = `prepare_call_python()` 里的断言，也就是 **JS 回头
+        调 Python 桥函数**那一刻）。所以取证形状必须按这一族复刻：求值线程进原生码 →
+        JS 调桥函数 → 桥函数里 `_invoke_watson`。`crash_journal_inflight()` 要能在
+        没有出记录的情况下点出这条规则，否则这份日志对下次现场没用。
+        """
+        if not sys.platform.startswith("win"):
+            self.skipTest("0xC0000409 的死亡姿势只在 Windows 上成立")
+        journal = self.root / "in-bridge.journal"
+        repo_root = str(APP_ROOT.parent)
+        child = f"""
+import ctypes, os, sys
+sys.path.insert(0, {repo_root!r})
+os.chdir({repo_root!r})
+os.environ["LEGADO_JS_JOURNAL"] = {str(journal)!r}
+from app.services.engine import legado_js
+fn = ctypes.CDLL("ucrtbase.dll")._invoke_watson
+fn.argtypes = [ctypes.c_void_p] * 4
+rt = legado_js.LegadoJsRuntime()
+# 桥函数被 JS 调起来的那一瞬间按现场的方式死掉（__b64decode 是 add_callable 绑上去的）
+rt._base64_decode = lambda value: (fn(None, None, None, None), "")[1]
+rt.evaluate('@js:__b64decode("aGk=")', legado_js.JsContext(
+    source={{"bookSourceUrl": "https://journal-bridge.test"}},
+    rule_name="ruleContent.title"))
+print("不该走到这里")
+"""
+        script = self.root / "child.py"
+        script.write_text(child, encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(script)],
+                              capture_output=True, text=True, timeout=180,
+                              encoding="utf-8", errors="replace")
+        self.assertEqual(proc.returncode, 3221226505,
+                         "样本没按现场那条 0xC0000409 死掉，这条实测的前提变了："
+                         f"rc={proc.returncode} stderr={proc.stderr[-400:]}")
+        inflight = self.module.crash_journal_inflight(journal)
+        self.assertEqual(len(inflight), 1,
+                         f"崩在回调里应当只剩一条没回来的进记录：{inflight}")
+        self.assertIn("rule=ruleContent.title", inflight[0])
+        self.assertIn("url=https://journal-bridge.test", inflight[0])
+        # 出记录一条都不该有：有的话就是"已经出来了"，那条崩的根本不是这次求值
+        self.assertFalse([text for text in self.module.crash_journal_records(journal, limit=100)
+                          if "ev=X" in text], "崩在原生里面却写出了记录，配对判据是空的")
+
+    def test_a_foreign_thread_in_the_same_context_is_written_down(self):
+        """④：另一条线程进到还开着的那条 Context 时，当场落一条 ``ev=!``。
+
+        `module.c:83/:99` 那一族要的就是"同一 Context 被两条线程碰"。求值都排在
+        dispatcher 唯一线程上，所以这条记录正常**永远不该出现**——真出现就是现场证据，
+        必须落在进之前（崩了也还在盘上）。这里就真的开第二条线程进同一条 Context。
+        """
+        import threading as _threading
+
+        runtime = LegadoJsRuntime()
+        context = JsContext(source=self._source(), rule_name="ruleBookInfo.name")
+        serial = 4242                      # 代表"同一条 Context"的那个构造序号
+        first = runtime._journal_eval(context, "https://journal.test", "libkey",
+                                             serial, 5, True)
+        self.assertIsNotNone(first, "日志没开，这条护栏什么都没盯")
+        others: list = []
+        try:
+            def enter_same_context():
+                others.append(runtime._journal_eval(
+                    context, "https://journal.test", "libkey", serial, 5, False))
+            worker = _threading.Thread(target=enter_same_context, name="engine-loop-仿")
+            worker.start()
+            worker.join(10)
+            records = self.module.crash_journal_records(self.root / "eval.journal",
+                                                        limit=100)
+            clashes = [text for text in records if "ev=!" in text]
+            self.assertEqual(len(clashes), 1,
+                             f"外线程撞进同一条 Context 却没落记录：{records}")
+            self.assertIn(f"runtime={serial}", clashes[0])
+            self.assertIn(f"other_seq={first[1]}", clashes[0])
+            self.assertIn("th=engine-loop", clashes[0])
+            # 撞车这一条是**后来那条线程**写的：thid= 是它，other_thid= 是先进去的那条
+            self.assertEqual(len(others), 1, "第二条线程没能把进记录开起来，下面全是空转")
+            self.assertIn(f"thid={others[0][3]}", clashes[0])
+            self.assertIn(f"other_thid={first[3]}", clashes[0])
+        finally:
+            if others:
+                runtime._journal_leave(others[0])
+            runtime._journal_leave(first)
+        self.assertEqual(dict(self.module._JOURNAL_INFLIGHT), {},
+                         "还原上一层之后在飞表还留着东西")
+
+    def test_the_inflight_map_drains_after_every_eval(self):
+        """④的另一半：在飞表是进程级字典，求值完了必须清空，也不许误报撞车。
+
+        这条同时钉两件事——表不清空就是每次求值漏一条记录 + 内存；而"同一条线程重入
+        同一条 Context"（`@js:` 嵌套、回调里再算一段）是**合法**的，不能报成撞车，
+        否则日志会被自己人刷满，真撞车反而看不见。
+        """
+        runtime = LegadoJsRuntime()
+        for _ in range(4):
+            runtime.evaluate("@js:__journal_lib+1", JsContext(source=self._source(),
+                                                             rule_name="ruleBookInfo.name"))
+        self.assertEqual(dict(self.module._JOURNAL_INFLIGHT), {},
+                         "在飞表没随求值清空：漏记录、还越攒越多")
+        records = self.module.crash_journal_records(self.root / "eval.journal", limit=100)
+        self.assertFalse([text for text in records if "ev=!" in text],
+                         "同线程正常求值被报成了撞车，日志会被自己人刷满")
+        self.assertEqual(self.module.crash_journal_inflight(
+            self.root / "eval.journal"), [])
+
+    def test_the_reader_treats_the_old_single_line_format_as_enters(self):
+        """读回工具要认第五十三轮那份**只有进记录**的旧格式（现场那份证据就长那样）。
+
+        那份文件已经在 `%LOCALAPPDATA%` 里存成 crash-*.journal，取证时是按同一支工具读的；
+        旧行没有 `ev=` 字段，把它当"已闭合"就会当场漏报，而这条崩的正是那条规则。
+        """
+        journal = self.root / "legacy.journal"
+        legacy = self.module._CrashJournal(journal, size=8 * self.module._JOURNAL_RECORD)
+        self.addCleanup(legacy._file.close)
+        self.addCleanup(legacy._map.close)
+        legacy.write("ts=1 pid=1 th=legado-quickjs depth=1 runtime=9 fresh=0 "
+                     "jslib=deadbeef bytes=172 rule= url=https://old.test")
+        legacy.write("ev=E ts=2 pid=1 th=legado-quickjs thid=3 depth=1 runtime=10 "
+                     "fresh=1 jslib=beefdead bytes=5 rule=ruleX url=https://new.test")
+        legacy.write("ev=X ts=3 pid=1 th=legado-quickjs thid=3 runtime=10 ref=2 "
+                     "took=1.0 out=ok")
+        inflight = self.module.crash_journal_inflight(journal)
+        self.assertEqual(len(inflight), 1, f"旧格式那条没回来的读不出来：{inflight}")
+        self.assertIn("url=https://old.test", inflight[0])
+
+
+    def test_records_survive_fastfail_without_sync(self):
+        """②：按住 journal 不 close、一行都不 sync，__fastfail 之后还读得回来。
+
+        这条是"为什么不每行 msync"的唯一凭据，也是整个设计的支点：生产里
+        `_journal_eval` 从不 flush，所以必须实测 fast-fail 后盘上还有内容。
+        死亡姿势按现场复刻——`ucrtbase._invoke_watson`（ntdll 不导出
+        `RtlFailFast`，实测 AttributeError），退出码与真崩逐位相同。
+        """
+        if not sys.platform.startswith("win"):
+            self.skipTest("0xC0000409 的死亡姿势只在 Windows 上成立")
+        journal = self.root / "failfast.journal"
+        repo_root = str(APP_ROOT.parent)
+        child = f"""
+import ctypes, os, sys
+sys.path.insert(0, {repo_root!r})
+os.chdir({repo_root!r})
+os.environ["LEGADO_JS_JOURNAL"] = {str(journal)!r}
+from app.services.engine import legado_js
+rt = legado_js.LegadoJsRuntime()
+rt.evaluate("@js:1+1", legado_js.JsContext(
+    source={{"bookSourceUrl": "https://journal-failfast.test"}},
+    rule_name="ruleContent.content"))
+fn = ctypes.CDLL("ucrtbase.dll")._invoke_watson
+fn.argtypes = [ctypes.c_void_p] * 4
+fn(None, None, None, None)
+"""
+        script = self.root / "child.py"
+        script.write_text(child, encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(script)],
+                              capture_output=True, text=True, timeout=180,
+                              encoding="utf-8", errors="replace")
+        self.assertEqual(proc.returncode, 3221226505,
+                         "样本没按现场那条 0xC0000409 死掉，这条实测的前提变了："
+                         f"rc={proc.returncode} stderr={proc.stderr[-400:]}")
+        records = self.module.crash_journal_records(journal, limit=100)
+        self.assertEqual(len(records), 2,
+                         f"fast-fail 后遗言没成对留在盘上（一进一出两条）：{records}")
+        self.assertIn("url=https://journal-failfast.test", records[0])
+        self.assertIn("rule=ruleContent.content", records[0])
+        # 求值已经出来了才死的，所以这条不该被读成"崩在里面"
+        self.assertEqual(self.module.crash_journal_inflight(journal), [],
+                         f"出来了的两条被读成没回来：{records}")
+
+    def test_a_broken_journal_never_breaks_evaluation(self):
+        """③：日志坏了只关掉日志本身——求值照跑，而且不再逐条重付坏掉的钱。"""
+        runtime = LegadoJsRuntime()
+        journal = self._journal()
+        self.assertIsNotNone(journal)
+        self.assertEqual(runtime.evaluate("@js:40+2",
+                                          JsContext(source=self._source())), 42)
+        journal._map.close()          # 模拟盘没了/句柄被收回：之后每次写都是 ValueError
+        self.assertEqual(runtime.evaluate("@js:40+2",
+                                          JsContext(source=self._source())), 42)
+        self.assertTrue(self.module._JOURNAL_UNAVAILABLE,
+                        "写失败没被记下来，坏日志会一直挂在每段规则的求值路径上")
+        self.assertIsNone(self._journal(),
+                          "日志已失效却还在往外发对象，热路径白付拼串的钱")
+
+    def test_disabling_the_journal_creates_no_file(self):
+        """关得掉：`LEGADO_JS_JOURNAL=0` 一个字节都不落（默认开，但要能关）。"""
+        with patch.dict(os.environ, {"LEGADO_JS_JOURNAL": "0"}, clear=False):
+            self.module._JOURNAL = None
+            self.module._JOURNAL_UNAVAILABLE = False
+            runtime = LegadoJsRuntime()
+            self.assertEqual(runtime.evaluate("@js:1+1",
+                                              JsContext(source=self._source())), 2)
+            self.assertIsNone(self._journal())
+        self.assertEqual(list(self.root.iterdir()), [],
+                         "关掉日志却还是建了文件，数据目录里会攒一堆没人看的 4 MiB")
+
+    def test_hook_is_placed_before_the_native_call(self):
+        """①的形状护栏：落记录那一句必须排在进原生码**之前**。
+
+        落在之后等于"崩在原生里时，最想读的那一条恰好没写"，而求值成功时两种摆法
+        用例都绿，所以只能按源码位置钉。附带栽一份"挪到原生码之后"的样本，证明这条
+        扫描真会红（记忆 `guard-tests-assert-absence`）。
+
+        第五十五轮起原生 `ctx.eval` 搬进了 `_eval_with_stringify_frame`（带帧的
+        stringify），所以这条扫描读**两段**：`_evaluate_locked` 里钉"日志句在那句调用
+        之前"，`_eval_with_stringify_frame` 里钉"那里面真有原生 eval"——否则前者退化成
+        在空文本上比大小，护栏就是空转的。
+        """
+        import inspect
+
+        def positions(source_text, marker):
+            lines = [line for line in source_text.splitlines()
+                     if not line.lstrip().startswith("#")]
+            return [i for i, line in enumerate(lines) if marker in line]
+
+        locked = inspect.getsource(self.module.LegadoJsRuntime._evaluate_locked)
+        frame = inspect.getsource(self.module.LegadoJsRuntime._eval_with_stringify_frame)
+        journal = positions(locked, "_journal_eval(")
+        entry = positions(locked, "_eval_with_stringify_frame(")
+        self.assertEqual(len(journal), 1, f"落日志的调用点应当只有一处：{journal}")
+        self.assertEqual(len(entry), 1, f"进原生码的调用点应当只有一处：{entry}")
+        self.assertEqual(len(positions(frame, ".eval(")), 2,
+                         "带帧求值里应当有「建帧 + 跑规则」两次原生 eval，读到的形状变了")
+        self.assertLess(journal[0], entry[0],
+                        "遗言日志被挪到了进原生码之后，那种崩法一条都落不下来")
+
+        hook = [line for line in locked.splitlines() if "_journal_eval(" in line][0]
+        # 栽样本：把这一句摘掉再拼到方法末尾（也就是进原生码之后）。这种摆法在
+        # 求值成功时看不出区别，所以只能靠位置读。
+        without = "\n".join(line for line in locked.splitlines()
+                            if "_journal_eval(" not in line)
+        flipped = without + "\n" + hook
+        journal, entry = positions(flipped, "_journal_eval("), positions(
+            flipped, "_eval_with_stringify_frame(")
+        self.assertEqual(len(journal), 1)
+        self.assertEqual(len(entry), 1)
+        self.assertGreater(journal[0], entry[0],
+                           "扫描器读不出「挪到原生码之后」这一种摆法，护栏是空转的")
+
+    def test_ring_overwrites_oldest_and_keeps_write_order(self):
+        """写满回头覆盖，回读仍按写入顺序——取证要的是"最近 N 条"，不是"最早 N 条"。"""
+        journal = self.module._CrashJournal(self.root / "ring.journal",
+                                            size=8 * self.module._JOURNAL_RECORD)
+        self.addCleanup(journal._file.close)
+        self.addCleanup(journal._map.close)
+        for index in range(11):
+            journal.write(f"record-{index}")
+        records = journal.records()
+        self.assertEqual(len(records), 8)
+        self.assertEqual(records[0], "#4 record-3")
+        self.assertEqual(records[-1], "#11 record-10")
+        # 反空转：序号按字符串排会把 "#11" 塞到 "#4" 前面，那条排序得真起作用
+        self.assertEqual([int(text[1:].split()[0]) for text in records],
+                         [4, 5, 6, 7, 8, 9, 10, 11])
+
+
+
+
+
+class QuickJsStringifyFrameTests(unittest.TestCase):
+    """`:99` 的真因护栏：JS 值的 JSON 转换必须在 QuickJS 的**调用帧**里做。
+
+    上游 `_quickjs` 只有四处动 `runtime_data->thread_state`（本机 sdist
+    `D:/tmp/qjs1194/quickjs-1.19.4/module.c`）：`Context.eval`(:507) 与 `Object()`(:257)
+    进去之前都先 `prepare_call_js`(:81) 建帧，而 `Object.json()`(:143) 是**裸的**
+    `JS_JSONStringify`。被序列化的对象只要属性读取落到"JS 回头调 Python 桥函数"
+    ——本引擎的元素句柄就是 Proxy，陷阱里叫 `__dom_*`——`prepare_call_python` 的
+    `assert(runtime_data->thread_state)`(:99) 就当场 abort 整个进程（0xC0000409，
+    绕过 Python 异常、信号处理器、atexit 与 faulthandler）。
+    机制四臂实测：`.probe/qjs_jsonstringify_no_frame_attr.py`
+    （`.json()` 3/3 崩 / 同一对象在 `eval` 里 `JSON.stringify` 3/3 活 /
+    无陷阱的普通对象 `.json()` 3/3 活 / `Object()` 3/3 活）；
+    生产路径复现：`.probe/qjs_element_json_frame_attr.py`
+    （改前 `elements_*` 三臂 3/3 崩、`plain_*` 两臂活 → 改后六臂全活）。
+    现场那一次与完整取证见
+    `docs/known-issues/004_long_scan_page_frozen_and_quickjs_abort.md`。
+
+    护栏都钉"这件坏事没发生"，并按记忆 `guard-tests-assert-absence` 各配一条
+    "该发生的仍然发生"：①崩点整形状（子进程，含带回 8 条元素的正证）；
+    ②转换走帧、一次都不碰 `Object.json()`（记账式假对象）；③帧进出成对
+    （抛异常要弹干净、嵌套要把外层那一份还回来）；④引擎源码里不许再有裸
+    `X.json()` 调用点（AST 审计）；⑤建帧取到的 `JSON.stringify` 不受规则改写
+    `JSON` 影响（闭包硬化那一层的存在理由）。
+    """
+
+    HTML = ('<div class="episode-group">'
+            + "".join(f'<a class="episode-item" href="/ch/{i}.html">第{i}话</a>'
+                      for i in range(1, 9)) + '</div>')
+
+    def setUp(self):
+        import app.services.engine.legado_js as module
+
+        self.module = module
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="frame-test-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self._saved_frame = dict(self.module._JS_STRINGIFY_FRAME.__dict__)
+        self.addCleanup(self._restore_frame)
+        self._env = patch.dict(os.environ, {"LEGADO_JS_JOURNAL": "0"})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def _restore_frame(self):
+        current = self.module._JS_STRINGIFY_FRAME
+        for name in list(current.__dict__):
+            delattr(current, name)
+        current.__dict__.update(self._saved_frame)
+
+    def _frame(self):
+        return getattr(self.module._JS_STRINGIFY_FRAME, "stringify", None)
+
+    def _context(self, rule_name="ruleToc.chapterList"):
+        return JsContext(source={"bookSourceUrl": "https://frame.test",
+                                 "bookSourceName": "帧护栏样本"},
+                         result=self.HTML, base_url="https://frame.test/book/1.html",
+                         rule_name=rule_name)
+
+    def test_a_rule_returning_element_handles_survives_and_returns_rows(self):
+        """①＋"该发生的仍然发生"：末句是 `java.getElements(...)` 的规则跑完，
+        并且真的把 8 条元素带回来。
+
+        这条必须跑在**子进程**里：它测的就是"进程还在不在"，同进程跑的话回归不是
+        红，而是把整个测试会话带走。改前这个形状 3/3 打出 rc=3221226505。
+        """
+        repo_root = str(APP_ROOT.parent)
+        child = f"""
+import json, sys
+sys.path.insert(0, {repo_root!r})
+from app.services.engine import legado_js
+
+HTML = {self.HTML!r}
+RULE = "@js: java.setContent(" + json.dumps(HTML) + "); java.getElements('.episode-item')"
+BRIDGE_RULE = "@js: java.getString('.episode-item', java.getElements('.episode-item'))"
+runtime = legado_js.LegadoJsRuntime(state_dir={str(self.root)!r})
+try:
+    rows = runtime.evaluate(RULE,
+                            legado_js.JsContext(source={{"bookSourceUrl": "https://frame.test"}},
+                                                result=HTML,
+                                                base_url="https://frame.test/book/1.html",
+                                                rule_name="ruleToc.chapterList"))
+except Exception as exc:
+    print("FAIL 末句返回元素句柄的求值: %s: %s" % (type(exc).__name__, exc))
+    sys.exit(3)
+print("ELEMENTS", len(rows) if hasattr(rows, "__len__") else -1)
+try:
+    inner = runtime.evaluate(
+        BRIDGE_RULE,
+        legado_js.JsContext(source={{"bookSourceUrl": "https://frame.test"}},
+                            result=HTML, base_url="https://frame.test/book/1.html",
+                            rule_name="ruleToc.chapterName"))
+except Exception as exc:
+    print("FAIL 桥回调里的转换: %s: %s" % (type(exc).__name__, exc))
+    sys.exit(4)
+print("BRIDGE", type(inner).__name__)
+runtime.close()
+sys.exit(0)
+"""
+        script = self.root / "child.py"
+        script.write_text(child, encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(script)], capture_output=True,
+                              text=True, timeout=300, encoding="utf-8", errors="replace")
+        self.assertEqual(proc.returncode, 0,
+                         "规则返回元素句柄时进程又没了。rc=%s（3221226505 就是 "
+                         "module.c:99 那条原生 abort）stderr=%s stdout=%s"
+                         % (proc.returncode, proc.stderr[-400:], proc.stdout[-400:]))
+        self.assertIn("ELEMENTS 8", proc.stdout,
+                      "没崩但 8 条元素也没转换出来（那同样是断：转换整条没工作）："
+                      f"{proc.stdout[-300:]}")
+        self.assertIn("BRIDGE str", proc.stdout,
+                      f"桥回调里那次转换没跑成：{proc.stdout[-300:]}")
+
+    def test_conversion_uses_the_frame_and_never_calls_object_json(self):
+        """②：转换只走帧。记账式假对象——坏形状会去调 `.json()`，好形状一次都不调。"""
+        calls = []
+
+        class JsValueStandIn:
+            def json(self):
+                calls.append("object_json")
+                return "[1,2]"
+
+        def frame(value):
+            calls.append("frame")
+            return "[1,2]"
+
+        self.module._JS_STRINGIFY_FRAME.stringify = frame
+        self.assertEqual(self.module.LegadoJsRuntime._json_of(JsValueStandIn()), "[1,2]")
+        self.assertEqual(calls, ["frame"], f"转换没走帧：{calls}")
+
+        # 没有帧的时候宁可抛一条可捕获的错，也不许退回裸 `.json()`
+        calls.clear()
+        for name in list(self.module._JS_STRINGIFY_FRAME.__dict__):
+            delattr(self.module._JS_STRINGIFY_FRAME, name)
+        with self.assertRaises(self.module.JsBridgeError):
+            self.module.LegadoJsRuntime._json_of(JsValueStandIn())
+        self.assertEqual(calls, [], f"没有帧就退回去调 Object.json() 了：{calls}")
+
+    def test_the_frame_is_popped_on_the_way_out_and_nesting_hands_it_back(self):
+        """③：帧进出成对。求值抛异常要弹干净；嵌套求值退出时要把**外层那一份**还回来。
+
+        还回外层而不是置 None——嵌套 `LegadoJsRuntime` 的 Context 已经 close() 了，
+        外层继续拿那一份就是 use-after-free，比原来那个 abort 更难查。
+        """
+        import quickjs
+
+        runtime = self.module.LegadoJsRuntime()
+        context = self._context()
+        self.assertIsNone(self._frame())
+        with self.assertRaises(Exception):
+            runtime._eval_with_stringify_frame(quickjs.Context(),
+                                               "throw new Error('规则抛了')", context)
+        self.assertIsNone(self._frame(), "求值抛异常之后帧漏在线程上")
+
+        self.module._JS_STRINGIFY_FRAME.stringify = "外层那一份"
+        runtime._eval_with_stringify_frame(quickjs.Context(), "1+1", context)
+        self.assertEqual(self._frame(), "外层那一份",
+                         "嵌套求值退出时把外层的帧丢了（或干脆没还回来）")
+
+    def test_no_bare_object_json_conversion_is_left_in_the_engine(self):
+        """④：按 AST 钉"引擎里不再有裸 `X.json()`"，防止下一个转换点又裸写。"""
+        source = (APP_ROOT / "services" / "engine" / "legado_js.py").read_text(
+            encoding="utf-8")
+        hits = [node.lineno for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "json"]
+        self.assertEqual(hits, [],
+                         f"这些行又用了不带调用帧的 `X.json()`（module.c:99 的入口）：{hits}")
+
+    def test_a_rule_that_overwrites_JSON_still_converts_through_the_original(self):
+        """⑤：帧是**建帧时**取到的 `JSON.stringify`，规则事后改写 `JSON` 影响不到它。
+
+        上游 `JS_JSONStringify` 本来就不受 `JSON` 改写影响，所以闭包那一层是在保持
+        等价，不是多余的一层——写成 `(function(v){return JSON.stringify(v);})` 就红。
+        """
+        runtime = self.module.LegadoJsRuntime()
+        value = runtime.evaluate(
+            "@js: JSON = {stringify: () => 'HACKED'}; ({kept: [1, 2]})", self._context())
+        self.assertEqual(value, {"kept": [1, 2]},
+                         "规则改写 JSON 之后转换跟着变了：和上游语义不一致")
 
 
 if __name__ == "__main__":
