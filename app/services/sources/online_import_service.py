@@ -59,6 +59,8 @@ _AUDIT_WARNING_FIELDS = (
     "missing_java_apis", "missing_object_apis", "unknown_fields",
     "unsupported_pseudos", "js_syntax_errors", "regex_errors",
     "rule_syntax_errors",
+    # 审计没跑完（子进程被打穿）也要出一条：漏了它，"没审"在导入面看起来就是"干净"。
+    "not_audited",
 )
 
 

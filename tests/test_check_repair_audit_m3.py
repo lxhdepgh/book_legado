@@ -262,8 +262,9 @@ async def _fanout_checker(sources, concurrency=8, timeout=12, on_result=None,
 class _CountingCompat:
     """记账替身（子类约束见记忆 `guard-tests-assert-absence`：这里必须是同形状协程）。
 
-    `audit_source` 里 await 一段假 CPU——真实审计是 ~12 ms 的纯 Python 遍历加两条
-    `to_thread`；扇出有没有被限住，就看同时有几条卡在这个 await 上。
+    `audit_source` 里 await 一段假 CPU——真实审计是纯 Python 遍历（`_audit_one`
+    中位 3.2 ms、p95 189 ms，`.probe/mp_cpu_step_magnitude.py`）；扇出有没有被限住，
+    就看同时有几条卡在这个 await 上。
     """
 
     def __init__(self, hold: float = 0.02) -> None:
@@ -289,25 +290,64 @@ class TestAuditFanOutBound(unittest.IsolatedAsyncioTestCase):
         return SourceCheckService(checker=_fanout_checker, compat_audit=compat)
 
     async def test_fan_out_never_exceeds_the_declared_cap(self):
-        """护栏钉"没发生"：并发从未越过 AUDIT_CONCURRENCY。"""
+        """护栏钉"没发生"：并发从未越过本轮该用的那一档上限。"""
         from app.services.sources import source_check_service as shell
         compat = _CountingCompat()
         svc = await self._service(compat)
+        bound = shell._audit_fanout_bound()   # noqa: SLF001
         await svc._run_checks(_fanout_sources(self.N))
-        self.assertLessEqual(compat.peak, shell.AUDIT_CONCURRENCY,
-                             f"审计并发冲到 {compat.peak}，上限写的是 {shell.AUDIT_CONCURRENCY}")
+        self.assertLessEqual(compat.peak, bound,
+                             f"审计并发冲到 {compat.peak}，本轮上限是 {bound}")
         self.assertEqual(len(compat.calls), self.N, "有审计被限丢了")
 
     async def test_the_cap_actually_lets_that_many_through(self):
         """反证：上限不是"永远只跑一条"——照出的并发必须真的等于上限。
 
-        上一栏只写 `peak <= 2` 的话，把上限改成 1、或让闸门永远只放一条，都能蒙过去。
+        上一栏只写 `peak <= 上限` 的话，把上限改成 1、或让闸门永远只放一条，都能蒙过去。
         """
         from app.services.sources import source_check_service as shell
         compat = _CountingCompat()
         svc = await self._service(compat)
+        bound = shell._audit_fanout_bound()   # noqa: SLF001
         await svc._run_checks(_fanout_sources(self.N))
+        self.assertEqual(compat.peak, bound)
+
+    async def test_the_bound_follows_where_the_audit_actually_runs(self):
+        """两档口径：审计在子进程里跑就喂满池，退回线程池就必须限死。
+
+        退回那一档不是摆设——池被打穿（子进程原生 abort）超过
+        `AUDIT_POOL_MAX_REBUILDS` 次之后，审计就回到默认线程池里跑，而检测自己要的
+        `to_thread` 用的是同一个池；那时还按 8 扇出就是把重 CPU 审计放回去挤它。
+        """
+        from app.services.sources import compat_audit_service as cas
+        from app.services.sources import source_check_service as shell
+        saved = cas._STATE.disabled           # noqa: SLF001
+        try:
+            cas._STATE.disabled = False       # noqa: SLF001
+            self.assertEqual(shell._audit_fanout_bound(),  # noqa: SLF001
+                             shell.AUDIT_POOL_FANOUT)
+            self.assertGreater(shell.AUDIT_POOL_FANOUT, shell.AUDIT_CONCURRENCY,
+                               "两档写成一样，这个分支就白读了")
+            cas._STATE.disabled = True        # noqa: SLF001
+            self.assertEqual(shell._audit_fanout_bound(),  # noqa: SLF001
+                             shell.AUDIT_CONCURRENCY)
+        finally:
+            cas._STATE.disabled = saved       # noqa: SLF001
+
+    async def test_the_thread_tier_bound_is_the_one_actually_gating(self):
+        """池关掉那一轮，闸门必须真的降到线程那一档（不是只改了那个查询函数）。"""
+        from app.services.sources import compat_audit_service as cas
+        from app.services.sources import source_check_service as shell
+        compat = _CountingCompat()
+        svc = await self._service(compat)
+        saved = cas._STATE.disabled           # noqa: SLF001
+        try:
+            cas._STATE.disabled = True        # noqa: SLF001
+            await svc._run_checks(_fanout_sources(self.N))
+        finally:
+            cas._STATE.disabled = saved       # noqa: SLF001
         self.assertEqual(compat.peak, shell.AUDIT_CONCURRENCY)
+        self.assertEqual(len(compat.calls), self.N, "降档把审计限丢了")
 
     async def test_no_audit_is_still_running_when_the_run_returns(self):
         """收尾：`_run_checks` 返回时不该还有在跑的审计（占的是下一条检测的线程池）。"""
@@ -359,6 +399,78 @@ class TestAuditFanOutBound(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(compat.running, 0, "取消后还有审计在跑")
         self.assertEqual(compat.calls, [], "取消后还有审计落到底（写进了 audit_log）")
         self.assertTrue(all(t.done() for t in svc._audit_tasks))
+
+
+# --------------------------------------------------------------------------- #
+# 1.5 大轮收尾把审计进程池关掉还内存（还早/还晚都算退化）
+# --------------------------------------------------------------------------- #
+class TestAuditPoolReap(unittest.IsolatedAsyncioTestCase):
+    """关池这笔交换只对**大轮**做：早了会砍掉还在跑的审计，晚了白背 270 MB。
+
+    护栏钉的是"没发生"（记忆 `guard-tests-assert-absence`）：小轮没发生关池、
+    大轮的尾巴没被关池砍掉、计数没跨轮累加。计数用替身记账，不碰真池状态
+    （`_STATE` 是模块级的，跨用例跨文件会互相污染）。
+    """
+
+    def setUp(self) -> None:
+        from app.services.sources import compat_audit_service as cas
+        from app.services.sources import source_check_service as shell
+        self.shell = shell
+        self.calls: list[dict] = []
+        self._orig = cas.shutdown_audit_pool
+        #: 关池那一刻的"还在跑的审计条数"由用例注入；-1 = 探针没接上
+        self.running_probe = lambda: -1
+
+        def recorder() -> None:
+            # 快照"关池时审计跑完没有"——把关池搬到 drain 之前就会在这里露出来
+            self.calls.append({"running": self.running_probe()})
+
+        cas.shutdown_audit_pool = recorder                   # noqa: SLF001
+
+    def tearDown(self) -> None:
+        from app.services.sources import compat_audit_service as cas
+        cas.shutdown_audit_pool = self._orig                 # noqa: SLF001
+
+    async def _run(self, n: int, hold: float = 0.002):
+        compat = _CountingCompat(hold=hold)
+        svc = SourceCheckService(checker=_fanout_checker, compat_audit=compat)
+        # (正在跑的审计, 还挂着引用的审计任务) —— 探针必须是**这两样都归零**才算收完
+        self.running_probe = lambda: (compat.running, len(svc._audit_tasks))
+        await svc._run_checks(_fanout_sources(n))
+        return svc, compat
+
+    async def test_a_big_round_closes_the_pool_after_the_audit_tail(self):
+        """到阈值就关：而且必须等审计尾巴收完再关，不能把在跑的审计一起带走。
+
+        hold 取 0.03 s、条数取阈值，就是让审计在收尾那一刻**还没跑完**——把关池
+        搬到 `_drain_audits()` 之前，这里会照见 (在跑 > 0, 引用 > 0) 和少掉的条数。
+        """
+        n = self.shell.AUDIT_POOL_REAP_AFTER
+        svc, compat = await self._run(n, hold=0.03)
+        self.assertEqual(len(self.calls), 1,
+                         f"审计 {n} 条这一轮没关池（花了 {n} 条的内存却没还回去）")
+        self.assertEqual(self.calls[0]["running"], (0, 0),
+                         f"关池时审计还没收完：{self.calls[0]['running']}")
+        self.assertEqual(len(compat.calls), n, "审计被关池砍丢了几条")
+        self.assertEqual(svc._audit_submitted, n)
+
+    async def test_a_small_round_leaves_the_pool_warm(self):
+        """单源/小批量不关：那 177~184 ms 的建池钱会算进下一次检测的收尾等待。"""
+        for n in (1, 8, self.shell.AUDIT_POOL_REAP_AFTER - 1):
+            self.calls.clear()
+            await self._run(n)
+            self.assertEqual(self.calls, [],
+                             f"{n} 条的小轮把池关了，下一轮要赔一次建池")
+
+    async def test_the_count_is_per_round_not_cumulative(self):
+        """阈值读的是**本轮**排出去多少条：跨轮累加会让第二轮小轮也触发关池。"""
+        n = self.shell.AUDIT_POOL_REAP_AFTER // 2
+        svc, _ = await self._run(n)
+        self.assertEqual(self.calls, [])
+        await svc._run_checks(_fanout_sources(n))
+        self.assertEqual(self.calls, [],
+                         "计数没每轮复位，两轮小批量凑成了大轮（白赔一次建池）")
+        self.assertEqual(svc._audit_submitted, n)
 
 
 # --------------------------------------------------------------------------- #

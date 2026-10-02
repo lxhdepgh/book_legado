@@ -20,7 +20,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import multiprocessing
 import re
+import threading
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -36,7 +40,7 @@ logger = logging.getLogger(__name__)
 class AuditReport:
     """单个书源的静态审计报告（契约 §6 数据类）。
 
-    六个清单字段均为字符串列表（不可变语义：接收方不得回写）；
+    七个清单字段均为字符串列表（不可变语义：接收方不得回写）；
     ``suggestions`` 为给用户看的处置建议。空清单即"该项无缺口"。
     """
 
@@ -50,18 +54,23 @@ class AuditReport:
     # 规则（选择器/伪类）静态校验错误：与 regex_errors 分列，便于视图区分提示。
     rule_syntax_errors: list[str] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
+    #: 审计**没跑完**的原因（跑完了就是空串）。它和"跑完了、没缺口"必须能分开：
+    #: 子进程被打穿时返回的是空清单，若只靠七个清单判 ``clean``，界面会把"没审"
+    #: 显示成"这条源干净"。
+    not_audited: str = ""
 
     @property
     def clean(self) -> bool:
-        """是否完全没有缺口（无错误、无未支持 API、无未知字段）。"""
-        return not (self.missing_java_apis or self.missing_object_apis
+        """是否完全没有缺口（审完了，且无错误、无未支持 API、无未知字段）。"""
+        return not (self.not_audited or self.missing_java_apis
+                    or self.missing_object_apis
                     or self.unknown_fields or self.unsupported_pseudos
                     or self.js_syntax_errors or self.regex_errors
                     or self.rule_syntax_errors)
 
 
 def _audit_one(data: dict) -> AuditReport:
-    """对单个书源 dict 跑静态审计（纯 CPU，设计为 asyncio.to_thread 调用）。
+    """对单个书源 dict 跑静态审计（纯 CPU，经 :func:`audit_off_loop` 送出事件循环）。
 
     这里是唯一的逐源编排：清单与校验一律取自 ``compat_audit``，本函数只负责拼
     ``AuditReport``——同一套判定写两份（旧的整库入口 ``audit_source_corpus`` 就是这样）
@@ -141,6 +150,8 @@ def _audit_one(data: dict) -> AuditReport:
         # 那个会带走进程的形状，护栏 QuickJsRuntimeOverlapTests 盯着这两件事。
         # 换成"收进 dispatcher/锁"也不划算：600 段预编译 108 ms → 541 ms（5.0×），
         # 换不来任何安全。
+        # 这段是审计里唯一会进原生码的地方，而整个 `_audit_one` 现在跑在子进程里
+        # （见 `audit_off_loop`）：真 abort 带走的是一个 worker，不是应用。
         for field_path, script in ca._script_blocks(data, 0):
             prepared = re.sub(r"\{\{[\s\S]*?\}\}", "0", script).split("##", 1)[0]
             prepared = LegadoJsRuntime._clean_script(prepared)  # type: ignore[union-attr]
@@ -192,6 +203,158 @@ def _suggest(*, unknown_fields=(), unsupported_pseudos=(), missing_java_apis=(),
     return suggestions
 
 
+#: 静态审计跑在几个子进程里。实测（`.probe/mp_pool_sizing.py`，240 条真库快照 ×
+#: 3 轮交替、池先预热再计时）：1 个 worker 7783.9 ms → 2 个 4091.3（1.90×）→
+#: 4 个 2285.9（**3.41×**）→ 8 个 1675.9 ms（4.64×），子进程常驻内存
+#: 75.5 / 147.1 / 285.3 / 562.0 MB。取 4：再翻一倍只多买 1.2×，内存却要再翻一倍。
+AUDIT_POOL_WORKERS = 4
+#: 池被打穿（子进程原生 abort）后最多重建几次，超了就永久退回线程池：
+#: 每次都重建的话，一条毒源能把"建池 332 ms + 崩一次"这笔钱重复收满整轮。
+AUDIT_POOL_MAX_REBUILDS = 3
+
+
+class _PoolState:
+    """进程池的全部可变状态（集中一处，好让测试断言"到底走没走子进程"）。"""
+
+    __slots__ = ("pool", "disabled", "rebuilds", "reason",
+                 "subprocess_hits", "thread_fallbacks")
+
+    def __init__(self) -> None:
+        self.pool = None
+        self.disabled = False       # 建不出来 / 崩太多次 → 永久退回线程池
+        self.rebuilds = 0
+        self.reason = ""
+        self.subprocess_hits = 0    # 真在子进程里审完的条数
+        self.thread_fallbacks = 0   # 退回线程池的条数
+
+
+_STATE = _PoolState()
+_STATE_LOCK = threading.Lock()
+
+
+def _new_pool() -> ProcessPoolExecutor:
+    """建池的唯一出口（测试把它换成同接口的线程池，就能不 spawn 地验编排）。
+
+    显式要 ``spawn`` 上下文：Windows 只有这一种，而 fork 在别处会把已经起了
+    线程/Flet 的进程整个复制过去，子进程里那些锁的状态是随机的。
+    """
+    return ProcessPoolExecutor(
+        max_workers=AUDIT_POOL_WORKERS,
+        mp_context=multiprocessing.get_context("spawn"))
+
+
+def audit_pool_in_use() -> bool:
+    """静态审计现在是不是走子进程（扇出上限要按这个定，见 SourceCheckService）。"""
+    return not _STATE.disabled
+
+
+def _acquire_pool():
+    """拿到常驻的池；拿不到返回 ``None``，调用方退回 ``asyncio.to_thread``。
+
+    懒建：建池 + 第一条结果实测 332.3 ms（裸 spawn 一个子进程 361.3 ms），
+    所以只在第一条审计来的时候建一次，之后整轮共用——每条源建一次的话，
+    省下来的 CPU 全赔在建池上。
+    """
+    with _STATE_LOCK:
+        if _STATE.disabled:
+            return None
+        if _STATE.pool is None:
+            try:
+                _STATE.pool = _new_pool()
+            except Exception as exc:   # 没权限 / 冻结包没走 freeze_support / 被安全软件拦
+                _STATE.disabled = True
+                _STATE.reason = f"{type(exc).__name__}: {exc}"
+                logger.warning("审计进程池建不起来，静态审计退回线程池：%s", _STATE.reason)
+                return None
+        return _STATE.pool
+
+
+def _retire_pool(pool, reason: str) -> None:
+    """把被打穿的池摘下来关掉（下一次 :func:`_acquire_pool` 会重建，直到超次数）。"""
+    with _STATE_LOCK:
+        if _STATE.pool is not pool:
+            return                     # 并发的那条已经处理过同一个池了
+        _STATE.pool = None
+        _STATE.rebuilds += 1
+        if _STATE.rebuilds > AUDIT_POOL_MAX_REBUILDS:
+            _STATE.disabled = True
+            _STATE.reason = reason
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        logger.warning("关被打穿的审计进程池失败", exc_info=True)
+    if _STATE.disabled:
+        logger.error("审计进程池被打穿 %s 次，静态审计永久退回线程池（最后一次：%s）",
+                     _STATE.rebuilds, reason)
+    else:
+        logger.warning("审计子进程异常退出（%s），池已摘除，下一条重建", reason)
+
+
+def shutdown_audit_pool() -> None:
+    """关掉常驻池（服务停机 / 应用退出），不留孤儿子进程。
+
+    ``wait=False``：停机跑在**引擎循环**上（``on_stop``），而 ``shutdown(wait=True)``
+    会一直等到 worker 把手上那条跑完——那个 worker 可能正卡在原生码里，
+    等它就是拿整条循环去陪葬（记忆 ``engine-hub-loop-split``）。
+    ``cancel_futures=True`` 先把还没开工的条目丢掉；已经跑起来的那条由 executor
+    自己的管理线程收尾，解释器退出时 ``concurrent.futures`` 的 atexit 钩子再兜一次。
+    """
+    with _STATE_LOCK:
+        pool, _STATE.pool = _STATE.pool, None
+    if pool is None:
+        return
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        logger.warning("关审计进程池失败", exc_info=True)
+
+
+async def audit_off_loop(data: dict) -> AuditReport:
+    """把 ``_audit_one`` 送出事件循环：**优先进程池**，池不可用退回默认线程池。
+
+    为什么是进程而不是线程：``_audit_one`` 是纯 CPU 的 GIL 活，240 条真库快照
+    合计 7.8 s（中位 3.2 ms、p95 189 ms、max 266 ms，
+    `.probe/mp_cpu_step_magnitude.py`）。把线程池加宽一点用都没有——8 条线程
+    8897.1 ms vs 现形状（``to_thread`` + 限并发 2）9263.2 ms；同样 240 条走
+    4 个子进程 2018.4 ms，前台那条 ``to_thread`` 的 max 也从 67.5 ms 掉到 20.2 ms
+    （`.probe/mp_pool_sizing.py`，三臂交替 × 3 轮）。
+
+    顺带买到隔离：``_audit_one`` 自己会 ``quickjs.Context().eval`` 预编译每个 JS 块，
+    原生 abort 在子进程里只带走那一个 worker，主进程照常活着
+    （known-issues 004 未决项「拦住崩」）。
+
+    代价也都量过：单条源 pickle 后平均 11 011 B，IPC 空跑一来回中位 0.244 ms
+    （p95 0.440），带 195 KB 载荷也才 0.327 ms——相对中位 3.2 ms 的活是零头，
+    但对**轻**函数不成立：同一条流水线里 ``_unsupported_java_packages`` 中位只有
+    0.011 ms，比 IPC 底价还小 22 倍，那种步绝不能塞进子进程。
+    """
+    pool = _acquire_pool()
+    if pool is None:
+        _STATE.thread_fallbacks += 1
+        return await asyncio.to_thread(_audit_one, data)
+    try:
+        report = await asyncio.get_running_loop().run_in_executor(
+            pool, _audit_one, data)
+    except BrokenProcessPool as exc:
+        # 这条**不重跑**：打穿池的大概率就是它（那段 quickjs 预编译），换进新池再喂
+        # 一次只会再带走一个 worker；退回线程池跑它更是把原生 abort 请回主进程——
+        # 那正是这层隔离要挡的东西。返回一份 not_audited 报告，导入面/编辑器会把它
+        # 显示成一条 warning，检测面本来就 best-effort（`_audit_safe` 吞掉）。
+        _retire_pool(pool, f"{type(exc).__name__}: {exc}")
+        return AuditReport(
+            source_id=str(data.get("bookSourceUrl") or ""),
+            not_audited="审计子进程异常退出（原生崩溃），这条源本轮未做静态判定")
+    except Exception:
+        # 这一条自己的毛病（源 dict 里有不可 pickle 的东西 / 池正好在关）：退回线程池
+        # 跑这一条，池照旧留着给别的源用。（取消是 BaseException，走不到这里，
+        # 检测被停时照常往上抛。）
+        logger.warning("审计送进子进程失败，这一条退回线程池", exc_info=True)
+        _STATE.thread_fallbacks += 1
+        return await asyncio.to_thread(_audit_one, data)
+    _STATE.subprocess_hits += 1
+    return report
+
+
 class CompatAuditService(Service):
     """单源静态审计 + audit_log 落库（§3.7）。"""
 
@@ -214,6 +377,9 @@ class CompatAuditService(Service):
         logger.info("CompatAuditService 已启动")
 
     async def on_stop(self) -> None:
+        # 进程池是模块级常驻的（跨服务重启复用，省掉每次 332 ms 的建池钱），
+        # 所以关它的钩子挂在停机上，别留孤儿子进程。
+        shutdown_audit_pool()
         logger.info("CompatAuditService 已停止")
 
     # ------------------------------------------------------------------ #
@@ -223,11 +389,12 @@ class CompatAuditService(Service):
         """审计单个书源并落 audit_log；返回纯数据报告（不抛到导入方）。
 
         ``source_json`` 可为 dict 或 BookSource（带 to_dict）。审计是纯 CPU 活，
-        放线程池跑，别卡住事件循环（§3.7 触发点③的 asyncio.to_thread 语义）。
+        一律送出事件循环（:func:`audit_off_loop`：子进程优先、线程池兜底），
+        别卡住循环（§3.7 触发点③的 asyncio.to_thread 语义）。
         """
         data = (source_json.to_dict()
                 if hasattr(source_json, "to_dict") else dict(source_json))
-        report = await asyncio.to_thread(_audit_one, data)
+        report = await audit_off_loop(data)
         try:
             # 落库也离开事件循环：持锁的写实测最长等过 304 ms（见 _persist）。
             await asyncio.to_thread(self._persist, report)
@@ -263,6 +430,9 @@ class CompatAuditService(Service):
             "unsupported_pseudos": report.unsupported_pseudos,
             "js_syntax_errors": report.js_syntax_errors,
             "regex_errors": report.regex_errors,
+            # 「没审完」也得落库：否则 audit_log 里那行是一份空清单，和「审完了、
+            # 没缺口」长得一模一样，回溯时看不出这条源其实压根没判过。
+            "not_audited": report.not_audited,
         }
         ts = datetime.now().isoformat(timespec="seconds")
         self._storage.execute(

@@ -299,7 +299,7 @@ class CodeEditorController(BaseController):
         lines = []
         for field_name in ("missing_java_apis", "missing_object_apis",
                            "unknown_fields", "unsupported_pseudos",
-                           "js_syntax_errors", "regex_errors"):
+                           "js_syntax_errors", "regex_errors", "not_audited"):
             bucket = getattr(report, field_name, None)
             if bucket:
                 items = bucket if isinstance(bucket, (list, tuple)) else [bucket]

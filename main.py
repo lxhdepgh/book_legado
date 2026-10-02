@@ -54,6 +54,34 @@ def smoke_test():
     finally:
         runtime.close()
 
+    _audit_pool_selftest()
+
+
+def _audit_pool_selftest():
+    """审计进程池的现场自检：spawn 在这个包里到底走不走得通。
+
+    静态审计跑在子进程里（``compat_audit_service.audit_off_loop``）。冻结包缺
+    ``freeze_support``、或杀软拦 spawn 时，它会**静默**退回线程池——功能不坏，
+    只是那 3.4× 的加速没了，而现场看不出区别。所以冒烟里显式量一次并断言走的
+    是子进程；退回原因（``_STATE.reason``）一并打出来，别让人对着一个"通过"猜。
+    """
+    import time
+
+    from app.services.sources import compat_audit_service as cas
+
+    payload = {"bookSourceUrl": "https://smoke", "ruleSearch": {"bookList": "ul li"}}
+    t0 = time.perf_counter()
+    report = asyncio.run(cas.audit_off_loop(payload))
+    built_ms = (time.perf_counter() - t0) * 1000
+    state = cas._STATE  # noqa: SLF001  自检要读的就是这份记账
+    hits, fallbacks, reason = state.subprocess_hits, state.thread_fallbacks, state.reason
+    cas.shutdown_audit_pool()
+    assert report.source_id == "https://smoke"
+    print(f"审计进程池：建池 + 首条 {built_ms:.0f} ms | 子进程 {hits} 条"
+          f" / 退回线程 {fallbacks} 条" + (f"（{reason}）" if reason else ""))
+    assert hits == 1 and not fallbacks, (
+        f"静态审计没能跑进子进程，退回线程池了：{reason or '未知原因'}")
+
 
 def _engine_browser_fetchers(browser):
     """引擎要的两个 fetcher：内核在场才给（§1.19 浏览器回退）。
@@ -248,6 +276,11 @@ def main():
 
     import flet as ft
 
+    # 视图在函数里才 import（不是模块顶层）：审计跑在子进程里，Windows 的 spawn
+    # 会在每个子进程里把 `__main__`（也就是本文件）重新 import 一遍，顶层那行
+    # flet + 视图树会让每个 worker 白背 ~126 ms 的导入和几十 MB 常驻。
+    from app.views.navigation import build_app_shell
+
     # resource_dir：M3 起供浏览器/主题等资源查找使用，M1 不消费，保留通道。
     resource_dir = _ROOT / "resource"  # noqa: F841
 
@@ -264,10 +297,10 @@ def main():
         hub.shutdown()  # 主线程等 stop_all 收尾，随后关掉 EngineHub 守护线程
 
 
-# 延迟导入视图（视图可 import flet；core 不可）。
-# M6：入口从 M1 单体 build_dashboard 切换为全量导航容器 build_app_shell
-# （NavigationRail 分组 / 窄窗底部导航；旧 dashboard 文件冻结保留至 M7 删除）。
-from app.views.navigation import build_app_shell  # noqa: E402
-
 if __name__ == "__main__":
+    # 冻结包里 spawn 出来的子进程会**重新执行本 exe**，没有这一句就是"exe 套 exe"
+    # 无限繁殖（审计进程池一建就炸）。源码跑法下它是空操作。
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     main()
