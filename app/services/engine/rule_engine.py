@@ -8,6 +8,7 @@ import gzip
 import html
 import hashlib
 import io
+import ipaddress
 import json
 import re
 import socket
@@ -815,6 +816,78 @@ def dns_ip_resolver() -> _DnsIpResolver:
     return _DnsIpResolver()
 
 
+# --------------------------------------------------------------------------- #
+# 连接层失败的说人话形状：aiohttp 那句在最常见的两种失败里几乎没信息
+# --------------------------------------------------------------------------- #
+#: 本机安全产品/代理做 DNS 吸洞时爱用的段（RFC 2544 网段基准保留段）。现场那条
+#: `Cannot connect to host …:443 ssl:False [None]` 命中的就是这里：名字解析到
+#: 198.18.8.94，连上去握手即被复位。取证与形状对照见
+#: `docs/M1网络栈修复记录.md`"现场读法"一节、`.probe/connector_error_shapes.py`。
+_SINKHOLE_NETWORKS = (ipaddress.ip_network("198.18.0.0/15"),)
+
+
+def in_sinkhole_range(address: object) -> bool:
+    """这个地址是不是落在"本机拦截器吸洞段"里。
+
+    IPv6 的 `%` ZoneId 先剥掉；双栈解析会把 v4 写成 `::ffff:a.b.c.d`，那种也要认。
+    """
+    try:
+        addr = ipaddress.ip_address(str(address).split("%", 1)[0])
+    except ValueError:
+        return False
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return any(addr in network for network in _SINKHOLE_NETWORKS)
+
+
+async def _dialed_addresses(host: object, port: object) -> list[str]:
+    """这次拨号**大概**连到了哪些地址：dnsIp 钉表命中就以钉表为准，否则重新解析一次。
+
+    只在"已经拨不通"的那条路上跑，正常请求一分钱不付。重新解析出来的地址与当时
+    拨的那个可能不同（DNS 轮询），但对吸洞/失效这种稳定形状恰好就是要的信息。
+    """
+    pinned = _DNS_IP_TABLE.get(str(host or "").strip().lower())
+    if pinned:
+        return [pinned]
+    if not host:
+        return []
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            str(host), int(port or 0), type=socket.SOCK_STREAM)
+    except Exception:  # noqa: BLE001 — 报错的路上不许再制造一次失败
+        return []
+    out: list[str] = []
+    for info in infos:
+        address = str(info[4][0])
+        if address not in out:
+            out.append(address)
+    return out
+
+
+def _connect_failure_tail(exc: aiohttp.ClientConnectorError, addresses: list[str]) -> str:
+    """给 aiohttp 那句连接失败补上"拨到哪、谁抛的"，接在原文后面（原文一字不动）。
+
+    为什么要补：`ClientConnectorError.__str__` 那对方括号填的是 `os_error.strerror`，
+    而 TLS 握手期被复位时抛的是**不带任何参数**的 `ConnectionResetError`，于是现场只剩
+    `… ssl:False [None]`——连"是谁、拨到哪儿"都读不出来，开发者据此怀疑规则引擎被改坏，
+    真因却是本机安全产品把域名吸到 198.18.0.0/15。补完这一句能自己分清"本机拦的"、
+    "端口拒连"与"站点死了"。
+    """
+    bits: list[str] = []
+    inner = getattr(exc, "os_error", None)
+    if not (getattr(exc, "strerror", None) or getattr(inner, "strerror", None)):
+        cause = inner if inner is not None else exc
+        code = getattr(cause, "winerror", None) or getattr(cause, "errno", None)
+        bits.append(f"底层 {type(cause).__name__}"
+                    + (f"(code={code})" if code else "") + " 未给出错误文本")
+    if addresses:
+        bits.append("拨到 " + "/".join(addresses[:3]))
+        if any(in_sinkhole_range(address) for address in addresses):
+            bits.append("地址在 198.18.0.0/15 保留段（本机安全产品/代理的 DNS 吸洞特征，"
+                        "多半不是站点失效，也不是引擎的问题）")
+    return ("｜" + "；".join(bits)) if bits else ""
+
+
 class ReaderEngine:
     _global_rate_states = {}
     _global_rate_lock = threading.Lock()
@@ -1425,7 +1498,11 @@ class ReaderEngine:
                     # 重拨不消耗 HTTP 状态重试预算（attempt 在循环顶部已 +1，这里回退）。
                     attempt -= 1
                     continue
-                raise RequestConnectionError(f"连接失败：{exc}") from exc
+                # 走代理时拨的是代理的地址，解析目标域名只会误导人——那段就不补。
+                addresses = ([] if (normalized_proxy or socks_proxy)
+                             else await _dialed_addresses(exc.host, exc.port))
+                raise RequestConnectionError(
+                    f"连接失败：{exc}{_connect_failure_tail(exc, addresses)}") from exc
             except asyncio.TimeoutError as exc:
                 # aiohttp 的超时异常字符串通常是空的，照抄只会得到“连接超时：”。
                 limit = timeout.total or timeout.connect
