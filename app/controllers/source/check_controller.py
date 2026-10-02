@@ -27,16 +27,28 @@ except Exception:  # pragma: no cover
 
 
 def _summary_line(snap: dict) -> str:
-    """快照 → 一行收尾文案（空串表示还没结论，别把「尚未检测」盖掉）。"""
+    """快照 → 一行收尾文案（空串表示还没结论，别把「尚未检测」盖掉）。
+
+    分档不再是用户选的那一档，所以收尾要说的是**这一轮实际怎么分的**：浅遍扫了多少、
+    补验正文多少，以及队列里还欠着几条没验完（取消或浅遍没结论的那批）。
+    """
     if snap.get("cancelled"):
         return "检测已停止"
     summary = snap.get("summary")
-    if isinstance(summary, dict):
-        depth = "（快速检测，未验正文）" if snap.get("depth") == "list" else ""
-        return (f"检测完成：可用 {summary.get('usable', 0)}/"
-                f"{summary.get('total', 0)}，"
-                f"阻断 {summary.get('blocked', 0)}{depth}")
-    return ""
+    if not isinstance(summary, dict):
+        return ""
+    tiering = summary.get("tiering") or snap.get("tiering") or {}
+    bits = []
+    if tiering.get("plan_total"):
+        bits.append(f"快检 {tiering.get('shallow', 0)} 源、"
+                    f"补验正文 {tiering.get('deep', 0)} 源")
+    pending = len(snap.get("deep_queue") or [])
+    if pending:
+        bits.append(f"待深检 {pending} 源")
+    tail = f"（{'，'.join(bits)}）" if bits else ""
+    return (f"检测完成：可用 {summary.get('usable', 0)}/"
+            f"{summary.get('total', 0)}，"
+            f"阻断 {summary.get('blocked', 0)}{tail}")
 
 
 class CheckController(BaseController):
@@ -48,7 +60,6 @@ class CheckController(BaseController):
         self._check = self._safe_service(SourceCheckService)
         self._seen: set[str] = set()
         self._total = 0
-        self._depth = "full"
         self._running = False
         self._view.on_start = self.start
         self._view.on_stop = self.stop
@@ -69,7 +80,7 @@ class CheckController(BaseController):
     # ------------------------------------------------------------------ #
     # 启动 / 停止
     # ------------------------------------------------------------------ #
-    def start(self, depth: str = "full") -> None:
+    def start(self) -> None:
         if self._check is None:
             self._view.set_summary("SourceCheckService 未就绪（并行集成中）")
             return
@@ -78,7 +89,6 @@ class CheckController(BaseController):
             return
         self._seen.clear()
         self._total = 0
-        self._depth = depth
         self._running = True
         self._view.set_running(True, "检测已启动…")
         self.ui_call(self._run())
@@ -86,7 +96,7 @@ class CheckController(BaseController):
     async def _run(self) -> None:
         """跑完这一轮再按服务快照重画：收尾那一行不该只给启动它的视图看到。"""
         try:
-            await self._check.check_all(depth=self._depth)
+            await self._check.check_all()
         except asyncio.CancelledError:
             logger.info("检测已按请求停止")
         except Exception as exc:
@@ -160,10 +170,6 @@ class CheckController(BaseController):
         """快照 → 界面（幂等：``render_result`` 按 source_id 覆盖同名行）。"""
         results = list(snap.get("results") or [])
         self._total = int(snap.get("total") or 0)
-        # 下拉回到这一轮**实际用的**深度：别人（上一份视图）启动的那轮可能是快速。
-        self._depth = snap.get("depth") or self._depth
-        if hasattr(self._view, "set_depth"):
-            self._view.set_depth(self._depth)
         self._seen = {str(entry.get("source_id") or "") for entry in results}
         for entry in results:
             self._view.render_result(entry.get("source_id", ""),

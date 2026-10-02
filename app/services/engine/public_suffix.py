@@ -14,6 +14,22 @@ _DATA = Path(__file__).resolve().parents[2] / "resources" / "publicsuffixes.gz"
 
 
 @lru_cache(maxsize=1)
+def _tld_rules() -> frozenset[str]:
+    """表里那些"只有一段"的规则，就是全部已知顶级域（com / net / cn / 国别中文域…）。"""
+    return frozenset(rule for rule in _rules()[0] if "." not in rule)
+
+
+def is_known_tld(value: str) -> bool:
+    """这个字符串是不是公共后缀表里的一个顶级域。
+
+    用途是**判别一段文本像不像主机**：`search.html` 的最后一段 `html` 不在表里，
+    而 `www.x.com` 的 `com` 在——比"数点数、看最后一段是不是字母"可靠得多
+    （Legado 的相对 `searchUrl` 大量长这样：`search.php?key={{key}}`）。
+    """
+    return str(value or "").strip().strip(".").lower() in _tld_rules()
+
+
+@lru_cache(maxsize=1)
 def _rules() -> tuple[set[str], set[str]]:
     raw = gzip.open(_DATA, "rb").read()
     rule_size = struct.unpack(">I", raw[:4])[0]

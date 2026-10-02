@@ -5,7 +5,9 @@
 - 四段流水线（连通→搜索→分类→阅读链路）、九态分类、自动停用、单源预算**全部保留**，
   本壳只调 :func:`check_service.check_sources`，不改其内部；
 - 对外入口：``async check_source(source_json)``（单源）、``async check_all(groups=None)``
-  （批量）、``cancel()``（取消在跑的检测；服务生命周期停止走基类 async stop）；
+  （批量，**自动两遍**：浅遍只验列表链路，进深检队列的源再补验正文，判据与队列在
+  :mod:`app.services.sources.tiered_check`）、``cancel()``（取消在跑的检测；服务
+  生命周期停止走基类 async stop）；
 - 检测完成发 :class:`~app.core.events.CheckFinishedEvent`，检测进度写
   ``status.progress``（0-1）；
 - **本轮批量检测留一份可回放快照**（:meth:`run_snapshot` /
@@ -21,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+from collections import Counter
 from typing import Callable
 
 from app.core.events import CheckFinishedEvent
@@ -28,8 +31,13 @@ from app.core.lifecycle import Service
 from app.models.book_source import BookSource
 from app.services import check_service
 from app.services.block_pages import block_reason  # noqa: F401  共享依赖归属声明（§3.4）
+from app.services.sources import compat_audit_service, tiered_check
 
 logger = logging.getLogger(__name__)
+
+#: 批量检测那一轮用的高度：不是 `full`/`list` 之一，而是"两遍都跑，谁进第二遍由判据定"。
+#: 快照里写这个值，界面据此别再显示"本轮快速检测"那种单档措辞。
+DEPTH_AUTO = "auto"
 
 
 def _resolve_class(dotted: str) -> type | None:
@@ -58,25 +66,70 @@ def _summary(result: dict) -> str:
            or result.get("search_error") or "").strip()
     line = f"{name}：{state}（{err}）" if err else f"{name}：{state}"
     # "没试正文"和"试了失败"在九态里都落进列表那一级，界面上必须点出来是哪种，
-    # 否则快速检测的结论看起来像源本身有毛病。
-    if result.get("reading_check_skipped") == check_service.CHECK_DEPTH_LIST:
+    # 否则浅遍的结论看起来像源本身有毛病。
+    if (result.get("tier") == check_service.CHECK_DEPTH_LIST
+            or result.get("reading_check_skipped") == check_service.CHECK_DEPTH_LIST):
         line += "（本轮快速检测，未验正文）"
     return line
 
 
-#: 触发点③（每源检测完复跑一次静态审计）的并发上限。审计单条只有 ~12.9 ms 的 CPU，
-#: 但它是**每条两笔 `asyncio.to_thread`**甩进默认线程池（本机 cpu=20 → 24 条），而
-#: 检测自己要的 `to_thread`（`_unsupported_java_packages`、`_parse_off_loop`）用的是
-#: **同一个池**。不设上限的实测形状（240 条真库快照、每源 20 ms 假 IO、三臂交替，
-#: `.probe/check_slowdown_audit_fanout.py`）：
-#:   峰值同时在跑的审计 206 条 vs 限死后 2 条；整轮墙钟（含收尾）不跑审计 8167 ms /
-#:   无上限 16186 ms / 上限 2 13596 ms；检测自己那条 to_thread 的 max 从 13257.7 ms
-#:   回到 8528.2 ms（不跑审计是 8029.0 ms）——限并发买的是"检测自己的线程步回到没审计
-#:   那一档"，代价是收尾那一截有界（`AUDIT_DRAIN_BUDGET`）。取 2 与 JS 检测段
-#:   （`JS_CHECK_CONCURRENCY`）同量级。
+def _merge_by_url(shallow: list[dict], deep: list[dict]) -> list[dict]:
+    """把两遍结果并成一份：同一条源（按 ``raw_url`` 认）以深遍那份为准。
+
+    按 url **配对**而不是 dict 覆盖：库里可能有两条源填了同一个地址，覆盖会把其中
+    一条的结论吞掉（结果条数比计划源数少，进度与汇总就都对不上了）。浅遍里同一个
+    url 出现几次，深遍里就出现几次（队列按 url 收取源，两边挑的是同一批），所以
+    先进先出的配对不会错位。深遍里配不上对的那些是静态判据直接收走的源——浅遍根本
+    没跑它们，直接补在末尾。
+    """
+    by_url: dict[str, list[dict]] = {}
+    for item in deep:
+        by_url.setdefault(str(item.get("raw_url") or ""), []).append(item)
+    merged: list[dict] = []
+    for item in shallow:
+        twin = by_url.get(str(item.get("raw_url") or ""))
+        merged.append(twin.pop(0) if twin else item)
+    merged.extend(rest for twin in by_url.values() for rest in twin)
+    return merged
+
+
+#: 触发点③（每源检测完复跑一次静态审计）的并发上限，**按审计跑在哪儿分两档**。
+#:
+#: 退回线程池那一档必须限死：审计是**每条两笔 `asyncio.to_thread`**甩进默认线程池
+#: （本机 cpu=20 → 24 条），而检测自己要的 `to_thread`（`_unsupported_java_packages`、
+#: `_parse_off_loop`）用的是**同一个池**。不设上限的形状（240 条真库快照、三臂交替，
+#: `.probe/check_slowdown_audit_fanout.py`）：峰值同时在跑的审计 **206** 条，限死后 2 条。
+#: 取 2 与 JS 检测段（`JS_CHECK_CONCURRENCY`）同量级。
 AUDIT_CONCURRENCY = 2
+#: 走子进程那一档（现形状）：提交只是往池的队列里塞一条，不占本机线程，上限的作用
+#: 变成"别把 900 条一次性全塞进队列"，所以放宽到够喂满 worker 即可
+#: （= 2 × `AUDIT_POOL_WORKERS`；worker 数与其实测见 compat_audit_service）。
+AUDIT_POOL_FANOUT = 8
 #: 收尾等多久。审计是 best-effort：超预算就把没跑完的取消，不拖检测的结束。
 AUDIT_DRAIN_BUDGET = 5.0
+#: 一轮排出去多少条审计之后，跑完就把进程池关掉（下一轮再按需重建）。
+#:
+#: 为什么要关：worker 的常驻内存是**跟着做过的条数涨**的——刚建好 4 个共 63 MB
+#: （≈16 MB/个），审完 917 条真库快照涨到 269 MB（≈67 MB/个），审完 2161 条
+#: 326 MB（≈80 MB/个），之后基本不再涨也不还给 OS（`.probe/mp_pool_memory.py`）。
+#: 桌面端一轮整库检测完就白背这 270 MB，而同一台机器上还有内置浏览器要吃内存。
+#: 关池实测把子进程 RSS 归零，代价是下次重建 177~184 ms——所以只对**大轮**这么干：
+#: 单源/小批量检测本来就快，为它赔一次建池不划算（那 180 ms 会算进收尾等待里）。
+#:
+#: 顺带一个好处：`shutdown(cancel_futures=True)` 会把收尾时被取消、却还排在池队列里
+#: 的那些条目真丢掉（线程路径上取消不掉，线程还会把 `_audit_one` 跑完）。
+AUDIT_POOL_REAP_AFTER = 64
+
+
+def _audit_fanout_bound() -> int:
+    """本轮该用哪一档扇出上限——**每轮读一次**，不是写死常量。
+
+    池可能在跑的过程中被打穿（子进程原生 abort）而永久退回线程池，那种情况下
+    下一轮必须自动降回 :data:`AUDIT_CONCURRENCY`，否则就是 8 条重 CPU 审计
+    挤在默认线程池里，正好是上面那个上限要挡的形状。
+    """
+    return (AUDIT_POOL_FANOUT if compat_audit_service.audit_pool_in_use()
+            else AUDIT_CONCURRENCY)
 
 
 class SourceCheckService(Service):
@@ -108,9 +161,15 @@ class SourceCheckService(Service):
         #: 本轮排出去的审计任务：留引用（不留会被 GC 悄悄回收）、收尾等它们
         self._audit_tasks: set[asyncio.Task] = set()
         self._audit_sem: asyncio.Semaphore | None = None
+        #: 本轮排出去多少条审计（任务跑完就从 `_audit_tasks` 里摘掉，所以要单独数）：
+        #: 收尾时按这个数决定要不要把进程池关掉还内存（`AUDIT_POOL_REAP_AFTER`）。
+        self._audit_submitted = 0
         #: 本轮批量检测的回放快照（见 :meth:`run_snapshot`）
         self._run: dict | None = None
         self._run_done: asyncio.Event | None = None
+        #: 待深检队列（服务侧，见 :mod:`tiered_check`）：跨轮存"谁该补验正文"。
+        #: 不落库、不进用户分组——它是检测自己的账，不是用户看得见的一个组。
+        self._deep_queue = tiered_check.DeepQueue()
 
     # ------------------------------------------------------------------ #
     # 生命周期：经 hub 补齐未注入的基础设施，并读检测偏好
@@ -156,13 +215,19 @@ class SourceCheckService(Service):
         results = await self._run_checks([source], depth=depth)
         return results[0] if results else {}
 
-    async def check_all(self, groups=None,
-                        depth: str = check_service.CHECK_DEPTH_FULL) -> dict:
-        """批量检测；``groups`` 给定时只检测这些分组。返回汇总 dict。
+    async def check_all(self, groups=None) -> dict:
+        """批量检测：**自动两遍**——浅遍只验到列表链路，进队列的源再补验正文。
 
-        ``depth`` 是分级检测的深度：``full`` 一路验到正文，``list`` 验到列表链路就
-        收（阅读链是唯一会翻倍的段，实测占两段规则耗时 74.7%，见
-        :data:`check_service.CHECK_DEPTH_LIST`）。
+        分级不是给用户选的档位，而是这一轮自己决定"谁值得花钱验正文"：
+        浅遍（`CHECK_DEPTH_LIST`，实测 12.1 ms/源、每源 2.00 次 HTTP，正文段 0 次）
+        跑完之后，只有列表链路证明可用、或浅遍根本没测出结论、或地址形状使浅遍无从
+        判定的源，才进深遍（`CHECK_DEPTH_FULL`，23.7 ms/源、4.92 次 HTTP，多出来的
+        2.92 次全在正文段）。单价实测于 `.probe/tiered_two_pass_cost.py` (C)。
+        判据与队列在 :mod:`app.services.sources.tiered_check`。
+
+        两遍合计是**一个分母**（本轮计划源数），进度与 `CheckFinishedEvent.done/total`
+        跨两遍连续；深遍的结果按 `raw_url` 覆盖同一条源的浅遍结论。
+        被取消/没跑完的深检留在服务侧队列里，下一轮捡回（不落库、不进用户分组）。
 
         已有批量在跑时**不再派第二遍全量联网**（两份流水线同时打站点对既浪费
         又容易被封），而是接到那一轮的收尾上。
@@ -172,9 +237,17 @@ class SourceCheckService(Service):
             snap = await self.await_run_finished()
             return snap.get("summary") or {}
         sources = self._collect_sources(groups)
-        run = self._begin_run(len(sources), depth)
+        run = self._begin_run(len(sources), depth=DEPTH_AUTO)
         try:
-            results = await self._run_checks(sources, run, depth)
+            if not sources:
+                self.status.progress = None
+                results, tiering = [], self._empty_tiering()
+            else:
+                results, tiering = await self._run_tiered(sources, run)
+                # 进度条按"已定论的源数"走（见 _run_checks），整轮收工时才把它钉到 1.0：
+                # 浅遍结束时它只到"浅遍定论数/计划数"，那一格不算跑完。
+                self.status.progress = 1.0
+            run["tiering"] = tiering
             run["summary"] = {
                 "total": len(results),
                 "finished": len(results),
@@ -182,10 +255,101 @@ class SourceCheckService(Service):
                 "blocked": sum(1 for r in results
                                if r.get("check_state") == "blocked"),
                 "results": results,
+                "tiering": tiering,
             }
         finally:
             self._end_run(run)   # 标记写完才放行等待收尾的视图
         return run["summary"]
+
+    @staticmethod
+    def _empty_tiering() -> dict:
+        return {"plan_total": 0, "shallow": 0, "deep": 0, "carried": 0,
+                "by_reason": {}}
+
+    async def _run_tiered(self, sources: list[BookSource],
+                          run: dict) -> tuple[list[dict], dict]:
+        """浅遍 → 判据 → 深遍，返回合并后的结果与本轮的分级账目。"""
+        url_of = lambda s: str(getattr(s, "bookSourceUrl", "") or "")   # noqa: E731
+        in_scope = {url_of(s) for s in sources}
+        self._deep_queue.prune()
+        carried_before = self._deep_queue.pending()
+
+        reasons: dict[str, str] = {}
+        for source in sources:
+            reason = tiered_check.static_deep_reason(source)
+            if reason:
+                reasons[url_of(source)] = reason
+        for url, reason in carried_before.items():
+            if url in in_scope:
+                reasons.setdefault(url, reason)   # 静态判据优先，它更具体
+        for url, reason in reasons.items():
+            self._deep_queue.add(url, reason)
+
+        deep_urls = set(reasons)
+        shallow_sources = [s for s in sources if url_of(s) not in deep_urls]
+        tiering = {"plan_total": len(sources),
+                   "shallow": len(shallow_sources), "deep": len(reasons),
+                   "carried": sum(1 for u in reasons if u in carried_before),
+                   "by_reason": dict(Counter(reasons.values()))}
+
+        shallow_results = []
+        if shallow_sources:
+            # 浅遍里"进了队列"的那些还没定论，不推动进度条（进度语义见 _run_checks）
+            shallow_results = await self._run_checks(
+                shallow_sources, run, check_service.CHECK_DEPTH_LIST,
+                total_plan=len(sources), reap=False,
+                counts=lambda r: not tiered_check.shallow_deep_reason(r))
+
+        settled = 0
+        for result in shallow_results:
+            reason = tiered_check.shallow_deep_reason(result)
+            if reason:
+                url = str(result.get("raw_url") or "")
+                reasons[url] = reason
+                self._deep_queue.add(url, reason)
+            else:
+                settled += 1
+
+        results: list[dict] = list(shallow_results)
+        deep_sources = self._deep_queue.select(sources)
+        if deep_sources:
+            deep_results = await self._run_checks(
+                deep_sources, run, check_service.CHECK_DEPTH_FULL,
+                total_plan=len(sources), settled_before=settled,
+                fresh_round=False, reap=False)
+            results = _merge_by_url(shallow_results, deep_results)
+            self._settle_queue(deep_results)
+        # 两遍合起来才算一次关池决定：浅遍单独不到 64 条不该让深遍那 600 条白背着
+        # 子进程内存过夜（计数闸门与单价见 AUDIT_POOL_REAP_AFTER）。
+        self._reap_audit_pool()
+        tiering["deep"] = len(deep_sources)
+        tiering["by_reason"] = dict(Counter(
+            reasons.get(url_of(s), "") for s in deep_sources))
+        deep_set = {url_of(s) for s in deep_sources}
+        for result in results:
+            result["tier"] = ("full" if str(result.get("raw_url") or "")
+                              in deep_set else "list")
+        order = {url_of(s): index for index, s in enumerate(sources)}
+        results.sort(key=lambda r: order.get(str(r.get("raw_url") or ""),
+                                             len(order)))
+        for index, result in enumerate(results, 1):
+            result["idx"] = index
+        return results, tiering
+
+    def _settle_queue(self, deep_results: list[dict]) -> None:
+        """深遍跑过的条目从队列里摘掉；只有一时判不出结论的（`unknown`）留下重试。
+
+        留也要有次数上限：一条 `rate_limited`/超时的源不能每轮都占一条深检预算，
+        试满 :data:`tiered_check.DEEP_MAX_ATTEMPTS` 次之后它不再被排进深遍，歇
+        :data:`tiered_check.DEEP_RETRY_COOLDOWN_SECONDS` 再由浅遍重新判（计数与冷却
+        都在队列里，见 :class:`tiered_check.DeepQueue`）。
+        """
+        for result in deep_results:
+            url = str(result.get("raw_url") or "")
+            if str(result.get("check_state") or "") == "unknown":
+                self._deep_queue.note_attempt(url)
+                continue
+            self._deep_queue.drop(url)
 
     def _begin_run(self, total: int, depth: str = check_service.CHECK_DEPTH_FULL) -> dict:
         """开一轮可回放快照（必须在引擎循环上调，见 :meth:`_run_checks`）。"""
@@ -214,16 +378,23 @@ class SourceCheckService(Service):
 
         ``await`` 而非同步读：协程方法经 EngineProxy 跳回引擎循环，读到的
         ``run`` dict 不会被在跑的流水线改到一半（界面线程直读会拿到撕裂的进度）。
+
+        除了本轮结果，还带两份自动分档的账：``tiering``（这一轮浅遍/深遍各跑了多少、
+        按什么判据收的）和 ``deep_queue``（**下一轮**还欠着深检的那些）。队列是服务
+        侧状态，切页、甚至换一轮都还在，界面读它只是为了如实说"还有 N 条待深检"。
         """
         run = self._run
         if run is None:
             return {"running": False, "cancelled": False, "total": 0,
-                    "depth": check_service.CHECK_DEPTH_FULL,
+                    "depth": DEPTH_AUTO,
+                    "tiering": self._empty_tiering(), "deep_queue": [],
                     "summary": None, "results": []}
         return {"running": bool(run["running"]),
                 "cancelled": bool(run["cancelled"]),
                 "total": int(run["total"]),
-                "depth": run.get("depth", check_service.CHECK_DEPTH_FULL),
+                "depth": run.get("depth", DEPTH_AUTO),
+                "tiering": run.get("tiering") or self._empty_tiering(),
+                "deep_queue": self._deep_queue.snapshot(),
                 "summary": run["summary"],
                 "results": list(run["results"])}
 
@@ -250,26 +421,56 @@ class SourceCheckService(Service):
 
     async def _run_checks(self, sources: list[BookSource],
                           run: dict | None = None,
-                          depth: str = check_service.CHECK_DEPTH_FULL) -> list[dict]:
-        """跑一轮流水线；``run`` 给了就把逐源结果同步记进回放快照。
+                          depth: str = check_service.CHECK_DEPTH_FULL,
+                          *, total_plan: int | None = None,
+                          settled_before: int = 0,
+                          counts: Callable[[dict], bool] | None = None,
+                          fresh_round: bool = True,
+                          reap: bool = True) -> list[dict]:
+        """跑一遍流水线；``run`` 给了就把逐源结果同步记进回放快照。
 
         快照必须在**引擎循环**上读写（协程方法经 EngineProxy 派发）：界面线程
         直接读会在流水线改到一半时拿到撕裂的进度。
+
+        自动分档把批量检测拆成浅遍+深遍两遍调用，进度条要跨两遍还是**单调**的，
+        这四个参数就是为它准备的：
+
+        - 分母是**本轮计划源数**（``total_plan``），分子是"已经定论的源数"。一条源
+          浅遍给了明确结论就算定论；被浅遍收进深检队列的那条还没定论，浅遍里不计数、
+          深遍里才计数（``counts`` 就是这个判定的钩子，默认每条都算）。换成"派发条数"
+          当分子的话，控制器那侧按 source_id 去重计进度，进度条会提前卡在 100% 或
+          永远差深遍那一截——两条路都实测过界面侧的算法后才选的这里。
+        - ``settled_before`` 是上一遍已经定论的条数，第二遍从它接着数。
+        - ``fresh_round=False`` 表示这是同一轮的后续一遍：审计信号量与扇出计数都
+          不重置（重置会把浅遍排出去的审计条数抹掉，关池那道闸门就数错账）。
+        - ``reap=False`` 让关池的决定留到整轮结束再做一次。
         """
+        plan_total = int(total_plan) if total_plan else len(sources)
         if not sources:
-            self.status.progress = None
+            if fresh_round:
+                self.status.progress = None
             return []
-        total = len(sources)
-        self.status.progress = 0.0
-        # 每轮换一把新信号量：Semaphore 第一次 await 就认死当前循环，跨循环复用会抛
-        # "bound to a different event loop"（服务重启、单测每条各起一条循环都会换）。
-        self._audit_sem = asyncio.Semaphore(AUDIT_CONCURRENCY)
+        settled = int(settled_before)
+        if fresh_round:
+            self.status.progress = 0.0
+            # 每轮换一把新信号量：Semaphore 第一次 await 就认死当前循环，跨循环复用会抛
+            # "bound to a different event loop"（服务重启、单测每条各起一条循环都会换）。
+            self._audit_sem = asyncio.Semaphore(_audit_fanout_bound())
+            self._audit_submitted = 0
 
         def on_result(result: dict, done: int, t: int) -> None:
             # 进度写 status.progress（§4.5 状态可见）
-            self.status.progress = (done / t) if t else 1.0
-            self._publish_finished(result, run, done, t)
-            self._maybe_audit(result, sources)
+            nonlocal settled
+            final = counts is None or counts(result)
+            if final:
+                settled += 1
+            self.status.progress = (settled / plan_total) if plan_total else 1.0
+            self._publish_finished(result, run, settled, plan_total)
+            # 审计只跟着**会被留下的那一行**走：被浅遍收进深检队列的那条源，浅遍结论
+            # 马上被深遍的顶掉（`_merge_by_url`），审它是同一份规则、却是会被丢弃的行，
+            # 等于每个深检源多付一次重 CPU 审计（`_audit_one` 中位 3.2 ms、p95 189 ms）。
+            if final:
+                self._maybe_audit(result, sources)
 
         async def runner():
             return await self._checker(
@@ -287,11 +488,30 @@ class SourceCheckService(Service):
             raise
         finally:
             self._task = None
-        # 审计的尾巴要在进度到 100% 之后立刻收掉：留着不等人，占的是下一条检测、
-        # 阅读页都要用的默认线程池（见 AUDIT_CONCURRENCY 上方的实测）。
+        # 审计的尾巴要在进度到 100% 之后立刻收掉：留着不等人，占的是子进程池的队列
+        # （退回线程池时占的就是下一条检测、阅读页都要用的默认线程池）。
         await self._drain_audits()
-        self.status.progress = 1.0 if total else None
+        if reap:
+            self._reap_audit_pool()
+        self.status.progress = min(1.0, settled / plan_total) if plan_total else None
         return results
+
+    def _reap_audit_pool(self) -> None:
+        """大轮跑完就把审计进程池关掉，把 worker 涨出来的内存还给系统。
+
+        见 :data:`AUDIT_POOL_REAP_AFTER`：常驻内存跟着做过的条数涨（917 条 269 MB），
+        关池能归零、重建要 177~184 ms，所以只在大轮做这笔交换。小轮不关，
+        免得单源检测每次都为下一轮赔一次建池。
+
+        关池不改变"审计走不走子进程"这件事（`shutdown_audit_pool` 不动
+        `_STATE.disabled`），所以下一轮的扇出上限仍是进程池那一档；池会在下一条
+        审计来时按原样重建。
+        """
+        if self._audit_submitted < AUDIT_POOL_REAP_AFTER:
+            return
+        logger.info("本轮审计 %s 条（≥%s），关掉审计进程池还内存",
+                    self._audit_submitted, AUDIT_POOL_REAP_AFTER)
+        compat_audit_service.shutdown_audit_pool()
 
     def _cancel_audits(self) -> None:
         """把这一轮还没跑完的审计全部取消（检测被停/被取消时不留后台尾巴）。"""
@@ -314,11 +534,11 @@ class SourceCheckService(Service):
     def _maybe_audit(self, result: dict, sources: list[BookSource]) -> None:
         """触发点③：检测流水线每源复跑静态审计（best-effort，不阻断检测）。
 
-        限并发（:data:`AUDIT_CONCURRENCY`）并留任务引用：审计本身只有十几毫秒 CPU，
-        但它往默认线程池一次甩两笔 `to_thread`，不设上限时检测自己那步要排在
-        200 多条审计后面（实测见 :data:`AUDIT_CONCURRENCY` 上方注释）。
-        任务引用必须留在 `self._audit_tasks` 里——`create_task` 的返回值不被持有
-        时，事件循环只握弱引用，跑到一半的任务可能被 GC 掉。
+        限并发（:func:`_audit_fanout_bound`）并留任务引用：审计是重 CPU 活
+        （`_audit_one` 中位 3.2 ms、p95 189 ms，240 条真库快照合计 7.8 s），
+        不设上限时一轮就是 200 多条同时往外甩（实测见 :data:`AUDIT_CONCURRENCY`
+        上方注释）。任务引用必须留在 `self._audit_tasks` 里——`create_task` 的返回值
+        不被持有时，事件循环只握弱引用，跑到一半的任务可能被 GC 掉。
         """
         if self._compat is None or not hasattr(self._compat, "audit_source"):
             return
@@ -332,6 +552,7 @@ class SourceCheckService(Service):
         except Exception:
             return
         task = asyncio.create_task(self._audit_gated(data))
+        self._audit_submitted += 1
         self._audit_tasks.add(task)
         task.add_done_callback(self._audit_tasks.discard)
 
