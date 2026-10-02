@@ -14,10 +14,16 @@
   从"第 1 轮即崩"变成 5/5 活。机制、证据与护栏见下面"§B 的真因"一节。
   症状 A 的否证结论不变：下面两项改动是**降本与可观测**，不是"治好了停在 loading"，
   写注释时不许把它们写成病因。
+  **第六十五轮**把待修清单 3（10054 归因）收完：现场身份已判明是 engine 循环的 socket 收尾
+  竞态，认得出的两族降成一条带累计计数的短行、族 1 顺手补上被异常跳过的 `sock.close()`，
+  认不出的一律照旧两遍——它是**噪声与句柄**的处理，不是"停在 loading"的病因，同上不许混。
 - 影响面：书源检测（全库联网扫描，数百至上千条源）；顺带波及所有走
   `BaseController.flush()` 整页下发的常驻大列表（换源扫描、书内索引行）
 - 取证详情：`docs/dev-logs/2026-09-30.md` 第五十二～五十五轮（崩溃链）与第五十八～六十二轮
   （重启按钮、越跑越慢的两个累积器、进度分母、分级检测；探针与输出全在 `.probe/`）；
+  10054 那一族见 `docs/dev-logs/2026-10-01.md` 第六十五轮
+  （`.probe/loop_teardown_matrix.py` 62 格否证、`.probe/loop_teardown_cleanup_probe.py` 三臂、
+  `.probe/mutate_teardown_guards.py` 变异 5/5）；
   现场那份环形文件已改名留底
   `%LOCALAPPDATA%\LegadoBookSourceCheck\diagnostics\crash-20260930-131140.journal`
 
@@ -302,7 +308,9 @@ file module.c, line 99` 后 **Python 进程停了、窗口还在、中间提示 
 另两条继续成立、本轮未推翻：**quickjs 求值期间放 GIL**（`qjs_gil_held.py`：198 ms 求值期间
 旁路心跳最大间隔 2.0 ms），所以"一条长 eval 把界面循环饿死"也不成立。
 
-## 10054 归因：未定
+## 10054 归因：定了（第五十三轮装身份 → 第六十五轮按身份收噪声）
+
+### 一、当时的取证为什么停在"未定"
 
 `.probe/connection_reset_who_attr.py` → `out_rst_who.txt`：本地**裸 TCP** 假源（不走
 aiohttp.web，免得它先把异常吞成 `Error handling request`）对 `/rst` 写半个响应头后
@@ -311,10 +319,67 @@ aiohttp `ClientSession`，即 `check_service` 的 probe/search 那条路），�
 `set_exception_handler`。**本机 0 条循环级异常记录**——aiohttp 把被截断的响应当读完
 就返回了，`_call_connection_lost` 没进异常处理器。
 
-所以既不能断言"10054 是扫描噪声"，也不能断言"Flet 客户端掉过线"。
-**第五十三轮已在两条真循环上装好只加身份的异常处理器**（`install_loop_attribution`，
-见待修清单 3），下一次现场那 6 行会带着 `循环[engine]` / `循环[ui]` 与线程名出来，
-归谁一家眼就能判；本轮不做过滤，判出来之前滤一条都是抹线索。
+所以第五十二~五十三轮既不能断言"10054 是扫描噪声"，也不能断言"Flet 客户端掉过线"。
+第五十三轮因此在两条真循环上只装身份、不做过滤（`install_loop_attribution`，
+见待修清单 3）：判出来之前滤一条都是抹线索。
+
+### 二、现场那份日志把归属判完了（第六十五轮）
+
+开发者自己跑了一次全库扫描（退出码 0、**请求一条没失败**），两族记录都带
+`循环[engine]线程=legado-engines loop=0x…`：
+
+1. `Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)`
+   + `ConnectionResetError(10054, …)`，traceback 末行 `proactor_events.py:165
+   self._sock.shutdown(socket.SHUT_RDWR)`；
+2. `Future exception was never retrieved` + `ClientOSError(1,
+   '[SSL: APPLICATION_DATA_AFTER_CLOSE_NOTIFY] …')`，经 `sslproto.py:651
+   _do_shutdown` → `ssl.py:920 unwrap`。
+
+**结论：都是 engine 循环家的 socket 收尾竞态，与 Flet 的 websocket 无关**——第五十三轮
+装的身份这一眼就读出来了。`args=(None)` 那半段还额外钉住路径：`Handle._run` 的
+`message` 是 `f'Exception in callback {cb!r}({args!r})'` 拼的，`(None)` 说明这次收尾
+是 `close()`/`abort()`/`_force_close(None)` 排进来的（读/写路径会把异常本体带进 args），
+也就是**我们自己关的连接**在对端复位之后收尾。
+
+### 三、发生频率离线复现不了，但后果能离线量
+
+* **频率**：`.probe/loop_teardown_matrix.py` 把 状态(idle/paused/silence/unread/tls) ×
+  动作(close/abort/io-then-close) × 对端(rst/fin) × 延时(0.05/0.2) 摊成 44 格，再加
+  3 个 aiohttp 形状 × 2 延时 = 12 格，**62 格全部 0 条循环级记录**（合计那行：归属行 0 +
+  default dump 0）；进程句柄起始 293 → 原始 44 格跑完 288 → 12 格 aiohttp 跑完 294（差 +1，
+  **不随事件数涨**）。
+  根因当场量清：本机回环上 `sock.shutdown(SHUT_RDWR)` 在四种复位状态下**全部成功**
+  （读完响应再等复位、一口不读、写完 200KB 无人读、复位后再发一个请求）——回环上发送
+  数据总被对端协议栈立刻吸走，**不存在"在途未确认的发送数据"**，而 10054 撞在
+  `shutdown()` 上要的正是那个状态（真链路：请求刚写出去、链路或对端复位；或中间盒注入
+  RST）。所以这一族的**次数**只能留在现场，文档里不许写离线测不到的数。
+* **后果**：复现不了"会抛"就直接造"已经抛"——`.probe/loop_teardown_cleanup_probe.py`
+  给 40 条**活着的** proactor 传输层换上抛 10054 的 `shutdown()`，走完 `transport.close()`
+  那条回调。三臂（本轮实测）：
+
+  | 臂 | 日志 | 命中后 `fileno≥0` | 句柄轨迹 | `gc.collect()` 后 | ResourceWarning |
+  | --- | --- | --- | --- | --- | --- |
+  | A 对照（不抛 + 第 53 轮处理器） | 归属 0 + default 0 | **0/40** | 245 / 245 / 245 | 245 | 0 |
+  | B 抛 10054 + 第 53 轮处理器（现场那份） | 归属 40 + default **80** = 每事件 3.0 行 | **40/40** | 251 → 299 → 305 | **303** | 23/40 |
+  | C 抛 10054 + 第六十五轮处理器 | **1 行 / 40 事件** | **0/40** | 245 / 245 / 245 | 245 | 0 |
+
+  也就是 `proactor_events.py:154-172` 那句 `finally`：`shutdown()` 一抛，166 行
+  `sock.close()`、167 行 `_sock = None`、172 行 `_called_connection_lost = True`
+  **三行都不执行**，一次竞态留下一个不归还的 socket 句柄（B 臂 +54～+60，显式
+  `gc.collect()` 只收回 2 个——`__del__` 那条兜底路要么没跑、要么跑了也不归还句柄，
+  40 次里只有 23 条 ResourceWarning）。
+  顺带量的一条：`connection_lost` **被调两次**这件事三臂都是 0/40——每臂一条传输层只
+  close 一次，155 行那道闸门失效的代价在这个形状里出不来，不写成"没问题"。
+
+### 四、否掉的补法（都有理由，别再走一遍）
+
+* `TCPConnector(enable_cleanup_closed=True)`：Python 3.12 上 aiohttp 自己把它当**死参数**
+  （`_cleanup_closed` 只在 `enable` 且非 3.12.x 的分支里被调用），装上去不改任何东西。
+* `force_close=True` 或把 `keepalive_timeout` 调小：那是把"优雅收尾"这条更容易撞上
+  的路换成"直接 abort"，且第六十二轮实测过的 keep-alive 收益要一起赔掉。
+* `connector.close(abort_ssl=True)`：`ClientSession.close()` 没把这个参数透出来，真要打得穿
+  会话层，并且它改的是**连接池策略**——超出本轮边界（本轮只处理噪声与句柄，不动池子）。
+
 
 ## 待修清单（按证据强度排）
 
@@ -383,6 +448,13 @@ aiohttp `ClientSession`，即 `check_service` 的 probe/search 那条路），�
    日志形如 `循环[engine]线程=legado-engines loop=0x… 报告异常：<message>：<exc>`，
    打完身份**原样转给** `default_exception_handler`（一条记录都不许少）。
    白名单过滤按清单原计划**继续等归因结果再做**，本轮不过滤任何噪声。
+   —— **第六十五轮归因到手、这一条收完**：现场两族都落在 `循环[engine]`，且请求一条没失败。
+   于是按原计划只把**认得出的两族收尾竞态**降成一条带累计计数的短行，并顺手补上
+   `proactor_events.py:166-172` 被异常跳过的那三行（族 1 每事件留一个不归还的 socket 句柄）；
+   **认不出的异常一律保持第五十三轮那份两遍待遇**。机制、三臂实测数字与被否掉的补法
+   见上"10054 归因：定了"一节，护栏与变异见下"第六十五轮落地的改动与护栏"。
+   噪声的**次数**仍是现场量（回环上 `shutdown()` 任何复位状态都不抛，离线造不出触发状态），
+   本轮不再追。
 4. `BaseController.flush()` 整页 diff 是既定形状（要覆盖 page 级覆盖层/对话框，
    `app/controllers/base.py:211`）。900 行 = 21.7 ms 可接受；一旦出现更大的常驻列表
    （换源扫描、书内索引行），用同一支探针**重量**。
@@ -399,6 +471,13 @@ aiohttp `ClientSession`，即 `check_service` 的 probe/search 那条路），�
 7. **拦住崩**（未开工）：把 QuickJS 放子进程，崩只带走 worker 不带走服务端——
    真因这一类已经改掉，但**未知形状**仍只有这条路能兜；第五十五轮的改动**不是**它，
    写注释时不许混。
+   **第六十三轮只推进了边界上的一小格，仍然算未开工**：静态审计里那段
+   `quickjs.Context().eval()` 预编译（240 条快照中 154 条含 JS、占审计合计 CPU 的
+   89%）现在跑在子进程里，它真 abort 带走的是一个 worker——护栏已经按这个形状写了
+   （`BrokenProcessPool` → 摘池、**不重跑那条毒源**、回 `not_audited`）。
+   但**检测/阅读的规则求值（`legado_js._evaluate_locked` 那条派发线程）一行都没动**，
+   还在主进程里，所以 0xC0000409 照样能带走整个应用。把求值也搬进子进程要先解决
+   桥回调（Python↔JS 双向、`add_callable` 那条）跨进程的问题，那是另一轮的事。
 8. `Context.get`:566 / `Context.set`:580 / `Context.parse_json`:551 与本轮修掉的
    `Object.json`:143 是同一族
    **不建帧**的原生入口，今天引擎一处没用（全库 grep 无调用点）。要堵的话，
@@ -520,16 +599,28 @@ rule/url、求值失败照旧落出记录、**桥回调里真按 0xC0000409 死�
 | 累积器 | 形状 | 实测代价 | 改法 |
 | --- | --- | --- | --- |
 | (a) 响应级整罐 cookie 写盘 | 每个响应把整罐重水化 + 整罐落库，而**绝大多数响应根本没动罐** | 罐 16/512/2048 条时 0.847 / 2.195 / 6.597 ms 每次、写库 20 次；带脏闸门后 0.001 ms、写库 0 次（真的动了罐才 1.092 / 3.557 / 11.980 ms、20 次） | `js.cookie_revision` 对 `engine._cookie_persist_revision`，罐变了才进 |
-| (b) 每源复检后扇出的静态审计 | 每条结果 `create_task` 甩进**默认线程池**、没人管并发 | 240 条快照：不跑审计整轮 8167.4 ms、峰值 0 条在跑、检测自己要的那条 `to_thread` max 8029.0 ms；扇出无上限 16185.8 ms / **峰值 206** / **13257.7 ms**；限并发 2 + 收尾预算 13596.4 ms / 2 / 8528.2 ms | `AUDIT_CONCURRENCY=2` + 留引用 + 每轮换信号量 + 取消连尾巴一起取消 + `AUDIT_DRAIN_BUDGET=5.0` |
+| (b) 每源复检后扇出的静态审计 | 每条结果 `create_task` 甩进**默认线程池**、没人管并发 | 240 条快照：扇出无上限时**峰值 206 条同时在跑**、返回时 0 条未完；限并发 2 之后峰值 2、返回时还剩 17 条没跑完。**这两栏的墙钟（8167/16186/13596 ms）与"检测自己那条 `to_thread` 排队时长"（8029/13258/8528 ms）已在第六十三轮作废**——探针把"检测自己要的那条 CPU 步"顶替成了 `_audit_one` 本身，三栏背的都是探针自造的 CPU（真那一步中位 0.011 ms、合计 3.6~47.0 ms，`_audit_one` 中位 3.0~3.2 ms、合计 7733~7845 ms，差 290 倍） | 第一档 `AUDIT_CONCURRENCY=2` + 留引用 + 每轮换信号量 + 取消连尾巴一起取消 + `AUDIT_DRAIN_BUDGET=5.0`；**第二档（第六十三轮）把 `_audit_one` 整条搬进进程池**：`run_in_executor(pool,…)`、扇出上限跟着执行位置分两档（子进程 8 / 退回线程 2）、建不出来或被打穿就退回线程池并**给得出"这条没审"**、大轮收尾关池还内存。240 条实测 5697→2542 ms（−55.4%）、审完 159→240 条、前台那条步 p50 10.087→0.923 ms、父进程二代 GC 16~17 次/轮→**0 次** |
 | (c) 进度分母 | "12/12"看着像数错了，其实是**订阅方自己数**：本视图自己点"开始"的那一轮从来没人告诉它 total | — | `CheckFinishedEvent.done/total` 带分母，控制器没分母就**不画**进度条，不用完成数冒充 |
 
 三条各带变异核验（6/6、7/7、4/4 全抓到）。**还有一条只记录未处理**：每源新建引擎时把
 整罐 cookie **重新水化**（读的那一头，罐 16→2048 条时 0.76→11.45 ms）——闸门堵住的是
 "没人动罐就别写"，读这一头还在。
 
+(b) 这一条在第六十轮只做到了"限并发"，**"重 CPU 还在本进程的默认线程池里"那一半**
+是第六十三轮补的：静态审计整条 `_audit_one` 搬进 `ProcessPoolExecutor(spawn)`，
+扇出上限跟着执行位置分两档，池建不出来/被打穿就退回线程池并显式记"这条没审"
+（`AuditReport.not_audited`，导入面、编辑器面、`audit_log` 三个出口都看得见）。
+配套 15 个变异（`.probe/_mut63_pool.py` P1~P15）**15/15 抓到**。收益、内存取舍
+（`max_tasks_per_child` 被否，改成大轮收尾关池）与 `max_tasks_per_child` 那笔
++6.4% 的实测，都在 `docs/dev-logs/2026-09-30.md` 第六十三轮。
+
 两条测量坑值得单独记：脏臂必须带 `Max-Age`（会话 cookie 本来就不进持久罐，"0 次写库"
 看着像闸门生效其实什么都没发生）；空罐不能当基线（`persistent_cookie_snapshot()` 空罐回
 `None`，版本号没被填上，"版本永不推进"这种坏写法照样全绿）。
+第三条是第六十三轮从第六十轮自己身上量出来的：**探针里"被测方要用到的那条 CPU 步"
+不能拿被测对象本身顶替**——那一轮的对照臂把检测自己要的步骤写成 `_audit_one`，
+于是三栏墙钟全被探针自造的 7.8 s 淹没，"不跑审计也要 8167 ms"这种话就是这么写进文档的。
+要么用真函数（本轮改为 `_unsupported_java_packages`），要么在登数之前先重量一次步长。
 
 ## 同一篇里的第四型：一个服务卡住会连累别的（未修）
 
@@ -539,6 +630,42 @@ rule/url、求值失败照旧落出记录、**桥回调里真按 0xC0000409 死�
 `js.evaluate()` 根本没带超时。于是一段长求值能把后面**任何服务**的请求一直顶住。
 修法（调用侧一律带截止 + `dispatcher_stuck()` 快速失败）**尚未实现**；在此之前，
 "书架突然全红"要先看一眼书源检测是不是正卡在一条长规则上。
+
+## 第六十五轮落地的改动与护栏
+
+| 改动 | 落点 | 护栏（红=改动失效） |
+| --- | --- | --- |
+| 认收尾竞态的两族指纹 | `app/core/engine_worker.py::_teardown_family`：族 1 要 `_call_connection_lost` 在 message 里 **且** 异常本体是 `ConnectionResetError`/`ConnectionAbortedError`；族 2 要 `OSError` 且 `APPLICATION_DATA_AFTER_CLOSE_NOTIFY` 在其字符串里 | `test_recognition_needs_both_halves_of_the_fingerprint`：只有一半（标记 + `ValueError`、别的回调 + 10054）都**不许**折成计数行 |
+| 认出就只落一条带累计计数的短行，不再 default dump | 同文件 `install_loop_attribution` 内的 `handler`：按族计数、`_TEARDOWN_MIN_INTERVAL = 10.0` s 节流，短行里保留 tag/线程/loop id/族/累计次数/异常本体 | `test_socket_teardown_race_is_one_counted_line_and_the_socket_gets_closed`（一行、含"累计第 1 次"、**不转 default**）、`test_every_teardown_event_…collapsed`（5 事件只 1 行）、`test_ssl_close_notify_race_is_counted_but_touches_no_socket` |
+| 补上被异常跳过的 socket 清理 | 同文件 `_finish_socket_teardown`：从 `context['handle']._callback.__self__` 拿传输层，`fileno() != -1` 就 `close()`，再把 `_sock = None`、`_called_connection_lost = True` 写回 | 上面两条一起断言 `sock.close_calls == 1` / 五个 socket 全关掉 / `_sock is None` / `_called_connection_lost is True`；族 2 那条断言**一个 socket 都不碰** |
+| 认不出的一律照旧 | `handler` 的 else 分支保持第五十三轮那份：身份一行 + **原样转给** `default_exception_handler` | `test_attribution_names_the_loop_and_keeps_the_original_record`（改用**认不出**的异常来钉"不许过滤"）、`test_attribution_reports_a_context_without_an_exception_object`、`test_attribution_is_installed_once_per_loop`、`test_both_production_loops_carry_their_own_identity`（接线核验） |
+
+一处设计坑（写下来免得下次再踩）：**补关不能放进"这次要落日志"的分支里**——降频一生效，
+被折掉的那些事件就漏补，等于把句柄泄漏换成"看运气"。现在补关在闸门**之外**，每事件必补。
+
+变异核验（`.probe/mutate_teardown_guards.py`，把生产文件逐条改坏跑 `tests/test_core_lifecycle.py`，
+跑完还原并 sha256 逐字节比对 `字节一致=True`）：
+
+| 变异 | 后果 |
+| --- | --- |
+| M1 不补关 socket | **2 红**（一行那条 + 五条那条） |
+| M2 把补关挪进降频闸门之后 | 1 红（5 事件只补到 1 个） |
+| M3 族 1 只看回调名、不看异常本体 | 1 红（两半指纹那条） |
+| M4 降频闸门失效（条件永假） | 1 红（"5 事件只 1 行"） |
+| M5 认出的族也照样转 default | **3 红**（三条"不转 default"全断） |
+
+基线 26 passed / 0 failed，变异 5/5 全抓到。
+
+**本轮实测数字**（`.probe/loop_teardown_cleanup_probe.py`，三臂各 40 事件；完整表见上
+"10054 归因：定了"第三节）：现场那份处理器 B 臂 = 每事件 3.0 行 + 40/40 个 socket 没关
++ 句柄 251 → 305（`gc.collect()` 后 303）；改后 C 臂 = 40 事件 1 行 + 0/40 没关 + 全程 245；
+对照 A 臂 = 0 行 + 全程 245。
+
+全量回归：**1662 passed + 161 subtests，104.33 s**（`--basetemp=D:/tmp/bt65b`；
+第六十四轮基线 1658 + 161，本轮净增 4 条）。`main.py --smoke-test` 退出码 0
+（`审计进程池：建池 + 首条 169 ms | 子进程 1 条 / 退回线程 0 条`）。
+验证全程离线（`127.0.0.1` 假 TCP/TLS 服务 + 真 proactor 传输层 + 本机进程句柄），
+**没有**批量访问任何真实书源站点。
 
 ## 相关
 

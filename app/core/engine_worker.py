@@ -25,6 +25,7 @@ import concurrent.futures
 import inspect
 import logging
 import threading
+import time
 import weakref
 
 from app.core.lifecycle import Service
@@ -38,30 +39,101 @@ logger = logging.getLogger(__name__)
 #: 装过归属处理器的循环（弱引用：循环对象回收即 forget，id 复用不会误判成"已装"）
 _ATTRIBUTED: "weakref.WeakSet[asyncio.AbstractEventLoop]" = weakref.WeakSet()
 
+#: 族 1 的指纹：`proactor_events._call_connection_lost` 收尾段里那句裸 `sock.shutdown()` 抛出来
+_SOCKET_TEARDOWN_MARK = "_call_connection_lost"
+#: 族 2 的指纹：TLS 收尾握手期间对面又塞应用数据（`sslproto._do_shutdown` → `unwrap()`）
+_SSL_TEARDOWN_MARK = "APPLICATION_DATA_AFTER_CLOSE_NOTIFY"
+#: 同一族两条日志之间至少隔这么久：刷屏的量与检测轮长度成正比，信息量却只在"发生过、多少次"
+_TEARDOWN_MIN_INTERVAL = 10.0
+
+
+def _teardown_family(context: dict) -> str | None:
+    """这条循环级记录是不是"连接收尾时的竞态"，是哪一族；认不出返回 ``None``。
+
+    判据按**现场那两条 traceback 的原文**收得极窄（族 1 还要求异常本体是复位/中止），
+    不是按"看着像噪声"来挑：认错的代价是把真故障折成一行计数，比多打几行严重得多。
+    """
+    message = str(context.get("message", ""))
+    exc = context.get("exception")
+    if (_SOCKET_TEARDOWN_MARK in message
+            and isinstance(exc, (ConnectionResetError, ConnectionAbortedError))):
+        return "socket 已复位仍被收尾"
+    if isinstance(exc, OSError) and _SSL_TEARDOWN_MARK in str(exc):
+        return "TLS 收尾期收到应用数据"
+    return None
+
+
+def _finish_socket_teardown(context: dict) -> bool:
+    """补上 ``proactor_events.py:154-172`` 那句 ``finally`` 被异常跳过的清理。
+
+    为什么要我们补：那里的顺序是 ``shutdown()`` → ``sock.close()`` → ``_sock = None`` →
+    ``_called_connection_lost = True``，而对端复位过的 socket 在 ``shutdown()`` 就抛
+    10054，后三行**一行都不执行**。实测后果（``.probe/loop_teardown_cleanup_probe.py``
+    B 臂，把 40 条活传输层的 ``shutdown`` 换成抛 10054）：40/40 次命中后
+    ``transport._sock.fileno()`` 仍 ≥ 0，进程句柄数 251 → 305，**显式 ``gc.collect()``
+    之后还是 303**（对照臂与补关臂全程 245 不动）——一次竞态一个不归还的 socket 句柄。
+
+    这里只做 CPython 自己已经决定要做的那三行（socket 本来就要被丢弃），不碰别的。
+    返回是否真的补到了一条传输层（护栏测试要能断到）。
+    """
+    callback = getattr(context.get("handle"), "_callback", None)
+    transport = getattr(callback, "__self__", None)
+    if transport is None or getattr(transport, "_sock", None) is None:
+        return False
+    sock = transport._sock
+    try:
+        if sock.fileno() != -1:
+            sock.close()
+    except OSError:
+        return False
+    transport._sock = None                        # type: ignore[attr-defined]
+    transport._called_connection_lost = True      # type: ignore[attr-defined]
+    return True
+
 
 def install_loop_attribution(loop: asyncio.AbstractEventLoop, tag: str) -> None:
-    """给一条循环装"报错先自报家门"的异常处理器——只加身份，不改行为。
+    """给一条循环装"报错先自报家门"的异常处理器。
 
-    为什么现在需要：现场那串 ``Exception in callback
-    _ProactorBasePipeTransport._call_connection_lost(ConnectionResetError())``
-    （10054）只写了回调名，没写是**哪条循环**家的 socket。本进程同时有两条
-    asyncio 循环（界面循环在 Flet 线程、服务协程在 ``legado-engines`` 线程），
-    归到谁家决定下一步查 flet 的 websocket 还是查 aiohttp 会话的归属
-    （``docs/known-issues/004`` 待修清单第 3 条：离线用生产同构形状复现过，
-    本机 0 条循环级异常记录，所以只能等现场，而现场必须一眼能读）。
+    为什么先只做身份（第 53 轮）：现场那串 ``Exception in callback
+    _ProactorBasePipeTransport._call_connection_lost(None)``（10054）只写了回调名，
+    没写是**哪条循环**家的 socket。本进程同时有两条 asyncio 循环（界面循环在 Flet 线程、
+    服务协程在 ``legado-engines`` 线程），归到谁家决定下一步查 flet 的 websocket 还是查
+    aiohttp 会话的归属。
 
-    这里**不做任何过滤**：打完身份就原样交给 ``default_exception_handler``，
-    一条记录都不许少——判明归属之前把噪声按白名单滤掉，等于把唯一的线索抹了。
+    归属定了之后（第 65 轮现场：两族都落在 ``[engine]``，且**请求一条没失败**）就只把
+    **认出的两族收尾竞态**降成一条带累计计数的短行——它们每次都是同一条码路径，重复的
+    traceback 里没有新信息，反而把 ``logger.error`` + ``default_exception_handler`` 的
+    双份打印放大成刷屏；族 1 顺手补上被跳过的 socket 清理（见
+    :func:`_finish_socket_teardown`）。**其余一切照旧**：打完身份就原样交给
+    ``default_exception_handler``，一条记录都不许少。
 
     重复调用安全（WeakSet 记账），两条循环各自只装一次。
     """
     if loop in _ATTRIBUTED:
         return
     _ATTRIBUTED.add(loop)
+    #: 各族累计次数与上次落日志的时刻（随处理器闭包一起活，一条循环一份）
+    teardown_stats: dict[str, list] = {}
 
     def handler(target: asyncio.AbstractEventLoop, context: dict) -> None:
         exc = context.get("exception")
         message = context.get("message", "")
+        family = _teardown_family(context)
+        if family is not None:
+            stats = teardown_stats.setdefault(family, [0, 0.0])
+            stats[0] += 1
+            # socket 补关**不受降频影响**：每一次都得补，漏一次就漏一个不归还的句柄
+            plugged = (_finish_socket_teardown(context)
+                       if family.startswith("socket") else None)
+            now = time.monotonic()
+            if stats[1] and now - stats[1] < _TEARDOWN_MIN_INTERVAL:
+                return                            # 只累计，不落日志
+            logger.error("循环[%s]线程=%s loop=%#x 收尾竞态[%s] 累计第 %d 次"
+                         "（已就地补关 socket=%s，不再逐条打 traceback）：%r",
+                         tag, threading.current_thread().name, id(target),
+                         family, stats[0], plugged, exc)
+            stats[1] = now
+            return
         if exc is not None:
             # 异常本体也写进消息一行：现场是翻控制台找线索，只挂 exc_info 的话
             # grep 一句 "10054" 什么都读不出来。
@@ -75,6 +147,7 @@ def install_loop_attribution(loop: asyncio.AbstractEventLoop, tag: str) -> None:
         target.default_exception_handler(context)
 
     loop.set_exception_handler(handler)
+
 
 
 class EngineHub(Service):

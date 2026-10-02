@@ -664,6 +664,11 @@ def test_detach_cancels_the_pending_coalesced_flush():
 # --------------------------------------------------------------------- #
 def _probe_exception(target: asyncio.AbstractEventLoop, context: dict) -> str:
     """在这条循环上走一次异常处理器，返回它打出来的那行日志。"""
+    return (_probe_lines(target, [context]) or [""])[0]
+
+
+def _probe_lines(target: asyncio.AbstractEventLoop, contexts: list[dict]) -> list[str]:
+    """连走多次，返回每次打出来的行（可能为空 = 那条被降频了）。"""
     records: list[str] = []
 
     class _Catch(logging.Handler):
@@ -674,19 +679,25 @@ def _probe_exception(target: asyncio.AbstractEventLoop, context: dict) -> str:
     log = logging.getLogger("app.core.engine_worker")
     log.addHandler(handler)
     try:
-        target.call_exception_handler(context)
+        for context in contexts:
+            before = len(records)
+            target.call_exception_handler(context)
+            if len(records) == before:
+                records.append("")            # 占位：第 n 次事件没落日志
     finally:
         log.removeHandler(handler)
-    return records[0] if records else ""
+    return records
 
 
 def test_attribution_names_the_loop_and_keeps_the_original_record():
-    """装了归属处理器之后：日志里有 tag/线程名，而 asyncio 原本那条记录一条不少。
+    """认不出的循环异常照旧两遍待遇：日志里有 tag/线程名，且原样转给默认处理器。
 
-    现场那 6 行 ``Exception in callback _ProactorBasePipeTransport
+    现场那串 ``Exception in callback _ProactorBasePipeTransport
     ._call_connection_lost(...)`` 只写了回调名，读不出是**谁家**的 socket——本进程
     同时有界面循环与 ``legado-engines`` 两条，归错家下一步就查错子系统。
-    这一条同时钉"不许过滤"：判明归属之前把噪声吞掉，等于把唯一线索抹了。
+    第六十五轮只把**认出的两族收尾竞态**降成一行，其余一律"打完身份再原样交出去"，
+    这一条钉的就是那条边界（拿一个同样带 10054、但回调名不是收尾段的异常来试，
+    免得测试本身把白名单当成"所有 10054 都滤"）。
     """
     loop = asyncio.new_event_loop()
     delegated: list[dict] = []
@@ -695,14 +706,151 @@ def test_attribution_names_the_loop_and_keeps_the_original_record():
         # 实例属性顶掉内置默认处理器：只盯"有没有转出去"，不真往 stderr 打
         loop.default_exception_handler = delegated.append
         line = _probe_exception(loop, {
-            "message": "Exception in callback _ProactorBasePipeTransport._call_connection_lost()",
+            "message": "Exception in callback _SSLProtocol._on_shutdown()",
             "exception": ConnectionResetError(10054, "远程主机强迫关闭了一个现有的连接")})
     finally:
         loop.close()
     assert "循环[engine]" in line, f"归属日志连是谁家的循环都没写：{line!r}"
     assert "线程=" in line and "loop=0x" in line, f"归属日志缺线程名/loop id：{line!r}"
     assert "10054" in line, f"归属日志里读不出原异常：{line!r}"
-    assert delegated, "归属处理器把原始那条记录吞了——现场再也看不到回调异常"
+    assert delegated, f"认不出的异常被吞了（现场再也看不到回调异常）：{line!r}"
+
+
+# --------------------------------------------------------------------------- #
+# 第六十五轮：认出的两族收尾竞态——一行带计数、不再刷 traceback、socket 就地补关
+# --------------------------------------------------------------------------- #
+class _FakeSock:
+    """只装 `fileno/close` 的最小 socket：要能断到"补关真的发生了"。"""
+
+    def __init__(self, fileno=4321):
+        self._fileno = fileno
+        self.close_calls = 0
+
+    def fileno(self):
+        return self._fileno
+
+    def close(self):
+        self.close_calls += 1
+        self._fileno = -1
+
+
+class _FakeTransport:
+    def __init__(self, sock):
+        self._sock = sock
+        self._called_connection_lost = False
+
+
+def _lost_context(sock: _FakeSock) -> dict:
+    """现场族 1 的 context 形状：`Handle._callback` 是绑定方法，`__self__` 就是传输层。"""
+    transport = _FakeTransport(sock)
+
+    def _call_connection_lost(exc=None):     # 只为造出绑定方法的 `__self__`
+        pass
+
+    class _Bound:
+        __self__ = transport
+
+    bound = _Bound()
+    bound.__name__ = "_call_connection_lost"
+    return {
+        "message": "Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)",
+        "exception": ConnectionResetError(10054, "远程主机强迫关闭了一个现有的连接"),
+        "handle": type("H", (), {"_callback": bound})(),
+        "_transport": transport,
+    }
+
+
+def test_socket_teardown_race_is_one_counted_line_and_the_socket_gets_closed():
+    """认出的族 1：一行带累计计数、**不**再转给默认处理器，并补上被跳过的 `sock.close()`。
+
+    为什么补：`proactor_events.py:154-172` 的 `finally` 顺序是 `shutdown()` → `sock.close()`
+    → `_sock = None` → `_called_connection_lost = True`，复位过的 socket 在 `shutdown()`
+    就抛，后三行一行都不执行。实测（`.probe/loop_teardown_cleanup_probe.py` B 臂）：40 次
+    这种事件后 40/40 个 socket 的 `fileno()` 仍 ≥ 0，句柄 253 → 307，`gc.collect()` 之后
+    还是 306 —— 一次竞态一个不归还的句柄。
+    """
+    loop = asyncio.new_event_loop()
+    delegated: list[dict] = []
+    sock = _FakeSock()
+    try:
+        install_loop_attribution(loop, "engine")
+        loop.default_exception_handler = delegated.append
+        context = _lost_context(sock)
+        line = _probe_exception(loop, context)
+        transport = context["_transport"]
+    finally:
+        loop.close()
+    assert "收尾竞态" in line and "累计第 1 次" in line, f"没折成一条带计数的短行：{line!r}"
+    assert "循环[engine]" in line and "10054" in line, f"短行丢了归属或异常本体：{line!r}"
+    assert not delegated, "这一族还是被转给了默认处理器——traceback 刷屏没被止住"
+    assert sock.close_calls == 1, f"CPython 跳过的 sock.close() 没补上：{sock.__dict__}"
+    assert transport._sock is None, "补关后还留着 socket 引用（`__del__` 会再报 ResourceWarning）"
+    assert transport._called_connection_lost is True, "闸门没置位：同一传输层会被二次收尾"
+
+
+def test_every_teardown_event_gets_the_socket_back_even_while_logging_is_collapsed():
+    """降频窗口里不落日志的那些次，**句柄照样要一次不落地补回来**。
+
+    护栏钉的是"没发生"（记忆 `guard-tests-assert-absence`）：5 次事件只许出 1 行日志，
+    但 5 个 socket 全部关闭。把补关挪进"要落日志"那个分支的改法会被这条抓到。
+    """
+    loop = asyncio.new_event_loop()
+    delegated: list[dict] = []
+    socks = [_FakeSock(fileno=4400 + i) for i in range(5)]
+    try:
+        install_loop_attribution(loop, "engine")
+        loop.default_exception_handler = delegated.append
+        lines = _probe_lines(loop, [_lost_context(sock) for sock in socks])
+    finally:
+        loop.close()
+    logged = [line for line in lines if line]
+    assert len(logged) == 1, f"同族 5 次落了 {len(logged)} 行，刷屏没止住：{logged}"
+    assert "累计第 1 次" in logged[0], f"落的那行不是首次：{logged[0]!r}"
+    assert all(s.close_calls == 1 for s in socks), \
+        f"降频窗口里的次数漏补关：{[s.close_calls for s in socks]}"
+    assert not delegated, "被降频的那几次还是转给了默认处理器"
+
+
+def test_ssl_close_notify_race_is_counted_but_touches_no_socket():
+    """现场第二族（TLS 收尾期收到应用数据）：同样折成一条计数，但它没有 socket 可补。"""
+    import ssl as _ssl
+
+    loop = asyncio.new_event_loop()
+    delegated: list[dict] = []
+    try:
+        install_loop_attribution(loop, "engine")
+        loop.default_exception_handler = delegated.append
+        line = _probe_exception(loop, {
+            "message": "Future exception was never retrieved",
+            "exception": _ssl.SSLError(1, "[SSL: APPLICATION_DATA_AFTER_CLOSE_NOTIFY] "
+                                          "application data after close notify (_ssl.c:2706)")})
+    finally:
+        loop.close()
+    assert "收尾竞态[TLS 收尾期收到应用数据]" in line, f"第二族没被认出：{line!r}"
+    assert "APPLICATION_DATA_AFTER_CLOSE_NOTIFY" in line, f"短行读不出是哪族：{line!r}"
+    assert not delegated, "第二族还是被转给了默认处理器——那一大段 traceback 没被止住"
+
+
+def test_recognition_needs_both_halves_of_the_fingerprint():
+    """认族必须**两半都对**才算：只带回调名（异常是 ValueError）或只带 10054（回调名不认）
+    都不许降级——按一半的形状滤，滤掉的可能是真故障。"""
+    loop = asyncio.new_event_loop()
+    delegated: list[dict] = []
+    try:
+        install_loop_attribution(loop, "engine")
+        loop.default_exception_handler = delegated.append
+        lines = _probe_lines(loop, [
+            {"message": "Exception in callback _ProactorBasePipeTransport"
+                        "._call_connection_lost(None)",
+             "exception": ValueError("协议解析炸了")},
+            {"message": "Exception in callback SomeOtherThing.run()",
+             "exception": ConnectionResetError(10054, "复位")},
+        ])
+    finally:
+        loop.close()
+    assert all("收尾竞态" not in line for line in lines), f"半指纹被认成了收尾竞态：{lines}"
+    assert len(delegated) == 2, f"两半都不齐的异常被滤掉了：{len(delegated)}/2 转出去"
+
 
 
 def test_attribution_reports_a_context_without_an_exception_object():
