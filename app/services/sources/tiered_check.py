@@ -1,11 +1,12 @@
-"""自动分级检测的进深检判据 + 待深检队列（第六十四轮）。
+"""自动分级检测的进深检判据 + 待深检队列（第六十四轮，形状在第六十八轮定下）。
 
-形状：一轮批量检测分两遍。**浅遍**只验到列表链路（`check_service.CHECK_DEPTH_LIST`），
-**深遍**只对进了队列的源跑完整阅读链（`full`）。单价实测于
+形状：一轮批量检测跑**浅遍扫全书**（`check_service.CHECK_DEPTH_LIST`），补验正文的
+**完整档**（`full`）只吃**这一轮开跑前就欠着**的那一片（:func:`per_round_deep_limit`），
+浅遍当场排进队列的源留给后续轮次——一条源一轮只被派发一次。单价实测于
 `.probe/tiered_two_pass_cost.py` (C) 的参照臂（36 条同形状假源、外壳并发 8）：浅遍
 12.1 ms/源、2.00 次 HTTP（正文段 0.00 次），完整档 23.7 ms/源、4.92 次 HTTP（正文段
 2.92 次）—— 多出来的那 2.92 次全是正文段（开书/取目录/取正文），这就是阅读链的价钱，
-单价比 0.508。
+单价比 0.508。首轮因此只付浅遍单价（2.0× 便宜），贵的阅读链摊到后面几轮慢慢付。
 
 ⚠ **同一轮里紧接着跑第二遍买不到便宜**（同一支探针 (C) 的扫档，深遍占比 5.6%→91.7%
 逐档实测，最低那一档就已经亏 16.1%，最亏 −47.8%）：两臂的**正文段请求数每一档都相等**，
@@ -90,6 +91,26 @@ DEEP_ENTRY_TTL_SECONDS = 7 * 24 * 3600.0
 #: 试满配额之后隔多久重新给一次机会（比 TTL 短：一条常年超时的源不该每轮都赔深检，
 #: 但也不该被永久拉黑——它的超时设置、线路甚至站点本身都会变）。
 DEEP_RETRY_COOLDOWN_SECONDS = 24 * 3600.0
+
+#: **一轮最多吃掉多少条补验**。第六十四轮 (C) 的扫档实测"同一轮里紧接着跑第二遍"
+#: 每一档都是净亏（最低那档 −16.1%，最亏 −47.8%），因为那一批源浅遍、深遍各付一次钱，
+#: 而正文段请求数与"一遍全完整档"完全相等。深遍挪到**后续轮次**之后，这个数就是
+#: "每轮替未来付多少"。单价与总账取自 `.probe/tiered_deferred_cost.py`（127.0.0.1 假源、
+#: A/B 交替、200 条同形状源）：一轮 184 条浅遍 + 16 条补验比整轮全完整档**省 12.6%**
+#: （首轮欠账从零开始省 15.3%），正文段请求省 70.7%，欠账第 4 轮还完。
+#: 下限 12 条让小库（十几条源）一轮就能挪完，不让它卡在比例上——36 条那一组限额吃满
+#: 1/3 库，同一探针量到的是省 8.6%，形状对但比例偏高，大库按 8% 那一档看。
+DEEP_PER_ROUND_RATIO = 0.08
+DEEP_PER_ROUND_MIN = 12
+
+
+def per_round_deep_limit(plan_total: int) -> int:
+    """这一轮最多补验多少条（按本轮计划源数取，见 :data:`DEEP_PER_ROUND_RATIO`）。"""
+    try:
+        plan = int(plan_total)
+    except (TypeError, ValueError):
+        plan = 0
+    return max(DEEP_PER_ROUND_MIN, int(round(max(0, plan) * DEEP_PER_ROUND_RATIO)))
 
 
 def _first_token(raw) -> str:
@@ -241,9 +262,15 @@ def shallow_deep_reason(result: dict) -> str:
 class DeepQueue:
     """待深检队列（**服务侧**，不落库、不进用户分组）。
 
-    只存 `raw_url → {reason, attempts, ts}`：源本身随时可能在库里被改过或删掉，
-    队列只记"谁该深检、为什么、试了几次"，取的时候再按 `raw_url` 回到当前源列表里
-    捞，捞不到就顺手淘汰（不留幽灵条目）。
+    只存 `raw_url → {reason, attempts, ts, queued_at}`：源本身随时可能在库里被改过或
+    删掉，队列只记"谁该深检、为什么、试了几次、什么时候欠下的"，取的时候再按
+    `raw_url` 回到当前源列表里捞，捞不到就顺手淘汰（不留幽灵条目）。
+
+    两个时间各管各的：`ts` 每次重新排进来都刷新，是"这条结论还新不新"（TTL/cooldown
+    看它）；`queued_at` 只在**换判据**时刷新，是"排在哪一队"（每轮限额切片看它，见
+    :meth:`select`）。合并成一个字段会出事：静态判据（跨站、`@js:`）是源的地址形状，
+    每轮重新推导、每轮都重新排进来，于是那条时间每轮都被推回"现在"——按它切片就永远
+    是从源列表头部吃，浅遍欠下的那一大批（占债的绝大多数）一轮都轮不上。
     """
 
     def __init__(self, *, max_attempts: int = DEEP_MAX_ATTEMPTS,
@@ -263,17 +290,20 @@ class DeepQueue:
         key = str(raw_url or "")
         if not key or reason not in DEEP_REASONS:
             return
+        now = self._clock()
         entry = self._entries.get(key)
         if entry is None:
             self._entries[key] = {"reason": reason, "attempts": 0,
-                                  "ts": self._clock()}
+                                  "ts": now, "queued_at": now}
             return
+        entry["ts"] = now
         if entry["reason"] != reason:
-            # 判据换了就是新信息（比如从"浅遍没结论"变成"跨站"），重试预算跟着重置；
-            # 同一个原因反复排进来不许洗白次数，否则试满配额的源每轮都能复活。
+            # 判据换了就是新信息（比如从"浅遍没结论"变成"跨站"），重试预算跟着重置，
+            # 队也重新排；同一个原因反复排进来不许洗白次数，否则试满配额的源每轮都能
+            # 复活，也不许把 queued_at 推回队尾，否则限额切片永远吃不到排在后面的债。
             entry["reason"] = reason
             entry["attempts"] = 0
-        entry["ts"] = self._clock()
+            entry["queued_at"] = now
 
     def exhausted(self, raw_url) -> bool:
         """这一条是不是已经把重试预算花完了。"""
@@ -316,15 +346,28 @@ class DeepQueue:
         return {url: entry["reason"] for url, entry in self._entries.items()
                 if int(entry.get("attempts", 0)) < self.max_attempts}
 
-    def select(self, sources) -> list:
+    def select(self, sources, limit: int | None = None) -> list:
         """从本轮要检的源里挑出队列中那些（顺序跟源列表，不跟队列）。
 
         队列里但**不在本轮范围内**的（比如只检某分组）不会被打出来，也不会被淘汰
         ——它们还在队列里，等下一次覆盖到它们的轮次。
+
+        给了 ``limit`` 就是"这一轮只吃得起这么多"：挑的**不是源列表的前 N 条**，而是
+        还没被补验过的先、试得少的先、欠得久的先（``(attempts, queued_at, 列表序)``）。
+        按列表前 N 条取的话，排在后面的那些每一轮都轮不上（浅遍把它们一次次重新排进
+        队列，深遍永远从头部吃），队列就成了一头只进不出的账。
         """
         wanted = self.pending()
-        return [source for source in sources
-                if str(getattr(source, "bookSourceUrl", "") or "") in wanted]
+        picked = [(index, source) for index, source in enumerate(sources)
+                  if str(getattr(source, "bookSourceUrl", "") or "") in wanted]
+        if limit is not None and 0 <= limit < len(picked):
+            def rank(item):
+                entry = self._entries.get(
+                    str(getattr(item[1], "bookSourceUrl", "") or ""), {})
+                return (int(entry.get("attempts", 0)),
+                        float(entry.get("queued_at", 0.0)), item[0])
+            picked = sorted(picked, key=rank)[:limit]
+        return [source for _index, source in picked]
 
     def snapshot(self) -> list[dict]:
         """给回放快照用的明细（按原因分组稳定排序，界面/统计直接读）。

@@ -73,26 +73,6 @@ def _summary(result: dict) -> str:
     return line
 
 
-def _merge_by_url(shallow: list[dict], deep: list[dict]) -> list[dict]:
-    """把两遍结果并成一份：同一条源（按 ``raw_url`` 认）以深遍那份为准。
-
-    按 url **配对**而不是 dict 覆盖：库里可能有两条源填了同一个地址，覆盖会把其中
-    一条的结论吞掉（结果条数比计划源数少，进度与汇总就都对不上了）。浅遍里同一个
-    url 出现几次，深遍里就出现几次（队列按 url 收取源，两边挑的是同一批），所以
-    先进先出的配对不会错位。深遍里配不上对的那些是静态判据直接收走的源——浅遍根本
-    没跑它们，直接补在末尾。
-    """
-    by_url: dict[str, list[dict]] = {}
-    for item in deep:
-        by_url.setdefault(str(item.get("raw_url") or ""), []).append(item)
-    merged: list[dict] = []
-    for item in shallow:
-        twin = by_url.get(str(item.get("raw_url") or ""))
-        merged.append(twin.pop(0) if twin else item)
-    merged.extend(rest for twin in by_url.values() for rest in twin)
-    return merged
-
-
 #: 触发点③（每源检测完复跑一次静态审计）的并发上限，**按审计跑在哪儿分两档**。
 #:
 #: 退回线程池那一档必须限死：审计是**每条两笔 `asyncio.to_thread`**甩进默认线程池
@@ -216,18 +196,23 @@ class SourceCheckService(Service):
         return results[0] if results else {}
 
     async def check_all(self, groups=None) -> dict:
-        """批量检测：**自动两遍**——浅遍只验到列表链路，进队列的源再补验正文。
+        """批量检测：**浅遍扫全书，补验正文排在后面几轮**。
 
-        分级不是给用户选的档位，而是这一轮自己决定"谁值得花钱验正文"：
-        浅遍（`CHECK_DEPTH_LIST`，实测 12.1 ms/源、每源 2.00 次 HTTP，正文段 0 次）
-        跑完之后，只有列表链路证明可用、或浅遍根本没测出结论、或地址形状使浅遍无从
-        判定的源，才进深遍（`CHECK_DEPTH_FULL`，23.7 ms/源、4.92 次 HTTP，多出来的
-        2.92 次全在正文段）。单价实测于 `.probe/tiered_two_pass_cost.py` (C)。
-        判据与队列在 :mod:`app.services.sources.tiered_check`。
+        分级不是给用户选的档位，而是这一轮自己决定"谁值得花钱验正文"。浅遍
+        （`CHECK_DEPTH_LIST`，实测 12.1 ms/源、每源 2.00 次 HTTP，正文段 0 次）跑完整
+        个范围，其中列表链路证明可用、浅遍没给出结论、或地址形状使浅遍无从判定的源
+        进深检队列，由**后续轮次**按限额补验正文（`CHECK_DEPTH_FULL`，23.7 ms/源、
+        4.92 次 HTTP，多出来的 2.92 次全在正文段）。判据与队列在
+        :mod:`app.services.sources.tiered_check`。
 
-        两遍合计是**一个分母**（本轮计划源数），进度与 `CheckFinishedEvent.done/total`
-        跨两遍连续；深遍的结果按 `raw_url` 覆盖同一条源的浅遍结论。
-        被取消/没跑完的深检留在服务侧队列里，下一轮捡回（不落库、不进用户分组）。
+        为什么不赶在同一轮里补验：第六十四轮 (C) 的扫档实测那样**每一档都是净亏**
+        （深遍占比最低那档 −16.1%，最亏 −47.8%），两臂的正文段请求数逐档相等，
+        赔的是同一批源浅遍、深遍各付一遍。挪出这一轮之后一条源一轮只被派发一次，
+        首轮只付浅遍单价（2.0× 便宜），贵的那一半摊到后续轮次里排队吃。
+
+        进度与 `CheckFinishedEvent.done/total` 的分母仍是**本轮计划源数**：浅遍 +
+        补验那一片加起来正好走满 0→1。本轮浅遍新排进队列的条数记在
+        `tiering.deferred`，服务侧快照的 `deep_queue` 一直看得见还欠着几条。
 
         已有批量在跑时**不再派第二遍全量联网**（两份流水线同时打站点对既浪费
         又容易被封），而是接到那一轮的收尾上。
@@ -244,8 +229,7 @@ class SourceCheckService(Service):
                 results, tiering = [], self._empty_tiering()
             else:
                 results, tiering = await self._run_tiered(sources, run)
-                # 进度条按"已定论的源数"走（见 _run_checks），整轮收工时才把它钉到 1.0：
-                # 浅遍结束时它只到"浅遍定论数/计划数"，那一格不算跑完。
+                # 两遍的派发数加起来正好是计划源数，这里只把收尾那一格钉到 1.0。
                 self.status.progress = 1.0
             run["tiering"] = tiering
             run["summary"] = {
@@ -264,67 +248,90 @@ class SourceCheckService(Service):
     @staticmethod
     def _empty_tiering() -> dict:
         return {"plan_total": 0, "shallow": 0, "deep": 0, "carried": 0,
-                "by_reason": {}}
+                "slice_limit": tiered_check.DEEP_PER_ROUND_MIN,
+                "deferred": 0, "queued": 0, "by_reason": {}}
 
     async def _run_tiered(self, sources: list[BookSource],
                           run: dict) -> tuple[list[dict], dict]:
-        """浅遍 → 判据 → 深遍，返回合并后的结果与本轮的分级账目。"""
+        """浅遍扫全书 + 按限额补验队列里欠着的那一片，返回结果与本轮的分级账目。
+
+        第六十四轮 (C) 实测"浅遍跑完紧接着在同一轮里补验"每一档都是净亏
+        （深遍占比 5.6% 就已经 −16.1%，最亏 −47.8%）：那一批源浅遍、深遍各付一次钱，
+        而正文段请求数与"一遍全完整档"完全相等。所以补验的条数由
+        :func:`tiered_check.per_round_deep_limit` 封顶、从队列里按"欠得久的先"切片，
+        本轮浅遍新排进来的排在下一轮——**一条源在一轮里只被派发一次**，浅遍的那一行
+        和补验的那一行不会出现在同一轮里，贵的阅读链摊到后面几轮慢慢付。
+
+        两遍挑的是互不相交的源，所以每一行派发都是这条源这一轮的定论（进度、审计都
+        按它走），也无需合并：同一条源一轮只出一行。
+        """
         url_of = lambda s: str(getattr(s, "bookSourceUrl", "") or "")   # noqa: E731
         in_scope = {url_of(s) for s in sources}
         self._deep_queue.prune()
-        carried_before = self._deep_queue.pending()
+        carried = {url: reason for url, reason in self._deep_queue.pending().items()
+                   if url in in_scope}
 
-        reasons: dict[str, str] = {}
+        # 本轮的欠账 = 上一轮带着的 + 静态判据（地址形状），静态更具体所以覆写它。
+        static_reasons: dict[str, str] = {}
         for source in sources:
             reason = tiered_check.static_deep_reason(source)
             if reason:
-                reasons[url_of(source)] = reason
-        for url, reason in carried_before.items():
-            if url in in_scope:
-                reasons.setdefault(url, reason)   # 静态判据优先，它更具体
+                static_reasons[url_of(source)] = reason
+        reasons: dict[str, str] = dict(carried)
+        reasons.update(static_reasons)
         for url, reason in reasons.items():
             self._deep_queue.add(url, reason)
 
-        deep_urls = set(reasons)
+        limit = tiered_check.per_round_deep_limit(len(sources))
+        deep_sources = self._deep_queue.select(sources, limit=limit)
+        deep_urls = {url_of(s) for s in deep_sources}
         shallow_sources = [s for s in sources if url_of(s) not in deep_urls]
         tiering = {"plan_total": len(sources),
-                   "shallow": len(shallow_sources), "deep": len(reasons),
-                   "carried": sum(1 for u in reasons if u in carried_before),
-                   "by_reason": dict(Counter(reasons.values()))}
+                   "shallow": len(shallow_sources), "deep": len(deep_sources),
+                   "slice_limit": limit,
+                   "carried": sum(1 for s in deep_sources
+                                  if url_of(s) in carried),
+                   "by_reason": {}}
 
-        shallow_results = []
+        results: list[dict] = []
         if shallow_sources:
-            # 浅遍里"进了队列"的那些还没定论，不推动进度条（进度语义见 _run_checks）
-            shallow_results = await self._run_checks(
+            results = await self._run_checks(
                 shallow_sources, run, check_service.CHECK_DEPTH_LIST,
-                total_plan=len(sources), reap=False,
-                counts=lambda r: not tiered_check.shallow_deep_reason(r))
+                total_plan=len(sources), reap=False)
 
-        settled = 0
-        for result in shallow_results:
+        deferred = 0
+        for result in results:
+            url = str(result.get("raw_url") or "")
             reason = tiered_check.shallow_deep_reason(result)
-            if reason:
-                url = str(result.get("raw_url") or "")
-                reasons[url] = reason
-                self._deep_queue.add(url, reason)
-            else:
-                settled += 1
+            if not reason:
+                # 浅遍给了明确结论（不可用 / 被拦 / 正文段那一层已经跑过）：旧债跟着
+                # 注销——深遍对它是重付一遍已经否证过的路。静态判据不注销，那条债要的
+                # 是"验正文"，列表段的结论回答不了它。
+                if url in carried and url not in static_reasons:
+                    self._deep_queue.drop(url)
+                continue
+            if url in static_reasons:
+                continue
+            if url not in reasons:
+                deferred += 1
+            reasons[url] = reason
+            self._deep_queue.add(url, reason)
 
-        results: list[dict] = list(shallow_results)
-        deep_sources = self._deep_queue.select(sources)
         if deep_sources:
             deep_results = await self._run_checks(
                 deep_sources, run, check_service.CHECK_DEPTH_FULL,
-                total_plan=len(sources), settled_before=settled,
+                total_plan=len(sources), settled_before=len(results),
                 fresh_round=False, reap=False)
-            results = _merge_by_url(shallow_results, deep_results)
+            results = results + deep_results
             self._settle_queue(deep_results)
         # 两遍合起来才算一次关池决定：浅遍单独不到 64 条不该让深遍那 600 条白背着
         # 子进程内存过夜（计数闸门与单价见 AUDIT_POOL_REAP_AFTER）。
         self._reap_audit_pool()
-        tiering["deep"] = len(deep_sources)
-        tiering["by_reason"] = dict(Counter(
-            reasons.get(url_of(s), "") for s in deep_sources))
+        tiering["deferred"] = deferred
+        # 按原因归组的是**整本欠账**（含这一轮没吃到的那一片），不是切片：界面要说清
+        # "队列里欠着的那些各是为了什么"，只数切片会把绝大多数写成空。
+        tiering["by_reason"] = dict(Counter(reasons.values()))
+        tiering["queued"] = len(self._deep_queue.pending())
         deep_set = {url_of(s) for s in deep_sources}
         for result in results:
             result["tier"] = ("full" if str(result.get("raw_url") or "")
@@ -424,7 +431,6 @@ class SourceCheckService(Service):
                           depth: str = check_service.CHECK_DEPTH_FULL,
                           *, total_plan: int | None = None,
                           settled_before: int = 0,
-                          counts: Callable[[dict], bool] | None = None,
                           fresh_round: bool = True,
                           reap: bool = True) -> list[dict]:
         """跑一遍流水线；``run`` 给了就把逐源结果同步记进回放快照。
@@ -432,15 +438,12 @@ class SourceCheckService(Service):
         快照必须在**引擎循环**上读写（协程方法经 EngineProxy 派发）：界面线程
         直接读会在流水线改到一半时拿到撕裂的进度。
 
-        自动分档把批量检测拆成浅遍+深遍两遍调用，进度条要跨两遍还是**单调**的，
-        这四个参数就是为它准备的：
+        自动分档把批量检测拆成浅遍+补验两遍调用（补验只吃开跑前欠着的那一片，见
+        :meth:`_run_tiered`），一条源在一轮里只被派发一次，所以**每一行派发都是它的
+        定论**，进度按派发数推进。剩下三个口子是为跨两遍准备的：
 
-        - 分母是**本轮计划源数**（``total_plan``），分子是"已经定论的源数"。一条源
-          浅遍给了明确结论就算定论；被浅遍收进深检队列的那条还没定论，浅遍里不计数、
-          深遍里才计数（``counts`` 就是这个判定的钩子，默认每条都算）。换成"派发条数"
-          当分子的话，控制器那侧按 source_id 去重计进度，进度条会提前卡在 100% 或
-          永远差深遍那一截——两条路都实测过界面侧的算法后才选的这里。
-        - ``settled_before`` 是上一遍已经定论的条数，第二遍从它接着数。
+        - 分母是**本轮计划源数**（``total_plan``），不是这一遍的条数。
+        - ``settled_before`` 是上一遍已经定论的条数，第二遍从它接着数，进度条单调。
         - ``fresh_round=False`` 表示这是同一轮的后续一遍：审计信号量与扇出计数都
           不重置（重置会把浅遍排出去的审计条数抹掉，关池那道闸门就数错账）。
         - ``reap=False`` 让关池的决定留到整轮结束再做一次。
@@ -461,16 +464,12 @@ class SourceCheckService(Service):
         def on_result(result: dict, done: int, t: int) -> None:
             # 进度写 status.progress（§4.5 状态可见）
             nonlocal settled
-            final = counts is None or counts(result)
-            if final:
-                settled += 1
+            settled += 1
             self.status.progress = (settled / plan_total) if plan_total else 1.0
             self._publish_finished(result, run, settled, plan_total)
-            # 审计只跟着**会被留下的那一行**走：被浅遍收进深检队列的那条源，浅遍结论
-            # 马上被深遍的顶掉（`_merge_by_url`），审它是同一份规则、却是会被丢弃的行，
-            # 等于每个深检源多付一次重 CPU 审计（`_audit_one` 中位 3.2 ms、p95 189 ms）。
-            if final:
-                self._maybe_audit(result, sources)
+            # 每一行派发都是这条源**这一轮**的结论（补验在后面的轮次，不改本轮这一行），
+            # 所以审计跟着每一条留下的结果走。
+            self._maybe_audit(result, sources)
 
         async def runner():
             return await self._checker(

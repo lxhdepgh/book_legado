@@ -563,15 +563,36 @@ class DeepQueueTests(unittest.TestCase):
 
 
 class ServiceTieringTests(unittest.IsolatedAsyncioTestCase):
-    """自动分档：谁跑浅遍、谁补验正文、两遍怎么并成一份结论。"""
+    """自动分档：谁跑浅遍、欠谁的正文、后面的轮次怎么把欠账吃回来。
 
-    async def test_the_shallow_pass_runs_first_and_the_deep_pass_follows(self):
+    一轮里**一条源只被派发一次**（第六十四轮 (C) 实测同一轮紧接着补验每一档都净亏），
+    所以这些用例几乎都是两轮制：第 1 轮看"谁被排进欠账"，第 2 轮看"欠账真的被吃掉了"。
+    """
+
+    async def test_the_first_round_only_pays_the_shallow_pass(self):
+        """浅遍排进队列的那些**不在这一轮**补验：一轮只派发一次。"""
+        checker = _RecordingChecker()
+        svc = _service(checker, _src("https://a.example"), _src("https://b.example"))
+        summary = await svc.check_all()
+        self.assertEqual([check_service.CHECK_DEPTH_LIST], checker.depths)
+        self.assertEqual([], checker.urls_for(check_service.CHECK_DEPTH_FULL))
+        # 两条源的浅遍结论都是"列表可用、正文没验"——正是"贵的那段还没花"的那批
+        self.assertEqual(2, summary["tiering"]["deferred"], summary["tiering"])
+        self.assertEqual(["https://a.example", "https://b.example"],
+                         sorted(svc._deep_queue.pending()))
+
+    async def test_the_debt_is_paid_by_a_later_round(self):
+        """欠着的债下一轮就吃到：浅遍只派发一次不等于正文永远不验。
+
+        这一条是分档形状的底线——只欠不还的话，"快速检测"就成了永久档位。
+        """
         checker = _RecordingChecker()
         svc = _service(checker, _src("https://a.example"), _src("https://b.example"))
         await svc.check_all()
-        self.assertEqual([check_service.CHECK_DEPTH_LIST,
-                          check_service.CHECK_DEPTH_FULL], checker.depths)
-        # 两条源的浅遍结论都是"列表可用、正文没验"——正是"贵的那段还没花"的那批
+        checker.calls.clear()
+        await svc.check_all()
+        self.assertEqual([check_service.CHECK_DEPTH_FULL], checker.depths,
+                         "两条都在欠账里且吃得下限额 → 第二遍不该再重跑浅遍")
         self.assertEqual([["https://a.example", "https://b.example"]],
                          checker.urls_for(check_service.CHECK_DEPTH_FULL))
 
@@ -581,8 +602,11 @@ class ServiceTieringTests(unittest.IsolatedAsyncioTestCase):
             "https://a.example": {check_service.CHECK_DEPTH_LIST: "unusable"},
             "https://b.example": {check_service.CHECK_DEPTH_LIST: "blocked"}})
         svc = _service(checker, _src("https://a.example"), _src("https://b.example"))
-        await svc.check_all()
-        self.assertEqual([check_service.CHECK_DEPTH_LIST], checker.depths)
+        for _round in range(3):
+            checker.calls.clear()
+            await svc.check_all()
+            self.assertEqual([check_service.CHECK_DEPTH_LIST], checker.depths)
+        self.assertEqual([], svc._deep_queue.snapshot())
 
     async def test_a_relative_search_url_is_not_mistaken_for_a_different_site(self):
         """`/d/{key}` 这种相对搜索地址和主站天生同一台机器（真库 917 条里有 386 条）。
@@ -596,8 +620,12 @@ class ServiceTieringTests(unittest.IsolatedAsyncioTestCase):
         await svc.check_all()
         self.assertEqual([check_service.CHECK_DEPTH_LIST], checker.depths)
 
-    async def test_a_cross_host_search_url_skips_the_shallow_pass_entirely(self):
-        """主站通不通和搜索通不通问的是两台机器：浅遍那段结论对它没有推力。"""
+    async def test_a_cross_host_search_url_goes_straight_into_the_debt(self):
+        """主站通不通和搜索通不通问的是两台机器：浅遍那段结论对它没有推力。
+
+        静态判据在**开跑前**就把它记进欠账，所以这一轮的切片（还没被限额挡住时）直接
+        按完整档派发它，一次浅遍都不跑。
+        """
         checker = _RecordingChecker(states={
             "https://a.example": {check_service.CHECK_DEPTH_LIST: "unusable"},
             "https://b.example": {check_service.CHECK_DEPTH_FULL: "fully_usable"}})
@@ -609,6 +637,8 @@ class ServiceTieringTests(unittest.IsolatedAsyncioTestCase):
                          checker.urls_for(check_service.CHECK_DEPTH_LIST))
         self.assertEqual([["https://b.example"]],
                          checker.urls_for(check_service.CHECK_DEPTH_FULL))
+        self.assertEqual([], svc._deep_queue.snapshot(),
+                         "深遍给出了明确结论 → 欠账当场注销")
 
     async def test_a_js_generated_search_url_is_decided_by_the_deep_pass(self):
         """`@js:` 的搜索地址静态看不出会打到哪，浅遍无从判定 → 直接按完整档跑。"""
@@ -618,7 +648,7 @@ class ServiceTieringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([check_service.CHECK_DEPTH_FULL], checker.depths)
 
     async def test_a_shallow_verdict_with_no_book_in_hand_buys_no_deep_pass(self):
-        """替身交出"搜索链路通、一本没命中"：这条不进深检队列，第二遍不替它花钱。
+        """替身交出"搜索链路通、一本没命中"：这条不进欠账，后面的轮次也不替它花钱。
 
         没有这一条护栏，`search_only` 一律排队会让深遍占比冲到 100%
         （`.probe/tiered_two_pass_cost.py` (D) 的 `nogate` 臂：+65.1% 墙钟），
@@ -627,53 +657,79 @@ class ServiceTieringTests(unittest.IsolatedAsyncioTestCase):
         checker = _RecordingChecker(no_books={"https://a.example"})
         svc = _service(checker, _src("https://a.example"), _src("https://b.example"))
         summary = await svc.check_all()
-        self.assertEqual([["https://b.example"]],
-                         checker.urls_for(check_service.CHECK_DEPTH_FULL))
-        self.assertEqual(1, summary["tiering"]["deep"], summary["tiering"])
+        self.assertEqual({"https://b.example"}, set(svc._deep_queue.pending()),
+                         summary["tiering"])
         self.assertEqual({"list_usable"}, set(summary["tiering"]["by_reason"]))
         # 没进队列不等于结论变了：它仍然按浅遍的结果出那一行
         self.assertEqual(2, summary["total"])
+        checker.calls.clear()
+        await svc.check_all()
+        self.assertEqual([["https://b.example"]],
+                         checker.urls_for(check_service.CHECK_DEPTH_FULL))
 
-    async def test_the_deep_verdict_replaces_the_shallow_one_for_that_source(self):
+    async def test_a_deeper_round_replaces_that_source_row_for_the_round(self):
+        """补验那一轮到它时，界面拿到的那一行就是完整档的结论，一条源一轮只出一行。"""
         checker = _RecordingChecker(states={
             "https://a.example": {check_service.CHECK_DEPTH_FULL: "fully_usable"}})
         svc = _service(checker, _src("https://a.example"))
-        summary = await svc.check_all()
-        self.assertEqual(1, summary["total"], "同一条源不能算成两行")
-        self.assertEqual(1, summary["usable"])
-        self.assertEqual("fully_usable", summary["results"][0]["check_state"])
-        self.assertEqual("full", summary["results"][0]["tier"])
+        first = await svc.check_all()
+        self.assertEqual("search_only", first["results"][0]["check_state"])
+        self.assertEqual("list", first["results"][0]["tier"])
+        second = await svc.check_all()
+        self.assertEqual(1, second["total"], "同一条源不能算成两行")
+        self.assertEqual(1, second["usable"])
+        self.assertEqual("fully_usable", second["results"][0]["check_state"])
+        self.assertEqual("full", second["results"][0]["tier"])
 
     async def test_two_passes_still_yield_one_row_per_source_when_urls_repeat(self):
-        """库里两条源填了同一个地址：按 url 配对覆盖会吞掉一条，结果数对不上计划数。"""
+        """库里两条源填了同一个地址：按 url 去重会吞掉一条，结果数对不上计划数。
+
+        队列按 `raw_url` 收取源，两条同地址的源共用一条欠账——派发时必须还是两行，
+        不然汇总会说"检了 1 条"而计划里明明有 2 条。
+        """
         checker = _RecordingChecker()
         svc = _service(checker, _src("https://d.example"), _src("https://d.example"))
-        summary = await svc.check_all()
-        self.assertEqual(2, summary["total"])
-        self.assertEqual([1, 2], [row["idx"] for row in summary["results"]])
+        for _round in range(2):
+            checker.calls.clear()
+            summary = await svc.check_all()
+            self.assertEqual(2, summary["total"], summary["tiering"])
+            self.assertEqual([1, 2], [row["idx"] for row in summary["results"]])
 
-    async def test_the_bar_counts_settled_sources_not_dispatches(self):
-        """分母是本轮计划源数，分子是**已定论**的源数：被收进深检队列的那条浅遍里不推进度。
+    async def test_the_bar_walks_the_plan_once_per_round(self):
+        """分母是本轮计划源数，分子是派发数：一条源一轮只派发一次，所以两数刚好对上。
 
-        这条是界面侧算法逼出来的：控制器按 source_id 去重数进度，浅遍就把两条都"跑过"
-        了，进度会提前到 100%，深遍再长也不动——所以分子只能数定论。
+        这条是界面侧算法逼出来的：控制器按 source_id 去重数进度，一条源被派两遍的话
+        进度会提前到 100%、后面那一遍再长也不动。第六十四轮的"定论闸门"随轮内第二遍
+        一起退场，这里钉的是它退场之后**不许有人再把同一条源派两遍**。
         """
         checker = _RecordingChecker(states={
             "https://a.example": {check_service.CHECK_DEPTH_LIST: "unusable"}})
         svc = _service(checker, _src("https://a.example"), _src("https://b.example"))
         await svc.check_all()
         seen = [(event.done, event.total) for event in svc.bus.events]
-        self.assertEqual([(1, 2), (1, 2), (2, 2)], seen)
+        self.assertEqual([(1, 2), (2, 2)], seen)
+        self.assertEqual(1.0, svc.status.progress)
+        # 第二轮补验 b：分母还是这一轮计划的两条源，a 跑浅遍、b 跑完整档，各一次
+        svc.bus.events.clear()
+        await svc.check_all()
+        self.assertEqual([(1, 2), (2, 2)],
+                         [(event.done, event.total) for event in svc.bus.events])
         self.assertEqual(1.0, svc.status.progress)
 
     async def test_only_the_row_that_was_never_prose_checked_says_so(self):
+        """浅遍那一行必须写明"正文没验"，欠账补完的那一行不再写。"""
         checker = _RecordingChecker(states={
             "https://a.example": {check_service.CHECK_DEPTH_LIST: "unusable"}})
         svc = _service(checker, _src("https://a.example"), _src("https://b.example"))
         await svc.check_all()
         lines = [event.summary for event in svc.bus.events]
+        self.assertEqual(2, len(lines), lines)
+        self.assertTrue(all("未验正文" in line for line in lines), lines)
+        svc.bus.events.clear()
+        await svc.check_all()
+        lines = [event.summary for event in svc.bus.events]
         self.assertIn("未验正文", lines[0], lines)
-        self.assertNotIn("未验正文", lines[2], lines)
+        self.assertNotIn("未验正文", lines[1], lines)
 
     async def test_an_unreachable_source_stops_buying_deep_passes_after_three(self):
         """浅遍深遍都没结论（超时那一类）：试满三次就歇着，不许每轮都赔一条深检。"""
@@ -681,15 +737,15 @@ class ServiceTieringTests(unittest.IsolatedAsyncioTestCase):
             "https://e.example": {check_service.CHECK_DEPTH_LIST: "unknown",
                                   check_service.CHECK_DEPTH_FULL: "unknown"}})
         svc = _service(checker, _src("https://e.example"))
-        for _round in range(4):
+        for _round in range(5):
             checker.calls.clear()
             await svc.check_all()
             depths = checker.depths
-            # 第 1 轮浅遍+深遍；第 2、3 轮队列直接把它送去深遍（浅遍不重跑）；
-            # 第 4 轮预算花完 → 只剩浅遍重判，深遍一次都不派。
+            # 第 1 轮只有浅遍（这一轮的欠账是它自己刚排上的）；第 2~4 轮队列直接把它
+            # 送去补验（浅遍不重跑）；第 5 轮预算花完 → 只剩浅遍重判，补验一次都不派。
             if _round < 1:
-                self.assertEqual(["list", "full"], depths)
-            elif _round < 3:
+                self.assertEqual(["list"], depths)
+            elif _round < 4:
                 self.assertEqual(["full"], depths)
             else:
                 self.assertEqual(["list"], depths, "试满配额还每轮重跑深遍 = 计数没生效")
@@ -698,10 +754,12 @@ class ServiceTieringTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rows[0]["exhausted"], rows)
 
     async def test_a_deep_verdict_takes_the_source_out_of_the_queue(self):
-        """深遍给出明确结论（哪怕是"正文不可用"）就把这条摘掉，不留悬挂。"""
+        """补验给出明确结论（哪怕是"正文不可用"）就把这条摘掉，不留悬挂。"""
         checker = _RecordingChecker(states={
             "https://a.example": {check_service.CHECK_DEPTH_FULL: "content_unavailable"}})
         svc = _service(checker, _src("https://a.example"))
+        await svc.check_all()
+        self.assertEqual(1, len(svc._deep_queue.pending()), "浅遍欠下的债还挂着")
         await svc.check_all()
         self.assertEqual([], svc._deep_queue.snapshot())
         self.assertEqual(0, len(svc._deep_queue.pending()))
@@ -726,12 +784,15 @@ class ServiceTieringTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("depth", params,
                         "批量检测再接受一个用户选的档位 = 回到第六十二轮那个下拉")
 
-    async def test_a_source_queued_for_the_deep_pass_is_audited_only_by_that_pass(self):
-        """静态审计只跟着"会被留下的那一行"走：浅遍排进深检队列的那条不在浅遍审。
+    async def test_a_round_audits_every_row_it_keeps_exactly_once(self):
+        """静态审计跟着**这一轮留下来的那一行**走：一条源一轮只审一次。
 
-        审计读的是同一份规则、却是马上被深遍结论顶掉的那一行（`_merge_by_url`），
-        审它等于每个深检源多付一次重 CPU 活。`watched` 是每一遍**结束时**的审计提交数：
-        浅遍只该提交 a（b 还要被深遍重审），深遍再提交 b。把闸门撤掉就是 [2, 3]。
+        浅遍排进欠账的那些本轮就长这样，审计读的就是界面看到的那份规则；补验在后面的
+        轮次，那一轮它换了一行，就再审一次（`watched` 是每一遍**结束时**的提交数）。
+
+        第二遍的账要接着第一遍数：关进程池那道闸门（:data:`AUDIT_POOL_REAP_AFTER`）数的
+        是**整轮**排出去多少条，补验那遍若当新轮起（`fresh_round=True`）就把浅遍那半截
+        抹掉，一轮的真实条数永远数不到闸门。
         """
         compat = _RecordingCompat()
         holder: dict = {}
@@ -742,12 +803,134 @@ class ServiceTieringTests(unittest.IsolatedAsyncioTestCase):
                        compat=compat)
         holder["svc"] = svc
         summary = await svc.check_all()
-        self.assertEqual([1, 2], checker.watched, checker.watched)
+        self.assertEqual([2], checker.watched, checker.watched)
         self.assertEqual(["https://a.example", "https://b.example"],
                          sorted(compat.audited), compat.audited)
-        self.assertEqual(3, sum(len(urls) for _depth, urls in checker.calls),
-                         "浅遍 2 行 + 深遍 1 行 = 3 行结果，审计只该有 2 次")
+        self.assertEqual(2, sum(len(urls) for _depth, urls in checker.calls),
+                        "一轮只派发一次：两行结果 = 两次审计")
         self.assertEqual("unusable", summary["results"][0]["check_state"])
+        checker.calls.clear()
+        checker.watched.clear()
+        compat.audited.clear()
+        await svc.check_all()
+        self.assertEqual([check_service.CHECK_DEPTH_LIST,
+                          check_service.CHECK_DEPTH_FULL], checker.depths)
+        self.assertEqual([1, 2], checker.watched,
+                        "补验那一遍把审计计数清零了 = 整轮条数过不了关池那道闸门")
+
+    async def test_a_round_buys_at_most_the_slice_it_can_afford(self):
+        """一轮补验的条数由限额封顶，剩下的照旧跑浅遍——一条都不漏。
+
+        限额 = `max(12, 计划源数 × 8%)`：30 条源 → 12 条补验、18 条浅遍。这一条钉的是
+        "分档不再靠运气"：撤掉限额，30 条债会在同一轮里全部跑完整档（第六十四轮 (C)
+        实测的净亏形状）。
+        """
+        checker = _RecordingChecker()
+        svc = _service(checker, *[_src(f"https://h{n}.example")
+                                  for n in range(30)])
+        summary = await svc.check_all()
+        self.assertEqual(30, summary["total"], "第一轮全都跑浅遍")
+        self.assertEqual([], checker.urls_for(check_service.CHECK_DEPTH_FULL))
+        self.assertEqual(30, summary["tiering"]["deferred"], summary["tiering"])
+        checker.calls.clear()
+        summary = await svc.check_all()
+        tiering = summary["tiering"]
+        self.assertEqual(12, tiering["slice_limit"], tiering)
+        self.assertEqual(12, tiering["deep"], tiering)
+        self.assertEqual(18, tiering["shallow"], tiering)
+        self.assertEqual(30, summary["total"], "没吃到补验的那 18 条也得出一行")
+        self.assertEqual(12, len(checker.urls_for(check_service.CHECK_DEPTH_FULL)[0]))
+
+    async def test_the_slice_rotates_instead_of_eating_the_same_head(self):
+        """静态判据每轮都把同一批源重新排进欠账：切片必须按"欠得久的先"轮转。
+
+        否则限额永远被源列表头部那批跨站源吃满，浅遍欠下的正文验证一条也排不上——
+        队列就成了只进不出的账。这里 14 条全是跨站源（限额 12），第 1 轮吃头 12 条，
+        第 2 轮那 12 条因为刚被验完重新排队，队尾两条必须顶上来。
+        """
+        urls = [f"https://h{n}.example" for n in range(14)]
+        checker = _RecordingChecker()
+        svc = _service(checker, *[_src(url,
+                                       searchUrl=f"https://s{n}.example/q?key={{{{key}}}}")
+                                  for n, url in enumerate(urls)])
+        # 轮与轮之间隔一分钟：真钟在本机只有毫秒粒度，两轮挤在同一毫秒里就没法看排序。
+        clock = _Clock()
+        svc._deep_queue = tiered_check.DeepQueue(clock=clock)
+        await svc.check_all()
+        served_first = set(checker.urls_for(check_service.CHECK_DEPTH_FULL)[0])
+        self.assertEqual(12, len(served_first), served_first)
+        tail = set(urls[-2:])
+        self.assertEqual(set(), served_first & tail, served_first)
+        clock.advance(60)
+        checker.calls.clear()
+        await svc.check_all()
+        served_next = set(checker.urls_for(check_service.CHECK_DEPTH_FULL)[0])
+        self.assertEqual(tail, tail & served_next,
+                         "队尾的源永远轮不上 = 切片在按源列表前 N 条取")
+
+    async def test_a_decisive_shallow_verdict_retires_an_older_debt(self):
+        """浅遍这一轮给出明确结论（不可用/被拦）：上一轮欠下的补验跟着注销。
+
+        深遍对一个已经否证过的源只是重付一遍路——判据本来就不收 `blocked`/`unusable`，
+        旧债没理由因为它是上一轮记的就豁免。这里 13 条超时源（限额 12）第 2 轮只有一条
+        轮不上补验、跑浅遍，它这一轮答"不可用"。
+        """
+        urls = [f"https://q{n}.example" for n in range(13)]
+        checker = _RecordingChecker(states={
+            url: {check_service.CHECK_DEPTH_LIST: "unknown",
+                  check_service.CHECK_DEPTH_FULL: "unknown"} for url in urls})
+        svc = _service(checker, *[_src(url) for url in urls])
+        await svc.check_all()
+        self.assertEqual(13, len(svc._deep_queue.pending()))
+        checker.states[urls[-1]][check_service.CHECK_DEPTH_LIST] = "unusable"
+        await svc.check_all()
+        pending = svc._deep_queue.pending()
+        self.assertEqual(12, len(pending), pending)
+        self.assertNotIn(urls[-1], pending,
+                         "浅遍已经否证过它，欠账还留着 = 白赔一条完整档")
+
+    async def test_a_static_debt_is_not_retired_by_a_shallow_negative(self):
+        """静态判据那条债要的是"验正文"，浅遍（列表段）答"不可用"注销不了它。
+
+        判据①②之所以在开跑前就记账，正因为**这类源的浅遍结论本身不可信**（搜索主机是
+        模板/JS 算出来的，列表段那一次拨到的未必是它真正的搜索机）。所以浅遍的明确否定
+        可以注销判据③那条债（那条债建立在可信的浅遍结论上，见
+        :meth:`test_a_decisive_shallow_verdict_retires_an_older_debt`），注销不了静态债
+        ——那等于"用一条自己判为不可信的读数把'要不要验正文'定了案"。
+
+        形状：30 条跨站源（限额 12）→ 第 1 轮欠 18 条；第 2 轮切片只吃得起 12 条，剩下
+        那批**既是上一轮带着的、又只跑了浅遍**，它们给的正是 `unusable`。同一轮里还顺手
+        钉第二道闸：浅遍的判据③不许把台账里的原因从 `cross_host` 改写成 `list_usable`
+        （改写会把它的排队时间一并挪到队尾，公平序跟着失真）。
+        """
+        urls = [f"https://h{n}.example" for n in range(30)]
+        checker = _RecordingChecker(
+            states={url: {check_service.CHECK_DEPTH_LIST: "unusable"} for url in urls[24:]})
+        svc = _service(checker, *[_src(url,
+                                       searchUrl=f"https://s{n}.example/q?key={{{{key}}}}")
+                                  for n, url in enumerate(urls)])
+        # 轮与轮之间隔一分钟：公平序看的是排队时间，真钟的毫秒粒度会让两轮挤在同一 tick 里。
+        clock = _Clock()
+        svc._deep_queue = tiered_check.DeepQueue(clock=clock)
+        await svc.check_all()
+        owed = set(svc._deep_queue.pending())
+        self.assertEqual(18, len(owed), "第 1 轮限额吃剩下的那些")
+        checker.calls.clear()
+        clock.advance(60)
+        await svc.check_all()
+        served = set(checker.urls_for(check_service.CHECK_DEPTH_FULL)[-1])
+        shallow = set(checker.urls_for(check_service.CHECK_DEPTH_LIST)[-1])
+        self.assertTrue(shallow & owed,
+                        "没有'上一轮欠着、这一轮只跑了浅遍'的那批，测不到注销那条分支")
+        self.assertEqual(served & owed, served, "切片该先吃欠得最久的那些")
+        pending = svc._deep_queue.pending()
+        self.assertEqual(18, len(pending), pending)
+        for url in shallow & owed:
+            self.assertIn(url, pending,
+                          f"{url}：静态债被浅遍的否定注销了 = 拿不可信的读数定了案")
+        for url, reason in pending.items():
+            self.assertEqual(tiered_check.REASON_CROSS_HOST, reason,
+                             f"{url}：浅遍把静态债的原因改写了，判据①②那条账就找不回了")
 
     async def test_single_source_check_still_asks_for_the_depth_it_was_given(self):
         """单源检测（换源、Web 桥那条路）档位仍由调用方定，不受批量分档影响。"""
