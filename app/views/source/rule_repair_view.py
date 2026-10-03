@@ -11,6 +11,9 @@ Controller 写回书源（红线 §3.2：不自动改源）。
   抽到的三章——Controller 把它们摊平成 (key, 文案) 喂进来，粘贴框是零样本时的出口。
 - key 的语义（``"组:章"``）由 Controller 解释，视图只负责存取，避免界面反过来
   依赖诊断的数据结构。
+- 两条下拉外面各套一只 ``ft.Semantics``：合着的 Dropdown 在语义树里没有文字，
+  读屏念不出选中了哪个源/哪一章（Dropdown 本身在 flet 0.86 没有 aria_label 字段），
+  标签由 ``_sync_labels`` 跟着选中值走。
 
 红线（§7.5）：本文件零 app.services.* import；报告以 dict 快照注入。
 报告 dict 结构：report_id / source_id / source_name / field / old_value /
@@ -48,10 +51,18 @@ class RuleRepairView(ft.Column):
         # 而静态测试都是直接调槽，照不出来——第六十七轮的浏览器探针抓的就是这个。
         self._source_dd = ft.Dropdown(
             label="书源", width=320, dense=True, enable_filter=True, options=[],
-            on_select=lambda e: self._fire(self.on_source_picked, e.control.value))
+            on_select=lambda e: self._pick_fired(self.on_source_picked, e))
         self._chapter_dd = ft.Dropdown(
             label="正文章节", width=360, dense=True, enable_filter=True, options=[],
-            on_select=lambda e: self._fire(self.on_chapter_picked, e.control.value))
+            on_select=lambda e: self._pick_fired(self.on_chapter_picked, e))
+        # 读屏面：flet 0.86.5 的 Dropdown 压根没有 aria_label 这个字段，而合着的框在
+        # 语义树里是一个**只有 role=button / aria-expanded、没有任何文字**的节点
+        # （第六十七轮界面取证：aria-label 与 textContent 全空，值只画在 canvas 上，
+        # 选项文字只有展开那一刻才在树里）。所以选中了哪个源/哪一章，只能由外层
+        # Semantics 自己念一遍，并跟着选中值同步。
+        self._source_sem = ft.Semantics(label="书源：未选择", content=self._source_dd)
+        self._chapter_sem = ft.Semantics(label="正文章节：未选择",
+                                         content=self._chapter_dd)
         self._reload_btn = ft.IconButton(
             ft.Icons.REFRESH, tooltip="重新载入书源与章节",
             on_click=lambda e: self._fire(self.on_reload_sources))
@@ -71,7 +82,7 @@ class RuleRepairView(ft.Column):
 
         self.controls = [
             self._title,
-            ft.Row([self._source_dd, self._chapter_dd, self._reload_btn,
+            ft.Row([self._source_sem, self._chapter_sem, self._reload_btn,
                     self._start_btn, self._spinner], spacing=8, wrap=True),
             self._manual,
             self._hint,
@@ -84,6 +95,27 @@ class RuleRepairView(ft.Column):
     def _fire(callback, *args):
         if callback is not None:
             callback(*args)
+
+    def _pick_fired(self, callback, event) -> None:
+        """用户点了下拉里的一项：先让读屏标签跟上，再转给 Controller。
+
+        程序改 ``value``（列表页带源进来那条路）不走这里，那条路各走
+        ``set_*_options`` / ``add_source_option`` 末尾的同步。
+        """
+        self._sync_labels()
+        self._fire(callback, event.control.value)
+
+    def _sync_labels(self) -> None:
+        """读屏标签 = "名字：当前选中项的文字"，没选中就说没选中。"""
+        self._source_sem.label = self._selection_label("书源", self._source_dd)
+        self._chapter_sem.label = self._selection_label("正文章节", self._chapter_dd)
+
+    @staticmethod
+    def _selection_label(base: str, dropdown) -> str:
+        value = str(dropdown.value or "")
+        text = next((str(option.text or "") for option in dropdown.options or []
+                     if option.key == value), "")
+        return f"{base}：{text or '未选择'}"
 
     # ------------------------------------------------------------------ #
     # 渲染接口
@@ -172,6 +204,7 @@ class RuleRepairView(ft.Column):
         self._source_dd.options = [
             ft.dropdown.Option(key, text) for key, text in list(options or [])]
         self._pick(self._source_dd, current)
+        self._sync_labels()
 
     def add_source_option(self, url: str, label: str) -> None:
         """把一条书源**并进**下拉并选中（列表页跳转过来时表里可能还没有它）。"""
@@ -182,6 +215,7 @@ class RuleRepairView(ft.Column):
             self._source_dd.options = list(self._source_dd.options or []) + [
                 ft.dropdown.Option(url, label or url)]
         self._source_dd.value = url
+        self._sync_labels()
 
     def set_chapter_options(self, options: list[tuple[str, str]],
                             current: str = "") -> None:
@@ -189,6 +223,7 @@ class RuleRepairView(ft.Column):
         self._chapter_dd.options = [
             ft.dropdown.Option(key, text) for key, text in list(options or [])]
         self._pick(self._chapter_dd, current)
+        self._sync_labels()
 
     @staticmethod
     def _pick(dropdown, current: str) -> None:

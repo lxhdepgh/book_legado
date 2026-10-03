@@ -396,6 +396,22 @@ class SourceService(_LegacySourceService, Service):
                 return True
         return False
 
+    def update_source_rule(self, source_url: str, field: str, value: str,
+                           *, backup: bool = True) -> Path | None:
+        """改一条书源的规则字段并落盘，**落盘后发 SourceChangedEvent**。
+
+        基类那份（冻结的 `app/services/source_service.py`）只写盘不发事件，于是
+        自愈写回之后列表页/找书页/书架还是旧规则，界面上只能让人手动刷一次——
+        第六十七轮那句"列表页要刷新才看得到"道歉字就是在补这个洞。改字段是
+        书源数据变更，语义与 ``saved`` 同一档，所以发 ``change_type="updated"``。
+        源不存在时基类抛 KeyError，不发事件。
+        """
+        backup_path = super().update_source_rule(
+            source_url, field, value, backup=backup)
+        self._publish(SourceChangedEvent(
+            change_type="updated", source_id=str(source_url or "")))
+        return backup_path
+
     # ------------------------------------------------------------------ #
     # 导入导出（JSON 互操作，契约 §3）
     # ------------------------------------------------------------------ #

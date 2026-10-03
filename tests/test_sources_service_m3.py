@@ -435,3 +435,36 @@ def test_source_changed_event_published(env):
     deleted = [e for e in fired if e.change_type == "deleted"
                and e.source_id == "https://ev.io"]
     assert saved and deleted
+
+
+def test_update_source_rule_publishes_and_persists(env):
+    """自愈写回要让列表页自己刷新：基类那份只落盘、不发事件（第六十七轮的口子）。
+
+    三面都钉：① 发一条带源地址的 ``updated``；② 字段**真的落库**了（只发事件不写盘
+    的写法必须被这条打死——覆写是靠 super() 干活的）；③ 没写成（源不存在，基类抛
+    KeyError）时一条都不发，否则列表页白刷一次，还把"写回失败"那句盖掉了。
+    """
+    fired: list = []
+
+    async def collector(ev):
+        fired.append(ev)
+
+    env.bus.subscribe(SourceChangedEvent, collector)
+    asyncio.run(env.svc.save_source(_source_dict(url="https://rule.io")))
+    _drain(env.pending)
+    fired.clear()
+
+    env.svc.update_source_rule("https://rule.io", "content", ".con@text")
+    _drain(env.pending)
+    updated = [e for e in fired if e.change_type == "updated"
+               and e.source_id == "https://rule.io"]
+    assert updated, "写回没发 SourceChangedEvent：列表页拿着旧规则不刷新"
+    stored = next(s for s in env.svc.sources if s.bookSourceUrl == "https://rule.io")
+    assert (stored.ruleContent or {}).get("content") == ".con@text", \
+        "事件发了，规则字段却没落盘"
+
+    fired.clear()
+    with pytest.raises(KeyError):
+        env.svc.update_source_rule("https://nope.io", "content", "x")
+    _drain(env.pending)
+    assert fired == [], "源不存在、什么都没改，却广播了变更"

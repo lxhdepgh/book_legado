@@ -34,6 +34,34 @@ from app.services.rule_repair import (RepairReport, diagnose_content_rule)
 
 logger = logging.getLogger(__name__)
 
+#: 自愈候选面的三个上限。**成本口径不同，所以不能合成一个数**：
+#: * ``MAX_CANDIDATE_ROWS``——下拉整页下发约 0.024 ms/行（单价出处见
+#:   `docs/dev-logs/2026-09-30.md`），只管**总行数**；
+#: * ``MAX_CANDIDATE_BOOKS``——每翻一本目录是一次磁盘 JSON 读 + 每章一个对象，
+#:   实测 5000 章一本约 20 ms、8 本约 0.17 s（`.probe/out_candidate_cost.txt`），
+#:   只管**本数**；
+#: * ``MAX_CANDIDATE_CHAPTERS_PER_BOOK``——一本书独占预算时也不把整本书端上下拉。
+#:
+#: 旧写法只有"3 本 × 100 章"这一个数：既把两个成本混在一起，又让书架第 4 本之后
+#: 的书在下拉里静默消失。现在每本摊到的是 ``行预算 // 实际本数``——书多时是
+#: "每本露一面、各自少抽几章"。
+MAX_CANDIDATE_ROWS = 300
+MAX_CANDIDATE_BOOKS = 8
+MAX_CANDIDATE_CHAPTERS_PER_BOOK = 100
+
+
+def _sample(chapters: list[dict], allowance: int) -> list[dict]:
+    """等间隔抽到 allowance 章以内，保持原序。
+
+    步长必须**向上取整**：``len // allowance`` 那种向下取整的步长会超额
+    （80 章 / 37 → 步长 2 → 端出 40 章），实测 8 本 × 5000 章那样摊下来是 312 行，
+    行预算就白设了（`.probe/out_candidate_cost.txt` 的 B 臂）。
+    """
+    if len(chapters) <= allowance:
+        return chapters
+    stride = max(1, -(-len(chapters) // allowance))
+    return chapters[::stride]
+
 
 class RuleRepairService(Service):
     """正文规则自愈：诊断出建议 → 用户确认后才写回。"""
@@ -138,17 +166,27 @@ class RuleRepairService(Service):
     # ------------------------------------------------------------------ #
     # 章节候选：自愈页"给哪一章做样本"的数据源
     # ------------------------------------------------------------------ #
-    async def chapter_candidates(self, source_url: str, *, max_books: int = 3,
-                                 per_book: int = 100) -> list[dict]:
+    async def chapter_candidates(self, source_url: str, *,
+                                 max_books: int = MAX_CANDIDATE_BOOKS,
+                                 per_book: int = MAX_CANDIDATE_CHAPTERS_PER_BOOK,
+                                 max_rows: int = MAX_CANDIDATE_ROWS) -> list[dict]:
         """这个源在架书的**已缓存目录**，按书分组给出可诊断的章节（不出网）。
 
         自愈要的样本章只有一个地方能免联网拿到：reader-cache 里读过的那份目录。
         这口径也对得上现场——会撞见正文规则坏的，正是把这本书读过的人。没读过
         的源返回空表，那不是错误而是"本地没有样本"，界面上由粘贴框接手。
 
-        两处都必须避开界面循环：目录是磁盘 JSON（整书动辄几千章）所以
-        ``to_thread``；选项要封顶（整页下发约 0.024 ms/行）所以按 ``per_book``
-        等间隔抽样，抽出来的仍保持原顺序，后续章仍能给 ``extra_chapters`` 用。
+        两个预算各自钉不同的成本（实测见模块常量的注），旧的"3 本"写法把它们
+        混成了一个：
+        * **行预算** ``max_rows``：下拉整页下发约 0.024 ms/行，只与摊出来的**总行数**
+          有关；
+        * **翻目录预算** ``max_books``：``load_catalog`` 是磁盘 JSON + 每章一个对象，
+          5000 章一本约 20 ms，与**本数**成正比（跑在 ``to_thread``，不冻界面，
+          但候选出现得晚）。
+
+        所以每本摊到的章数是 ``max_rows // 本数``（再受 ``per_book`` 上限）：书多的
+        时候是"每本露一面、各自少抽几章"，不再是"第 4 本之后的书静默消失"。
+        抽样仍等间隔、保持原顺序，后续章仍能给 ``extra_chapters`` 用。
         """
         source_url = str(source_url or "")
         if (not source_url or self._source_service is None
@@ -159,12 +197,11 @@ class RuleRepairService(Service):
         except Exception as exc:
             logger.warning("自愈候选取书架失败（当作没有样本）：%s", exc)
             return []
-        groups: list[dict] = []
+        # 书架记录的源/书地址有 Legado 的两套别名（同 SourceService.bookshelf_key）；
+        # 重复记录去重，本数上限按书架原序取前几本。
+        wanted: list[tuple[str, str]] = []
         seen: set[str] = set()
         for record in records:
-            if len(groups) >= max_books:
-                break
-            # 书架记录的源/书地址有 Legado 的两套别名（同 SourceService.bookshelf_key）
             origin = str((record or {}).get("source_url")
                          or (record or {}).get("origin") or "")
             book_url = str((record or {}).get("url")
@@ -172,14 +209,25 @@ class RuleRepairService(Service):
             if origin != source_url or not book_url or book_url in seen:
                 continue
             seen.add(book_url)
+            wanted.append((book_url, str((record or {}).get("name") or "")))
+        if not wanted:
+            return []
+        # 翻目录的次数就是成本，所以名额只被**翻到过的目录**消耗：没缓存过的书
+        # 那一次读是开文件失败（亚毫秒），不占名额（旧口径同样如此）。
+        # 先收到 max_books 本，再按实际本数摊每本的章数——行预算是总行数，不是本数。
+        collected: list[tuple[str, str, list[dict]]] = []
+        for book_url, book_name in wanted:
+            if len(collected) >= max(0, int(max_books)):
+                break
             chapters = await self._cached_chapters(source_url, book_url)
-            if not chapters:
-                continue
-            groups.append({"book_url": book_url,
-                           "book_name": str((record or {}).get("name") or ""),
-                           "chapters": chapters[:per_book] if len(chapters) <= per_book
-                           else chapters[::max(1, len(chapters) // per_book)]})
-        return groups
+            if chapters:
+                collected.append((book_url, book_name, chapters))
+        if not collected:
+            return []
+        allowance = max(1, min(int(per_book), int(max_rows) // len(collected)))
+        return [{"book_url": book_url, "book_name": book_name,
+                 "chapters": _sample(chapters, allowance)}
+                for book_url, book_name, chapters in collected]
 
     async def _cached_chapters(self, source_url: str,
                                book_url: str) -> list[dict]:

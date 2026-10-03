@@ -28,7 +28,8 @@ from unittest.mock import AsyncMock
 import flet as ft
 
 from app.core.events import (ImportFinishedEvent, ImportProgressEvent,
-                             RepairProgressEvent, RepairReportReadyEvent)
+                             RepairProgressEvent, RepairReportReadyEvent,
+                             SourceChangedEvent)
 from app.core.registry import SOURCE_DESTINATIONS, ViewRegistry
 from app.services.rule_repair import RepairReport, RepairSample, RuleFix
 from app.services.sources.online_import_service import OnlineImportService
@@ -127,6 +128,27 @@ class ControllerLifecycleTests(unittest.TestCase):
 
     def test_import_controller_symmetric(self):
         self._symmetric(SourceImportController, SourceImportView())
+
+    def test_list_controller_takes_the_write_back_event(self):
+        """写回事件的接收端也要有：发出去没人接等于没发。
+
+        服务面那条（``update_source_rule`` 落盘后发 ``updated``）钉的是"发"，
+        这一条钉"收"——两条合起来才是"自愈写回之后列表页自己刷新"。
+        """
+        hub = _FakeHub()
+        controller = BookSourceListController(hub)
+        controller.attach(BookSourceListView())
+        self.addCleanup(controller.detach)
+        carriers = [h for etype, h in hub.bus.subscriptions
+                    if etype is SourceChangedEvent]
+        self.assertEqual(len(carriers), 1,
+                         "列表页对 SourceChangedEvent 的订阅应当正好一条")
+        # 挂在总线上的是界面编组壳 ``on_ui``（app/controllers/base.py:_marshal），
+        # 真处理器在它的闭包里——只断"订阅了"照不出接的是别的路。
+        wanted = controller._on_source_changed
+        self.assertTrue(any(cell.cell_contents == wanted
+                            for cell in (carriers[0].__closure__ or ())),
+                        "订阅了却没接到 _on_source_changed 这条刷新路上")
 
 
 class CodeEditorHighlightTests(unittest.TestCase):
@@ -447,6 +469,44 @@ class RepairViewRenderTests(unittest.TestCase):
         self.assertFalse(view._card.visible)
         # 空态不再是"等待自愈报告"：这一页现在自己就能起诊断，空态得把人指回选择器。
         self.assertIn("选一个书源", view._status.value)
+
+    def test_closed_dropdowns_carry_a_readable_semantic_label(self):
+        """读屏面：合着的下拉在语义树里没有字，选中值得由外层 Semantics 念出来。
+
+        flet 0.86.5 的 ``Dropdown`` 根本没有 ``aria_label`` 这个字段（当场反射过
+        字段表），而第六十七轮浏览器探针量到两条下拉是 ``role=button`` +
+        ``aria-expanded``、``aria-label`` 与 ``textContent`` **全空**（值只画在
+        canvas 上，选项文字只在展开那一刻在树里）。三条都要钉：没选中说"未选择"、
+        程序改 value 跟得上、用户点选也跟得上——少一条就回到"念不出选的是谁"。
+        """
+        view = RuleRepairView()
+        row = view.controls[1]
+        self.assertIn(view._source_sem, row.controls,
+                      "标签没挂上工具行：读屏还是念不到")
+        self.assertIs(view._source_sem.content, view._source_dd)
+        self.assertIs(view._chapter_sem.content, view._chapter_dd)
+
+        view.set_source_options([(_PO5, "源A（正文规则坏了）"),
+                                 ("https://b/", "源B")], current="")
+        self.assertEqual(view._source_sem.label, "书源：未选择")
+        view.set_source_options([("https://c/", "源C")])       # 单条候选会自动选中
+        self.assertEqual(view._source_sem.label, "书源：源C")
+        view.set_source_options([(_PO5, "源A（正文规则坏了）"),
+                                 ("https://b/", "源B")], current="https://b/")
+        self.assertEqual(view._source_sem.label, "书源：源B")
+        _select(view._source_dd, _PO5)                         # 用户点选那一条
+        self.assertEqual(view._source_sem.label, "书源：源A（正文规则坏了）")
+
+        view.set_chapter_options([("0:0", "第1章 开局"), ("0:1", "第2章 转折")],
+                                 current="0:1")
+        self.assertEqual(view._chapter_sem.label, "正文章节：第2章 转折")
+
+    def test_merged_source_option_updates_the_label(self):
+        """列表页带源进来那条路是 ``add_source_option``（程序改 value，不走 on_select）。"""
+        view = RuleRepairView()
+        view.set_source_options([(_PO5, "源A")], current="")
+        view.add_source_option("https://other/", "别源")
+        self.assertEqual(view._source_sem.label, "书源：别源")
 
 
 class _Settled:

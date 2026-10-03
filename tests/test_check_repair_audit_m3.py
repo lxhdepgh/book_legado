@@ -868,6 +868,62 @@ class ChapterCandidateTests(unittest.IsolatedAsyncioTestCase):
                          ["https://b/1", "https://b/2", "https://b/3"],
                          "封顶没生效，或重复的书架记录被摊了两份")
 
+    async def test_five_books_each_get_a_face(self):
+        """第 4、5 本不许静默消失。
+
+        旧 shape 硬编"最近 3 本"：一个把同一源读了 5 本的人，在下拉里永远挑不到
+        第 4 本之后的章，界面上也没有一行字说过这件事。**这条不许从常量取数**——
+        上一版那么写，把上限改回 3 之后测试跟着改口，变异照样绿（第七十轮核验抓到
+        的就是这一族）。
+        """
+        for i in range(1, 6):
+            self._catalog(f"https://b/{i}", 80)
+        svc = self._svc([_shelf(self.source_url, f"https://b/{i}")
+                         for i in range(1, 6)])
+        groups = await svc.chapter_candidates(self.source_url)
+        self.assertEqual([g["book_url"] for g in groups],
+                         [f"https://b/{i}" for i in range(1, 6)],
+                         "只摊了前几本：后面的书在下拉里没了")
+
+    async def test_row_budget_bounds_the_total_not_each_book(self):
+        """行预算管的是**总行数**：8 本各摊满 100 章就是 640 行，那是一次卡顿。
+
+        预算数字当场写死（300），不从服务模块读常量——读常量的写法在
+        ``MAX_CANDIDATE_ROWS`` 被人改掉时会一起改口，等于没钉。
+        """
+        for i in range(1, 9):
+            self._catalog(f"https://b/{i}", 80)
+        svc = self._svc([_shelf(self.source_url, f"https://b/{i}")
+                         for i in range(1, 9)])
+        groups = await svc.chapter_candidates(self.source_url, max_books=8,
+                                              per_book=100, max_rows=300)
+        self.assertEqual(len(groups), 8, "本数没摊全")
+        rows = sum(len(g["chapters"]) for g in groups)
+        self.assertLessEqual(rows, 300, f"摊出 {rows} 行，超了行预算")
+        self.assertTrue(all(g["chapters"] for g in groups),
+                        "名额全花在第一本上了，后面的书还是没摊到")
+        # 每本抽到的章不许退化成"取前 N 章"：坏的常常正是后面新出的章
+        for group in groups:
+            numbers = [int(c["url"].rsplit("/", 1)[1].split(".")[0])
+                       for c in group["chapters"]]
+            self.assertEqual(numbers, sorted(numbers), "抽样打乱了目录顺序")
+            self.assertGreater(numbers[-1], 40,
+                               f"抽到的最深只到第 {numbers[-1]} 章")
+
+    async def test_uncached_books_do_not_eat_the_scan_slots(self):
+        """没缓存过的书不占名额：那一次翻目录是开文件失败（亚毫秒），不是成本。
+
+        前面排的要**比本数上限多**，否则"先切前 N 本"那种写法照样能翻到缓存那本，
+        变异就绿了（第七十轮 N9 抓到的正是这一条没钉住）。
+        """
+        self._catalog("https://b/cached", 4)
+        svc = self._svc([_shelf(self.source_url, f"https://b/miss{i}")
+                         for i in range(10)]
+                        + [_shelf(self.source_url, "https://b/cached")])
+        groups = await svc.chapter_candidates(self.source_url)
+        self.assertEqual([g["book_url"] for g in groups], ["https://b/cached"],
+                         "前面的空书把名额吃光了：这一源的样本明明就在后面那本")
+
 
 class CheckSnapshotCarriesSampleChapters(unittest.TestCase):
     """检测快照必须把抽到的样本章留下来——那是"检过但没读过"的源唯一的章节来源。"""

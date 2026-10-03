@@ -293,10 +293,12 @@ class RuleRepairController(BaseController):
 
     def _candidate_hint(self, url: str, options: list[tuple[str, str]]) -> str:
         if options:
-            shelf = sum(len(g["chapters"]) for g in self._candidate_groups
-                        if g.get("book_url"))
-            return (f"本地有 {len(options)} 章可做样本"
-                    + (f"（其中 {shelf} 章来自已缓存的目录）" if shelf else "")
+            cached = [g for g in self._candidate_groups if g.get("book_url")]
+            shelf = sum(len(g["chapters"]) for g in cached)
+            # 覆盖几本书要写出来：候选面是按本数摊的，不写就看不出"还有书没摊出来"
+            tail = (f"（其中 {shelf} 章来自 {len(cached)} 本书的已缓存目录）"
+                    if shelf else "")
+            return (f"本地有 {len(options)} 章可做样本{tail}"
                     + "；诊断会真抓 1-3 页，只有你点确认才写回书源")
         return ("这个源本地没有可读目录，也没有检测样本：粘贴一个正文页地址，"
                 "或先读一章 / 跑一轮检测")
@@ -452,8 +454,8 @@ class RuleRepairController(BaseController):
             self._view.set_status(f"写回失败：{exc}")
             return
         self._view.set_status(
-            "已写回书源并复测（列表页要刷新才看得到：update_source_rule 不发事件）"
-            if ok else "写回未生效（报告过期或书源已删除）")
+            "已写回书源并复测，列表页会自己刷新" if ok
+            else "写回未生效（报告过期或书源已删除）")
 
     def dismiss_fix(self, report: dict) -> None:
         self._expect_source_id = ""
