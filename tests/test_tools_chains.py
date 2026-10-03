@@ -116,10 +116,19 @@ def _option_keys(view):
     return [str(o.key) for o in view._chooser.options]
 
 
+def _select(dropdown, value):
+    """模拟用户点下拉项：Flet 先改 ``control.value``，再发一条只有
+    name/data/control 的 ``Event``——事件对象上**没有** ``value``。
+    早先这里传的是 ``SimpleNamespace(value=…)``，替身比真事件多一个字段，
+    于是视图里 ``getattr(e, "value", None)`` 在读一个永远不存在的东西，
+    测试全绿而界面上点了没反应（第六十七轮浏览器探针抓的）。
+    """
+    dropdown.value = value
+    dropdown.on_select(ft.Event(name="select", control=dropdown))
+
+
 def _pick(view, url):
-    """模拟用户选下拉项：Flet 先改 value 再回调 on_select。"""
-    view._chooser.value = url
-    view._chooser.on_select(SimpleNamespace(value=url))
+    _select(view._chooser, url)
 
 
 class ExportBookPickerTests(unittest.IsolatedAsyncioTestCase):
@@ -764,8 +773,9 @@ class WebDavRemoteListTests(unittest.IsolatedAsyncioTestCase):
         _controller, view = self._attach(service)
         view._list_remote_btn.on_click(None)
         self.assertTrue(await wait_until(lambda: view._remote.options))
-        view._remote.value = "legado/backup/a.zip"
-        view._remote.on_select(SimpleNamespace(value="legado/backup/a.zip"))
+        view._list_remote_btn.on_click(None)
+        self.assertTrue(await wait_until(lambda: view._remote.options))
+        _select(view._remote, "legado/backup/a.zip")
         self.assertEqual(view._restore_path.value, "legado/backup/a.zip")
 
     async def test_restore_button_asks_before_touching_anything(self) -> None:

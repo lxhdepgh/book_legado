@@ -156,13 +156,11 @@ class CodeEditorView(ft.Column):
         # -- 编辑目标：哪个书源、哪一条规则 --
         self._source_dd = ft.Dropdown(
             label="书源", width=300, dense=True, options=[],
-            on_select=lambda e: self._fire(self.on_source_picked,
-                                           getattr(e, "value", None)))
+            on_select=lambda e: self._fire(self.on_source_picked, e.control.value))
         self._field_dd = ft.Dropdown(
             label="规则字段", width=260, dense=True, value=WHOLE_SOURCE,
             options=[ft.dropdown.Option(WHOLE_SOURCE, "整份书源 JSON")],
-            on_select=lambda e: self._fire(self.on_field_picked,
-                                           getattr(e, "value", None)))
+            on_select=lambda e: self._fire(self.on_field_picked, e.control.value))
         self._reload_btn = ft.IconButton(
             ft.Icons.REFRESH, tooltip="重新载入书源列表",
             on_click=lambda e: self._fire(self.on_reload_sources))

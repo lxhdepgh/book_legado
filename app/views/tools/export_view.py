@@ -27,7 +27,7 @@ class ExportView(ft.Column):
         self._chooser = ft.Dropdown(
             label="已缓存书籍", width=320, dense=True,
             options=[], on_select=lambda e: self._fire(self.on_book_chosen,
-                                                       getattr(e, "value", None)))
+                                                       e.control.value))
         self._pick_btn = ft.OutlinedButton(
             "刷新", icon=ft.Icons.REFRESH,
             on_click=lambda e: self._fire(self.on_pick_book))

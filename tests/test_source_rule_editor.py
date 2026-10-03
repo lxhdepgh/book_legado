@@ -34,6 +34,18 @@ from app.views.source.code_editor_view import (WHOLE_SOURCE, CodeEditorView,
                                                tokenize_rule)
 
 
+def _select(dropdown, value):
+    """模拟用户点下拉项：Flet 先改 ``control.value``，再发一条 ``Event``。
+
+    事件对象上只有 name/data/control 三个字段，**没有** ``value``——早先这里传
+    ``SimpleNamespace(value=…)``，替身比真事件多一个字段，视图里的
+    ``getattr(e, "value", None)`` 于是在测试里"能用"、在浏览器里永远回 None。
+    第六十七轮的自愈页浏览器探针抓的就是这一族读法（见 dev-logs/2026-10-03.md）。
+    """
+    dropdown.value = value
+    dropdown.on_select(ft.Event(name="select", control=dropdown))
+
+
 class _FakeBus:
     def __init__(self):
         self.subscriptions: list = []
@@ -163,7 +175,7 @@ class SourcesListedOnOpenTests(unittest.TestCase):
     def test_picking_a_source_loads_that_record(self):
         view, controller = _rig([_record("https://a/", "甲源")])
         # 走控件的 on_select：验证下拉确实把值递给了控制器（不是只绑了个方法名）
-        view._source_dd.on_select(SimpleNamespace(value="https://a/"))
+        _select(view._source_dd, "https://a/")
         self.assertIn("甲源", view._title.value)
         self.assertIn("ruleSearch", view.get_text())
         self.assertEqual(controller._current["bookSourceUrl"], "https://a/")
@@ -176,7 +188,7 @@ class FieldScopedEditingTests(unittest.TestCase):
     def setUp(self):
         self.record = _record()
         self.view, self.controller = _rig([self.record])
-        self.view._source_dd.on_select(SimpleNamespace(value="https://src1/"))
+        _select(self.view._source_dd, "https://src1/")
 
     def _field_keys(self):
         return [option.key for option in self.view._field_dd.options]
@@ -195,21 +207,21 @@ class FieldScopedEditingTests(unittest.TestCase):
         self.assertEqual(by_key["ruleContent.content"], "正文 · 正文")
 
     def test_choosing_a_field_loads_only_that_rule(self):
-        self.view._field_dd.on_select(SimpleNamespace(value="ruleSearch.name"))
+        _select(self.view._field_dd, "ruleSearch.name")
         self.assertEqual(self.view.get_text(), ".title@text")
         self.assertIn("ruleSearch.name", self.view._status.value)
 
     def test_switching_back_to_whole_shows_the_stashed_edit(self):
-        self.view._field_dd.on_select(SimpleNamespace(value="ruleSearch.name"))
+        _select(self.view._field_dd, "ruleSearch.name")
         self.view._editor.value = ".h2@text"
         self.view._on_text_changed()
-        self.view._field_dd.on_select(SimpleNamespace(value=WHOLE_SOURCE))
+        _select(self.view._field_dd, WHOLE_SOURCE)
         text = self.view.get_text()
         self.assertIn(".h2@text", text, "换回整份 JSON 时刚才那条编辑不能消失")
         self.assertIn("bookSourceGroup", text, "合并只动那一个键")
 
     def test_saving_one_field_merges_and_keeps_everything_else(self):
-        self.view._field_dd.on_select(SimpleNamespace(value="ruleSearch.name"))
+        _select(self.view._field_dd, "ruleSearch.name")
         self.view._editor.value = ".h3@text"
         self.view._on_text_changed()
         fake = self.controller._source
@@ -241,8 +253,8 @@ class DebugRunTests(unittest.TestCase):
         """没样本就别调引擎：以前那条"（示例为空…）"的回显等于坏按钮。"""
         engine = _FakeEngine()
         view, controller = _rig([_record()], engine=engine)
-        view._source_dd.on_select(SimpleNamespace(value="https://src1/"))
-        view._field_dd.on_select(SimpleNamespace(value="ruleSearch.name"))
+        _select(view._source_dd, "https://src1/")
+        _select(view._field_dd, "ruleSearch.name")
         controller.run_debug(view.get_text())
         self.assertEqual(engine.calls, [], "空样本还是去求值了")
         self.assertIn("示例正文", view._debug.value)
@@ -251,8 +263,8 @@ class DebugRunTests(unittest.TestCase):
     def test_debug_runs_the_rule_being_edited_not_a_hardcoded_field(self):
         engine = _FakeEngine()
         view, controller = _rig([_record()], engine=engine)
-        view._source_dd.on_select(SimpleNamespace(value="https://src1/"))
-        view._field_dd.on_select(SimpleNamespace(value="ruleContent.content"))
+        _select(view._source_dd, "https://src1/")
+        _select(view._field_dd, "ruleContent.content")
         view.set_sample("<div id='content'>正文一段</div>")
         controller.run_debug(view.get_text())
         self.assertEqual(engine.calls, [("#content@html",
@@ -271,7 +283,7 @@ class DebugRunTests(unittest.TestCase):
     def test_whole_json_mode_still_debugs_and_says_which_field(self):
         engine = _FakeEngine()
         view, controller = _rig([_record()], engine=engine)
-        view._source_dd.on_select(SimpleNamespace(value="https://src1/"))
+        _select(view._source_dd, "https://src1/")
         view.set_sample("<div class='item'>甲</div>")
         controller.run_debug(view.get_text())
         self.assertIn("bookNameRule", view._debug.value,
@@ -312,8 +324,8 @@ class RealEngineSurfaceTests(unittest.TestCase):
     def test_the_button_end_to_end_runs_on_the_real_service(self):
         """不装替身：真服务接进 rig，粘样本点试跑，屏幕上得是真取到的值。"""
         view, controller = _rig([_record()], engine=RuleEngineService())
-        view._source_dd.on_select(SimpleNamespace(value="https://src1/"))
-        view._field_dd.on_select(SimpleNamespace(value="ruleSearch.name"))
+        _select(view._source_dd, "https://src1/")
+        _select(view._field_dd, "ruleSearch.name")
         view.set_sample("<div class='item'><span class='title'>远航</span></div>")
         controller.run_debug(view.get_text())
         self.assertIn("远航", view._debug.value)
@@ -430,7 +442,7 @@ def _done(report):
     def test_editing_marks_the_status_with_what_is_being_edited(self):
         view, controller = _rig([_record()])
         controller.load_source(_record())
-        view._field_dd.on_select(SimpleNamespace(value="ruleSearch.name"))
+        _select(view._field_dd, "ruleSearch.name")
         controller.mark_dirty(".x@text")
         self.assertIn("ruleSearch.name", view._status.value)
 

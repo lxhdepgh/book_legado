@@ -37,7 +37,7 @@ class WebDavView(ft.Column):
         # 远端备份清单：不列出来就得让用户手敲一个 zip 路径（没人敲得对）。
         self._remote = ft.Dropdown(
             label="远端备份包", width=380, dense=True, options=[],
-            on_select=lambda e: self._choose_remote(getattr(e, "value", None)))
+            on_select=lambda e: self._choose_remote(e.control.value))
         self._list_remote_btn = ft.OutlinedButton(
             "列出远端备份", icon=ft.Icons.REFRESH,
             on_click=lambda e: self._fire(self.on_list_remote))

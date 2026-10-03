@@ -380,6 +380,96 @@ def test_flet_surface_names_and_kwargs():
     assert not problems, "flet 面断链：\n" + "\n".join(problems)
 
 
+# --------------------------------------------------------------------------- #
+# 事件对象的字段面：``getattr(e, "value", None)`` 读的是一个不存在的东西
+#
+# 0.86 的 ``Event`` 只有 name / data / control 三个字段。这种读法不报错，静默
+# 回退成 None，界面表现是"下拉选了等于没选"。第六十七轮的浏览器探针一次抓出
+# 6 处 / 4 个视图文件，而 1695 条单测全绿——测试是把 ``SimpleNamespace(value=…)``
+# 当事件递进去的，**替身比真事件多一个字段**，恰好把那行坏读法喂饱。
+# --------------------------------------------------------------------------- #
+#: 事件参数的常见取名：具名处理函数（不是 lambda）也按这个认
+_EVENT_NAMES = {"e", "ev", "evt", "event"}
+
+
+def _event_lambdas(tree: ast.AST) -> list[ast.Lambda]:
+    """挂在 ``on_xxx=`` 关键字上的 lambda：它的第一个形参就是事件对象。"""
+    parents = _parents(tree)
+    found: list[ast.Lambda] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Lambda):
+            continue
+        up = parents.get(node)
+        if isinstance(up, ast.keyword) and (up.arg or "").startswith("on_"):
+            found.append(node)
+    return found
+
+
+def _reads_value_off_target(node: ast.AST, target: str) -> int | None:
+    """在这一段子树里找 ``getattr(target, "value", …)`` 或 ``target.value``。"""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) \
+                and sub.func.id == "getattr" and len(sub.args) >= 2 \
+                and isinstance(sub.args[0], ast.Name) \
+                and sub.args[0].id == target \
+                and isinstance(sub.args[1], ast.Constant) \
+                and sub.args[1].value == "value":
+            return sub.lineno
+        if isinstance(sub, ast.Attribute) and sub.attr == "value" \
+                and isinstance(sub.value, ast.Name) and sub.value.id == target:
+            return sub.lineno
+    return None
+
+
+def test_flet_event_object_really_has_no_value():
+    """钉住事实本身：flet 哪天给 ``Event`` 补上 ``value``，这条先红。
+
+    那时 ``test_no_handler_reads_value_off_the_event`` 就该放宽或删掉——留着会把
+    真能用的写法当违规。别为了让这条绿去动扫描的判据。
+    """
+    import dataclasses
+
+    fields = {f.name for f in dataclasses.fields(flet.Event)}
+    assert "value" not in fields, \
+        f"flet 的 Event 现在有 {sorted(fields)}，下面那条事件读法扫描该放宽"
+
+
+def test_no_handler_reads_value_off_the_event():
+    """视图里不许再从事件对象上读 ``value``：唯一正确读法是 ``e.control.value``。
+
+    只认两种形状：``on_xxx=lambda e: …`` 的那个形参，以及取名成 e/ev/evt/event 的
+    具名形参。别处的 ``getattr(block, "value")`` / ``getattr(control, "value")``
+    读的是正文块和控件，那是真字段，不算犯案。
+    """
+    problems: list[str] = []
+    for path in sorted((ROOT / "app" / "views").rglob("*.py")):
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(ROOT).as_posix()
+        for lam in _event_lambdas(tree):
+            argnames = lam.args.posonlyargs + lam.args.args
+            if not argnames:
+                continue
+            bad = _reads_value_off_target(lam, argnames[0].arg)
+            if bad:
+                problems.append(
+                    f"{rel}:{bad} on_* 的事件形参 {argnames[0].arg} 上没有 value，"
+                    "读 e.control.value")
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for a in fn.args.posonlyargs + fn.args.args:
+                if a.arg not in _EVENT_NAMES:
+                    continue
+                bad = _reads_value_off_target(fn, a.arg)
+                if bad:
+                    problems.append(
+                        f"{rel}:{bad} 事件形参 {a.arg} 上没有 value，"
+                        "读 e.control.value")
+    assert not problems, "事件上读了不存在的字段：\n" + "\n".join(problems)
+
+
 def test_flet_enum_members_exist():
     """``ft.Icons.RADIOS`` 这类不存在的枚举成员会在构造控件时抛 AttributeError。"""
     import enum
