@@ -46,7 +46,7 @@ class BookSourceListController(BaseController):
         self.on_open_editor = None     # (record: dict) -> None
         self.on_open_import = None    # () -> None
         self.on_open_check = None      # () -> None
-        self.on_open_repair = None     # () -> None
+        self.on_open_repair = None     # (record: dict) -> None
 
         self._records: list = []       # 最近一次全量快照（模型对象）
         self._query = ""
@@ -64,7 +64,7 @@ class BookSourceListController(BaseController):
         self._view.on_import_json = lambda e: self._fire(self.on_open_import)
         self._view.on_export_json = self.export_json
         self._view.on_start_check = lambda e: self._fire(self.on_open_check)
-        self._view.on_start_repair = lambda e: self._fire(self.on_open_repair)
+        self._view.on_start_repair = lambda e: self._start_repair()
         # -- 批量选择（对齐旧 manage_view） --
         self._view.on_selection_changed = self._on_selection_changed
         self._view.on_select_all = self.select_all
@@ -268,6 +268,29 @@ class BookSourceListController(BaseController):
             self.on_open_editor(record)
         else:
             self._view.set_status(f"编辑《{record.get('bookSourceName', '')}》（编辑器路由由装配处绑定）")
+
+    def _start_repair(self) -> None:
+        """工具栏「自愈」：把勾上的那一源交给自愈页，让它去摊可诊断的样本章。
+
+        载荷只有 ``source_url``/``source_name``（契约见
+        :meth:`RuleRepairController.load_record`）：章节**不许**从这页传——列表页
+        手上既没有目录也没有检测样本，硬凑的键名只会让自愈页去猜。
+        一次诊断只治一个源，多选时如实说带走了哪一条，别默默丢掉其余的。
+        """
+        urls = sorted(url for url in self._selected_urls if url)
+        if not urls:
+            self._fire(self.on_open_repair)
+            return
+        if len(urls) > 1:
+            self._view.set_status(f"自愈一次只诊断一个源，已带入 {urls[0]}")
+        self._fire(self.on_open_repair, {"source_url": urls[0],
+                                         "source_name": self._source_name(urls[0])})
+
+    def _source_name(self, url: str) -> str:
+        for source in self._records:
+            if str(getattr(source, "bookSourceUrl", "") or "") == url:
+                return str(getattr(source, "bookSourceName", "") or "") or url
+        return url
 
     # ------------------------------------------------------------------ #
     # 批量选择 / 批量操作（对齐旧 manage_view：启用/禁用/删除/取消选择）

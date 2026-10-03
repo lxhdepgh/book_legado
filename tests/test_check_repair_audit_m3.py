@@ -751,3 +751,149 @@ class TestCompatAuditWriteShape(unittest.IsolatedAsyncioTestCase):
             "audit_log 的写落在事件循环线程上，等锁时界面会整块冻住"
         assert len(storage.rows()) == 1
 
+
+
+# --------------------------------------------------------------------------- #
+# 2b. RuleRepairService.chapter_candidates：自愈页选择器的数据源（全程不出网）
+# --------------------------------------------------------------------------- #
+class _ShelfSourceService:
+    """只回答书架的 SourceService 替身。"""
+
+    def __init__(self, records):
+        self._records = records
+        self.calls = 0
+
+    async def list_bookshelf(self, include_staged: bool = False):
+        self.calls += 1
+        return list(self._records)
+
+
+def _shelf(source_url: str, book_url: str, name: str = "《测试书》") -> dict:
+    return {"source_url": source_url, "url": book_url, "name": name}
+
+
+class ChapterCandidateTests(unittest.IsolatedAsyncioTestCase):
+    """候选面只能读磁盘上已有的目录：一多出网就成了"点开列表页就抓站"。"""
+
+    def setUp(self):
+        import tempfile
+        from app.services.reading_cache import ReadingCache
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.cache = ReadingCache(self._dir.name)
+        self.source_url = "https://www.po5.net"
+
+    def _svc(self, records):
+        return RuleRepairService(
+            source_service=_ShelfSourceService(records), cache=self.cache)
+
+    def _catalog(self, book_url, count=3, source_url=None, start=1):
+        self.cache.save_catalog(source_url or self.source_url, book_url, [
+            ChapterItem(name=f"第{i}章", url=f"{book_url}/{i}.html", index=i - 1)
+            for i in range(start, start + count)])
+
+    async def test_only_the_requested_source_and_only_readable_chapters(self):
+        self._catalog("https://b/1", 3)
+        self._catalog("https://b/other-source", 2, source_url="https://elsewhere/")
+        # 卷标题没有地址、也没有地址的章：递给诊断只会白抓一次
+        self.cache.save_catalog(self.source_url, "https://b/vol", [
+            ChapterItem(name="第一卷", url="", is_volume=True),
+            ChapterItem(name="空地址", url=""),
+            ChapterItem(name="第二章", url="https://b/vol/2.html")])
+        svc = self._svc([
+            _shelf(self.source_url, "https://b/1"),
+            _shelf("https://elsewhere/", "https://b/other-source"),
+            _shelf(self.source_url, "https://b/vol"),
+        ])
+        groups = await svc.chapter_candidates(self.source_url)
+        self.assertEqual([g["book_url"] for g in groups],
+                         ["https://b/1", "https://b/vol"], "串了源或整组丢了")
+        first = groups[0]["chapters"]
+        self.assertEqual([c["url"] for c in first],
+                         ["https://b/1/1.html", "https://b/1/2.html",
+                          "https://b/1/3.html"])
+        self.assertEqual([c["url"] for c in groups[1]["chapters"]],
+                         ["https://b/vol/2.html"], "卷标题/空地址被端上了候选面")
+
+    async def test_a_foreign_shelf_record_does_not_borrow_this_key(self):
+        """源隔离要钉的是"这一组候选属于这一源"：地址撞车的别源书不算。
+
+        缓存按 (源, 书) 分键，所以只要漏了源这一维，别源的书架记录就会借着
+        同一本书的目录缓存端上来，诊断拿到的却是手上这个源的规则。
+        """
+        self._catalog("https://b/1", 2, source_url=self.source_url)
+        svc = self._svc([_shelf("https://elsewhere/", "https://b/1")])
+        self.assertEqual(await svc.chapter_candidates(self.source_url), [],
+                         "串了源：那是别源书架上的书，只是书地址相同")
+
+    async def test_no_cache_and_no_service_degrade_to_empty(self):
+        """没读过 / 没装配 = 空表，不是异常：界面上由粘贴框接手。"""
+        self._svc([])
+        empty = self._svc([_shelf(self.source_url, "https://b/missing")])
+        self.assertEqual(await empty.chapter_candidates(self.source_url), [])
+        self.assertEqual(await RuleRepairService().chapter_candidates(
+            self.source_url), [], "没 SourceService 也不该炸")
+        self.assertEqual(await self._svc([]).chapter_candidates(""), [])
+
+    async def test_local_pseudo_source_is_refused(self):
+        """本地书有缓存目录却没有规则源：端出来只会起一趟抓 file:// 的空诊断。"""
+        from app.services.content.local_book_service import LOCAL_BOOK_SOURCE_URL
+        self._catalog("/tmp/某本书.txt", 2, source_url=LOCAL_BOOK_SOURCE_URL)
+        svc = self._svc([_shelf(LOCAL_BOOK_SOURCE_URL, "/tmp/某本书.txt")])
+        calls = svc._source_service
+        self.assertEqual(await svc.chapter_candidates(LOCAL_BOOK_SOURCE_URL), [])
+        self.assertEqual(calls.calls, 0, "连书架都不该去读")
+
+    async def test_big_catalog_is_sampled_not_dumped(self):
+        """整书几千章必须抽样下发：整页 diff 约 0.024 ms/行，五千条本身就是一次卡顿。"""
+        self._catalog("https://b/big", 5000)
+        svc = self._svc([_shelf(self.source_url, "https://b/big")])
+        chapters = (await svc.chapter_candidates(
+            self.source_url, per_book=100))[0]["chapters"]
+        self.assertLessEqual(len(chapters), 100)
+        indexes = [int(url.rsplit("/", 1)[1].split(".")[0])
+                   for url in (c["url"] for c in chapters)]
+        self.assertEqual(indexes, sorted(indexes), "抽样打乱了目录顺序")
+        # 抽样不许退化成"取前 100 章"：正文规则坏了的常常正是后面新出的章。
+        self.assertGreater(indexes[-1], 5000 // 2, f"抽到的最深只到第 {indexes[-1]} 章")
+
+    async def test_more_than_max_books_and_duplicate_records(self):
+        for i in range(1, 5):
+            self._catalog(f"https://b/{i}", 2)
+        svc = self._svc([_shelf(self.source_url, f"https://b/{i}")
+                         for i in range(1, 5)]
+                        + [_shelf(self.source_url, "https://b/2")])
+        groups = await svc.chapter_candidates(self.source_url, max_books=3)
+        self.assertEqual([g["book_url"] for g in groups],
+                         ["https://b/1", "https://b/2", "https://b/3"],
+                         "封顶没生效，或重复的书架记录被摊了两份")
+
+
+class CheckSnapshotCarriesSampleChapters(unittest.TestCase):
+    """检测快照必须把抽到的样本章留下来——那是"检过但没读过"的源唯一的章节来源。"""
+
+    def _svc(self):
+        svc = SourceCheckService()
+        svc.bus = RecordingBus()
+        return svc
+
+    def test_snapshot_entry_has_them_and_the_event_still_builds(self):
+        svc = self._svc()
+        run = {"results": []}
+        svc._publish_finished(
+            {"raw_url": "https://a/", "check_state": "fully_usable",
+             "sample_chapter_urls": ("https://a/1.html", None, "https://a/3.html")},
+            run=run, done=1, total=9)
+        self.assertEqual(run["results"][0]["sample_chapter_urls"],
+                         ["https://a/1.html", "https://a/3.html"])
+        # 事件那一面不许跟着加键：CheckFinishedEvent 只有五个字段，多一个就是 TypeError
+        event = svc.bus.events[0]
+        self.assertIsInstance(event, CheckFinishedEvent)
+        self.assertFalse(hasattr(event, "sample_chapter_urls"))
+
+    def test_source_without_samples_gets_an_empty_list(self):
+        svc = self._svc()
+        run = {"results": []}
+        svc._publish_finished({"raw_url": "https://a/", "check_state": "blocked"},
+                              run=run, done=1, total=1)
+        self.assertEqual(run["results"][0]["sample_chapter_urls"], [])

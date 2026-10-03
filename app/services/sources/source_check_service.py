@@ -525,7 +525,16 @@ class SourceCheckService(Service):
                  "state_class": str(result.get("check_state") or "unknown"),
                  "summary": _summary(result)}
         if run is not None:
-            run["results"].append(entry)   # 切页期间没人接事件，靠这份回放
+            # 快照比事件多带一样：抽到的样本章地址（check_service 检正文时目录就
+            # 在手上，顺手记了三章）。自愈页要靠它给"检过但没读过"的源挑失败章——
+            # 那种源在 reader-cache 里没有目录，这一份是唯一来源。
+            # 事件那边不许加键：CheckFinishedEvent 只有五个字段，**entry 多一个键
+            # 就是 TypeError。
+            run["results"].append({
+                **entry,
+                "sample_chapter_urls": [str(url) for url in
+                                        (result.get("sample_chapter_urls") or [])
+                                        if url]})
         if self.bus is None:
             return
         # 分母跟着事件走：订阅方自己数完成的条数，只会得出 12/12（症状见事件文档）

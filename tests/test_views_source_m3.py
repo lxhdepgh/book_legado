@@ -10,7 +10,10 @@
 5. 导入视图渲染 ImportFinishedEvent 结果；
 6. 自愈视图渲染报告卡；
 7. 书源组五目的地注册进 ViewRegistry；
-8. import-lint AST 扫描：``app/views/source/`` 零 ``app.services.`` import。
+8. import-lint AST 扫描：``app/views/source/`` 零 ``app.services.`` import；
+9. 自愈页选择器流程（第六十七轮）：列表页带源进来 → 摊本地样本章 → 点「开始诊断」。
+   下拉的 ``on_select`` 事件形状那条静态护栏挪去了
+   ``test_controller_service_surface.py``（它扫的是整片视图面，不只书源域）。
 """
 from __future__ import annotations
 
@@ -30,6 +33,7 @@ from app.core.registry import SOURCE_DESTINATIONS, ViewRegistry
 from app.services.rule_repair import RepairReport, RepairSample, RuleFix
 from app.services.sources.online_import_service import OnlineImportService
 from app.services.sources.rule_repair_service import RuleRepairService
+from app.services.sources.source_check_service import SourceCheckService
 from app.services.sources.source_service import SourceService
 
 from app.views.source import (BookSourceListView, CheckView, CodeEditorView,
@@ -441,7 +445,20 @@ class RepairViewRenderTests(unittest.TestCase):
         self.assertTrue(view._card.visible)
         view.render_report(None)
         self.assertFalse(view._card.visible)
-        self.assertEqual(view._status.value, "等待自愈报告…")
+        # 空态不再是"等待自愈报告"：这一页现在自己就能起诊断，空态得把人指回选择器。
+        self.assertIn("选一个书源", view._status.value)
+
+
+class _Settled:
+    """``future.result()`` 的两面：有值返回值，有异常原样抛给回调。"""
+
+    def __init__(self, value=None, error=None):
+        self._value, self._error = value, error
+
+    def result(self):
+        if self._error is not None:
+            raise self._error
+        return self._value
 
 
 class _DeferredFuture:
@@ -456,9 +473,17 @@ class _DeferredFuture:
         self._callbacks.append(fn)
 
     async def run(self):
-        value = await self._coro if self._coro is not None else None
+        # 异常要照真 future 的样子交给 done 回调（真 ui_call 就是这么把失败露给
+        # _after_* 的），只在最后再往外抛一次给测试断言。
+        value, error = None, None
+        try:
+            value = await self._coro if self._coro is not None else None
+        except BaseException as exc:  # noqa: BLE001 - 原样转交，不吞
+            error = exc
         for fn in self._callbacks:
-            fn(SimpleNamespace(result=lambda: value))
+            fn(_Settled(value, error))
+        if error is not None:
+            raise error
 
 
 class RepairFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -558,11 +583,12 @@ class RepairFlowTests(unittest.IsolatedAsyncioTestCase):
         controller, view, repair, posted = self._make(
             RepairReport(self._fix()))
         controller.detach()
+        before = view._status.value
         await controller._on_progress(RepairProgressEvent(
             source_id="https://a/", stage="正在抓取样本页…"))
         await controller._on_report_ready(RepairReportReadyEvent(
             report_id="r1", source_id="https://a/"))
-        self.assertEqual(view._status.value, "等待自愈报告…")
+        self.assertEqual(view._status.value, before)
         self.assertFalse(view._card.visible)
 
     async def test_both_repair_events_are_subscribed_on_attach(self):
@@ -629,6 +655,305 @@ class ImportLintTests(unittest.TestCase):
             offenders, [],
             "views/source/ 的 import 语句不得引用 app.services.*（红线 §7.5）：\n"
             + "\n".join(offenders))
+
+
+# --------------------------------------------------------------------------- #
+# 自愈页的选择器：列表页带源进来 → 摊本地样本章 → 点「开始诊断」才出网
+# --------------------------------------------------------------------------- #
+_REPAIR_GROUPS = [{
+    "book_url": "https://b/1", "book_name": "《测试书》",
+    "chapters": [{"name": f"第{i}章", "url": f"https://b/1/{i}.html"}
+                 for i in (1, 2, 3)],
+}]
+_PO5 = "https://www.po5.net"
+
+
+def _select(dropdown, value):
+    """模拟用户点下拉项：Flet 先改 ``control.value``，再发一条 ``Event``。
+
+    事件对象上只有 name/data/control，**没有** ``value``——所以这里必须走真事件，
+    否则视图 lambda 里那行读法（``e.control.value``）从来没被执行过，
+    正是第六十七轮浏览器探针抓出来的那一族（替身 ``SimpleNamespace(value=…)``
+    比真事件多一个字段，测试全绿而界面上点了没反应）。
+    """
+    dropdown.value = value
+    dropdown.on_select(ft.Event(name="select", control=dropdown))
+
+
+class RepairPickerFlowTests(unittest.IsolatedAsyncioTestCase):
+    """自愈页必须自己起得来诊断：从列表页跳进来不再是"等待自愈报告…"的空白页。"""
+
+    def _make(self, *, groups=None, snapshot=None, report=None):
+        repair = SimpleNamespace(
+            get_report=lambda rid: report,
+            apply_fix=AsyncMock(return_value=True),
+            chapter_candidates=AsyncMock(
+                return_value=_REPAIR_GROUPS if groups is None else groups),
+            repair=AsyncMock(return_value=report))
+        source = SimpleNamespace(
+            list_sources=AsyncMock(return_value=[
+                SimpleNamespace(bookSourceUrl=_PO5, bookSourceName="源A")]),
+            load_source=AsyncMock(return_value=SimpleNamespace(bookSourceUrl=_PO5)))
+        check = SimpleNamespace(run_snapshot=AsyncMock(
+            return_value=snapshot if snapshot is not None else {"results": []}))
+        hub = _FakeHub({RuleRepairService: repair, SourceService: source,
+                        SourceCheckService: check})
+        view = RuleRepairView()
+        controller = RuleRepairController(hub)
+        # on_attach 自己就发一次拉书源的编排，所以 ui_call 必须**在 attach 之前**换掉
+        # （同 test_source_rule_editor 的 _run_now 约定）。
+        posted: list = []
+        controller.ui_call = lambda coro: _DeferredFuture(coro, posted)
+        controller.attach(view)
+        self.addCleanup(controller.detach)
+        return controller, view, repair, source, posted
+
+    async def _drain(self, posted):
+        """排干待跑编排：拉书源那趟会再排一次"摊章节"，所以要循环到没有为止。"""
+        while posted:
+            await posted.pop(0).run()
+
+    def test_view_offers_two_pickers_and_a_start_button(self):
+        view = RuleRepairView()
+        self.assertIsInstance(view._source_dd, ft.Dropdown)
+        self.assertIsInstance(view._chapter_dd, ft.Dropdown)
+        self.assertFalse(view._manual.visible,
+                         "粘贴框是零样本时的出口，不该一进来就占地方")
+        self.assertEqual(set(view.get_selection()),
+                         {"source_url", "chapter_key", "manual_url"})
+
+    async def test_attach_wires_every_new_slot(self):
+        """"按钮存在但没人接"正是这一页原来的病：四个新槽一个都不许留空。"""
+        controller, view, repair, source, posted = self._make()
+        for slot in ("on_start_diagnosis", "on_source_picked",
+                     "on_chapter_picked", "on_reload_sources"):
+            self.assertIsNotNone(getattr(view, slot), f"{slot} 没接：控件成了死键")
+        await self._drain(posted)
+
+    async def test_payload_from_the_list_page_lands_and_loads_chapters(self):
+        controller, view, repair, source, posted = self._make()
+        await self._drain(posted)
+        repair.chapter_candidates.reset_mock()
+        controller.load_record({"source_url": "https://other/",
+                                "source_name": "别源", "origin": "sources.list"})
+        await self._drain(posted)
+        self.assertEqual(view._source_dd.value, "https://other/",
+                         "列表页带来的源没进下拉，用户还得自己找一遍")
+        repair.chapter_candidates.assert_awaited_once_with("https://other/")
+        self.assertEqual([o.key for o in view._chapter_dd.options],
+                         ["0:0", "0:1", "0:2"])
+        self.assertIn("真抓 1-3 页", view._hint.value)
+        self.assertFalse(view._manual.visible,
+                         "有得挑了粘贴框还挂着，两个入口会互相抢")
+
+    async def test_picking_the_source_by_hand_reloads_chapters(self):
+        """用户自己点下拉那一条路：视图读的是 ``e.control.value``。
+
+        上面那条走的是列表页带进来的 payload（程序改 value，不触发 on_select），
+        所以这一条必须发**真事件**——探针抓出六个死下拉时，缺的正是这一条。
+        """
+        controller, view, repair, source, posted = self._make()
+        await self._drain(posted)
+        repair.chapter_candidates.reset_mock()
+        _select(view._source_dd, _PO5)
+        await self._drain(posted)
+        repair.chapter_candidates.assert_awaited_once_with(_PO5)
+        self.assertEqual([o.key for o in view._chapter_dd.options],
+                         ["0:0", "0:1", "0:2"],
+                         "手点的源没换成它的章节，端上来的还是上一源的样本")
+
+    async def test_start_diagnosis_passes_chapter_followers_and_book(self):
+        controller, view, repair, source, posted = self._make()
+        await self._drain(posted)
+        _select(view._chapter_dd, "0:1")
+        self.assertIn("复核还会带上：第3章", view._hint.value)
+        view._start_btn.on_click(None)
+        self.assertEqual(len(posted), 1, "点了开始诊断却没把任务排出去")
+        self.assertTrue(view._start_btn.disabled, "在途没被按死：连点两下就是两趟诊断")
+        self.assertTrue(view._spinner.visible)
+        self.assertFalse(view._card.visible)
+        await self._drain(posted)
+        repair.repair.assert_awaited_once()
+        args, kwargs = repair.repair.await_args
+        self.assertEqual(args[0].bookSourceUrl, _PO5)
+        self.assertEqual(args[1].url, "https://b/1/2.html")
+        self.assertEqual([c.url for c in kwargs["extra_chapters"]],
+                         ["https://b/1/3.html"], "复核样本没带上紧跟的那一章")
+        self.assertEqual(kwargs["book"].url, "https://b/1")
+        self.assertFalse(view._start_btn.disabled, "跑完了按钮还按着，这一页就废了")
+        self.assertFalse(view._spinner.visible)
+
+    async def test_second_click_while_running_dispatches_nothing(self):
+        controller, view, repair, source, posted = self._make()
+        await self._drain(posted)
+        view._chapter_dd.value = "0:0"
+        view._start_btn.on_click(None)
+        view._start_btn.on_click(None)
+        self.assertEqual(len(posted), 1,
+                         "在途又点一次：同一源派了两趟诊断，两趟报告互相盖")
+        await self._drain(posted)
+
+    async def test_local_pseudo_source_is_refused_before_any_dispatch(self):
+        """本地书在书架里**有**缓存目录，候选面却绝不能把它当正常源端出来。"""
+        from app.services.content.local_book_service import LOCAL_BOOK_SOURCE_URL
+        controller, view, repair, source, posted = self._make()
+        await self._drain(posted)
+        repair.chapter_candidates.reset_mock()
+        controller.load_record({"source_url": LOCAL_BOOK_SOURCE_URL,
+                                "source_name": "本地书籍"})
+        await self._drain(posted)
+        self.assertIn("本地", view._status.value)
+        repair.chapter_candidates.assert_not_awaited()
+        self.assertEqual(view._chapter_dd.options, [],
+                         "本地书的缓存目录被端上了候选面")
+        view._manual.value = "file:///tmp/x.txt"
+        view._start_btn.on_click(None)
+        self.assertEqual(posted, [], "本地源还是派了诊断——那一趟只会去抓 file://")
+
+    async def test_new_diagnosis_collapses_the_stale_report_card(self):
+        """旧报告的卡必须先收起来：让它挂着等于叫用户确认一条不相干的规则。"""
+        report = RepairReport(RuleFix(
+            source_name="源A", source_url=_PO5, field="content",
+            old_value="#nr1@html", new_value="#nr1@html||.txt@text",
+            samples=(), page_url=_PO5, note=""))
+        controller, view, repair, source, posted = self._make(report=report)
+        await self._drain(posted)
+        await controller._on_report_ready(RepairReportReadyEvent(
+            report_id="r1", source_id=_PO5))
+        self.assertTrue(view._card.visible)
+        view._chapter_dd.value = "0:0"
+        view._start_btn.on_click(None)
+        self.assertFalse(view._card.visible)
+        await self._drain(posted)
+
+    async def test_zero_candidates_opens_the_manual_box_not_a_dead_button(self):
+        controller, view, repair, source, posted = self._make(groups=[])
+        await self._drain(posted)
+        self.assertTrue(view._manual.visible,
+                        "本地一章都没缓存过，粘贴框却没亮——用户只剩下一个"
+                        "点了只会说『挑一章』的按钮")
+        view._start_btn.on_click(None)
+        self.assertEqual(posted, [], "没有样本章却照样派活")
+        self.assertIn("挑一章", view._status.value)
+
+        view._manual.value = "b/9.html"
+        view._start_btn.on_click(None)
+        self.assertEqual(posted, [], "相对地址派出去只会白抓一次")
+        self.assertIn("http(s)://", view._status.value)
+
+        view._manual.value = f"{_PO5}/9.html"
+        view._start_btn.on_click(None)
+        self.assertEqual(len(posted), 1, "手填了地址就该能起诊断")
+        await self._drain(posted)
+        self.assertEqual(repair.repair.await_args.args[1].url, f"{_PO5}/9.html")
+        self.assertEqual(repair.repair.await_args.kwargs["extra_chapters"], [])
+
+    async def test_check_samples_fill_a_source_never_read(self):
+        """没读过、只检过的源：上一轮检测抽到的三章是唯一免联网的样本来源。"""
+        controller, view, repair, source, posted = self._make(
+            groups=[], snapshot={"results": [
+                {"source_id": "https://别的/", "sample_chapter_urls": ["x"]},
+                {"source_id": _PO5,
+                 "sample_chapter_urls": [f"{_PO5}/7.html", f"{_PO5}/8.html"]}]})
+        await self._drain(posted)
+        self.assertEqual([o.key for o in view._chapter_dd.options], ["0:0", "0:1"],
+                         "唯一那一源已被选中，章节却没跟着摊开")
+        self.assertEqual(controller._candidate_groups[0]["book_name"],
+                         "上次检测抽到的章节", "摊错了来源：那是检测样本，不是书架目录")
+        self.assertFalse(view._manual.visible)
+        view._chapter_dd.value = "0:1"
+        view._start_btn.on_click(None)
+        await self._drain(posted)
+        self.assertEqual(repair.repair.await_args.args[1].url, f"{_PO5}/8.html")
+        self.assertEqual(repair.repair.await_args.kwargs["extra_chapters"], [],
+                         "检测样本是拼出来的三章，彼此没有同书后续章可复核")
+
+    async def test_check_snapshot_is_matched_by_source_not_taken_at_random(self):
+        """快照里排第一的可能是别的源：不看 source_id 就端上别源的章节。"""
+        controller, view, repair, source, posted = self._make(
+            groups=[], snapshot={"results": [
+                {"source_id": _PO5, "sample_chapter_urls": [f"{_PO5}/7.html"]},
+                {"source_id": "https://别的/",
+                 "sample_chapter_urls": ["https://别的/9.html"]}]})
+        await self._drain(posted)
+        self.assertEqual([c["url"] for c in controller._candidate_groups[0]["chapters"]],
+                         [f"{_PO5}/7.html"], "端上来的章节地址来自另一个源")
+        self.assertFalse(view._manual.visible)
+
+    async def test_report_from_another_source_does_not_steal_this_page(self):
+        controller, view, repair, source, posted = self._make()
+        await self._drain(posted)
+        view._chapter_dd.value = "0:0"
+        view._start_btn.on_click(None)
+        before = view._status.value
+        await controller._on_report_ready(RepairReportReadyEvent(
+            report_id="rx", source_id="https://别的源/"))
+        self.assertEqual(view._status.value, before)
+        self.assertFalse(view._card.visible)
+        await self._drain(posted)
+        await controller._on_report_ready(RepairReportReadyEvent(
+            report_id="r1", source_id=_PO5))
+        self.assertFalse(view._spinner.visible)
+
+    async def test_inflight_candidate_load_after_detach_touches_no_widgets(self):
+        controller, view, repair, source, posted = self._make()
+        await self._drain(posted)
+        before = [o.key for o in view._chapter_dd.options]
+        view._hint.value = "哨兵"
+        controller.load_chapter_options(_PO5)
+        controller.detach()          # 摊候选还没跑完人就切了页
+        await self._drain(posted)
+        self.assertEqual(view._hint.value, "哨兵")
+        self.assertEqual([o.key for o in view._chapter_dd.options], before)
+
+    async def test_diagnose_failure_leaves_the_page_startable_again(self):
+        """诊断炸了不许把按钮永久按死：在途形状必须收掉，闸门的账也要抹平。"""
+        controller, view, repair, source, posted = self._make()
+        await self._drain(posted)
+        source.load_source = AsyncMock(return_value=None)
+        view._chapter_dd.value = "0:0"
+        view._start_btn.on_click(None)
+        with self.assertRaises(RuntimeError):
+            await self._drain(posted)   # 源取不到 = 协程抛错，走的是 _after_repair 那面
+        self.assertIn("没有书源", view._status.value)
+        self.assertFalse(view._start_btn.disabled)
+        self.assertFalse(view._spinner.visible)
+        posted.clear()
+        view._start_btn.on_click(None)
+        self.assertEqual(len(posted), 1, "失败一次之后这一页再也起不动诊断")
+        posted.pop(0)._coro.close()   # 这一趟不再跑：丢给 GC 只会喊 never awaited
+
+
+class RepairNavigationTests(unittest.TestCase):
+    """列表页那颗「自愈」：跳过去要带着勾上的那一源，别让自愈页再问一遍。"""
+
+    def _make(self):
+        view = BookSourceListView()
+        controller = BookSourceListController(_FakeHub({}))
+        # 这一页本轮只测导航，不测它的加载编排：协程就地关掉，别留 never-awaited
+        controller.ui_call = lambda coro: (coro.close(), _Settled())[1]
+        jumped: list = []
+        controller.attach(view)
+        controller.on_open_repair = lambda *payload: jumped.append(payload)
+        return controller, view, jumped
+
+    def test_unselected_jump_carries_no_payload(self):
+        """没勾选就只跳页：塞一个空 source_url 过去，自愈页会把它当选中源显示。"""
+        controller, view, jumped = self._make()
+        view._repair_btn.on_click(None)
+        self.assertEqual(jumped, [()])
+
+    def test_selection_travels_as_a_two_key_payload(self):
+        controller, view, jumped = self._make()
+        view._repair_btn.on_click(None)
+        controller._on_selection_changed("https://b/", True)
+        controller._on_selection_changed("https://a/", True)
+        view._repair_btn.on_click(None)
+        self.assertEqual(jumped[-1], ({"source_url": "https://a/",
+                                       "source_name": "https://a/"},),
+                         "载荷里混进了章节或检测结果：自愈页只能靠猜键名取值")
+        self.assertIn("一次只诊断一个源", view._status.value,
+                      "多选只带走一条却没说带走的是哪条")
 
 
 if __name__ == "__main__":
