@@ -13,7 +13,12 @@ Controller 写回书源（红线 §3.2：不自动改源）。
   依赖诊断的数据结构。
 - 两条下拉外面各套一只 ``ft.Semantics``：合着的 Dropdown 在语义树里没有文字，
   读屏念不出选中了哪个源/哪一章（Dropdown 本身在 flet 0.86 没有 aria_label 字段），
-  标签由 ``_sync_labels`` 跟着选中值走。
+  标签由 ``_sync_labels`` 跟着选中值走。手填正文页地址那只 ``TextField`` 同理，
+  而且更糟——裸框在树里是一只 role/aria-label/textContent 全空的节点，敲进去的
+  地址也一个字不进树，所以标签里连"填了什么"一起念（第七十一轮浏览器探针）。
+- 报告卡里的文字一律普通 ``Text`` + 外层 ``ft.SelectionArea``：``selectable=True``
+  的文本在语义树里是空节点（套 Semantics 也救不回），而原/新规则那两串恰恰是
+  确认写回前必须读到的内容。
 
 红线（§7.5）：本文件零 app.services.* import；报告以 dict 快照注入。
 报告 dict 结构：report_id / source_id / source_name / field / old_value /
@@ -70,9 +75,18 @@ class RuleRepairView(ft.Column):
             "开始诊断", icon=ft.Icons.SEARCH,
             on_click=lambda e: self._fire(self.on_start_diagnosis))
         #: 零样本出口：本地既没读过也没检过的源，只有用户手上的一个正文页地址。
+        # 读屏面同下拉：裸 TextField 在语义树里是一只**三色全空**的节点
+        # （第七十一轮浏览器探针：role/aria-label/textContent 皆空，敲进去
+        # 一整串地址之后仍然一个字都不在树里），TextField 的 label 与 value
+        # 都不进语义树，所以这只框得由外层 Semantics 连"要填什么"和"填了什么"
+        # 一起念。套 Semantics 不伤输入（同一支探针实测：键盘敲 8 拍 on_change
+        # 全收到，值正确落进 value）。
         self._manual = ft.TextField(
             label="正文页地址（本地没有可读目录时手填一章）",
-            width=520, dense=True, text_size=12, visible=False)
+            width=520, dense=True, text_size=12, visible=False,
+            on_change=lambda e: self._sync_labels())
+        self._manual_sem = ft.Semantics(label="正文页地址：还没填",
+                                        content=self._manual)
         self._hint = ft.Text("", size=12, color=ft.Colors.GREY_600)
         self._spinner = ft.ProgressRing(width=16, height=16, visible=False)
 
@@ -84,7 +98,7 @@ class RuleRepairView(ft.Column):
             self._title,
             ft.Row([self._source_sem, self._chapter_sem, self._reload_btn,
                     self._start_btn, self._spinner], spacing=8, wrap=True),
-            self._manual,
+            self._manual_sem,
             self._hint,
             self._status,
             ft.Container(expand=True, content=self._card),
@@ -109,6 +123,9 @@ class RuleRepairView(ft.Column):
         """读屏标签 = "名字：当前选中项的文字"，没选中就说没选中。"""
         self._source_sem.label = self._selection_label("书源", self._source_dd)
         self._chapter_sem.label = self._selection_label("正文章节", self._chapter_dd)
+        # 手填框的内容进不了语义树（见构造处），所以标签里得把用户填的那串念出来。
+        manual = str(self._manual.value or "").strip()
+        self._manual_sem.label = f"正文页地址：{manual or '还没填'}"
 
     @staticmethod
     def _selection_label(base: str, dropdown) -> str:
@@ -140,13 +157,13 @@ class RuleRepairView(ft.Column):
             self._card.content = ft.Card(
                 content=ft.Container(
                     padding=16,
-                    content=ft.Column([
+                    content=ft.SelectionArea(content=ft.Column([
                         ft.Text(f"书源：{source_name}", weight=ft.FontWeight.W_500),
                         ft.Text(report.get("reason") or "没有找到可写回的规则。",
-                                size=13, selectable=True),
+                                size=13),
                         ft.Text("书源未做任何改动。", size=12,
                                 color=ft.Colors.GREY_600),
-                    ], tight=True, spacing=8)))
+                    ], tight=True, spacing=8))))
             self._card.visible = True
             self.set_status("这次自愈没有给出可确认的提议（书源未改动）")
             return
@@ -160,11 +177,15 @@ class RuleRepairView(ft.Column):
         ]
         if report.get("note"):
             rows.append(ft.Text(report["note"], size=12, color=ft.Colors.GREY_600))
+        # 原/新规则**不用 selectable=True**：第七十一轮矩阵探针实测，可复制文本在
+        # 语义树里是一只空节点（中英都一样），外层套 Semantics 也救不回来——
+        # 而这两串正是用户点"应用并重试"之前必须读到的东西。复制面改由外层
+        # SelectionArea 提供（探针同一支量到：包进去的普通 Text 照样在树里）。
         rows += [
             ft.Text("原规则", size=12, weight=ft.FontWeight.BOLD),
-            ft.Text(report.get("old_value", ""), size=12, selectable=True),
+            ft.Text(report.get("old_value", ""), size=12),
             ft.Text("新规则", size=12, weight=ft.FontWeight.BOLD),
-            ft.Text(report.get("new_value", ""), size=12, selectable=True,
+            ft.Text(report.get("new_value", ""), size=12,
                      color=ft.Colors.BLUE_700),
         ]
         preview = (samples[0].get("snippet", "") if samples
@@ -178,7 +199,8 @@ class RuleRepairView(ft.Column):
             content=ft.Container(
                 padding=16,
                 content=ft.Column([
-                    *rows,
+                    ft.SelectionArea(content=ft.Column(rows, tight=True,
+                                                       spacing=8)),
                     ft.Row([
                         ft.TextButton("忽略", on_click=lambda e: self._fire(
                             self.on_dismiss, report_slot)),
@@ -241,8 +263,13 @@ class RuleRepairView(ft.Column):
         self._hint.value = text or ""
 
     def set_manual_visible(self, flag: bool) -> None:
-        """零样本时把"手填一个正文页地址"的出口亮出来。"""
+        """零样本时把"手填一个正文页地址"的出口亮出来。
+
+        外壳一起收：只藏里面的 TextField，读屏仍然会念到"正文页地址：…"
+        这一条不存在的路（Semantics 标签自己就是一个节点）。
+        """
         self._manual.visible = bool(flag)
+        self._manual_sem.visible = bool(flag)
 
     def get_selection(self) -> dict:
         """当前选中的源、章节 key 与手填地址（只回字符串）。"""

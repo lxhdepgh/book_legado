@@ -524,6 +524,19 @@ aiohttp `ClientSession`，即 `check_service` 的 probe/search 那条路），�
    要接着查就从 `run()` 里那条 `for (i in $.domains)` 循环 + 请求全失败这条路径起手
    （现场能不能读到这本书的正文没验过，别当已知）。它与待修清单 7 是同一件事的两头：
    未知形状只有"求值在子里"这条路能兜，而这条就是它的一条现成理由。
+10. **全库还有 22 处 `selectable=True` 的文字，读屏一个都念不出（第七十一轮量到的形状）**：
+   `grep -rn "selectable=True" app | grep -v rule_repair_view | wc -l` = **22**，分布在
+   **13** 个视图文件——服务仪表盘（日志行、service_id、错误列）、WebDAV / 更新 / 导出
+   三处日志、Web 桥 URL 与日志、字典弹窗释义、二维码结果、代码编辑器高亮与错误、
+   导入预览、阅读器简介、RSS 正文与链接、找书结果简介、登录地址。
+   浏览器语义树实测（`docs/dev-logs/2026-10-03.md` 第七十一轮 §3）：
+   `Text(selectable=True)` 在语义树里是 **role/aria-label/textContent 三样全空**的节点，
+   中文英文一样；外面套 `ft.Semantics(label=…)` **救不回来**（连标签自己都不进树）。
+   自愈页那三处已按实测改法收掉（去掉 `selectable`，整段包 `ft.SelectionArea`——
+   `SelectionArea` 包普通 `Text` 实测**字照样在树里**）；其余 22 处同方子，
+   但每改一处都得**当场重跑语义树探针**：这些文字里有的是日志（要看的就是那串英文堆栈），
+   有的眼下正靠 selectable 复制出去（改法要保住复制面，而**复制面这一路
+   探针量不到**，见下面探针坑那条，只能人工点一次）。
 
 ## 探针/工具坑（三条同属"探针自己没测到"被当成"被测对象没问题"）
 
@@ -542,6 +555,18 @@ aiohttp `ClientSession`，即 `check_service` 的 probe/search 那条路），�
   → 调用静默失败。改用 psutil。
 - `ft.run` 永不返回，探针收尾要 `os._exit(0)`；`| head -N` 会吃掉不退出程序的全部输出，
   改成重定向到文件再读。
+- **探针往控件上挂 handler 会顶掉被测的那只**（第七十一轮）：界面探针 `main()` 里写
+  `view._manual.on_change = 记数用的 handler`，视图自己那只"同步读屏标签"的 handler
+  就没了——第一遍"改后"读数因此仍是 `正文页地址：还没填`，看着像改动没生效。
+  挂之前必须把原 handler 接进链里（记完读数再 `prev(e)`）。
+- **Flutter canvas 上的拖选/双击在 Playwright 里量不到**（第七十一轮）：剪贴板管子自证
+  是通的（写 `SENTINEL-71` 读回一致），但三格（含线上就在用的 `selectable=True` 那一格）
+  拖选 + Ctrl+C 与双击选词全拿不到字，`SelectionArea.on_change` 0 拍。基线也失败 =
+  手势没打进去，**不许把三条空读写成"三种写法都不能复制"**（同
+  `zero-counts-need-a-positive-control`）。这一面要验只能人工点一次。
+- **Semantics 的标签不是万能的**（第七十一轮矩阵）：包 `Dropdown` ✅、包 `TextField` ✅
+  （且不打断输入）、包 `Text(selectable=True)` ❌ 标签一起消失。所以"补读屏面"的
+  每一步都得在浏览器里重读一次，静态断言 `.label` 字符串只证明 Python 对象改了。
 
 ### 第六十九轮新增的两条（同一家族：读数全绿，但仪器压根没接上）
 

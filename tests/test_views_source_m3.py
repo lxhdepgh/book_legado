@@ -33,7 +33,8 @@ from app.core.events import (ImportFinishedEvent, ImportProgressEvent,
 from app.core.registry import SOURCE_DESTINATIONS, ViewRegistry
 from app.services.rule_repair import RepairReport, RepairSample, RuleFix
 from app.services.sources.online_import_service import OnlineImportService
-from app.services.sources.rule_repair_service import RuleRepairService
+from app.services.sources.rule_repair_service import (CandidateFace,
+                                                      RuleRepairService)
 from app.services.sources.source_check_service import SourceCheckService
 from app.services.sources.source_service import SourceService
 
@@ -501,6 +502,68 @@ class RepairViewRenderTests(unittest.TestCase):
                                  current="0:1")
         self.assertEqual(view._chapter_sem.label, "正文章节：第2章 转折")
 
+    def test_the_manual_box_reads_back_what_was_typed(self):
+        """手填地址那只框：读屏既要念得出「要填什么」，也要念得出「填了什么」。
+
+        第七十一轮探针量到的形状是裸 ``TextField`` 在语义树里 role/aria-label/
+        textContent **三样全空**（连 label 文案都不进树），敲进去一整串地址之后
+        树里仍然一个字没有；而 ``Semantics`` 的标签确实落进了树
+        （group 节点带 ``aria-label``），并且套上之后键盘仍然打得进（8 拍
+        ``on_change`` 全收到）。所以钉三条：标签包着这只框、打字那拍标签跟上、
+        没填时明说没填。
+        """
+        view = RuleRepairView()
+        self.assertIs(view._manual_sem.content, view._manual)
+        self.assertIn(view._manual_sem, view.controls,
+                      "挂上标签的是外壳，列里却是裸框——等于没套")
+
+        view.set_manual_visible(True)
+        _type(view._manual, f"{_PO5}/12345.html")
+        self.assertIn("12345.html", view._manual_sem.label)
+
+        _type(view._manual, "")
+        self.assertEqual(view._manual_sem.label, "正文页地址：还没填")
+
+    def test_hiding_the_manual_box_hides_the_reader_label_too(self):
+        """藏框要连标签一起藏：只藏里面的话，读屏会念出一条根本不存在的出口。"""
+        view = RuleRepairView()
+        view.set_manual_visible(True)
+        self.assertTrue(view._manual_sem.visible)
+        view.set_manual_visible(False)
+        self.assertFalse(view._manual.visible)
+        self.assertFalse(view._manual_sem.visible, "外壳没跟着收，树里还挂着这只框")
+
+    def test_the_proposed_rule_is_readable_not_only_copyable(self):
+        """报告卡里的规则串不许再用 ``selectable=True``：可复制文本在语义树里是空节点。
+
+        第七十一轮矩阵探针：普通 Text ✅ 在树里；``selectable=True`` 的 Text（中英
+        都一样）❌ 空节点；外面套 ``Semantics`` ❌ 连标签一起消失；外层
+        ``SelectionArea`` 包普通 Text ✅ 照样在树里。这两串是用户点「应用并重试」
+        之前唯一能读到「要写回什么」的地方，看不见就等于这一页不能独自完成。
+        """
+        view = RuleRepairView()
+        view.render_report({
+            "report_id": "r", "source_name": "源A", "has_fix": True,
+            "old_value": ".con@html", "new_value": ".con@html||.content@text",
+            "samples": [{"chapter": "第2章", "chars": 1834, "snippet": "下雨了"}]})
+        for value in (".con@html", ".con@html||.content@text"):
+            node = _find_text(view._card, value)
+            self.assertIsNotNone(node, f"{value!r} 不在卡里")
+            self.assertFalse(node.selectable,
+                             f"{value!r} 是可复制文本，语义树里读不到")
+            path = _path_to_text(view._card, value)
+            self.assertTrue(any(isinstance(c, ft.SelectionArea) for c in path),
+                            f"{value!r} 没了 selectable 也就没了复制面")
+
+    def test_the_no_fix_reason_is_readable_too(self):
+        """没找到可写回规则那一面：原因那句原先也是 selectable 的。"""
+        view = RuleRepairView()
+        view.render_report({"source_name": "源A", "has_fix": False,
+                            "reason": "这一页被拦截了，取不到正文。"})
+        node = _find_text(view._card, "这一页被拦截了")
+        self.assertIsNotNone(node)
+        self.assertFalse(node.selectable, "原因念不出来，用户只知道「没改成」")
+
     def test_merged_source_option_updates_the_label(self):
         """列表页带源进来那条路是 ``add_source_option``（程序改 value，不走 on_select）。"""
         view = RuleRepairView()
@@ -740,15 +803,58 @@ def _select(dropdown, value):
     dropdown.on_select(ft.Event(name="select", control=dropdown))
 
 
+def _type(field, value):
+    """模拟用户在手填框里敲字：Flet 先改 ``control.value``，再发一条 ``Event``。
+
+    和 ``_select`` 同一条红线：程序改 value 不会触发 ``on_change``，读屏标签
+    跟不跟得上只有走真事件才测得到。
+    """
+    field.value = value
+    field.on_change(ft.Event(name="change", control=field))
+
+
+def _children(control) -> list:
+    out = list(getattr(control, "controls", None) or [])
+    inner = getattr(control, "content", None)
+    if isinstance(inner, ft.Control):
+        out.append(inner)
+    return out
+
+
+def _path_to_text(control, needle, depth=0) -> list:
+    """从 control 到那串文字所在节点的路径（找不到回空表）。
+
+    要的是**路径**不是节点：钉"这串在 SelectionArea 底下"得看得到它的祖先。
+    """
+    if depth > 12:
+        return []
+    for child in _children(control):
+        if isinstance(child, ft.Text) and needle in str(child.value or ""):
+            return [control, child]
+        deeper = _path_to_text(child, needle, depth + 1)
+        if deeper:
+            return [control] + deeper
+    return []
+
+
+def _find_text(control, needle) -> ft.Text | None:
+    path = _path_to_text(control, needle)
+    return path[-1] if path else None
+
+
 class RepairPickerFlowTests(unittest.IsolatedAsyncioTestCase):
     """自愈页必须自己起得来诊断：从列表页跳进来不再是"等待自愈报告…"的空白页。"""
 
-    def _make(self, *, groups=None, snapshot=None, report=None):
+    def _make(self, *, groups=None, census=None, snapshot=None, report=None):
+        rows = _REPAIR_GROUPS if groups is None else groups
+        face = census if census is not None else CandidateFace(
+            groups=list(rows), shelf_books=len(rows), cached_books=len(rows),
+            shown_books=len(rows),
+            rows=sum(len(group["chapters"]) for group in rows))
         repair = SimpleNamespace(
             get_report=lambda rid: report,
             apply_fix=AsyncMock(return_value=True),
-            chapter_candidates=AsyncMock(
-                return_value=_REPAIR_GROUPS if groups is None else groups),
+            chapter_candidates=AsyncMock(return_value=face),
             repair=AsyncMock(return_value=report))
         source = SimpleNamespace(
             list_sources=AsyncMock(return_value=[
@@ -805,6 +911,29 @@ class RepairPickerFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("真抓 1-3 页", view._hint.value)
         self.assertFalse(view._manual.visible,
                          "有得挑了粘贴框还挂着，两个入口会互相抢")
+
+    async def test_the_hint_names_the_books_that_got_left_out(self):
+        """摊不到的那几本要在界面上说出来：被预算切掉的东西不能是静默消失的。
+
+        普查数字当场写死（在架 12 / 存过目录 9 / 摊了 1），不从服务模块读常量——
+        读常量的写法在常量被改掉时会跟着改口（第七十轮变异核验抓到的那一族）。
+        """
+        census = CandidateFace(groups=list(_REPAIR_GROUPS), shelf_books=12,
+                               cached_books=9, shown_books=1, rows=3)
+        controller, view, repair, source, posted = self._make(census=census)
+        await self._drain(posted)
+        hint = view._hint.value
+        self.assertIn("在架 12 本", hint, "提示行没报这个源一共有几本书")
+        self.assertIn("读过 9 本", hint)
+        self.assertIn("还有 8 本没摊到", hint,
+                      "9 本只摊了 1 本，界面上却一句没提——那就是静默丢书")
+
+    async def test_a_fully_covered_shelf_does_not_apologise(self):
+        """反面：全都摊到了就不许再念"没摊到"，否则提示行永远在报一个不存在的洞。"""
+        controller, view, repair, source, posted = self._make()
+        await self._drain(posted)
+        self.assertIn("真抓 1-3 页", view._hint.value)
+        self.assertNotIn("没摊到", view._hint.value)
 
     async def test_picking_the_source_by_hand_reloads_chapters(self):
         """用户自己点下拉那一条路：视图读的是 ``e.control.value``。
