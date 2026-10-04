@@ -772,6 +772,23 @@ def _shelf(source_url: str, book_url: str, name: str = "《测试书》") -> dic
     return {"source_url": source_url, "url": book_url, "name": name}
 
 
+class _Clock:
+    """假钟：每问一次走 ``step_ms`` 毫秒（候选面的时间预算只能这样钉）。
+
+    用真 ``time.perf_counter`` 的话，这条用例红不红取决于机器当时多忙——
+    那测的是调度器，不是预算。
+    """
+
+    def __init__(self, step_ms: float):
+        self._now = 0.0
+        self._step = step_ms / 1000.0
+
+    def __call__(self) -> float:
+        value = self._now
+        self._now += self._step
+        return value
+
+
 class ChapterCandidateTests(unittest.IsolatedAsyncioTestCase):
     """候选面只能读磁盘上已有的目录：一多出网就成了"点开列表页就抓站"。"""
 
@@ -805,7 +822,7 @@ class ChapterCandidateTests(unittest.IsolatedAsyncioTestCase):
             _shelf("https://elsewhere/", "https://b/other-source"),
             _shelf(self.source_url, "https://b/vol"),
         ])
-        groups = await svc.chapter_candidates(self.source_url)
+        groups = (await svc.chapter_candidates(self.source_url)).groups
         self.assertEqual([g["book_url"] for g in groups],
                          ["https://b/1", "https://b/vol"], "串了源或整组丢了")
         first = groups[0]["chapters"]
@@ -823,17 +840,21 @@ class ChapterCandidateTests(unittest.IsolatedAsyncioTestCase):
         """
         self._catalog("https://b/1", 2, source_url=self.source_url)
         svc = self._svc([_shelf("https://elsewhere/", "https://b/1")])
-        self.assertEqual(await svc.chapter_candidates(self.source_url), [],
+        face = await svc.chapter_candidates(self.source_url)
+        self.assertEqual(face.groups, [],
                          "串了源：那是别源书架上的书，只是书地址相同")
+        self.assertEqual((face.shelf_books, face.cached_books), (0, 0),
+                         "普查把别源的书数进了这个源的账")
 
     async def test_no_cache_and_no_service_degrade_to_empty(self):
         """没读过 / 没装配 = 空表，不是异常：界面上由粘贴框接手。"""
         self._svc([])
         empty = self._svc([_shelf(self.source_url, "https://b/missing")])
-        self.assertEqual(await empty.chapter_candidates(self.source_url), [])
-        self.assertEqual(await RuleRepairService().chapter_candidates(
-            self.source_url), [], "没 SourceService 也不该炸")
-        self.assertEqual(await self._svc([]).chapter_candidates(""), [])
+        self.assertEqual((await empty.chapter_candidates(self.source_url)).groups,
+                         [])
+        self.assertEqual((await RuleRepairService().chapter_candidates(
+            self.source_url)).groups, [], "没 SourceService 也不该炸")
+        self.assertEqual((await self._svc([]).chapter_candidates("")).groups, [])
 
     async def test_local_pseudo_source_is_refused(self):
         """本地书有缓存目录却没有规则源：端出来只会起一趟抓 file:// 的空诊断。"""
@@ -841,7 +862,8 @@ class ChapterCandidateTests(unittest.IsolatedAsyncioTestCase):
         self._catalog("/tmp/某本书.txt", 2, source_url=LOCAL_BOOK_SOURCE_URL)
         svc = self._svc([_shelf(LOCAL_BOOK_SOURCE_URL, "/tmp/某本书.txt")])
         calls = svc._source_service
-        self.assertEqual(await svc.chapter_candidates(LOCAL_BOOK_SOURCE_URL), [])
+        self.assertEqual((await svc.chapter_candidates(
+            LOCAL_BOOK_SOURCE_URL)).groups, [])
         self.assertEqual(calls.calls, 0, "连书架都不该去读")
 
     async def test_big_catalog_is_sampled_not_dumped(self):
@@ -849,7 +871,7 @@ class ChapterCandidateTests(unittest.IsolatedAsyncioTestCase):
         self._catalog("https://b/big", 5000)
         svc = self._svc([_shelf(self.source_url, "https://b/big")])
         chapters = (await svc.chapter_candidates(
-            self.source_url, per_book=100))[0]["chapters"]
+            self.source_url, per_book=100)).groups[0]["chapters"]
         self.assertLessEqual(len(chapters), 100)
         indexes = [int(url.rsplit("/", 1)[1].split(".")[0])
                    for url in (c["url"] for c in chapters)]
@@ -857,16 +879,18 @@ class ChapterCandidateTests(unittest.IsolatedAsyncioTestCase):
         # 抽样不许退化成"取前 100 章"：正文规则坏了的常常正是后面新出的章。
         self.assertGreater(indexes[-1], 5000 // 2, f"抽到的最深只到第 {indexes[-1]} 章")
 
-    async def test_more_than_max_books_and_duplicate_records(self):
+    async def test_duplicate_shelf_records_are_merged(self):
+        """同一本书两条书架记录（Legado 的 url/bookUrl 别名）：候选面只摊一份。"""
         for i in range(1, 5):
             self._catalog(f"https://b/{i}", 2)
         svc = self._svc([_shelf(self.source_url, f"https://b/{i}")
                          for i in range(1, 5)]
                         + [_shelf(self.source_url, "https://b/2")])
-        groups = await svc.chapter_candidates(self.source_url, max_books=3)
-        self.assertEqual([g["book_url"] for g in groups],
-                         ["https://b/1", "https://b/2", "https://b/3"],
-                         "封顶没生效，或重复的书架记录被摊了两份")
+        face = await svc.chapter_candidates(self.source_url)
+        self.assertEqual([g["book_url"] for g in face.groups],
+                         [f"https://b/{i}" for i in range(1, 5)],
+                         "重复的书架记录被摊了两份")
+        self.assertEqual(face.shelf_books, 4, "普查把重复记录数成了两本书")
 
     async def test_five_books_each_get_a_face(self):
         """第 4、5 本不许静默消失。
@@ -880,7 +904,7 @@ class ChapterCandidateTests(unittest.IsolatedAsyncioTestCase):
             self._catalog(f"https://b/{i}", 80)
         svc = self._svc([_shelf(self.source_url, f"https://b/{i}")
                          for i in range(1, 6)])
-        groups = await svc.chapter_candidates(self.source_url)
+        groups = (await svc.chapter_candidates(self.source_url)).groups
         self.assertEqual([g["book_url"] for g in groups],
                          [f"https://b/{i}" for i in range(1, 6)],
                          "只摊了前几本：后面的书在下拉里没了")
@@ -895,11 +919,13 @@ class ChapterCandidateTests(unittest.IsolatedAsyncioTestCase):
             self._catalog(f"https://b/{i}", 80)
         svc = self._svc([_shelf(self.source_url, f"https://b/{i}")
                          for i in range(1, 9)])
-        groups = await svc.chapter_candidates(self.source_url, max_books=8,
-                                              per_book=100, max_rows=300)
+        face = await svc.chapter_candidates(self.source_url, per_book=100,
+                                            max_rows=300)
+        groups = face.groups
         self.assertEqual(len(groups), 8, "本数没摊全")
-        rows = sum(len(g["chapters"]) for g in groups)
-        self.assertLessEqual(rows, 300, f"摊出 {rows} 行，超了行预算")
+        self.assertLessEqual(face.rows, 300, f"摊出 {face.rows} 行，超了行预算")
+        self.assertEqual(face.rows, sum(len(g["chapters"]) for g in groups),
+                         "普查报的行数和真摊出来的不是一回事")
         self.assertTrue(all(g["chapters"] for g in groups),
                         "名额全花在第一本上了，后面的书还是没摊到")
         # 每本抽到的章不许退化成"取前 N 章"：坏的常常正是后面新出的章
@@ -911,18 +937,67 @@ class ChapterCandidateTests(unittest.IsolatedAsyncioTestCase):
                                f"抽到的最深只到第 {numbers[-1]} 章")
 
     async def test_uncached_books_do_not_eat_the_scan_slots(self):
-        """没缓存过的书不占名额：那一次翻目录是开文件失败（亚毫秒），不是成本。
+        """没缓存过的书不占预算：stat 普查（实测 0.014 ms/本）先把它们挡在翻目录之前。
 
-        前面排的要**比本数上限多**，否则"先切前 N 本"那种写法照样能翻到缓存那本，
-        变异就绿了（第七十轮 N9 抓到的正是这一条没钉住）。
+        前面排的要**比默认预算摊得动的本数多**，否则"先切前 N 本"那种写法照样能翻到
+        缓存那本，变异就绿了（第七十轮 N9 抓到的正是这一条没钉住）。
         """
         self._catalog("https://b/cached", 4)
         svc = self._svc([_shelf(self.source_url, f"https://b/miss{i}")
                          for i in range(10)]
                         + [_shelf(self.source_url, "https://b/cached")])
-        groups = await svc.chapter_candidates(self.source_url)
-        self.assertEqual([g["book_url"] for g in groups], ["https://b/cached"],
-                         "前面的空书把名额吃光了：这一源的样本明明就在后面那本")
+        face = await svc.chapter_candidates(self.source_url)
+        self.assertEqual([g["book_url"] for g in face.groups], ["https://b/cached"],
+                         "前面的空书把预算吃光了：这一源的样本明明就在后面那本")
+        self.assertEqual((face.shelf_books, face.cached_books, face.skipped_books),
+                         (11, 1, 0), "普查把没存过目录的书算成了欠账")
+
+    async def test_small_books_all_fit_under_a_time_budget(self):
+        """40 本 × 100 章一共十几毫秒：按**本数**钉上限会把它们一律砍到 8 本。
+
+        实测单本 100 章 0.43 ms、5000 章 25.7 ms（`.probe/out_catalog_concurrency.txt`），
+        差 60 倍，所以这一档预算只能按时间给。钟是注入的假钟（每问一次走 1 ms），
+        不然这条会在机器负载高时红——那测的是调度器，不是预算。
+        """
+        for i in range(40):
+            self._catalog(f"https://b/{i}", 100)
+        svc = self._svc([_shelf(self.source_url, f"https://b/{i}")
+                         for i in range(40)])
+        face = await svc.chapter_candidates(self.source_url, max_scan_ms=200,
+                                            clock=_Clock(1.0))
+        self.assertEqual(face.shown_books, 40, "小书被本数上限砍了")
+        self.assertEqual(face.skipped_books, 0)
+        self.assertLessEqual(face.rows, 300, "摊全了本数就不管行数了")
+
+    async def test_the_time_budget_stops_and_reports_who_is_left_out(self):
+        """预算到点就停，而且**停下来的人要报出来**：静默截断就是第七十轮的病。
+
+        假钟每问一次走 100 ms、预算 200 ms、五本都有目录 → 第 4 本开读前超时。
+        数字全写死，不从模块常量取。
+        """
+        for i in range(1, 6):
+            self._catalog(f"https://b/{i}", 20)
+        svc = self._svc([_shelf(self.source_url, f"https://b/{i}")
+                         for i in range(1, 6)])
+        face = await svc.chapter_candidates(self.source_url, max_scan_ms=200,
+                                            clock=_Clock(100.0))
+        self.assertEqual([g["book_url"] for g in face.groups],
+                         [f"https://b/{i}" for i in (1, 2, 3)],
+                         "预算没生效，或者停的位置不对")
+        self.assertEqual((face.shelf_books, face.cached_books, face.shown_books,
+                          face.skipped_books), (5, 5, 3, 2),
+                         "普查没承认'存过目录但没摊到'那一截")
+
+    async def test_the_first_book_is_never_dropped_by_a_zero_budget(self):
+        """预算给 0 也只停"第二本起"：一本都没摊出来的候选面等于把用户推回手填框。"""
+        self._catalog("https://b/1", 3)
+        self._catalog("https://b/2", 3)
+        svc = self._svc([_shelf(self.source_url, "https://b/1"),
+                         _shelf(self.source_url, "https://b/2")])
+        face = await svc.chapter_candidates(self.source_url, max_scan_ms=0,
+                                            clock=_Clock(100.0))
+        self.assertEqual([g["book_url"] for g in face.groups], ["https://b/1"])
+        self.assertEqual(face.skipped_books, 1)
 
 
 class CheckSnapshotCarriesSampleChapters(unittest.TestCase):

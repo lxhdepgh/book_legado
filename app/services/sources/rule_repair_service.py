@@ -24,7 +24,9 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import time
 import uuid
+from dataclasses import dataclass, field
 
 from app.core.events import RepairProgressEvent, RepairReportReadyEvent
 from app.core.lifecycle import Service
@@ -37,17 +39,42 @@ logger = logging.getLogger(__name__)
 #: 自愈候选面的三个上限。**成本口径不同，所以不能合成一个数**：
 #: * ``MAX_CANDIDATE_ROWS``——下拉整页下发约 0.024 ms/行（单价出处见
 #:   `docs/dev-logs/2026-09-30.md`），只管**总行数**；
-#: * ``MAX_CANDIDATE_BOOKS``——每翻一本目录是一次磁盘 JSON 读 + 每章一个对象，
-#:   实测 5000 章一本约 20 ms、8 本约 0.17 s（`.probe/out_candidate_cost.txt`），
-#:   只管**本数**；
+#: * ``MAX_CANDIDATE_SCAN_MS``——翻目录的钱。实测单本 5000 章 25.7 ms、1000 章
+#:   4.4 ms、300 章 1.3 ms、100 章 0.4 ms（`.probe/out_catalog_concurrency.txt`），
+#:   **价差 60 倍**，所以这一档必须按**时间**给而不是按本数：按本数钉死就等于给小书
+#:   收 100 倍过路费（40 本 × 100 章一共 17 ms，本来全摊得下）；
 #: * ``MAX_CANDIDATE_CHAPTERS_PER_BOOK``——一本书独占预算时也不把整本书端上下拉。
 #:
-#: 旧写法只有"3 本 × 100 章"这一个数：既把两个成本混在一起，又让书架第 4 本之后
-#: 的书在下拉里静默消失。现在每本摊到的是 ``行预算 // 实际本数``——书多时是
-#: "每本露一面、各自少抽几章"。
+#: 为什么并发不能替时间预算省钱（第六十七/七十轮那版留的疑问）：实测 8 本并发只省
+#: 4.5%，16/24/40 本**负收益**——一次读的三段是 read_text 2.7 ms + json.loads 8.7 ms
+#: + 构造 5000 个 ChapterItem 7.5 ms，后两段全在 GIL 里，线程并发买不回来。
+#:
+#: 历史：旧写法只有"3 本 × 100 章"，两个成本混成一个数，还让第 4 本之后的书在下拉里
+#: 静默消失；第七十轮拆成"本数 + 行数"，本数那一档今天换成时间。现在每本摊到的是
+#: ``行预算 // 实际本数``，摊不到的那几本由 :class:`CandidateFace` 报给界面。
 MAX_CANDIDATE_ROWS = 300
-MAX_CANDIDATE_BOOKS = 8
+MAX_CANDIDATE_SCAN_MS = 200
 MAX_CANDIDATE_CHAPTERS_PER_BOOK = 100
+
+
+@dataclass(frozen=True)
+class CandidateFace:
+    """候选面：摊出来的章 + 一份**普查**（普查是用来承认没摊到谁的）。
+
+    ``cached_books`` 的口径是"目录文件在盘上"（一次 stat，实测 8 本 0.11 ms），
+    不是"读得出来"——版本不符的老目录极少数情况下会算进 ``cached_books`` 却进不了
+    ``groups``，那种书本来也做不了样本，宁可让提示行多说一句"没摊到"。
+    """
+
+    groups: list[dict] = field(default_factory=list)
+    shelf_books: int = 0        # 这个源在架几本书（书架记录，免费）
+    cached_books: int = 0       # 其中本地存过目录的几本（stat 级）
+    shown_books: int = 0        # 真摊进下拉的几本
+    rows: int = 0               # 摊出来的总行数
+
+    @property
+    def skipped_books(self) -> int:
+        return max(0, self.cached_books - self.shown_books)
 
 
 def _sample(chapters: list[dict], allowance: int) -> list[dict]:
@@ -167,38 +194,36 @@ class RuleRepairService(Service):
     # 章节候选：自愈页"给哪一章做样本"的数据源
     # ------------------------------------------------------------------ #
     async def chapter_candidates(self, source_url: str, *,
-                                 max_books: int = MAX_CANDIDATE_BOOKS,
+                                 max_scan_ms: int = MAX_CANDIDATE_SCAN_MS,
                                  per_book: int = MAX_CANDIDATE_CHAPTERS_PER_BOOK,
-                                 max_rows: int = MAX_CANDIDATE_ROWS) -> list[dict]:
+                                 max_rows: int = MAX_CANDIDATE_ROWS,
+                                 clock=time.perf_counter) -> CandidateFace:
         """这个源在架书的**已缓存目录**，按书分组给出可诊断的章节（不出网）。
 
         自愈要的样本章只有一个地方能免联网拿到：reader-cache 里读过的那份目录。
         这口径也对得上现场——会撞见正文规则坏的，正是把这本书读过的人。没读过
         的源返回空表，那不是错误而是"本地没有样本"，界面上由粘贴框接手。
 
-        两个预算各自钉不同的成本（实测见模块常量的注），旧的"3 本"写法把它们
-        混成了一个：
-        * **行预算** ``max_rows``：下拉整页下发约 0.024 ms/行，只与摊出来的**总行数**
-          有关；
-        * **翻目录预算** ``max_books``：``load_catalog`` 是磁盘 JSON + 每章一个对象，
-          5000 章一本约 20 ms，与**本数**成正比（跑在 ``to_thread``，不冻界面，
-          但候选出现得晚）。
+        两个预算各钉一种成本（实测见模块常量的注）：**行预算** ``max_rows`` 管下发，
+        **时间预算** ``max_scan_ms`` 管翻目录。翻目录这一档按时间不按本数，因为
+        单本价格随章数差 60 倍（100 章 0.4 ms ↔ 5000 章 25.7 ms）：小书多的书架
+        能整架摊完，大书多的到点就停。停下来不是静默——``CandidateFace`` 把
+        "在架几本 / 存过目录几本 / 摊了几本 / 几本没摊"一并带回，界面上必须说。
 
-        所以每本摊到的章数是 ``max_rows // 本数``（再受 ``per_book`` 上限）：书多的
-        时候是"每本露一面、各自少抽几章"，不再是"第 4 本之后的书静默消失"。
-        抽样仍等间隔、保持原顺序，后续章仍能给 ``extra_chapters`` 用。
+        时间预算的检查在**每本开读之前**，所以最坏情况超出"一本"（一本五千章约
+        26 ms），不会超出"一整架"。
         """
         source_url = str(source_url or "")
         if (not source_url or self._source_service is None
                 or self._cache is None or is_local_source_url(source_url)):
-            return []
+            return CandidateFace()
         try:
             records = list(await self._source_service.list_bookshelf() or [])
         except Exception as exc:
             logger.warning("自愈候选取书架失败（当作没有样本）：%s", exc)
-            return []
+            return CandidateFace()
         # 书架记录的源/书地址有 Legado 的两套别名（同 SourceService.bookshelf_key）；
-        # 重复记录去重，本数上限按书架原序取前几本。
+        # 重复记录去重，顺序按书架原序（最近在读在前）。
         wanted: list[tuple[str, str]] = []
         seen: set[str] = set()
         for record in records:
@@ -211,23 +236,34 @@ class RuleRepairService(Service):
             seen.add(book_url)
             wanted.append((book_url, str((record or {}).get("name") or "")))
         if not wanted:
-            return []
-        # 翻目录的次数就是成本，所以名额只被**翻到过的目录**消耗：没缓存过的书
-        # 那一次读是开文件失败（亚毫秒），不占名额（旧口径同样如此）。
-        # 先收到 max_books 本，再按实际本数摊每本的章数——行预算是总行数，不是本数。
+            return CandidateFace()
+        # 一次 stat 普查（实测 8 本 0.11 ms）先把没存过目录的书滤掉：它们那一次
+        # 读本来就是开文件失败，但失败也要付一次线程跳转。
+        cached = await asyncio.to_thread(self._with_catalogs, source_url, wanted)
+        budget = max(0.0, float(max_scan_ms)) / 1000.0
+        started = clock()
         collected: list[tuple[str, str, list[dict]]] = []
-        for book_url, book_name in wanted:
-            if len(collected) >= max(0, int(max_books)):
+        for book_url, book_name in cached:
+            if collected and (clock() - started) > budget:
                 break
             chapters = await self._cached_chapters(source_url, book_url)
             if chapters:
                 collected.append((book_url, book_name, chapters))
         if not collected:
-            return []
+            return CandidateFace(shelf_books=len(wanted), cached_books=len(cached))
         allowance = max(1, min(int(per_book), int(max_rows) // len(collected)))
-        return [{"book_url": book_url, "book_name": book_name,
-                 "chapters": _sample(chapters, allowance)}
-                for book_url, book_name, chapters in collected]
+        groups = [{"book_url": book_url, "book_name": book_name,
+                   "chapters": _sample(chapters, allowance)}
+                  for book_url, book_name, chapters in collected]
+        return CandidateFace(groups=groups, shelf_books=len(wanted),
+                             cached_books=len(cached), shown_books=len(groups),
+                             rows=sum(len(g["chapters"]) for g in groups))
+
+    def _with_catalogs(self, source_url: str,
+                       wanted: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """只留下盘上确实存着目录的那些本（一次 stat 一本，不读内容）。"""
+        return [(book_url, book_name) for book_url, book_name in wanted
+                if self._cache.has_catalog(source_url, book_url)]
 
     async def _cached_chapters(self, source_url: str,
                                book_url: str) -> list[dict]:

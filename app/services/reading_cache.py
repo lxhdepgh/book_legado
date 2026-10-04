@@ -63,6 +63,14 @@ class ReadingCache:
             "chapters": [asdict(chapter) for chapter in chapters],
         })
 
+    def has_catalog(self, source_url: str, book_url: str) -> bool:
+        """这本书的目录在不在盘上——**只 stat，不读不 parse**。
+
+        普查"本地读过几本书"要过一整架书，读一次目录是 25 ms 量级，stat 是
+        0.014 ms/本（`.probe/out_catalog_concurrency.txt`），差三个数量级。
+        """
+        return (self._book_dir(source_url, book_url) / "catalog.json").is_file()
+
     def _content_path(self, source_url: str, book_url: str,
                       chapter_url: str) -> Path:
         return (self._book_dir(source_url, book_url) / "content" /

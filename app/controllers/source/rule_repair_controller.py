@@ -26,6 +26,7 @@ from app.core.events import RepairProgressEvent, RepairReportReadyEvent
 from app.controllers.base import BaseController
 from app.services.content.local_book_service import is_local_source_url
 from app.services.engine.rule_engine import BookItem, ChapterItem
+from app.services.sources.rule_repair_service import CandidateFace
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,9 @@ class RuleRepairController(BaseController):
         self._diagnosing = False
         self._expect_source_id = ""
         self._candidate_groups: list[dict] = []
+        #: 候选面的普查（在架几本 / 读过几本 / 摊了几本）：提示行靠它说"还有谁没摊到"，
+        #: 不这么说，摊不到的那几本就是静默消失的。
+        self._candidate_census = CandidateFace()
 
         self._view.on_confirm_fix = self.confirm_fix
         self._view.on_dismiss = self.dismiss_fix
@@ -233,6 +237,7 @@ class RuleRepairController(BaseController):
             # 本地书没有规则源，候选面却**有**它的缓存目录（书架里的伪源
             # book_url 是本地路径），端出来只会让人起一趟抓 file:// 的空诊断。
             self._candidate_groups = []
+            self._candidate_census = CandidateFace()
             self._view.set_chapter_options([])
             self._view.set_manual_visible(False)
             self._view.set_chapter_hint("")
@@ -242,16 +247,16 @@ class RuleRepairController(BaseController):
         future.add_done_callback(self.on_done(self._log_only))
 
     async def _load_candidates(self, url: str) -> None:
-        groups: list[dict] = []
         getter = getattr(self._repair, "chapter_candidates", None) \
             if self._repair is not None else None
-        if getter is not None:
-            groups = list(await getter(url) or [])
+        face = await getter(url) if getter is not None else None
+        groups = list(face.groups) if face is not None else []
         sample_group = await self._check_sample_group(url)
         if sample_group is not None:
             groups.append(sample_group)
         if self._view is None:            # 摊候选的工夫里切了页
             return
+        self._candidate_census = face if face is not None else CandidateFace()
         self._candidate_groups = [g for g in groups if g.get("chapters")]
         options = [(f"{gi}:{ci}", self._chapter_label(group, chapter))
                    for gi, group in enumerate(self._candidate_groups)
@@ -293,12 +298,17 @@ class RuleRepairController(BaseController):
 
     def _candidate_hint(self, url: str, options: list[tuple[str, str]]) -> str:
         if options:
+            census = self._candidate_census
             cached = [g for g in self._candidate_groups if g.get("book_url")]
             shelf = sum(len(g["chapters"]) for g in cached)
-            # 覆盖几本书要写出来：候选面是按本数摊的，不写就看不出"还有书没摊出来"
-            tail = (f"（其中 {shelf} 章来自 {len(cached)} 本书的已缓存目录）"
-                    if shelf else "")
-            return (f"本地有 {len(options)} 章可做样本{tail}"
+            # 摊了几本、还有几本没摊到都得写出来：候选面是被预算切的，不写就等于
+            # 静默丢书（第七十轮拆预算、本轮把"没摊到的要说出来"补上）。
+            covered = f"其中 {shelf} 章来自 {len(cached)} 本书的已缓存目录"
+            if census.skipped_books:
+                covered += (f"，这个源在架 {census.shelf_books} 本、本地读过 "
+                            f"{census.cached_books} 本，还有 {census.skipped_books} "
+                            f"本没摊到（先读一次那本书，或手填它的正文页）")
+            return (f"本地有 {len(options)} 章可做样本（{covered}）"
                     + "；诊断会真抓 1-3 页，只有你点确认才写回书源")
         return ("这个源本地没有可读目录，也没有检测样本：粘贴一个正文页地址，"
                 "或先读一章 / 跑一轮检测")
