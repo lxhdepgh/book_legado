@@ -240,6 +240,21 @@ elementpath/jsonpath_ng.ext/playwright/quickjs + 引擎核心资产导入 + publ
   订阅；配置 = 更多工具 / 外观 / 快捷键 / 服务。
 - 宽窗（≥720px）走 `NavigationRail`（`extended` + `use_indicator`），窄窗走底部
   `NavigationBar`；跨阈值 `on_resize` 重建外壳但保留当前内容视图。
+- **窄窗：外壳自适应之外，页面内容第七十六轮起开始降级**。Python 侧对窗宽作反应的判断
+  仍然只有上面那一条（`is_narrow_width` / 阈值 720）；内容侧靠 3 处 `ft.ResponsiveRow`
+  （`bookshelf_view`、`book_source_list_view`、`reader_view` 的阅读设置）与 13 处
+  `Row(wrap=True)` 按容器宽换行。第七十六轮把 004 待修清单 15 那五页改完（reader 工具条、
+  webdav 远端清单行、export 选书行、replace 工具行、dict 查词行），360 档的贴边候选从
+  5 页降到 1 页（剩下那 1 处是人眼确认过的通栏分隔线）。**验收判据只能像素筛 + 人眼**：
+  桌面 release 客户端对溢出零输出（明知溢出的那一拍日志仍只有正对照那行）。
+- **`wrap` 与 `expand` 不能同时出现在一条 `Row` 上**（第七十六轮五臂像素对照量到的客户端
+  契约）：`Row(wrap=True)` 里只要有任何子项带 `expand`——**连 `expand=False` 都算**——
+  release 客户端把整条行画成一块 196,196,196 的灰，并且不再产出后面的兄弟节点；
+  不换行的 `Row` + `expand` 是好的，且按 flex 分份。所以"给固定宽那位换 `expand`"和
+  "那一行改 `wrap`"是**两招互斥的修法**。复现：`.probe/probe_wrap_expand76.py`；
+  全库普查：`.probe/census_wrap_expand_clash76.py`（当前 0 处命中，只能当下界——运行时才改
+  `expand` 的写法扫不出来）。阅读器工具栏那颗 `Row` 的判据同步改成"必须 wrap、且子项不带
+  expand"（`tests/test_reader_read_aloud_placement.py`），代价是那一行行高随窗宽变。
 - **根控制外面按需垫一层全应用背景图**（`render()`：有背景时是 `Stack[图, 布局]`，没背景时
   直接就是那个布局）；`set_background()` 路径没变时什么都不做，`rebuild()`（宽窄窗切换）走
   `render()`，所以缩放重建不会把背景弄丢——形状与接线见 §5.16。
@@ -333,6 +348,16 @@ loop 关掉，服务还在发 `ServiceStateChangedEvent`，往死循环上派发
   仍要落进状态行），所以收进一个本地的 `say()` 而不是整段 `try/except: pass`。
   护栏：`tests/test_controller_midflight_detach.py`（替身在 await 回来**之前** detach，
   断言"不抛 **且** 一次控件都没碰"——`ui_call` 的异常只进日志，只断言不抛会一路绿）。
+
+**完成回调里不许同步等另一条 future**（第七十六轮，004 待修清单 16）。`ui_call` 返回的
+future 落值发生在**界面循环线程**上，`add_done_callback` 的回调因此也跑在那条线程——回调里
+再对**另一条**派发到同一条循环的 future 调 `.result()`，等的正是"这条循环腾出手去跑它"，
+于是必现死锁（不是竞态：先派发的先落值，回调必然跑在另一条之前）。要等多条结果就**合并成
+一条协程顺序 `await`**（`FontController._load_and_render`），或在回调里用 `ui_await` /
+`asyncio.wrap_future`。护栏 `tests/test_font_page_loop_liveness.py` 的判据是**另一条线程**
+拿着的秒表读出的"界面循环心跳断供秒数"——`asyncio.wait_for` 的超时自己就堵在那条循环上，
+不能当秒表（停摆时它连超时都不会响，这本身是读数）。同族扫描：全库控制器 done 回调里
+`.result()` 共 30 处，其余 29 处等的都是回调自己那条 future（值已落，不等）。
 
 **接"写入型"动作之前，先确认那个字段有人渲染**。书架换封面（09-27 第十九轮）是反面教材：
 `SourceService.update_cover` 在 `app/` 里零调用方，按"孤儿方法 ⇒ 接上即可"的套路补一个

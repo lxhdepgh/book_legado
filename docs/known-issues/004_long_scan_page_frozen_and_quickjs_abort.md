@@ -581,8 +581,97 @@ aiohttp `ClientSession`，即 `check_service` 的 probe/search 那条路），�
     ③ 探针里"最左 1/6 那一列（导航栏）平均变化 0.0"的解释（图铺在布局底下、Material
     `NavigationRail` 自己涂了不透明面）是**从形状推的**，没单独量过"换成透明面会怎样"。
     **怎么补**：人工走一次外观页选图（顺手看一眼正文），把 ①② 结掉；③ 要么量要么删掉这句解释。
+15. **【已修 · 第七十六轮】窄高窗（竖屏）内容出屏，而且拿不到机器判据（第七十五轮）**：桌面像素探针在
+    360 与 500 两档各拍 23 页，贴边筛子挑出四页，人眼复核确认——
+    `reading.reader` 工具条里"字号 −/16/＋、下一章"**整组出屏**、中间状态文字被挤成一字一行
+    竖排；`tools.webdav` 的"列出远端备份"整只按钮出屏（500 档就出一半）；
+    `tools.export` 下拉右侧刷新图标切掉一半；`tools.replace` 工具行末尾"共 0 条…"截断。
+    结构普查（写死 `width` 对账）只能当**下界筛子**：`sources.repair` 的 `TextField width=520`
+    是**误报**（被上游约束夹住，屏幕上没缺），后两处是**漏报**（固定宽 + 自适应宽混排，
+    "全固定宽行"这条判据不成立但兄弟照样被挤出去）。
+    **判据的天花板先钉死**：桌面 release 客户端对溢出**零输出**（明知溢出的那一拍，
+    管子已用子进程 print 正对照证明接上了，日志仍只有那一行；调试条纹像素也全是 0），
+    所以竖屏验收**只能像素筛 + 人眼**，不许拿"探针全绿"当"没溢出"。
+    **怎么修**：阅读器工具条那行改窄窗降级（把字号/翻页收进溢出菜单或 `ResponsiveRow`）、
+    webdav/export/replace 三行给固定宽那位 `expand`/换行；改完重跑
+    `.probe/probe_portrait_overflow75.py 360 780` + `.probe/measure_portrait_edges75.py _360`，
+    贴边候选要从 4 页降下来，并逐张人看。
+    **第七十六轮改完**：五处，不是四处——`measure_portrait_edges75.py` 原先用
+    `{"fits","overflows","dict"}` 排参照图，`dict` 把**真页面** `tools.dict`（"查询"按钮
+    整只在窗外）一起排掉了，基线其实是 5 页。改法见 `docs/dev-logs/2026-10-05.md`
+    第七十六轮 §3 那张表：reader 工具条 `wrap=True` + 进度标签定宽、webdav/export/dict
+    三处 `expand=True`、replace/dict 两处 `wrap=True`。
+    **读数**（tag 76，两档各重跑一遍）：360 档贴边候选 **5 → 1**、1200 档 0 → 0、
+    24 页里拍得出来的 **23 → 24**（`tools.font` 那一页见第 16 条）。剩下那一处
+    `reading_reader_360` 末列只采样到 1 个非背景点，人看图确认是正文下面那条通栏分隔线。
+    逐张人看：`reader`/`dict`/`export`/`webdav`/`replace`/`font`，两档都看。
+    **推翻了一条旧判据**：`test_reader_read_aloud_placement.py` 原本钉"工具栏不许 wrap"
+    （第二十八轮栅格教训），而 12 颗 40px 图标在 344px 客户区里怎么排都放不下。
+    判据改成"必须 wrap、且行里任何子项不带 `expand`"，代价写明：**工具栏行高随窗宽变**，
+    它下面那条朗读条的位置跟着变——这一条本轮没做连续拖窗观察。
+    **还留一条没修**：`tools.webdav` 的"备份对象"下拉 `width=160`，floating label 顶到
+    上面那条字段的边框上（1200 档同样紧）。它是间距问题不是窄窗降级。
+16. **进"配置 → 更多工具 → 字体"整个界面必现锁死，只能杀进程（第七十五轮）**：
+    `FontController.load_fonts` 把 `scan_system_fonts()` 与 `list_user_fonts()` 两条协程都
+    `ui_call` 到**同一条界面循环**上，再给第一条挂 done 回调，回调里 `_safe(user_future)`
+    同步 `.result()` 等第二条——第一条先派发就先落值，回调必然跑在第二条之前，
+    循环被回调占着，第二条永远轮不到跑。看门狗打出的栈是
+    `base.py:246 → font_controller.py:61 → :66 future.result() → threading.Condition.wait`，
+    离线两臂钉死（基线臂心跳满拍 47/1.5s，必现臂 12s 回不来；**不给延迟也照样锁死**，
+    不是竞态）。`app/controllers/base.py:225` 的 docstring 早就写着这条规矩
+    （"等待用 `wrap_future` 而不是 `future.result()`"），踩的是字体控制器。
+    同族扫描：全库控制器 done 回调里 `.result()` 共 30 处，其余 29 处等的都是回调自己那条
+    future（值已落，不等），跨 future 的只有这一处。
+    **怎么修**：合并成一条协程（一次 `ui_call` 里 `await` 两条），或回调里改 `ui_await` /
+    `asyncio.wrap_future`；护栏用**心跳计数**当机器判据（界面循环停跳 = 红）。
+    顺带一条否证：钱**不在**字体扫描本身（离线实测 349 文件 / 153 族名 / 0.08s）。
+    **第七十六轮改完**：走"合并成一条协程"那条（`font_controller.py:51` 起，两条 await 在 `:72`/`:77`，各兜各的
+    异常，沿用改前 `_safe` 的口径）。护栏 `tests/test_font_page_loop_liveness.py` 三条，
+    判据是**另一条线程**拿着的秒表读出的心跳断供秒数（`wait_for` 的超时自己就堵在循环上，
+    不能当秒表）。变异核验：换回当年那条写法，3 次跑 3 次红。
+    **仪器自己栽过两次，都是本轮当场量出来的**（同族："绿灯的那条正是最该红的"）：
+    ① 两次读取同速时死锁复现不出来——第一次落值时第二条已经跑完，`.result()` 当场拿到值；
+    改前那一跑两条正臂只红了一条。→ 第二次读取放慢到 30 拍，正是上面记的那条真形状。
+    ② `concurrent.futures.Future.add_done_callback` 在登记那一刻 future **已经算完**时会
+    当场在**主线程**调用回调，那一臂冻的是主线程、界面循环满拍（读数 0.016s，20 次撞见 2 次）。
+    → 两道闸门：`scan` 闸在登记回调前不开，`user` 闸整臂不开。改完 8 连跑 8/8 全绿。
+    另外判链 `test_controller_service_surface.py` 拦了一次：把服务调用套进取值助手
+    （`await self._read(self._svc.xxx(), ...)`）就不认了，它只看紧邻父节点是不是
+    `Await`/派发器。这条护栏拦的是改法，不是产品代码。
 
 ## 探针/工具坑（同属"探针自己没测到"被当成"被测对象没问题"）
+
+### 第七十六轮新增的一条（wrap×expand：客户端不报错，只把整行画成灰）
+
+- **`Row(wrap=True)` 里任何子项带 `expand`（连 `expand=False` 都算）→ release 桌面客户端
+  把整条行画成一块 196,196,196 的灰，并且不再产出后面的兄弟节点**。第一版像素探针五张图
+  全灰，看着像"探针写坏了"，其实是每一臂都显式传了 `expand`。五臂对照钉死这条：
+  `.probe/probe_wrap_expand76.py`（`nowrap_plain` / `wrap_plain` / `wrap_expand_false` /
+  `wrap_expand_true` / `nowrap_expand_true`，只有中间两臂灰）。**不换行的 Row + `expand`
+  是好的**，且按 flex 分份——所以"给固定宽那位换 `expand`"和"那一行改 `wrap`"两招
+  **不能用在同一行上**。全库普查 `.probe/census_wrap_expand_clash76.py`（24 棵目的地树，
+  当前命中 0 处；盲区：槽位表只覆盖常见容器，运行时才改 `expand` 的写法扫不出来）。
+
+### 第七十五轮新增的四条（桌面像素与"停住"这类读数）
+
+- **fd 级捕获客户端输出必须排在 `ft.run` 之前**：`flet_desktop` 是
+  `subprocess.Popen(args, env=...)`（不传 stdout），客户端继承的是**被 spawn 那一刻**的
+  fd 1/2。写在 `main(page)`/`walk()` 里再 `os.dup2` 只改到探针自己头上——日志 0 行看着
+  像"客户端一个字没说"，其实**根本没接上**。接上之后还要补一根明知非 0 的正对照
+  （`subprocess.run([sys.executable, "-c", "print('PIPE-OK-75')"])` 落进同一个文件），
+  否则"零行"仍然只是"我没量到"。
+- **`faulthandler.dump_traceback_later` 在 Windows 上不生效**：进程确实停住了（`Get-Process`
+  六秒 CPU 一动不动），dump 文件仍 0 字节，而且它**不抛错**。要看停住的栈只能自己起一条
+  纯 Python 看门狗线程 + `sys._current_frames()` + `traceback.print_stack`；
+  反过来，如果连看门狗线程都不出字，那读数就变成"有原生代码攥着 GIL"，同样是信息。
+- **`asyncio.wait_for` 超时没生效 = 一条读数，不是一条坏掉的探针**：`wait_for` 靠事件循环
+  还能转。它不触发而进程又不动，说明那一段是**同步**压在循环上（本轮的字体页死锁就是靠
+  这条区分出"同步阻塞"与"某个 await 没回来"）。
+- **结构普查（比对写死的 `width`）两头都不准，只能当下界筛子**：固定宽控件会被上游约束
+  夹住（`TextField width=520` 在 484px 窗里屏幕上什么都不缺 = 误报），而"固定宽 + 自适应宽"
+  混排的行合计不超也照样把兄弟挤出屏幕（`tools.export`/`tools.replace` 两处 = 漏报）。
+  另一条同族：窗宽 ≠ 客户区宽（`window.width=500` 截图 484、`=360` 截图 344，差 16px 边框），
+  所有竖屏判据要按**截图宽**算。
 
 - **界面探针不能 `page.route("**/*.woff2", 本地 CJK 字体)`**：它把 Flutter web 引擎自己的
   kit 字体一并顶掉 → 客户端会话握不完手 → 服务端 `main` 永远不被调用 → 表现是**零输出**，

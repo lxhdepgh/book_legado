@@ -21,11 +21,14 @@ class ExportView(ft.Column):
         self.on_export_txt = None      # () -> None
 
         self._title = ft.Text("导出书籍", size=20, weight=ft.FontWeight.BOLD)
+        # 书名回显单独一行：它原先和下拉、按钮挤在同一行，而**不换行的 Row 里非 flex
+        # 子项是先按无限宽排好的**，书名一长就把"刷新"挤出屏幕（第七十五轮 360 档实拍）。
         self._book = ft.Text("未选择书籍", size=13, color=ft.Colors.GREY_700)
         # 下拉选书，不是"点一下弹个什么都不知道"的按钮：清单来自
         # BookExportService.list_exportable_books()（只列真缓存到章节的书）。
+        # 走 expand 不走定宽：定宽那位在窄窗里不会自己缩，只会被裁掉半截。
         self._chooser = ft.Dropdown(
-            label="已缓存书籍", width=320, dense=True,
+            label="已缓存书籍", expand=True, dense=True,
             options=[], on_select=lambda e: self._fire(self.on_book_chosen,
                                                        e.control.value))
         self._pick_btn = ft.OutlinedButton(
@@ -44,7 +47,8 @@ class ExportView(ft.Column):
 
         self.controls = [
             self._title,
-            ft.Row([self._chooser, self._pick_btn, self._book], spacing=8),
+            ft.Row([self._chooser, self._pick_btn], spacing=8),
+            self._book,
             ft.Row([self._epub_btn, self._txt_btn], spacing=8),
             self._progress,
             self._stage,

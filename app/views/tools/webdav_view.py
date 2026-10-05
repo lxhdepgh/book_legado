@@ -35,8 +35,9 @@ class WebDavView(ft.Column):
         self._password = ft.TextField(label="令牌/密码", password=True,
                                       can_reveal_password=True)
         # 远端备份清单：不列出来就得让用户手敲一个 zip 路径（没人敲得对）。
+        # 用 expand 而不是定宽：定宽那位在窄窗里不会自己缩，只会被裁掉半截。
         self._remote = ft.Dropdown(
-            label="远端备份包", width=380, dense=True, options=[],
+            label="远端备份包", expand=True, dense=True, options=[],
             on_select=lambda e: self._choose_remote(e.control.value))
         self._list_remote_btn = ft.OutlinedButton(
             "列出远端备份", icon=ft.Icons.REFRESH,

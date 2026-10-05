@@ -34,7 +34,10 @@ class ReplaceRuleView(ft.Column):
 
         self.controls = [
             self._title,
-            ft.Row([self._add_btn, self._global, self._summary], spacing=12),
+            # 三个都不定宽、都不 flex：窄窗里让它们自己换到第二拍，
+            # 而不是把"共 N 条…"挤出屏幕（第七十五轮 360 档量到的截断）。
+            ft.Row([self._add_btn, self._global, self._summary],
+                   spacing=12, run_spacing=4, wrap=True),
             ft.Container(expand=True, content=self._rows),
         ]
 

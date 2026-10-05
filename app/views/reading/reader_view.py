@@ -196,9 +196,13 @@ class ReaderView(ft.Column):
             on_scroll=self._on_document_scroll,
             controls=[ft.Row([self._reader_document],
                              alignment=ft.MainAxisAlignment.CENTER)])
+        # 进度标签定宽 + 省略号，不用 ``expand``：工具条那一行是 ``wrap=True``，而
+        # 换行的 Row 里任何子项带 ``expand``（**连 ``expand=False`` 都算**）会让整条
+        # 行在 release 客户端画成一块灰（当场量的，见 `.probe/probe_wrap_expand76.py`
+        # 的 ``wrap_expand_*`` 两臂）。定宽也顺手治了窄窗里"一个字一行"的那一拍。
         self._progress_label = ft.Text(
-            "未选择章节", size=12, expand=True,
-            text_align=ft.TextAlign.CENTER)
+            "未选择章节", size=12, width=200, no_wrap=True,
+            overflow=ft.TextOverflow.ELLIPSIS, text_align=ft.TextAlign.CENTER)
         self._prev_btn = ft.IconButton(
             ft.Icons.CHEVRON_LEFT, tooltip="上一章", disabled=True,
             on_click=lambda e: self._fire(self.on_prev_chapter))
@@ -251,7 +255,7 @@ class ReaderView(ft.Column):
                               on_click=lambda e: self._fire(
                                   self.on_change_font_size, 1)),
                 self._next_btn,
-            ], spacing=0))
+            ], spacing=0, run_spacing=0, wrap=True))
         self._status_bar = ft.Container(
             padding=ft.Padding(12, 2, 12, 4),
             content=ft.Text("", size=11, text_align=ft.TextAlign.CENTER,

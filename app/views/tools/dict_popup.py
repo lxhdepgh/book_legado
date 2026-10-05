@@ -33,8 +33,10 @@ class DictPopup(ft.Column):
             "关闭", icon=ft.Icons.CLOSE,
             on_click=lambda e: self._fire(self.on_close))
         # 本页也是独立目的地：没有输入框就无从查起（划词入口之外必须可手输）。
+        # expand 而不是定宽：那一行不换行，非 flex 子项先按无限宽排好，
+        # 360 档下"查询"按钮整只被挤出屏幕（第七十六轮像素量到）。
         self._query = ft.TextField(
-            label="查词", hint_text="输入单词或短语",
+            label="查词", hint_text="输入单词或短语", expand=True,
             on_submit=lambda e: self._lookup_clicked())
         self._lookup_btn = ft.Button(
             "查询", icon=ft.Icons.SEARCH,
@@ -57,7 +59,8 @@ class DictPopup(ft.Column):
             self._status,
             ft.Row([self._close_btn], alignment=ft.MainAxisAlignment.END),
             ft.Divider(height=24),
-            ft.Row([self._add_rule_btn, self._rules_hint], spacing=8),
+            ft.Row([self._add_rule_btn, self._rules_hint], spacing=8,
+                   run_spacing=4, wrap=True),
             ft.Container(self._rule_rows, expand=True),
         ]
 

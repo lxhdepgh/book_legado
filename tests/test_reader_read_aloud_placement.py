@@ -68,16 +68,26 @@ class ReadAloudPlacementTests(unittest.TestCase):
         self.assertTrue(search < position < settings,
                         f"朗读入口没和书内搜索/设置放在一起：{tooltips}")
 
-    def test_toolbar_row_has_no_unwrapped_overflow(self):
-        """工具栏是一颗 Row（不换行）：控件再往上添，就得同时报出"这一行有多长"。
+    def test_toolbar_row_wraps_and_carries_no_expand_child(self):
+        """工具栏这颗 Row 必须换行，且行里任何子项都不许带 ``expand``。
 
-        钉的是"没人为新增的那颗键留位置"——1280 宽时版心左边有 266px 导航栏，
-        工具栏实际可用约 1010px，12 颗 40px 图标 + 进度标签已经吃掉 ~560px。
+        第七十六轮把这里从"不许 wrap"翻成"必须 wrap"：12 颗 40px 图标在 344px
+        的客户区里怎么排都放不下，而不换行的 Row 会**先按无限宽排好非 flex 子项**，
+        于是字号组和下一章整截被挤出屏幕（`.probe/out_portrait75_reading_reader_360.png`
+        实拍）。代价就是第二十八轮栅格教训那一条——这一行的高度随窗宽变；
+        换来的是窄窗里点得到键。
+
+        原先那颗"有人加键就报"的判据改由 expand 这条守着：换行的 Row 里只要有
+        子项带 ``expand``（**连 ``expand=False`` 都算**），整行在 release 客户端
+        画成一块灰（`.probe/probe_wrap_expand76.py` 的 ``wrap_expand_*`` 两臂）。
         """
         row = self.view._toolbar.content
         self.assertIsInstance(row, ft.Row)
-        self.assertFalse(getattr(row, "wrap", False),
-                         "工具栏换成 wrap 之后高度会随窗口变化，第二十八轮的栅格教训")
+        self.assertTrue(getattr(row, "wrap", False),
+                        "工具栏不换行：360 档里字号组和下一章会被挤出屏幕")
+        self.assertEqual([c for c in row.controls
+                          if getattr(c, "expand", None) is not None], [],
+                         "工具栏里有子项带 expand：wrap×expand 会让整行在客户端变灰")
 
 
 class ReadAloudFoldTests(unittest.TestCase):

@@ -55,17 +55,30 @@ class FontController(BaseController):
             self._view.set_current("")
             self._view.render_fonts([], [], "")
             return
-        sys_future = self.ui_call(self._svc.scan_system_fonts())
-        user_future = self.ui_call(self._svc.list_user_fonts())
-        sys_future.add_done_callback(self.on_done(lambda f: self._render(system=self._safe(f),
-                                   user=self._safe(user_future))))
+        self.ui_call(self._load_and_render())
 
-    @staticmethod
-    def _safe(future) -> list:
+    async def _load_and_render(self) -> None:
+        """两条列表在**同一条协程**里先后 await，回来到齐才渲染。
+
+        不能各自 `ui_call` 再在完成回调里 `future.result()` 等另一条：
+        `add_done_callback` 跑在界面循环线程上，而另一条 future 的落值正需要这个
+        循环——回调一堵，循环就永远腾不出手叫它醒（第七十五轮实测必现锁死，
+        栈见 `docs/known-issues/004` 第 16 条）。
+        """
+        # 两条各兜各的异常：一次读取失败不该让整页空掉（沿用改前 `_safe` 的口径）。
+        # 服务调用直接挂在 await 上，是为了过 tests/test_controller_service_surface.py
+        # 那条判链——它只认 await / ui_call 这两种紧邻的落点。
         try:
-            return list(future.result() or [])
-        except Exception:
-            return []
+            system = list(await self._svc.scan_system_fonts() or [])
+        except Exception as exc:
+            logger.warning("系统字体读取失败：%s", exc)
+            system = []
+        try:
+            user = list(await self._svc.list_user_fonts() or [])
+        except Exception as exc:
+            logger.warning("用户字体读取失败：%s", exc)
+            user = []
+        self._render(system=system, user=user)
 
     def _render(self, system: list, user: list) -> None:
         if self._view is None:  # 视图已 detach：在途结果丢弃
