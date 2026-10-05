@@ -162,6 +162,7 @@ class _RecordingView:
         self.previews: list[ThemeData] = []
         self.statuses: list[tuple[str, bool]] = []
         self.applied: list[tuple[str, str, bool]] = []
+        self.backgrounds: list[str] = []
         self.controller = None
         self.page = None
 
@@ -174,6 +175,9 @@ class _RecordingView:
     def set_status(self, text, error=False):
         self.statuses.append((str(text), bool(error)))
 
+    def set_background(self, path):
+        self.backgrounds.append(str(path))
+
 
 class _Hub:
     def __init__(self, service):
@@ -181,7 +185,10 @@ class _Hub:
         self.bus = None
 
     def get(self, stype):
-        return self._service
+        # 按类型给：外观控制器现在还要 BackgroundService，替身不分类型就返回同一个
+        # 对象，"那个服务没注册"这条线会被测成"齐了"（未就绪的降级永远走不到）。
+        svc = self._service
+        return svc if isinstance(svc, stype) else None
 
 
 class AppearanceControllerTests(unittest.TestCase):

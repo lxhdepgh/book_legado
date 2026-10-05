@@ -1,6 +1,6 @@
 """AppearanceView：外观设置页（M7 后补全，替代导航里的占位页）。
 
-模式单选（跟随系统/浅色/深色）+ 墨水屏开关 + 五个命名皮肤 + 实时预览。
+模式单选（跟随系统/浅色/深色）+ 墨水屏开关 + 五个命名皮肤 + 全应用背景图 + 实时预览。
 本视图只做 Flet 布局与渲染：偏好读写、主题求值全部经
 :class:`~app.controllers.settings.appearance_controller.AppearanceController`
 （视图零 import app.services，红线 §7.5）。
@@ -15,6 +15,8 @@
 一片默认灰"。本模块零 import app.services（红线 §7.5）。
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import flet as ft
 
@@ -75,7 +77,7 @@ def apply_page_theme(page, data) -> None:
 
 
 class AppearanceView(ft.Column):
-    """外观：模式 / 墨水屏 / 皮肤 / 预览 / 保存。"""
+    """外观：模式 / 墨水屏 / 皮肤 / 背景图 / 预览 / 保存。"""
 
     def __init__(self) -> None:
         super().__init__(expand=True, scroll=ft.ScrollMode.AUTO, spacing=0)
@@ -86,6 +88,13 @@ class AppearanceView(ft.Column):
         self.on_change_eink = None    # (eink: bool) -> None
         self.on_save = None           # () -> None
         self.on_reset = None          # () -> None
+        self.on_pick_background = None    # () -> None（选一张图铺到整个应用后面）
+        self.on_clear_background = None   # () -> None
+
+        # 图片选择器：视图只持有控件，"选完之后拷去哪儿"是控制器与服务的事。
+        # 名字必须是 image_picker——导航外壳装配视图时按这个名字自动 append 到
+        # page.services（Flet 0.86 的 Service 通道），离开本页再摘掉。
+        self.image_picker = ft.FilePicker()
 
         self._mode = ft.RadioGroup(
             value="system",
@@ -108,6 +117,21 @@ class AppearanceView(ft.Column):
                      for item in BUILTIN_SKINS.values()])
         self._description = ft.Text("", size=12,
                                     color=ft.Colors.ON_SURFACE_VARIANT)
+        # 背景图那一行：缩略 + 文件名 + 两颗按钮。**没有"透明度/背景模式"控件**——
+        # 图与主题底色的合成比例定死在外壳里（navigation._BACKGROUND_OPACITY），
+        # 因为一放开就得知道此刻系统是亮面还是暗面，而 theme_mode 可以是 SYSTEM。
+        self._background_thumb = ft.Image(
+            src="", width=132, height=76, fit=ft.BoxFit.COVER,
+            border_radius=6, visible=False,
+            error_content=ft.Container(
+                width=132, height=76, border_radius=6,
+                content=ft.Text("图读不出来", size=11,
+                                 color=ft.Colors.ON_SURFACE_VARIANT)))
+        self._background_label = ft.Text("当前没有背景图", size=12,
+                                         color=ft.Colors.ON_SURFACE_VARIANT)
+        self._clear_background = ft.TextButton(
+            "去掉背景", visible=False,
+            on_click=lambda e: self._fire(self.on_clear_background))
         self._status = ft.Text("", size=12, color=ft.Colors.GREEN_400)
         # 实时预览：一小组**真实控件**，配色全部来自 page.theme（换了主题这里就
         # 跟着变，等于把整页缩到一个卡片里看）。以前是三块手写 bgcolor 的色板，
@@ -139,6 +163,22 @@ class AppearanceView(ft.Column):
                 ft.Text("应用皮肤", size=18, weight=ft.FontWeight.BOLD),
                 self._skin,
                 self._description,
+                ft.Divider(),
+                ft.Text("应用背景图", size=18, weight=ft.FontWeight.BOLD),
+                ft.Text("选一张图垫在整个应用窗口后面，只淡到认得出来、不压正文；"
+                        "选中的图会存进应用数据目录，原图挪走也不影响。"),
+                ft.Row(spacing=12, controls=[
+                    self._background_thumb,
+                    ft.Column([
+                        self._background_label,
+                        ft.Row([
+                            ft.OutlinedButton("选择图片", icon=ft.Icons.IMAGE,
+                                              on_click=lambda e: self._fire(
+                                                  self.on_pick_background)),
+                            self._clear_background,
+                        ], spacing=8),
+                    ]),
+                ]),
                 ft.Divider(),
                 self._preview,
                 self._status,
@@ -193,3 +233,18 @@ class AppearanceView(ft.Column):
     def set_status(self, text: str, error: bool = False) -> None:
         self._status.value = str(text or "")
         self._status.color = ft.Colors.RED_300 if error else ft.Colors.GREEN_400
+
+    def set_background(self, path: str) -> None:
+        """回填当前背景图：缩略图 + 文件名；空串表示"没有"。
+
+        只认文件名不认整条路径：用户要确认的是"换成了我选的那张"，一长串
+        ``C:\\Users\\...`` 既占地方又读不出信息。
+        """
+        shown = str(path or "")
+        if shown:
+            self._background_thumb.src = shown
+            self._background_label.value = f"当前背景：{Path(shown).name}"
+        else:
+            self._background_label.value = "当前没有背景图"
+        self._background_thumb.visible = bool(shown)
+        self._clear_background.visible = bool(shown)

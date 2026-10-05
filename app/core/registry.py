@@ -115,10 +115,13 @@ TOOLS_DESTINATIONS: tuple[str, ...] = (
 # --------------------------------------------------------------------------- #
 DEST_SETTINGS_APPEARANCE = "settings.appearance"   # 外观（ThemeService 承接偏好，占位页）
 DEST_SETTINGS_DASHBOARD = "settings.dashboard"    # 服务仪表盘（M6 第三线交付完整版）
+#: 快捷键页（第七十三轮）：阅读器键位 + 老板键。此前 ``reader.shortcuts`` 只在
+#: 开书时读一次，界面上没有任何地方能改（用户报"打开软件没找到按键设置的位置"）。
+DEST_SETTINGS_SHORTCUTS = "settings.shortcuts"
 
-#: M6 设置组已注册目的地（供导航层/测试一次性回查）。
+#: 设置组已注册目的地（供导航层/测试一次性回查）。
 SETTINGS_DESTINATIONS: tuple[str, ...] = (
-    DEST_SETTINGS_APPEARANCE, DEST_SETTINGS_DASHBOARD,
+    DEST_SETTINGS_APPEARANCE, DEST_SETTINGS_DASHBOARD, DEST_SETTINGS_SHORTCUTS,
 )
 
 
@@ -168,6 +171,7 @@ NAV_META: dict[str, tuple] = {
     #    8 个工具子页仍是整页目的地（从「更多工具」卡片跳转）--
     DEST_TOOLS_OVERVIEW: (GROUP_CONFIG, "更多工具", False),
     DEST_SETTINGS_APPEARANCE: (GROUP_CONFIG, "外观", False),
+    DEST_SETTINGS_SHORTCUTS: (GROUP_CONFIG, "快捷键", False),
     DEST_SETTINGS_DASHBOARD:  (GROUP_CONFIG, "服务", False),
     DEST_TOOLS_BROWSER:  (GROUP_CONFIG, "浏览器",   True),
     DEST_TOOLS_DICT:     (GROUP_CONFIG, "词典",     True),

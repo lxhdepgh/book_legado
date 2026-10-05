@@ -5,7 +5,7 @@
 >
 > 状态：M7 回写版（2026-09-24），2026-09-27 校正第 8 节的删除范围与下列基线计数。
 > 本次桌面端重构（依据 `docs/桌面端重构设计.md`）已按
-> M1–M7 全部落地：进程内多服务架构、26 个业务服务按域分包、`app/core/` 基础设施、
+> M1–M7 全部落地：进程内多服务架构、28 个业务服务按域分包、`app/core/` 基础设施、
 > SQLite 主库 + 文件目录 + 互操作 JSON 三类存储、导航容器 `NavigationHost` 与
 > `ServiceDashboard` 上线。**M7 清理线删除的是旧单体 UI**（`app/app.py` + 旧平铺
 > `app/views/*.py` + `app/ui_feedback.py`）**以及被搬进域包的那 13 个旧平铺服务副本**；
@@ -45,12 +45,12 @@ app/
 │   ├── settings.py    #   SettingsService：settings 表键值 + 变更事件
 │   ├── registry.py    #   ViewRegistry：声明式目的地路由表（分组导航元数据）
 │   └── interfaces.py  #   BrowserInteractionCallback（跨层交互回调 Protocol）
-├── services/          # 26 个业务服务，按域分包（§4）
+├── services/          # 28 个业务服务，按域分包（§4）
 │   ├── engine/        #   规则兼容层核心资产（9 模块，只加壳不改行为）+ RuleEngineService 外壳
 │   ├── sources/       #   书源域 5 服务
 │   ├── reading/       #   阅读域 6 服务（+engine 外壳共 7）
 │   ├── content/       #   内容形态域 4 服务
-│   ├── tools/         #   工具域 10 服务
+│   ├── tools/         #   工具域 12 服务
 │   └── *.py           #   ⚠ 14 个旧平铺模块**未删除**，是上面各域外壳的共享实现 /
 │                      #   继承基座（source_service / check_service / rule_repair /
 │                      #   compat_audit / headless_browser / interactive_browser /
@@ -73,8 +73,9 @@ app/
 ├── themes/            # 内置主题纯数据（五命名皮肤 + 墨水屏，由 ThemeService 承接；
 │                      #   旧 `app/themes/builtin_themes.py` 仍是 tools 域的数据基座）
 └── resources/         # publicsuffixes.gz（公共后缀表，规则兼容层数据文件）
-tests/                 # 46 个 test_*.py，共 1220 个 `def test_`（2026-09-27 实测）
-                       #   其中 test_legado_compat.py 488 条零漂移守门
+tests/                 # 64 个 test_*.py，共 1804 个 `def test_`（含 `async def test_`；2026-10-05 实测；
+                       #   pytest 当场收集 1802 条通过 + 161 条 subtest）
+                       #   其中 test_legado_compat.py 493 条零漂移守门（当场收集数）
 ```
 
 **基线（2026-09-27 实测，全程离线）**：注册服务 30 个 = 基础设施 4 + 业务 26
@@ -102,9 +103,13 @@ tests/                 # 46 个 test_*.py，共 1220 个 `def test_`（2026-09-2
    `dependencies` 经 Kahn 拓扑排序决定启停顺序。
 2. `asyncio.run(hub.start_all())`：先依赖后消费者依次 `start()`；单服务启动失败不阻断
    其余（进入 SUSPENDED + `last_error` 可见）。
-3. `_apply_saved_theme(page, hub)` → `build_app_shell(page, hub)`：进 `ft.run` 的回调先把
-   **已保存**的外观落到页面三件套，再装导航（否则不进外观页就永远是 Flet 默认灰主题，
-   见 §5.7）。
+3. `_apply_saved_theme(page, hub)` → `build_app_shell(page, hub, shelf_probe=…,
+   key_filter=…, background=…)`：进 `ft.run` 的回调先把**已保存**的外观落到页面三件套，再装导航（否则
+   不进外观页就永远是 Flet 默认灰主题，见 §5.7）。三条可调用/初值都是装配根注入的**视图层
+   缺口**：`shelf_probe` 决定阅读组落书架还是落找书，`key_filter` 是全局按键的第一道闸
+   （老板键命中的那一拍不再往当前视图分发，见 §5.15），`background` 是首屏该垫哪张图
+   （`_wire_background(hub)` 的返回值，同时把 `appearance.background.image` 的订阅挂上，
+   见 §5.16）——视图层拿不到服务（红线 §7.5），所以只能由 `main.py` 把服务包成可调用递进去。
 4. `finally: hub.shutdown()`：主线程等守护 loop 上的逆序 `stop_all()` 落盘收尾，
    之后再关掉 EngineHub 那条线程（见 §4.4 不变式 2）。
 
@@ -112,7 +117,7 @@ tests/                 # 46 个 test_*.py，共 1220 个 `def test_`（2026-09-2
 elementpath/jsonpath_ng.ext/playwright/quickjs + 引擎核心资产导入 + publicsuffixes.gz
 在位断言），打包回归必跑，exit 0 为通过。
 
-## 4. 服务层（26 个业务服务 + 5 个基础设施）
+## 4. 服务层（28 个业务服务 + 5 个基础设施）
 
 ### 4.1 基础设施（core/，非业务服务）
 
@@ -161,7 +166,7 @@ elementpath/jsonpath_ng.ext/playwright/quickjs + 引擎核心资产导入 + publ
 | `RssService` | RSS 源管理 / 文章列表 / 订阅 / 已读收藏（主库 `rss_sources` / `rss_articles`） |
 | `LocalBookService` | 本地书导入解析：epub（ebooklib）/ pdf（pymupdf）/ txt 自写，归一化为与网络书源一致的数据模型落 `books` 表 |
 
-**工具域 `services/tools/`（10）**
+**工具域 `services/tools/`（12）**
 
 | 服务 | 职责 |
 | --- | --- |
@@ -175,6 +180,8 @@ elementpath/jsonpath_ng.ext/playwright/quickjs + 引擎核心资产导入 + publ
 | `WebBridgeService` | 本地 HTTP + WebSocket 服务（默认绑 127.0.0.1、默认关闭），远程书源管理/调试薄协议层 |
 | `BrowserService` | 浏览器会话统一管理：无头渲染（Playwright）/ CDP 投屏交互 / WebView 回退三模块收编，profile 目录与会话池由服务统一持有 |
 | `ThemeService` | 五命名皮肤 + 墨水屏配色 + 亮暗切换；外观偏好持久化并入 SettingsService |
+| `BossKeyService` | 老板键：一键把整个窗口藏掉（`page.window.visible=False`）+ 一只**只在藏窗期间存在**的托盘图标当唯一回来的入口；偏好走 SettingsService（`bosskey.enabled` / `bosskey.shortcut`），图标走 `services/tools/win_tray.py`（pywin32 懒 import）。**Windows 专属**：非 Windows 或缺 pywin32 时 `available=False`，快捷键页那句状态话写清"本机没有托盘能力"，其余功能照旧（见 §5.15） |
+| `BackgroundService` | 全应用一层背景图：把用户选中的图**归一后拷进 `<data>/backgrounds/`**（长边 ≤2560 的 JPEG，无 Pillow 则原样拷贝），偏好只落那条拷贝路径（`appearance.background.image`，SettingsService 单键）；换图时删掉被换下来的那份（**只删自己目录里的**），`current` 认文件不认键（文件没了就当没有）。`install()` 是协程（解码+缩放是重活）。把路径画到窗口上那一步在视图层（`NavigationHost.set_background`），本模块零 flet（见 §5.16） |
 
 ### 4.3 服务间通信
 
@@ -227,12 +234,15 @@ elementpath/jsonpath_ng.ext/playwright/quickjs + 引擎核心资产导入 + publ
 ### 5.1 导航容器 NavigationHost（`views/navigation.py`）
 
 - 顶级入口只有三个，沿用旧单体的形状：**书源 / 阅读 / 配置**
-  （`ViewRegistry.NAV_META` 为权威清单，当前 23 个目的地 = 11 个页签 + 12 个整页）。
+  （`ViewRegistry.NAV_META` 为权威清单，当前 24 个目的地 = 12 个页签 + 12 个整页）。
   **一个分组 = 侧栏一个顶级入口**，组内的非整页目的地不再各占一行，而是那一页顶部的
   Tab（`SectionView`）：书源 = 管理 / 导入 / 检测 / 规则 / 自愈；阅读 = 找书 / 书架 /
-  订阅；配置 = 更多工具 / 外观 / 服务。
+  订阅；配置 = 更多工具 / 外观 / 快捷键 / 服务。
 - 宽窗（≥720px）走 `NavigationRail`（`extended` + `use_indicator`），窄窗走底部
   `NavigationBar`；跨阈值 `on_resize` 重建外壳但保留当前内容视图。
+- **根控制外面按需垫一层全应用背景图**（`render()`：有背景时是 `Stack[图, 布局]`，没背景时
+  直接就是那个布局）；`set_background()` 路径没变时什么都不做，`rebuild()`（宽窄窗切换）走
+  `render()`，所以缩放重建不会把背景弄丢——形状与接线见 §5.16。
 - **阅读组的落地页签由「架上有书」决定**：`_anchor(group)` 的次序是
   记住的页签 > 书架探测 > 分组第一个页签，所以首屏和再点「阅读」入口都**先落书架**，
   空架才回落找书。探测由装配根注入（`main._shelf_has_books` →
@@ -523,9 +533,14 @@ URL 行只留「输入框 + 导入按钮」，预览卡与进度卡**只在有�
 > 本文不另列清单，免得两处各自走样；那类缺陷由
 > `tests/test_controller_service_surface.py` 的 AST 静态扫描在导入期就挑出来。
 
+**外观页底部那行背景图不走 pending/保存**（第七十四轮）：皮肤 / 亮暗 / 墨水屏是"预览了但
+没点保存就不落库"，换图不是——**选完就该看到**，落偏好即生效，"恢复默认"也**不动背景**
+（把用户刚选的图连带清掉最容易被当成丢数据）。形状、服务面与装配根那一跳见 §5.16。
+
 护栏：`tests/test_appearance_theme.py`（18 项：三件套下发 ×5、五皮肤 ×亮暗真构造
 `ft.Theme`、预览区结构静态扫描"wrap Row 里不许有 expand 子控件"、控制器 pending→预览
-不写库 / 预览失败必须写状态行、启动引导）；端到端取证走离线界面探针（真点：亮面
+不写库 / 预览失败必须写状态行、启动引导）+ `tests/test_background_image.py`（38 项，见 §5.16）；
+端到端取证走离线界面探针（真点：亮面
 `(255,251,255)` → 深色 `(20,18,24)` → 墨水屏 98% 像素落在黑白两极；换皮肤后主按钮均色
 `(84,100,189)` → `(69,139,123)`）。
 
@@ -881,12 +896,128 @@ PASS 是伪事件给的**（`completed=False` 被当成片尾），所以连播�
 强制重排当对照。中文字体由 `page.route` 喂本地 woff2，否则满屏豆腐块，截字问题根本
 看不见。护栏：`tests/test_shelf_reader_ui_layout.py`（26 条）+ 12 条变异核验。
 
+### 5.15 快捷键页与老板键（`views/settings/shortcut_view.py` + `controllers/settings/shortcut_controller.py` + `services/tools/boss_key_service.py`）
+
+用户报的是两句：「打开软件没有找到对应按键设置的位置」「阅读页面中也需要可以设置
+翻页/上下一章的快捷键」。落地形态是**配置组里新增一个「快捷键」页签**
+（`DEST_SETTINGS_SHORTCUTS` = `settings.shortcuts`），一张表管八行——七个阅读动作
+（翻页上/下、上一章/下一章、目录、阅读设置、退出）加老板键那一条。
+
+**键表住在 `app/core/shortcuts.py`，两边共用**。这是本页唯一的设计要点：阅读器原来
+自己带一张表，录键页再写一张的话，页面显示 `PageDown`、比较用的是 `pagedown`，
+用户录进去的键位**永远不会命中**。core 模块零 flet，三件事是纯函数——
+`normalize_key`（flet 的 `KeyboardEvent.key` 写法很野：`Arrow Left` / `arrowleft` /
+`ControlLeft` 都可能出现）、`chord_of`（把按住 Ctrl 再按 H 合成
+`ctrl+alt+shift+meta` 固定顺序的一条弦；单独按修饰键返回空串）、`format_binding`
+（反过来给人看）。`chord_of` 在无修饰键时给出的正是 `left`/`pagedown` 这种裸串，
+所以**历史偏好不用迁移**。显示写法里非拉丁那几条（`空格`/`逗号(,)`/`↑`）由
+`_DISPLAY_REVERSE` 读回同一个绑定，否则"显示过一次再存库，键位自己变了"。
+
+**存量分两处**：七个阅读动作存在 `reader.shortcuts`（一个字典，
+`ReadingService.save_reader_preference`），老板键存在 `bosskey.enabled` /
+`bosskey.shortcut` 两条标量（`SettingsService`）。界面一张表、落库两处，所以
+`save()` 分别写，任一处失败都要写在状态行上而不是只记日志。撞键**不拦保存**
+（Legado 也不拦），但分发是"表内第一个命中"（`action_for`），提示语必须说清
+"按下去只有排前面的会动"。
+
+**录键走既有分发链，不开新口子**。视图把 `on_key` 槽交给控制器（只在页签是当前视图
+时收得到），命中录制中那一拍才落绑定；用户"点一下录制、按一下键"就录完，没有输入框
+让他手敲组合串。控制器只认"正在录的那个动作"，其余按键一律不看——否则在页面上翻别的
+控件会被当成录键。
+
+**老板键的形状是"藏"不是"最小化"**（第七十三轮桌面 ctypes 实测）：
+`page.window.visible=False` 让 `IsWindowVisible` 与 `WS_VISIBLE` 同时转假、任务栏那格
+消失，且 `visible=True` 原样回得来；`minimized=True` 只转 `IsIconic`，窗口还在任务栏；
+`skip_task_bar=True` 在这套客户端上**样式位一位没动**，不能当"从任务栏摘掉"。所以
+唯一入口是**一只只在藏窗期间存在**的托盘图标（`services/tools/win_tray.py`，pywin32
+`Shell_NotifyIcon` + 自带消息窗口线程）。顺序是硬约束：
+
+1. `hide()`：**先挂图标、图标挂不上就绝不藏窗**。窗口消失又没有任何入口，用户只会
+   以为程序崩了直接强杀，读过的进度全丢——比功能没做成严重得多。
+2. `restore()`：**先回窗、再摘图标**。图标比窗口先没，用户同样以为程序消失了。
+3. 回窗必须 `to_front()`（0.86 是**协程**，裸调用只会得到 "never awaited"，窗口一动
+   没动；藏起来的窗口也不会自己抢回前台）——但这条要**等 `_FRONT_DELAY = 0.3` 秒、
+   到点时看藏窗标志再发**：客户端把 toFront 做在收到之后，它晚于其后那条 `visible=False`
+   落地，"点完图标立刻再按一次老板键"就会让窗口赖在桌面上而标志说藏着，此后每一拍
+   `handle_key` 都直接 return（桌面探针 0 秒间隔那一臂 2/2 复现；改成"落地后补一次藏"
+   **没用**，那条协程在消息发出去时就算完成了）。
+4. 托盘回调**跑在托盘线程上**，控件只认界面循环，所以经 `_run_on_ui` 用
+   `run_coroutine_threadsafe` 编组回 `ui_loop()`（§5.2 同一条契约；无头/测试没登记
+   界面循环时就地执行）。
+
+**真键盘那一条腿量过了**（`SendInput` 一次一键、间隔 60ms，同时读 `GetAsyncKeyState` 对账）：
+flet 自己造的 `KeyboardEvent` 写的是 `key='H'`（**大写**，`normalize_key` 折成小写才碰得上）
++ `ctrl/alt` 真布尔，`chord_of` 得到 `ctrl+alt+h` → 命中默认绑定、当场藏窗（等了 0.0s）；
+从托盘回来之后再按一把仍然命中，所以老板键不是"只能用一次"。
+
+**两处接线都在装配根**，视图层拿不到服务（红线 §7.5）：`main._wire_boss_key` 把
+`lambda: page` 注给 `set_page_provider` 并返回一个 `key_filter`，
+`build_app_shell(page, hub, shelf_probe=..., key_filter=...)` 把它挂在
+`page.on_keyboard_event` 的**最前面**——命中老板键那一拍必须吃掉，既藏窗又翻页是灾难。
+非 Windows / 没装 pywin32 → `available` 为 False，服务照样注册，快捷键页明说
+"本机没有托盘能力"，其它一切照旧。
+
+护栏：`tests/test_shortcut_page.py`（42 条，藏/回两条顺序用一份共享 sink 钉死
+`["tray_start","visible=False"]` 与 `["visible=True","tray_stop"]`，那条把关另钉"连按两下
+时 toFront 根本不许发"）+ 17 条变异核验；桌面真类探针 `.probe/probe_bosskey_roundtrip73.py`。
+**人手点托盘图标这一腿离线造不出来**（仪器只能把消息塞进回调），记在 `docs/known-issues/`
+待修清单 12，探针带 `--human` 留了 12 秒人工确认口；0.3 秒那道关是量出来的常数，
+客户端换版本后要重跑（同 004 待修清单 13）。
+
+### 5.16 全应用背景图（`services/tools/background_service.py` + `views/navigation.py` + 装配根订阅）
+
+同一条需求里的后半句："背景图片替换能力"。定下来的是**全应用一层**（不是每页一张、
+也不是只有书架换底）：**读的是同一个偏好，画的是同一个根**。
+
+**服务面**（`BackgroundService`，工具域）：用户选中的原图**归一后拷进
+`<data>/backgrounds/<md5-16>.jpg`**，库里落的键值是那份拷贝的路径——原图可能在移动盘、
+网盘或一个马上会被整理的下载文件夹里，下次开机它就没了，界面上只剩一块裂图。归一走
+Pillow：长边压到 2560、转 JPEG（背景层永远罩着一层半透明，85 质量看不出压缩痕迹；
+一张 6000×4000 的手机照片天天被解码不值）。**没装 Pillow 就原样拷贝**，功能不退化成
+"用不了"。`install()` 是协程（读原图 + 解码 + 缩放是几百毫秒到几秒的重活，同步方法会把
+窗口冻在那里），顺序是硬约束：**先写新图 → 再落键 → 最后删旧图**，落键之后界面已经指向
+新文件，这时删旧的才不会闪出一道"既没旧的也没新的"空窗。`current` **认文件不认键**
+（文件没了就当没有，这一层的替代品是纯色底，裂图比没背景难看）；`_prune` 只删**我们自己
+目录里**的路径，绝不碰用户自己的文件。偏好键 `appearance.background.image`（空串 = 没有）。
+
+**外壳那一层**（`NavigationHost.render()`，`views/navigation.py:346`）：有背景时把宽/窄窗
+布局垫进 `ft.Stack`，最底一层是 `Container(expand=True, image=DecorationImage(src,
+fit=COVER, opacity=_BACKGROUND_OPACITY))`，`_BACKGROUND_OPACITY = 0.25`。
+**是"图半透明压在主题底色上"，不是"图 + 一层黑纱"**：`DecorationImage` 的 opacity 让它跟
+窗口自己的 scaffold 底色合成，所以浅色面仍是浅底深字、深色面仍是深底浅字，两套主题都不
+用认当前是哪一面。反过来若在上面盖一层固定颜色的压暗层，就得知道系统此刻在亮面还是暗面
+——`theme_mode` 可以是 `SYSTEM`，Python 侧问不到解析结果。`set_background()` 路径没变时
+**什么都不做**（这条线会被每次偏好写入打到，重建整棵根树代价大，还会把当前视图的在途渲染
+一起掀掉）；`rebuild()`（宽/窄窗切换）走 `render()`，所以缩放重建不会把背景弄丢。
+
+**接线在装配根**（`main._wire_background`，红线 §7.5：视图层拿不到服务）：换图的是外观页
+控制器，画那一层的是导航外壳，两者互相不认识，中间这一跳只能由把两边都捏在手里的地方搭
+——`settings.subscribe([BACKGROUND_IMAGE_KEY], …)`，处理器**跑在 EngineHub 守护 loop 上**
+而 `set_background` 要改控件，所以经 `engine_worker.call_on_ui` 编组回界面循环（§5.2 同一条
+契约，老板键的托盘回调走的是同一个口子）。函数**返回首屏路径**给
+`build_app_shell(page, hub, …, background=…)`：外壳创建时就要拿到它，晚一步就得整棵根树
+重建一次。
+
+**外观页不走 pending/保存**：主题三件套是"预览→保存才落库"，换图不是——选完就该看到，
+落偏好即生效。所以"恢复默认"也**不动背景**（把用户刚选的图连带清掉是最容易被当成丢数据的
+意外，状态行明说）。控制器报成败前**自己读回一次**再比：`install` 落了键，但真正铺上去的是
+装配根那一跳订阅，服务没起来/键没写进去时说"已换上"就是假话。视图上标签只写**文件名**
+（`Path(...).name`），不把整条数据目录路径摊给用户看。
+
+护栏：`tests/test_background_image.py`（服务面：拷图归一/清除/换图删旧/不碰目录外/认文件不认
+键；界面面：Stack 层形状与不盖固定色压暗层、同路径不重建、`rebuild()` 后背景还在、装配根
+那一推必须**经编组而不是就地执行**、视图/服务模块零 `app.services.*` 与零 flet 用 AST 扫
+import 钉）+ 变异核验 `.probe/mutate_round74.py`；桌面像素探针
+`.probe/probe_background_paint74.py`（读数见 `docs/dev-logs/2026-10-05.md` 第七十四轮：这一层
+没有 DOM / 语义节点，所以走 `FLET_APP` + `page.take_screenshot` 逐格比图，不是
+WEB_BROWSER 那条语义树路）。
+
 ## 6. 存储（三类介质，设计 §6.2 落地态）
 
 | 介质 | 内容 | 位置 |
 | --- | --- | --- |
 | SQLite 主库 `legado.db` | 全部结构化数据，StorageService 独占，schema 版本化（当前 v7） | AppPaths.data（Windows `%LOCALAPPDATA%`，Linux/macOS XDG；可用 `LEGADO_BOOKSOURCE_DATA_DIR` 覆盖） |
-| 文件目录 | `reader-cache/`（章节正文）、`image-cache/`（封面/漫画图）、`downloads/`（导出/下载产物）、`chromium-profile*/`（浏览器登录态） | AppPaths.cache / data；可用 `LEGADO_BOOKSOURCE_CACHE_DIR` 覆盖 |
+| 文件目录 | `reader-cache/`（章节正文）、`image-cache/`（封面/漫画图）、`downloads/`（导出/下载产物）、`chromium-profile*/`（浏览器登录态）、`backgrounds/`（用户背景图归一后的拷贝，SettingsService 键指的就是这里，见 §5.16） | AppPaths.cache / data；可用 `LEGADO_BOOKSOURCE_CACHE_DIR` 覆盖 |
 | 互操作 JSON / zip | 书源导入导出、WebDAV 备份包——运行时不读写，仅在导入导出/备份恢复时生成与消费 | — |
 
 主库 v7 表清单（`app/storage/schema.py` 为权威）：
@@ -1014,7 +1145,13 @@ M7 清理线**真正删掉的是旧单体 UI**（`app/app.py`、旧平铺 `app/v
 详见 `docs/M7打包说明.md`（M7 新写）与 `docs/backend-operations-manual.md`。摘要：
 
 - 依赖分两份：`requirements.txt` 全平台通用；`requirements-desktop.txt` 追加
-  playwright（桌面内置无头浏览器用）。
+  playwright（桌面内置无头浏览器用）与 `pywin32>=306 ; sys_platform == "win32"`
+  （老板键的托盘图标用，见 §5.15；实测环境是 312，此前只靠 pyttsx3 传递带进来，
+  现在显式声明，免得朗读那条哪天去掉就把托盘一起带走）。pywin32 在
+  `services/tools/win_tray.py` 里是**懒 import**：非 Windows / 没装都只让
+  `is_available()` 返回 False，功能降级，绝不带着 ImportError 往上冒——所以
+  PyInstaller 要打 Windows 包时必须补 `--hidden-import=win32gui`（以及
+  `win32con`/`win32api`），懒 import 它自己扫不出来。
 - PyInstaller 入口 `main.py`；`--add-data` 必须把 `app/resources/publicsuffixes.gz`
   放到包内 `app/resources/` 下（`public_suffix._DATA` 按 `__file__` 相对定位，冻结包
   即 `sys._MEIPASS/app/resources/`）；新依赖按服务懒加载，`--hidden-import` 清单见打包说明。

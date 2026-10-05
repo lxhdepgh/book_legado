@@ -255,6 +255,30 @@ def ui_loop() -> asyncio.AbstractEventLoop | None:
     return _UI_LOOP
 
 
+def call_on_ui(fn) -> None:
+    """把一个"要碰控件"的动作编组到界面循环上执行（契约 §5.2）。
+
+    后台线程或引擎守护 loop 上的回调直接改控件是不行的——控件只认界面循环。
+    **没登记界面循环（无头测试、窗口已关）时就地执行**：那条线上本来就没有真窗口，
+    就地跑才是测试能观察到的行为，把它静默丢掉会变成"测试全绿但没人执行"。
+    """
+    loop = ui_loop()
+    if loop is None or loop.is_closed():
+        try:
+            fn()
+        except Exception:
+            logger.exception("后台回调就地执行失败")
+        return
+
+    async def call() -> None:
+        try:
+            fn()
+        except Exception:
+            logger.exception("界面循环上执行失败")
+
+    asyncio.run_coroutine_threadsafe(call(), loop)
+
+
 class EngineProxy:
     """跑在 EngineHub 上的服务对象的 UI 面句柄（§3.6 / §9.2）。
 

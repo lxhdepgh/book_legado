@@ -28,7 +28,8 @@ from app.core.lifecycle import ServiceState, ServiceStatus
 from app.core.registry import (DEST_BOOKSHELF, DEST_FIND_BOOKS, DEST_MANGA_READER,
                                DEST_READER, DEST_RSS,
                                DEST_SETTINGS_APPEARANCE,
-                               DEST_SETTINGS_DASHBOARD, DEST_SOURCE_CHECK,
+                               DEST_SETTINGS_DASHBOARD, DEST_SETTINGS_SHORTCUTS,
+                               DEST_SOURCE_CHECK,
                                DEST_SOURCE_EDITOR, DEST_SOURCE_IMPORT,
                                DEST_SOURCE_LIST, DEST_SOURCE_REPAIR,
                                DEST_TOOLS_EXPORT,
@@ -179,10 +180,12 @@ class NavigationMetadataTests(unittest.TestCase):
         # 阅读组：找书 + 书架 + 订阅三个页签（阅读器/漫画是整页目的地）
         self.assertEqual(members[GROUP_READING], [
             DEST_FIND_BOOKS, DEST_BOOKSHELF, DEST_RSS])
-        # 配置组：更多工具 + 外观 + 服务（8 个工具子页整页跳转，不进页签）
+        # 配置组：更多工具 + 外观 + 快捷键 + 服务（8 个工具子页整页跳转，不进页签）。
+        # 快捷键页是第七十三轮新加的：阅读器那七个动作以前只存在库里、界面没入口，
+        # 用户报的就是这句"打开软件没找到按键设置的位置"。
         self.assertEqual(members[GROUP_CONFIG], [
             DEST_TOOLS_OVERVIEW, DEST_SETTINGS_APPEARANCE,
-            DEST_SETTINGS_DASHBOARD])
+            DEST_SETTINGS_SHORTCUTS, DEST_SETTINGS_DASHBOARD])
 
     def test_every_factory_constructs_view(self):
         registry, _hub = _populated_registry()
@@ -337,16 +340,16 @@ class WholePageRouteTests(unittest.TestCase):
             self.assertEqual(route.hidden, hidden,
                              f"{dest} hidden 不一致: meta={hidden} route={route.hidden}")
 
-    def test_tab_count_is_eleven_and_whole_page_is_twelve(self):
+    def test_tab_count_is_twelve_and_whole_page_is_twelve(self):
         registry, _hub = _populated_registry()
         tabs = sum(len(items) for _g, items in registry.grouped_destinations())
         # 页签：书源 5（管理/导入/检测/规则/自愈）+ 阅读 3（找书/书架/订阅）
-        #       + 配置 3（更多工具/外观/服务）
+        #       + 配置 4（更多工具/外观/快捷键/服务）
         # 整页：阅读器、漫画、8 个工具子页 + 网络桥设置页 + 朗读语音档页
         #       （tools.webbridge / tools.tts 后补，都不在 TOOLS_DESTINATIONS
         #        冻结元组里，所以这里必须跟着涨）
         whole_page = sum(1 for entry in NAV_META.values() if entry[2])
-        self.assertEqual(tabs, 11)
+        self.assertEqual(tabs, 12)
         self.assertEqual(whole_page, 12)
         self.assertEqual(tabs + whole_page, len(NAV_META))
 

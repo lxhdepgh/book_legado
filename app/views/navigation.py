@@ -19,11 +19,11 @@
   的桥：负责把阅读/书源/工具三组 ``register_destinations`` + 设置组占位工厂 +
   :meth:`ViewRegistry.attach_navigation_meta` 一次性接齐。
 
-设置组两个目的地在 M6 本线只放**最小占位工厂**：
+设置组三个目的地：
 
-- ``settings.appearance``：外观偏好由 ThemeService 承接，完整外观页后续补全；
-- ``settings.dashboard``：M6 第三线（Agent C）交付完整版 ServiceDashboard 后
-  替换本占位（契约 §5）。
+- ``settings.appearance``：外观完整页（M7 补全，ThemeService 承接偏好）；
+- ``settings.shortcuts``：快捷键页（第七十三轮，阅读键位 + 老板键）；
+- ``settings.dashboard``：M6 第三线（Agent C）交付完整版 ServiceDashboard。
 """
 from __future__ import annotations
 
@@ -35,7 +35,8 @@ from app.core.hub import ServiceHub
 from app.core.registry import (ViewRegistry,
                                DEST_BOOKSHELF, DEST_FIND_BOOKS, DEST_READER,
                                DEST_MANGA_READER, GROUP_READING,
-                               DEST_SETTINGS_APPEARANCE, DEST_SETTINGS_DASHBOARD)
+                               DEST_SETTINGS_APPEARANCE, DEST_SETTINGS_DASHBOARD,
+                               DEST_SETTINGS_SHORTCUTS)
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,7 @@ _ICONS: dict[str, str] = {
     "tools.webdav": ft.Icons.UPLOAD_FILE,
     "tools.update": ft.Icons.SYSTEM_UPDATE,
     DEST_SETTINGS_APPEARANCE: ft.Icons.PALETTE_OUTLINED,
+    DEST_SETTINGS_SHORTCUTS: ft.Icons.KEYBOARD_OUTLINED,
     DEST_SETTINGS_DASHBOARD: ft.Icons.DASHBOARD_OUTLINED,
 }
 
@@ -86,12 +88,28 @@ def is_narrow_width(width: float | None) -> bool:
     return bool(width is not None and width < NARROW_WIDTH_THRESHOLD)
 
 
+#: 全应用背景图与主题底色的合成比例（见 :meth:`NavigationHost.render`）。
+#: 图是"垫在文字后面的一层"，不是壁纸展：超过这个数，深色主题下的浅色图块会把
+#: 浅字顶掉；低于 0.1 就等于换了张看不出来的图。
+_BACKGROUND_OPACITY = 0.25
+
+
 # --------------------------------------------------------------------------- #
 # 设置组工厂（M6 集成：appearance 占位 / dashboard 完整版）
 # --------------------------------------------------------------------------- #
 # 完整版 ServiceDashboard 工厂需要 page 引用（build_dashboard(page, hub) 签名），
 # 由 build_app_shell 在装配时写入；无头测试 page=None 时 dashboard 仍可离线构造。
 _APP_PAGE: ft.Page | None = None
+
+#: 当前导航外壳（:func:`build_app_shell` 装配时写入）。装配根订阅到"背景图偏好变了"
+#: 之后要把它推到那一层上：视图层拿不到服务（红线 §7.5），反过来装配根也不该重建外壳，
+#: 只需要这一个句柄——和上面 ``_APP_PAGE`` 同一个晚绑定路子。
+_APP_HOST: "NavigationHost | None" = None
+
+
+def current_host():
+    """当前导航外壳；还没装配起来时 None。"""
+    return _APP_HOST
 
 
 def _build_appearance_view(hub: ServiceHub):
@@ -117,12 +135,31 @@ def _build_dashboard_full(hub: ServiceHub):
     return build_dashboard(_APP_PAGE, hub)
 
 
+def _build_shortcut_view(hub: ServiceHub):
+    """快捷键页（第七十三轮）：阅读键位 + 老板键，按一下就能录。
+
+    老板键的可用性要问 :class:`BossKeyService`（非 Windows 就明说"本机没有托盘
+    能力"），所以工厂要把 hub 递下去；服务没注册时页照样起得来，只是那一段
+    写着"不会生效"。
+    """
+    from app.controllers.settings.shortcut_controller import ShortcutController
+    from app.views.settings.shortcut_view import ShortcutView
+    view = ShortcutView()
+    ShortcutController(hub).attach(view)
+    return view
+
+
 def _register_settings_destinations(registry: ViewRegistry, hub: ServiceHub) -> None:
-    """设置组两个目的地（appearance 占位 / dashboard 完整版）。"""
+    """设置组三个目的地（appearance 完整页 / 快捷键 / dashboard 完整版）。"""
     registry.register(
         DEST_SETTINGS_APPEARANCE,
         lambda: _build_appearance_view(hub),
         required_services=("ThemeService",),
+    )
+    registry.register(
+        DEST_SETTINGS_SHORTCUTS,
+        lambda: _build_shortcut_view(hub),
+        required_services=("SettingsService",),
     )
     registry.register(
         DEST_SETTINGS_DASHBOARD,
@@ -249,17 +286,22 @@ class NavigationHost:
     def __init__(self, page, registry: ViewRegistry, *,
                  width: float | None = None,
                  initial_destination: str | None = None,
-                 shelf_probe=None) -> None:
+                 shelf_probe=None, background: str | None = None) -> None:
         """``shelf_probe``：书架上有没有书（阅读组落地判定，见 :meth:`_anchor`）。
 
         视图层不许 import 服务（红线 §7.5），所以这个判定由装配根
         （:func:`build_app_shell` / 测试）注入的可调用对象提供；None 表示探不到，
         此时阅读组按 NAV_META 顺序落「找书」。
+
+        ``background``：全应用一层背景图的路径（空 = 没有）。外壳只认路径，
+        谁改了偏好由装配根回调 :meth:`set_background`（同样不许 import 服务）。
         """
         self.page = page
         self.registry = registry
         self._width = width
         self._shelf_probe = shelf_probe
+        #: 背景图路径（"" = 没有）；改它只经 :meth:`set_background`。
+        self._background = str(background or "")
         self.current: str | None = None
         #: 最近一次开读派发的 future（无头测试可 await/回查；运行期 fire-and-forget）。
         self._pending_open = None
@@ -302,6 +344,24 @@ class NavigationHost:
         return is_narrow_width(width)
 
     def render(self):
+        """根控制：宽/窄窗布局，外面按需垫一层全应用背景图。"""
+        layout = self._render_layout()
+        if not self._background:
+            return layout
+        # 背景是**半透明地压在主题底色上**，不是"图 + 一层黑纱"：
+        # DecorationImage 的 opacity 让它跟窗口自己的 scaffold 底色合成，所以浅色面
+        # 仍是浅底深字、深色面仍是深底浅字，两套主题都不用认当前是哪一面。
+        # 反过来若在上面盖一层固定颜色的压暗层，就得知道系统此刻在亮面还是暗面——
+        # 装配根在 Python 侧问不到（theme_mode 可以是 SYSTEM）。
+        # 合成比例见 :data:`_BACKGROUND_OPACITY`。
+        return ft.Stack(expand=True, controls=[
+            ft.Container(expand=True, image=ft.DecorationImage(
+                src=self._background, fit=ft.BoxFit.COVER,
+                opacity=_BACKGROUND_OPACITY)),
+            layout,
+        ])
+
+    def _render_layout(self):
         """按当前宽/窄窗决定根布局（Rail 行 / Bar 列）。"""
         if self._is_narrow():
             return ft.Column([
@@ -319,6 +379,38 @@ class NavigationHost:
         self.root = self.render()
         self._sync_selected()
         return self.root
+
+    # ------------------------------------------------------------------ #
+    # 全应用背景图（装配根在偏好变更时调用）
+    # ------------------------------------------------------------------ #
+    @property
+    def background(self) -> str:
+        return self._background
+
+    def set_background(self, path: str | None) -> None:
+        """换/去掉那一层背景，并把新根挂回页面。
+
+        路径没变时**什么都不做**：这条线会被每次偏好写入打到，重建整棵根树代价大，
+        而且会把当前视图的在途渲染一起掀掉。
+        """
+        next_path = str(path or "")
+        if next_path == self._background:
+            return
+        self._background = next_path
+        self.root = self.render()
+        self._sync_selected()
+        self._repaint_root()
+
+    def _repaint_root(self) -> None:
+        """把 ``self.root`` 重新塞回页面（与 :func:`build_app_shell` 的缩放重建同一条路）。"""
+        if self.page is None:
+            return
+        try:
+            self.page.controls.clear()
+            self.page.add(self.root)
+            self.page.update()
+        except Exception:  # 无头/已关窗：没有可刷新的窗口，不算失败
+            pass
 
     # ------------------------------------------------------------------ #
     # 内容区当前生效的视图
@@ -592,15 +684,23 @@ class NavigationHost:
 # --------------------------------------------------------------------------- #
 # main 入口装配
 # --------------------------------------------------------------------------- #
-def build_app_shell(page: ft.Page, hub: ServiceHub, shelf_probe=None) -> ft.Control:
+def build_app_shell(page: ft.Page, hub: ServiceHub, shelf_probe=None,
+                    key_filter=None, background: str | None = None) -> ft.Control:
     """M6 新入口：装配全量目的地 → 挂导航容器 → 首屏落地阅读组。
 
     ``shelf_probe``（可调用，返回「架上有书」）透传给 :class:`NavigationHost`：
     首屏与点「阅读」入口都按它决定落书架还是落找书。视图层不 import 服务，
     探测由装配根（main.py）提供；不传则落找书。
 
-    旧 ``build_dashboard``（M1 单体）不再作为默认入口；其文件仍在（M7 删），
-    导航只指向注册表里的新视图（契约 §4）。
+    ``key_filter``（可调用，收一个 ``KeyboardEvent``，返回 bool）是**全局按键的
+    第一道闸**：老板键这类"命中就不许再往下分发"的动作走它。返回 True 表示这一拍
+    已被吃掉。同样由装配根注入——视图层拿不到 :class:`BossKeyService`（红线 §7.5）。
+
+    ``background``：首屏的**全应用背景图**路径（空 = 没有）。外壳只认路径；之后
+    用户换图由装配根订阅偏好、回调 :meth:`NavigationHost.set_background`（同一红线）。
+
+    旧单体（``old_code/app/app.py`` 的 3 个顶级入口）不再作为默认入口；其文件
+    仍在（M7 删），导航只指向注册表里的新视图（契约 §4）。
     """
     import asyncio
 
@@ -621,17 +721,26 @@ def build_app_shell(page: ft.Page, hub: ServiceHub, shelf_probe=None) -> ft.Cont
         ui_loop = None
     inject_interaction_loop(hub, ui_loop)
 
+    # 外壳句柄登记给装配根：背景图偏好变了要有人能推到这一层（见 current_host）
+    global _APP_HOST
     registry = register_all_destinations(default_registry(), hub)
-    host = NavigationHost(page, registry, shelf_probe=shelf_probe)
+    host = NavigationHost(page, registry, shelf_probe=shelf_probe,
+                          background=background)
+    _APP_HOST = host
     page.add(host.root)
-    # 阅读器快捷键接线（M6 漏接，M7 后补回；分发到当前视图 on_key）
-    page.on_keyboard_event = host._on_keyboard_event
+    # 阅读器快捷键接线（M6 漏接，M7 后补回；分发到当前视图 on_key）。
+    # key_filter 在最前面：老板键命中的那一拍不该再让正文页当成翻页。
+    def _on_key(event):
+        if key_filter is not None and key_filter(event):
+            return
+        host._on_keyboard_event(event)
+
+    page.on_keyboard_event = _on_key
 
     # 窗口跨阈值缩放时：宽/窄窗切换重建外壳（内容视图保留，不重建）
     def _on_resize(e=None):
-        page.controls.clear()
-        page.add(host.rebuild())
-        page.update()
+        host.rebuild()
+        host._repaint_root()
 
     page.on_resize = _on_resize
     return host.root

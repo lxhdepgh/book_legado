@@ -38,35 +38,15 @@ from app.services.content.local_book_service import is_local_source_url
 from app.services.sources.rule_repair_service import RuleRepairService
 from app.services.engine.rule_engine import display_intro, html_to_text
 from app.services.tools.dict_service import DictService
+from app.core.shortcuts import (action_for, chord_of, default_reader_shortcuts,
+                                merge_reader_shortcuts)
 
 logger = logging.getLogger(__name__)
 
 
-#: 阅读器快捷键默认绑定（对齐旧 ReadingView._load_reader_preferences）。
-#: 键名以 Flet KeyboardEvent.key 的规范化形式为准（arrow left → left）。
-DEFAULT_SHORTCUTS: dict[str, str] = {
-    "previous": "left", "next": "right",
-    "page_up": "pageup", "page_down": "pagedown",
-    "directory": "f", "settings": "comma", "close": "escape",
-}
-
-#: Flet 事件键名 → 规范键名（对齐旧 _normalize_reader_key 的别名表）。
-_KEY_ALIASES: dict[str, str] = {
-    "arrow left": "left", "arrowleft": "left",
-    "arrow right": "right", "arrowright": "right",
-    "arrow up": "up", "arrowup": "up",
-    "arrow down": "down", "arrowdown": "down",
-    "page up": "pageup", "page down": "pagedown",
-    " ": "space", ",": "comma", "keyf": "f",
-    "keycomma": "comma", "esc": "escape",
-    "control left": "ctrl", "control right": "ctrl",
-    "controlleft": "ctrl", "controlright": "ctrl",
-    "ctrl left": "ctrl", "ctrl right": "ctrl",
-    "shift left": "shift", "shift right": "shift",
-    "shiftleft": "shift", "shiftright": "shift",
-    "alt left": "alt", "alt right": "alt",
-    "altleft": "alt", "altright": "alt",
-}
+#: 阅读器快捷键默认绑定与键名别名表：住在 :mod:`app.core.shortcuts`，与
+#: 「配置 → 快捷键」页共用一份。两处各写一张表的话，页面显示 "PageDown"、
+#: 比较时用的是 "pagedown"，用户录进去的键位就永远不会命中。
 
 
 #: 自动续读的迟滞区间（px，对齐旧 ReadingView._on_reader_scroll）：距文档底部
@@ -221,7 +201,7 @@ class ReaderController(BaseController):
 
         # 快捷键 + 阅读设置弹层（旧 ReadingView 方向键/翻页/目录能力，M6 漏接的
         # page.on_keyboard_event 在 navigation.build_app_shell 处接线分发到视图 on_key）
-        self._shortcuts: dict[str, str] = dict(DEFAULT_SHORTCUTS)
+        self._shortcuts: dict[str, str] = default_reader_shortcuts()
         self._settings_dialog = None
         # 释义弹窗：_lookup_word 是弹窗当前认领的那个词，关掉即清空——
         # 在途结果回来时对不上号就丢弃，晚到的 A 词释义不能贴到 B 词弹窗上。
@@ -271,11 +251,7 @@ class ReaderController(BaseController):
             self._view.apply_preferences(prefs)
         saved = await self._reading.get_reader_preference("shortcuts", None)
         if isinstance(saved, dict):
-            merged = dict(DEFAULT_SHORTCUTS)
-            for name, binding in saved.items():
-                if name in merged:
-                    merged[name] = str(binding or "").strip().lower()
-            self._shortcuts = merged
+            self._shortcuts = merge_reader_shortcuts(saved)
         # 语速不属于排版（不参与重排），但和快捷键一样是"进程级读一次"的偏好
         rate = await self._reading.get_reader_preference("tts_rate", None)
         bar = getattr(self._view, "read_aloud", None) if self._view else None
@@ -305,36 +281,35 @@ class ReaderController(BaseController):
         self._tts_profile = self._find_profile(bar.voice)
 
     # ------------------------------------------------------------------ #
-    # 快捷键（M6 补回：键位规范化 + 动作分发，行为对齐旧 _on_reader_key）
+    # 快捷键（M6 补回：键位分发；规范化在 app.core.shortcuts，与设置页同一份表）
     # ------------------------------------------------------------------ #
-    @classmethod
-    def _normalize_key(cls, value) -> str:
-        key = str(value or "").strip().lower().replace("_", " ")
-        if key.startswith("key ") and len(key) == 5:
-            key = key[-1]
-        return _KEY_ALIASES.get(key, key)
-
     def _on_key(self, event) -> None:
-        """阅读器快捷键分发（仅正文页生效，由导航层在 on_keyboard_event 中路由）。"""
-        binding = self._normalize_key(getattr(event, "key", ""))
-        if binding in {"ctrl", "shift", "alt"}:
+        """阅读器快捷键分发（仅正文页生效，由导航层在 on_keyboard_event 中路由）。
+
+        走 :func:`chord_of` 而不是只看 ``event.key``：设置页允许录组合键
+        （Ctrl+PgDn 之类），而单独按下修饰键那一拍 ``key`` 就是 "Control Left"，
+        旧写法靠一张"ctrl/shift/alt 直接 return"的补丁挡掉——组合键一进来
+        那个补丁会把 "Ctrl + P" 的主键当成裸键放行，两处都漏。
+        """
+        action = action_for(chord_of(event), self._shortcuts)
+        if not action:
             return
-        shortcuts = self._shortcuts
-        if binding == shortcuts["directory"]:
+        view = self._view
+        if action == "directory":
             self.open_directory()
-        elif binding == shortcuts["previous"]:
+        elif action == "previous":
             self.prev_chapter()
-        elif binding == shortcuts["next"]:
+        elif action == "next":
             self.next_chapter()
-        elif binding == shortcuts["page_up"]:
-            self._view.scroll_by(-560)
-        elif binding == shortcuts["page_down"]:
-            self._view.scroll_by(560)
-        elif binding == shortcuts["settings"]:
+        elif action == "page_up":
+            view.scroll_by(-560)
+        elif action == "page_down":
+            view.scroll_by(560)
+        elif action == "settings":
             self.open_settings()
-        elif binding == shortcuts["close"]:
-            self._view.show_directory(False)
-            self._view.show_side_panel("")
+        elif action == "close":
+            view.show_directory(False)
+            view.show_side_panel("")
             self.close_settings()
 
     # ------------------------------------------------------------------ #
