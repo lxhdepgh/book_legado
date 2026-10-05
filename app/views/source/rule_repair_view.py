@@ -86,7 +86,12 @@ class RuleRepairView(ft.Column):
             width=520, dense=True, text_size=12, visible=False,
             on_change=lambda e: self._sync_labels())
         self._manual_sem = ft.Semantics(label="正文页地址：还没填",
-                                        content=self._manual)
+                                        content=self._manual,
+                                        # 可见性必须与里面的框**同步起步**：这页起手时
+                                        # 手填框是藏着的，外壳若还 visible=True，客户端
+                                        # 建树当场报 `Semantics.content must be provided
+                                        # and visible`，整页起不来（第七十二轮现场报错）。
+                                        visible=False)
         self._hint = ft.Text("", size=12, color=ft.Colors.GREY_600)
         self._spinner = ft.ProgressRing(width=16, height=16, visible=False)
 

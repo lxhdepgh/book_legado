@@ -533,6 +533,35 @@ class RepairViewRenderTests(unittest.TestCase):
         self.assertFalse(view._manual.visible)
         self.assertFalse(view._manual_sem.visible, "外壳没跟着收，树里还挂着这只框")
 
+    def test_reader_wrapper_and_its_field_always_share_visibility(self):
+        """``Semantics`` 外壳与它包的那只控件必须**同进同退**。
+
+        第七十二轮现场报错：这一页起手时手填框是藏着的、外壳还亮着，客户端建树当场
+        提示 ``Semantics.content must be provided and visible``，整页起不来。反过来
+        （外壳藏了、框亮着）是另一半：框在屏上看得见，读屏却念不出"这是填什么的"。
+        两个方向都不能靠"点一遍"钉死，只能钉形状——任何时刻树上都不许有一对
+        可见性不一致的壳/芯。
+        """
+        def offenders(view):
+            bad = []
+            stack = list(view.controls)
+            while stack:
+                node = stack.pop()
+                for child in _children(node):
+                    stack.append(child)
+                inner = getattr(node, "content", None)
+                if isinstance(node, ft.Semantics) and isinstance(inner, ft.Control):
+                    if bool(getattr(node, "visible", True)) \
+                            != bool(getattr(inner, "visible", True)):
+                        bad.append((node, inner))
+            return bad
+
+        view = RuleRepairView()
+        self.assertEqual([], offenders(view), "起手就有壳/芯可见性不一致的一对")
+        for flag in (True, False, True, False):
+            view.set_manual_visible(flag)
+            self.assertEqual([], offenders(view), f"切到 visible={flag} 之后出现了")
+
     def test_the_proposed_rule_is_readable_not_only_copyable(self):
         """报告卡里的规则串不许再用 ``selectable=True``：可复制文本在语义树里是空节点。
 
