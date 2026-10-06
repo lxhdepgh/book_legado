@@ -131,8 +131,11 @@ class BrowserView(ft.Column):
             self._cast,
             ft.Text("点击网页输入框后，在这里输入并回车；拖动可操作滑块",
                     size=12, color=ft.Colors.ON_SURFACE_VARIANT),
+            # 不换行 Row 里 250 定宽那位 + 一颗按钮合计 ~340，304 那一档塞不下
+            # （第七十七轮按形状推的：这一行只在会话开着时才有，没拍到像素）。
             ft.Row([self._typed,
                     ft.Button("输入", on_click=lambda e: self._send_typed())],
+                   spacing=8, run_spacing=4, wrap=True,
                    alignment=ft.MainAxisAlignment.CENTER),
         ], tight=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
         self._close_btn.visible = True

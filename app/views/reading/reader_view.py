@@ -58,6 +58,12 @@ DEFAULT_PREFERENCES: dict = {
 }
 #: 版心宽度只认这三档（旧实现同规则：手改设置表的怪值一律退回"宽"）。
 _WIDTH_CHOICES = {620.0, 700.0, 760.0}
+#: 书签/书内搜索那条抽屉的设计宽。**不需要**按窗宽再夹一道：它是 Stack 里的一位，
+#: 客户端对 Stack 子项与对弹层一样夹到父框宽——320 塞进 304 那一档时实测面板宽 284
+#: （= Stack 自己的宽），而且头部那行的 `+`/`✕` 跟着面板一起右移同样的像素，
+#: 说明内容是**照窄框重排**、不是画在 320 上再切掉右边（第七十七轮两臂像素，
+#: `.probe/probe_side_clamp77.py`）。
+_SIDE_PANEL_WIDTH = 320
 #: 会把已挂出的正文**重排**的偏好键：这些变了，裸像素就不再指向原来那一段（#87）。
 #: 其余键（背景、状态栏、划词开关）只改颜色与可见性，像素位置原样不动。
 _REFLOW_KEYS = ("font_size", "line_height", "paragraph_spacing", "max_width",
@@ -343,7 +349,7 @@ class ReaderView(ft.Column):
                 ]),
             ]))
         self._side_host = ft.Container(
-            visible=False, width=320, bgcolor=ft.Colors.SURFACE,
+            visible=False, width=_SIDE_PANEL_WIDTH, bgcolor=ft.Colors.SURFACE,
             content=self._side_tabs)
 
         # ------------------------------------------------------------------ #
@@ -965,18 +971,28 @@ class ReaderView(ft.Column):
                      ft.dropdown.Option("night", "夜间"),
                      ft.dropdown.Option("eink", "墨水屏")],
             on_select=lambda e: on_change("background", e.control.value))
+        # 长标签必须**自己换行**，客户端不会：`ft.Switch(label=ft.Text(...))` 实测与裸串
+        # 一模一样照字面画出去（第七十七轮 304 档，两臂图完全重合），因为开关把标签按
+        # 无限宽排。所以补充说明另起一行小字，标签本身只留主谓那半截。
+        def hint(text: str) -> ft.Text:
+            return ft.Text(text, size=12, color=ft.Colors.ON_SURFACE_VARIANT)
         indent = ft.Switch(
             label="段首缩进", value=bool(preferences["indent"]),
             on_change=lambda e: on_change("indent", bool(e.control.value)))
         status = ft.Switch(
-            label="显示底部状态栏（书名 · 作者 · 总章数）",
+            label="显示底部状态栏",
             value=bool(preferences["show_status"]),
             on_change=lambda e: on_change("show_status", bool(e.control.value)))
         selection = ft.Switch(
-            label="划词可选（选中正文查词典）",
+            label="划词可选",
             value=bool(preferences["text_selection"]),
             on_change=lambda e: on_change(
                 "text_selection", bool(e.control.value)))
+        # 这块**留** 420 定宽：弹层会被客户端夹到窗宽、内容跟着窄框重排（304 那一档实测
+        # 框 256，三条下拉各自独占一行、滑条跟着变短，`out_dlg77b_reader_settings_320.png`）。
+        # 真正出屏的只有开关的长标签——它按无限宽排，所以拆成短标签 + 一行小字（见上）。
+        # 反过来把 420 去掉会更糟：宽窗里整块塌到 280，"左对齐"被截成"左对"（第七十七轮
+        # 两臂对照，`out_dlg77A_reader_settings_1200.png`）。
         panel = ft.Container(width=420, padding=12, content=ft.Column([
             ft.Row([ft.Text("阅读设置", size=20, weight=ft.FontWeight.BOLD),
                     ft.IconButton(ft.Icons.CLOSE, tooltip="关闭",
@@ -985,10 +1001,13 @@ class ReaderView(ft.Column):
             slider("行距", "line_height", 1.3, 2.2, 9),
             slider("段距", "paragraph_spacing", 4, 24, 10),
             ft.ResponsiveRow([width, alignment], columns=12),
-            background, indent, status, selection,
+            background, indent, status,
+            hint("那一栏显示书名 · 作者 · 总章数"),
+            selection, hint("打开后能在正文里选字查词典"),
         ], tight=True))
-        width.col = 6
-        alignment.col = 6
+        # 窄窗里两位下拉各占整行：并排时"左对齐"被截成"左对"（第七十七轮 360 档像素）。
+        width.col = {"xs": 12, "sm": 6}
+        alignment.col = {"xs": 12, "sm": 6}
         return ft.AlertDialog(modal=False, alignment=ft.Alignment.CENTER_RIGHT,
                               inset_padding=ft.Padding(24, 24, 24, 24),
                               scrollable=True, content=panel)

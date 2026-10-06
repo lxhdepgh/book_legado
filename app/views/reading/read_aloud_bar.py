@@ -101,10 +101,35 @@ class ReadAloudBar(ft.Container):
             label="连读下一章", value=True,
             on_change=lambda e: self._fire(self.on_follow_changed, e.control.value))
 
-        self.content = ft.Row(
-            [self._toggle_btn, self._stop_btn, self._label,
-             self._voice, self._rate, self._follow],
-            spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        # 四颗**平铺**的分栏格子，不是"一行六件"，也不是"两格里套一条 wrap 行"：
+        # 一行排完要 ~620px，344 那一档实测把"连读下一章"整只挤出屏幕（第七十七轮像素）。
+        # 为什么格子**里面**不能再放 wrap Row：同一位置三臂实测——格子里套 wrap 行，
+        # 音色+语速排完就换行，右边还剩 400px 空白；把那条 wrap 换成不换行 Row，三件
+        # 立刻排回一行（`out_cell77g_bar_A/B_1200.png`）。而格子本身量到的是 665px，
+        # 也就是**该给的宽给了**，是 wrap 行在格子里自己塌了。所以降级只走 col，
+        # 控件各占一格，不在格内再造会塌的行。
+        # 第一格里那条不换行 Row 可以带 `expand` 的标签（客户端契约：wrap × expand
+        # 才画成灰块，第七十六轮量的）。
+        # col 的窄档配比**算不出来**，只能读回来：格子宽 = 该档栏宽 × col/12，外面还要
+        # 扣朗读条自己的 padding 与栅格间距。三档实测（`.probe/probe_readaloud_cell77.py`：
+        # 四格各涂一色、逐列扫跨度，另放 5:7 两块纯色当尺子对照，量得比值 1.405/1.417/1.414
+        # 对 1.400 → 读数可信）：
+        #   客户区 1184（lg）：474 / 186 / 186 / 282 → **一行**，每格 ≥ 自己那位定宽；
+        #   客户区 344（xs） ：304 / 304 / 150＋150 → 三行，全够；
+        #   客户区 304（xs）：264 / 264 / 130＋130 → 三行，最紧那格 130 ≥ 语速 110、连读 122。
+        # 中途给过 音色 7 / 语速 5：304 那一档语速格量到 **107 < 110**，下拉右端被裁 3px
+        # （第七十七轮像素）。所以 xs 档让音色独占一行、语速与连读并排：语速格 107 → 130，
+        # 连读格从独占一行（264）让成并排（130），但 130 ≥ 它的 122，**行数一行没多**。
+        self.content = ft.ResponsiveRow([
+            ft.Container(
+                col={"xs": 12, "lg": 5},
+                content=ft.Row([self._toggle_btn, self._stop_btn, self._label],
+                               spacing=4,
+                               vertical_alignment=ft.CrossAxisAlignment.CENTER)),
+            ft.Container(col={"xs": 12, "lg": 2}, content=self._voice),
+            ft.Container(col={"xs": 6, "lg": 2}, content=self._rate),
+            ft.Container(col={"xs": 6, "lg": 3}, content=self._follow),
+        ], columns=12, spacing=4, run_spacing=2)
 
     # ------------------------------------------------------------------ #
     @staticmethod
