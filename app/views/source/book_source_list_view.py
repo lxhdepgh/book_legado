@@ -15,9 +15,6 @@ import flet as ft
 class BookSourceListView(ft.Column):
     """书源管理：搜索/分组/状态过滤 + 卡片列表 + 批量操作 + 导入导出/检测入口。"""
 
-    #: 每批懒加载行数（对齐旧 manage_view.LOAD_BATCH_SIZE 体感）。
-    BATCH_SIZE = 50
-
     def __init__(self) -> None:
         super().__init__(spacing=0, expand=True)
 
@@ -125,7 +122,16 @@ class BookSourceListView(ft.Column):
             ], spacing=8, wrap=True))
 
         # 列表区（记录以 dict 注入，视图不持有业务对象）
-        self._cards = ft.Column(spacing=6, scroll=ft.ScrollMode.AUTO)
+        #
+        # 必须是 `ListView`，不能是 `Column(scroll=AUTO)`：客户端只对 ListView 按可见区
+        # 建行，Column 会把下发的每一行都排出来。第七十八轮在真窗口上量过
+        # （`.probe/probe_drag78c.py`，每拍同步 `SetWindowPos` 的墙钟）：
+        # 空页 11 ms｜917 行**同样形状**在 ListView 里 11–12 ms｜在 Column 里 237 ms。
+        # 也不是行数本身贵——917 条裸 Text 装 Column 里仍 13 ms，贵的是"行数 × 每行
+        # ~10 个控件"（一行为 Card>Container>Row[Checkbox, Column[2×Text], IconButton×2,
+        # Switch]，917 行约 9200 个控件）。这一页整页重排 200+ ms，就是用户那句
+        # "应用无法顺畅拖动"。
+        self._cards = ft.ListView(spacing=6, expand=True)
 
         # 状态栏
         self._status = ft.Text("", size=12, color=ft.Colors.GREY_600)

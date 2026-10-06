@@ -378,7 +378,26 @@ class NavigationHost:
         """宽/窄窗切换时调用：换根布局但保留当前内容视图（不重建目的地）。"""
         self.root = self.render()
         self._sync_selected()
+        self._notify_band()
         return self.root
+
+    def _notify_band(self, view=None) -> None:
+        """把"此刻是宽窗还是窄窗"推给内容视图（只推实现了 ``on_band_change`` 的）。
+
+        为什么要由外壳推、不让视图自己读 ``page.width``：需要换形状的页要的不是
+        "某个时刻的宽度"，而是**宽度跨过档位**这一个时机——第七十八轮实测拖窗 30 拍
+        Python 只收到 1–4 次 ``on_resize``（客户端自己合掉了），而外壳正是在这一拍
+        换根；视图挂在同一拍上拿通知，形状就不会和外壳的档位错开。
+        没实现钩子的视图一次调用都不会多花（getattr 兜空）。
+        """
+        target = view if view is not None else self.current_view()
+        notify = getattr(target, "on_band_change", None)
+        if notify is None:
+            return
+        try:
+            notify(self._is_narrow())
+        except Exception:      # 一个页的降级坏了不该拖垮外壳重建
+            logger.warning("窄窗降级失败：%s", type(target).__name__, exc_info=True)
 
     # ------------------------------------------------------------------ #
     # 全应用背景图（装配根在偏好变更时调用）
@@ -462,6 +481,7 @@ class NavigationHost:
             # 否则从侧栏回到「阅读」会丢掉开读前看的那一签。
             self._last_tab[route.group] = destination
         self._sync_selected()
+        self._notify_band()        # 新装配/切回的页先拿到档位，再谈它自己的形状
         if self.page is not None:
             self.page.update()
 
@@ -477,6 +497,7 @@ class NavigationHost:
         group = self._dest_group.get(destination)
         if group is not None:
             self._last_tab[group] = destination
+        self._notify_band()        # 切到一个"上一档宽度下建好"的页：补推一次档位
         if self.page is not None:
             self.page.update()
 
@@ -737,8 +758,22 @@ def build_app_shell(page: ft.Page, hub: ServiceHub, shelf_probe=None,
 
     page.on_keyboard_event = _on_key
 
-    # 窗口跨阈值缩放时：宽/窄窗切换重建外壳（内容视图保留，不重建）
+    # 窗口跨阈值缩放时：宽/窄窗切换重建外壳（内容视图保留，不重建）。
+    #
+    # 只在这一拍**跨过** :data:`NARROW_WIDTH_THRESHOLD` 时才重建，同档位内直接返回。
+    # 第七十八轮实测：拖窗期间 Python 侧只收到 1–4 次 ``on_resize``（客户端合掉了），
+    # 但**每一次**处理器都要 0.5–2.1 s——因为 `rebuild()+_repaint_root()` 是把整棵根树
+    # 重新序列化后发给客户端（书源表 917 条时约 9200 个控件）。不跨阈值也照发的话，
+    # 拖窗过程中会随机冻住界面循环半秒到两秒（心跳同期落后 max 545 ms）。
+    # 形状没变的那一拍重发形状相同的树，除了冻页面什么都不换来。
+    last_narrow = host._is_narrow()
+
     def _on_resize(e=None):
+        nonlocal last_narrow
+        now_narrow = host._is_narrow()
+        if now_narrow == last_narrow:
+            return
+        last_narrow = now_narrow
         host.rebuild()
         host._repaint_root()
 
