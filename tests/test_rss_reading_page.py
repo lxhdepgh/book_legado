@@ -275,9 +275,9 @@ class RssPageTests(unittest.IsolatedAsyncioTestCase):
         _controller, view = _attach(stub)
         await _wait(lambda: len(_rows(view._sources)) == 2, what="源列表")
         await _wait(lambda: len(_rows(view._articles)) == 2, what="文章列表")
-        # 角标来自 article_counts（feed-a 未读 1）
-        self.assertEqual(_text_of(view._sources.controls[0].trailing.controls[0]),
-                         "1 未读")
+        # 角标来自 article_counts（feed-a 未读 1）；未读写在副标题里，
+        # 不再放 trailing 的 Row（那会把源名挤没，见第七十八轮像素）
+        self.assertIn("1 未读", view._sources.controls[0].subtitle.value)
         self.assertIn("2 篇", view._sources.controls[0].subtitle.value)
         self.assertIn("甲源", view._sources.controls[0].title.value)
 
@@ -434,8 +434,7 @@ class RssPageTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(c[0] == "list_articles" for c in stub.calls[before:]),
                         "刷新事件要重新拉列表")
         await _wait(lambda: len(_rows(view._articles)) == 3, what="第三条出现")
-        self.assertEqual(_text_of(view._sources.controls[0].trailing.controls[0]),
-                         "2 未读")
+        self.assertIn("2 未读", view._sources.controls[0].subtitle.value)
 
     async def test_other_sources_refresh_does_not_touch_open_list(self):
         stub = _RssStub()
