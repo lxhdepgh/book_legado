@@ -6,7 +6,8 @@
 
 - :class:`SystemTtsBackend`：pyttsx3 桥——Windows SAPI / macOS NSSpeech /
   Linux espeak。**M4 最小可用后端**；缺驱动/库时加载失败即 ``available=False``
-  降级（无音频设备环境不可用属预期，契约 §5）。
+  降级（无音频设备环境不可用属预期，契约 §5）。SAPI 是 COM 对象、线程亲和，
+  故本后端把 init/出声/停音/释放全部钉在一条专属线程上（跨线程调会静默死锁）。
 - :class:`EdgeTtsBackend`：edge-tts 在线神经语音。系统 TTS 不可用时的自动回退
   后端（验收不绑定单一引擎，§8.4 风险清单）。
 - :class:`HttpTtsBackend`：书源规则 HTTP-TTS，请求走 RuleEngineService 网络栈
@@ -23,7 +24,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue
 import threading
+import time
+from concurrent.futures import Future
 from typing import Any, Awaitable, Callable
 
 from app.core.events import ReadAloudStateEvent
@@ -63,6 +67,9 @@ class TtsBackend:
         """停止当前朗读（默认仅复位状态，子类覆盖真实停音）。"""
         self.state = "idle"
 
+    def close(self) -> None:
+        """释放后端持有的原生资源（COM 等）。默认无资源、无操作。"""
+
     def is_speaking(self) -> bool:
         return self.state == "speaking"
 
@@ -70,55 +77,197 @@ class TtsBackend:
 class SystemTtsBackend(TtsBackend):
     """系统 TTS 后端（pyttsx3 桥：Win SAPI / macOS NSSpeech / Linux espeak）。
 
+    **线程亲和是硬约束**：``pyttsx3.init()`` 在调用线程上建 SAPI COM 对象，出声
+    与 ``finished-utterance`` 回调也要在**同一条**线程上泵消息；换一条线程调
+    ``say``/``runAndWait`` 是静默死锁——旧写法 60s 内不返回、不报错，改后本机
+    2.0s 读完（A/B 交替 3 轮见 ``.probe/tts_affinity_fix.py``）。所以 init、
+    setProperty、say、泵送、stop、丢引用全部排进 :data:`OWNER_THREAD_NAME`
+    这一条专属线程。
+
     pyttsx3 在无音频设备 / 无语音驱动环境下 ``pyttsx3.init()`` 会抛错——
     此时不向上抛，而是把 ``available`` 置 False、``state`` 置 error，
     由 :class:`ReadAloudService` 自动回退到 EdgeTtsBackend（契约 §5）。
     """
 
     name = "system"
+    #: 引擎专属线程名。所有 pyttsx3 调用都在这条线程上；护栏测试按它核对。
+    OWNER_THREAD_NAME = "tts-system"
+    #: 泵送循环两轮 ``iterate()`` 之间的间隔（秒）。
+    PUMP_INTERVAL = 0.05
+    #: 等专属线程跑完 ``init()`` 的上限（秒）——超时按不可用降级，不拖住装配。
+    INIT_TIMEOUT = 20.0
+    #: 一条语音在泵送循环里的上限（秒）：驱动不回读完事件时不让它永挂
+    #: （旧的 ``runAndWait`` 正是永挂不返回）。
+    PUMP_TIMEOUT = 120.0
 
     def __init__(self) -> None:
         super().__init__()
-        self._engine = None
-        try:  # 懒加载：仅本后端 import pyttsx3
-            import pyttsx3  # type: ignore
-            self._engine = pyttsx3.init()
+        self._engine: Any = None
+        self._calls: queue.Queue[Any] = queue.Queue()
+        #: 停音请求（跨线程置位，由泵送循环在专属线程上执行真停音）。
+        self._stop_evt = threading.Event()
+        #: 读完信号，由 ``finished-utterance`` 回调置位。
+        self._done_evt = threading.Event()
+        self._token: dict | None = None
+        self._closed = False
+        #: 专属线程上是否正在朗读（决定 stop 走事件还是走队列）。
+        self._speaking_on_owner = False
+        thread = threading.Thread(target=self._serve,
+                                  name=self.OWNER_THREAD_NAME, daemon=True)
+        #: 专属线程句柄（护栏测试按它核对调用落点与"close 后线程收摊"）。
+        self._owner = thread
+        thread.start()
+        try:
+            # available 必须在构造期就定下来（服务据此选后端），init 又只能跑在
+            # 专属线程上——把活排进队列，同步等它的结果。
+            self._post(self._create_owned).result(timeout=self.INIT_TIMEOUT)
             self.available = True
             self.state = "idle"
-        except Exception as exc:  # 缺驱动/无音频设备：降级而非崩溃
+        except Exception as exc:  # 缺驱动/无音频设备/专属线程没起来：降级而非崩溃
             self.available = False
             self.state = "error"
             self.last_error = f"系统 TTS 不可用：{type(exc).__name__}: {exc}"
             logger.warning("SystemTtsBackend 加载失败，将回退 edge：%s", self.last_error)
+            self.close()
 
+    # ------------------------------------------------------------------ #
+    # 专属线程：命令队列
+    # ------------------------------------------------------------------ #
+    def _serve(self) -> None:
+        while True:
+            job = self._calls.get()
+            if job is None:
+                return
+            fn, args, kwargs, future = job
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:  # noqa: BLE001 - 原样回给调用线程
+                if future is not None:
+                    future.set_exception(exc)
+            else:
+                if future is not None:
+                    future.set_result(result)
+
+    def _post(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
+        """把一个只能在专属线程上跑的调用排进队列，返回它的 future。"""
+        future: Future = Future()
+        self._send((fn, args, kwargs, future))
+        return future
+
+    def _send(self, job: Any) -> None:
+        if self._closed:
+            raise RuntimeError(self.last_error or "系统 TTS 后端已关闭")
+        self._calls.put(job)
+
+    def _create_owned(self) -> None:
+        import pyttsx3  # type: ignore  # 懒加载：仅本后端 import pyttsx3
+        self._engine = pyttsx3.init()
+        self._token = self._engine.connect("finished-utterance", self._on_finished)
+
+    def _on_finished(self, **kwargs: Any) -> None:
+        # 由驱动在它自己的线程上回调，这里只给泵送循环一个终止信号。
+        self._done_evt.set()
+
+    # ------------------------------------------------------------------ #
+    # 播放
+    # ------------------------------------------------------------------ #
     async def speak(self, text: str, opts: dict[str, Any] | None = None) -> None:
         if not self.available or self._engine is None:
             raise RuntimeError(self.last_error or "系统 TTS 后端不可用")
         opts = opts or {}
+        text = str(text)
+        if not text.strip():
+            return
         self.state = "speaking"
+        # 停音请求在本次朗读开始时作废（stop 后紧接 speak 不该掐死新语音）。
+        self._stop_evt.clear()
+        self._speaking_on_owner = True
         try:
-            # pyttsx3.runAndWait 会阻塞调用线程，挪到工作线程避免卡事件循环。
-            await asyncio.to_thread(self._run_blocking, str(text), opts)
+            future = self._post(self._speak_owned, text, opts)
+            # 等结果不碰引擎、只等 future，故可交给事件循环（不占线程）。
+            await asyncio.wrap_future(future)
         finally:
             self.state = "idle"
 
-    def _run_blocking(self, text: str, opts: dict[str, Any]) -> None:
-        rate = opts.get("rate")
-        if rate:
-            self._engine.setProperty("rate", float(rate))
-        voice = opts.get("voice")
-        if voice:
-            self._engine.setProperty("voice", str(voice))
-        self._engine.say(text)
-        self._engine.runAndWait()
+    def _speak_owned(self, text: str, opts: dict[str, Any]) -> None:
+        looping = False
+        try:
+            eng = self._engine
+            if eng is None:
+                raise RuntimeError(self.last_error or "系统 TTS 后端不可用")
+            rate = opts.get("rate")
+            if rate:
+                eng.setProperty("rate", float(rate))
+            voice = opts.get("voice")
+            if voice:
+                eng.setProperty("voice", str(voice))
+            # 上一轮的读完回调可能迟到，进线程后再清，避免新语音被瞬间判读完。
+            self._done_evt.clear()
+            eng.say(text)
+            # 不用 runAndWait：它自己起驱动循环、外部插不进停音。外部循环 +
+            # iterate 让 stop 的请求能在这条线程上被取出并执行。
+            eng.startLoop(useDriverLoop=False)
+            looping = True
+            deadline = time.monotonic() + self.PUMP_TIMEOUT
+            while True:
+                eng.iterate()
+                if self._done_evt.wait(self.PUMP_INTERVAL):
+                    return
+                if self._stop_evt.is_set():
+                    eng.stop()
+                    return
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"系统 TTS {self.PUMP_TIMEOUT:.0f}s 未回读完事件")
+        finally:
+            if looping:
+                try:
+                    eng.endLoop()
+                except Exception as exc:  # pragma: no cover - 平台差异容错
+                    logger.debug("系统 TTS endLoop 异常：%s", exc)
+            self._speaking_on_owner = False
 
     async def stop(self) -> None:
-        if self._engine is not None:
+        self._stop_evt.set()
+        # 正在朗读时不能把停音排进队列（它排在朗读任务后面，永远等不到）；
+        # 泵送循环看到事件就自己在这条线程上停音。空闲时才走队列。
+        if not self._speaking_on_owner and not self._closed:
             try:
-                await asyncio.to_thread(self._engine.stop)
+                await asyncio.wrap_future(self._post(self._stop_owned))
             except Exception as exc:  # pragma: no cover - 平台差异容错
                 logger.debug("系统 TTS stop 异常：%s", exc)
         self.state = "idle"
+
+    def _stop_owned(self) -> None:
+        if self._engine is not None:
+            self._engine.stop()
+
+    def close(self) -> None:
+        """让专属线程丢掉 COM 引用后收摊。**不 join**：退出不等它，进程随即回收。"""
+        if self._closed:
+            return
+        self._closed = True
+        self.available = False
+        self._stop_evt.set()
+        # 关闭之后 _send 会拒绝新活，收尾的两笔直接进队列。
+        self._calls.put((self._destroy_owned, (), {}, None))
+        self._calls.put(None)
+
+    def _destroy_owned(self) -> None:
+        eng, self._engine = self._engine, None
+        if eng is None:
+            return
+        try:
+            eng.stop()
+        except Exception as exc:  # pragma: no cover
+            logger.debug("系统 TTS 关闭前 stop 异常：%s", exc)
+        try:
+            if self._token is not None:
+                eng.disconnect(self._token)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("系统 TTS disconnect 异常：%s", exc)
+        self._token = None
+        del eng  # 最后一个 COM 引用在这条线程上被丢掉
 
 
 class EdgeTtsBackend(TtsBackend):
@@ -201,7 +350,15 @@ class HttpTtsBackend(TtsBackend):
 
 
 def _release(backends: dict[str, Any]) -> None:
-    """在专用线程上丢掉后端引用（COM 对象的 `__del__` 会在这里阻塞，不影响引擎循环）。"""
+    """关掉并丢掉后端。COM 引用由每个后端自己的专属线程释放（见
+    :meth:`SystemTtsBackend.close`，它只排活、不 join），这里只保证不在
+    引擎循环上等这些收尾动作。"""
+    for backend in list(backends.values()):
+        try:
+            backend.close()
+        except Exception as exc:  # pragma: no cover - 收尾容错
+            logger.debug("TTS 后端 %s 关闭异常：%s",
+                         getattr(backend, "name", "?"), exc)
     backends.clear()
 
 
@@ -259,11 +416,12 @@ class ReadAloudService(Service):
         except Exception:  # pragma: no cover - 收尾容错
             logger.debug("ReadAloudService stop_speaking 异常")
         self._active = None
-        # 后端对象的**释放**不能在这条循环上做：pyttsx3 在 Windows 上是 COM
+        # 后端对象的**释放**不能在这条循环上等：pyttsx3 在 Windows 上是 COM
         # (SAPI) 对象，最后一个引用被丢掉时 comtypes 的 `_events.__del__` 会在
         # **当前线程**同步等它自己那条 COM 线程——实测把 EngineHub 引擎循环整个冻住，
         # 退出时 stop_all 卡到 10s 超时，后面所有服务都停不掉。
-        # 摘下来交给一次性守护线程去丢引用，退出不等它（进程随即回收）。
+        # 现在 COM 引用由 :class:`SystemTtsBackend` 自己的专属线程丢（close 只排活
+        # 不 join），摘字典这件事仍挪到一次性守护线程去做，退出不等它（进程随即回收）。
         backends, self._backends = self._backends, {}
         threading.Thread(target=_release, args=(backends,),
                          name="tts-teardown", daemon=True).start()
