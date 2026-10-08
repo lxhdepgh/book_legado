@@ -317,6 +317,29 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 > **§8 R6 同日交**：`tests/` 数过是 72 文件 / 28 导入 flet / 1,854 行断言（全库 36%），
 > 而**没有一条真起过 flet 客户端**（`ft.run` 0 次）——像素与语义树那批仪器都在 `.probe/`；
 > 清点与逐文件归堆见 `docs/界面测试资产清点.md`，A 1,315 / B 69 / C 470 三堆各写了处置。
+> **G1 同日交（Flutter 壳 + `RpcEngineRepository` + 握手 + `bookshelf` 一屏）**：
+> 同书单比对落在**一条实弹臂**上（`.probe/g1_live_run.py` 起真 `--serve` 子进程，语料与
+> 靶子同一份 920 行副本）——握手 **624 / 631 / 683 ms**（三发同臂，中位 631）、
+> `bookshelf.list` **7 行 / 5–6 ms**、那一发的 HTTP 响应体 **24,981 B**——判据里那个
+> 25,012 B 与它是**同一个口径**（R4 数的是 `ok_envelope(...)` 的 UTF-8 字节 = 响应体）。
+> 另外两个口径各报各的：`engine.hello` 那一发 418 B、Dart 侧 `jsonEncode` 的数据体
+> 24,368 B（与样本文件里那个 24,909 B 的差全是默认分隔符的空格）。
+> 三个口径不许相加——第一版就是把 hello 那 418 B 读成了书架那一发的信封，
+> 计数器按 action 拆开之后才现形（`docs/dev-logs/2026-10-08.md` 第八十三轮 §2 末）。
+> 参照物不是 Dart 自己算的：
+> `.probe/g1_flet_projection.py` 无头走 flet 的 `_to_render_record` + `_row` + `_load`，
+> 把 7 行的书名/副标题和状态行 `书架共 7 本` 落成
+> `tests/gateway/projection/bookshelf.list.json`，Dart 那两侧（屏幕臂与实弹臂）都只许对上这张表。
+> 收摊那一臂：`engine.shutdown` 之后 rc=**0** 且端口被拒（正对照 = 刚起的那台连得上）。
+> 三处产品缺陷是**测试抓出来的、不是读代码读出来的**：关窗用的 `AppLifecycleListener`
+> 因为 `late final` 唯一的读发生在 `dispose` 而**从未注册**（引擎留成孤儿进程）、
+> provider 默认重试策略让一次失败背靠背发出 **11** 发 `bookshelf.list` 并把错误屏翻回
+> 转圈、壳的宽档分支漏 `child`（窄档那一半前一交已记）。
+> Dart `69 passed / 2 skipped`（跳过的那两臂要真 python 环境，跑法见上面那个探针）、
+> 跨语言守卫新加一臂"书架那三处文案以 flet 源码为准"（两个方向各变异一次，都被抓住）、
+> Python 全库 `1923 passed, 161 subtests passed in 124.92s`。
+> G1 同时暴露一条服务语义缺口：`--idle-seconds` 在 RPC-only 这条路上**从没武装过**，
+> 客户端不告而别时引擎永留——走法等拍板，见 `docs/known-issues/005`。
 > 读数、仪器与变异核验见 `docs/dev-logs/2026-10-08.md`。
 
 ---
@@ -326,7 +349,10 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 - **契约**：每个 action 一份黄金样本（请求/schema/响应三元组，`tests/gateway/golden/*.json`），
   两侧各自比对；schema 改了没同步 → 红。按记忆 `guard-tests-assert-absence` 写"没发生"断言
   （例如"响应里出现了 `app.` 实例"、"某个 action 没有对应服务方法"），别只断言"成功返回"。
-- **Python 面**：现有回归（2026-10-08 实测 `1914 passed, 161 subtests passed`）基本不动；
+  G1 另外立了 `tests/gateway/projection/*.json`：那一摞不是信封样本而是**flet 那屏自己算出来的
+  参照表**（书名/副标题/状态行的逐行文本），它没有请求也没有响应，混进 `golden/` 只会逼
+  守卫为它开一条特例。
+- **Python 面**：现有回归（2026-10-08 G1 交付后实测 `1923 passed, 161 subtests passed`）基本不动；
   网关测试全离线（`127.0.0.1` 假服务，沿用
   记忆里"离线回环探针"的套路，不批量访问真实站点）。
 - **Dart 面**：`FakeEngineRepository` 喂黄金样本跑 widget 测试（真果鉴的

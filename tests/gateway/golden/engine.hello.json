@@ -1,0 +1,56 @@
+{
+  "action": "engine.hello",
+  "protocol_version": 1,
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "真库只读副本 + 3 条回环假源 = 920 行",
+  "data_shape": "object",
+  "request": {
+    "v": 1,
+    "id": "g1-1",
+    "action": "engine.hello",
+    "seq": 1,
+    "payload": {}
+  },
+  "response": {
+    "v": 1,
+    "id": "g1-1",
+    "ok": true,
+    "data": {
+      "protocol_version": 1,
+      "build": "1.0.0",
+      "capabilities": [
+        "rpc",
+        "events",
+        "media.covers",
+        "job.actions",
+        "webview.reverse"
+      ],
+      "schema_digest": "c93e2a121c1b",
+      "actions": [
+        "bookshelf.list",
+        "check.cancel",
+        "check.snapshot",
+        "check.start",
+        "engine.hello",
+        "engine.shutdown",
+        "engine.status",
+        "engine.webContentReady",
+        "source.list"
+      ],
+      "pid": 74016
+    },
+    "error": null,
+    "code": null
+  },
+  "row_count": 1,
+  "bytes": 346,
+  "sha256": "7421b8f1ed050c85f00487d55d71d76c68b72db4f1d3f60093bfb1006fab2e1b",
+  "field_names": [
+    "actions",
+    "build",
+    "capabilities",
+    "pid",
+    "protocol_version",
+    "schema_digest"
+  ]
+}
