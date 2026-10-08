@@ -354,12 +354,110 @@ def _wire_background(hub) -> str:
     return initial
 
 
+def _install_sigint(stop_event) -> None:
+    """Ctrl-C / 控制台关闭 → 置收摊标志（**不**直接 os._exit）。
+
+    默认 SIGINT 处理器会在主线程抛 KeyboardInterrupt，而主线程正 blocked 在
+    ``stop_event.wait()`` 上：抛穿的话 ``hub.shutdown()`` 那段收尾就没机会跑，
+    表现是"Ctrl-C 之后 QuickJS/COM 的收尾全没做"。换成置标志走同一条正常出口。
+    """
+    import signal
+
+    def _handler(signum, _frame):
+        stop_event.set()
+
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        number = getattr(signal, name, None)
+        if number is None:
+            continue
+        try:
+            signal.signal(number, _handler)
+        except (ValueError, OSError, RuntimeError):
+            # 非主线程 / 平台不支持：少一个信号不影响主路径（engine.shutdown 还在）。
+            logger.debug("忽略信号 %s 的接管失败", name, exc_info=True)
+
+
+def serve(argv: list[str] | None = None) -> int:
+    """``--serve`` 无头入口（设计 §5.5）：装配照旧，**不碰 flet**。
+
+    与桌面入口的差别只有两处：
+
+    - 多注册一个 :class:`GatewayService`（``_build_hub()`` 本身一行不动）；
+    - 收尾不是 ``ft.run`` 返回，而是等一个"收摊信号"——客户端主动
+      ``engine.shutdown``、最后一个 WS 会话断开后空闲超时、或 Ctrl-C。
+
+    全部服务协程与网关本体都在 **EngineHub 守护 loop** 上（``start_all`` 是 submit
+    上去的），所以这里没有第二条循环、也没有任何回调要编组回界面。
+    """
+    import threading
+
+    from app.core.engine_worker import engine_hub
+    from app.services.gateway.service import GatewayService
+
+    # 无头进程没有控制台之外的任何东西：日志得有去处，否则"服务启动失败"这类
+    # 只存在于 logger.exception 里的事实，父进程和人都看不见。
+    logging.basicConfig(
+        level=os.environ.get("LEGADO_BOOKSOURCE_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr)
+
+    argv = sys.argv[1:] if argv is None else list(argv)
+
+    def _number(name: str, default: float) -> float:
+        """读 ``--port 8765`` / ``--idle-seconds=5`` 两种写法；没给就用默认。"""
+        value = None
+        for index, item in enumerate(argv):
+            if item == name and index + 1 < len(argv):
+                value = argv[index + 1]
+                break
+            if item.startswith(f"{name}="):
+                value = item.split("=", 1)[1]
+                break
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except ValueError:
+            raise SystemExit(f"{name} 要一个数字，收到 {value!r}") from None
+
+    idle = _number("--idle-seconds", 15.0)
+    port = int(_number("--port", 0))
+
+    stop_event = threading.Event()
+    hub = _build_hub()
+    gateway = GatewayService(port=port, idle_exit_seconds=idle, exit_event=stop_event)
+    hub.register(gateway)
+
+    engine = engine_hub()
+    try:
+        # 装配与运行期同一条 loop：start_all 提交到守护 loop 上跑，网关的 socket
+        # 因此绑在那条 loop 上（绑错 loop 是 aiohttp 最阴的一类故障：能连、不动）。
+        engine.submit(hub.start_all()).result(timeout=180)
+    except Exception:
+        logger.exception("无头装配失败")
+        hub.shutdown()
+        return 1
+
+    # 握手行必须在 start_all 之后打：端口只有真绑上才知道（port=0 由系统分配）。
+    print(gateway.handshake_line(), flush=True)
+    _install_sigint(stop_event)
+    try:
+        stop_event.wait()
+    finally:
+        hub.shutdown()
+    return 0
+
+
 def main():
     if "--smoke-test" in sys.argv:
         smoke_test()
         if getattr(sys, "frozen", False):
             os._exit(0)
         return
+
+    if "--serve" in sys.argv:
+        # 无头进程：这一条路上方一行都不许出现 flet（护栏 tests/test_gateway_serve.py）。
+        sys.exit(serve())
 
     import flet as ft
 

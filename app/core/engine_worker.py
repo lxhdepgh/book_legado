@@ -238,8 +238,18 @@ def engine_hub() -> EngineHub:
 
 # --------------------------------------------------------------------------- #
 # UI 循环登记：Flet 控件只允许在界面循环上改，且改完必须 flush 一次
+#
+# 无头模式（``main.py --serve``）下这一整层是**恒等**的：没人登记界面循环，
+# 于是 ``call_on_ui`` 就地执行、控制器的编排退回引擎守护循环。设计文档
+# （docs/flutter前端与python服务架构设计.md §5.4）要的不是新行为，而是
+# "这条路上一次跨循环投递都没发生过"能被机械断言——所以下面记两个计数器。
 # --------------------------------------------------------------------------- #
 _UI_LOOP: asyncio.AbstractEventLoop | None = None
+
+#: 真的往界面循环投出去过几次（跨循环编组发生过）。
+_UI_MARSHALLED = 0
+#: 因为没有界面循环而就地执行过几次（无头路径上只有这一种）。
+_UI_INLINE = 0
 
 
 def set_ui_loop(loop: asyncio.AbstractEventLoop | None) -> None:
@@ -255,6 +265,20 @@ def ui_loop() -> asyncio.AbstractEventLoop | None:
     return _UI_LOOP
 
 
+def ui_dispatch_counts() -> tuple[int, int]:
+    """``(投递到界面循环的次数, 就地执行的次数)``。
+
+    无头装配的护栏按它核对：整条 serve 路径跑完，第一个数必须是 0。
+    """
+    return _UI_MARSHALLED, _UI_INLINE
+
+
+def reset_ui_dispatch_counts() -> None:
+    """归零两个计数（探针与护栏各自开一段账，免得互相看见）。"""
+    global _UI_MARSHALLED, _UI_INLINE
+    _UI_MARSHALLED = _UI_INLINE = 0
+
+
 def call_on_ui(fn) -> None:
     """把一个"要碰控件"的动作编组到界面循环上执行（契约 §5.2）。
 
@@ -262,8 +286,10 @@ def call_on_ui(fn) -> None:
     **没登记界面循环（无头测试、窗口已关）时就地执行**：那条线上本来就没有真窗口，
     就地跑才是测试能观察到的行为，把它静默丢掉会变成"测试全绿但没人执行"。
     """
+    global _UI_MARSHALLED, _UI_INLINE
     loop = ui_loop()
     if loop is None or loop.is_closed():
+        _UI_INLINE += 1
         try:
             fn()
         except Exception:
@@ -276,6 +302,7 @@ def call_on_ui(fn) -> None:
         except Exception:
             logger.exception("界面循环上执行失败")
 
+    _UI_MARSHALLED += 1
     asyncio.run_coroutine_threadsafe(call(), loop)
 
 

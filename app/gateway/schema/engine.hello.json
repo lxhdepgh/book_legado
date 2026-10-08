@@ -1,0 +1,6 @@
+{
+  "type": "object",
+  "description": "engine.hello 入参：无。客户端只要发空对象。",
+  "properties": {},
+  "additionalProperties": false
+}
