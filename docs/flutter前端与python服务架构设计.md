@@ -268,9 +268,9 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 | R1 | **靠 WebView 才能取正文的书源规则** | 记忆里定过："WebView 只由 URL option 打开"。今天浏览器路由是 `browser_service` 在 headless Chromium 与**可见 WebView** 之间选；进程分离后可见 WebView 归 Flutter，取到的内容要回传引擎再跑规则 | 挑 3 条真用 `<useweb>`/`url,{}` 的源，做一条"Flutter 侧 webview → `engine.webContentReady` RPC → 规则继续跑"的竖切，量通不通、慢多少。**通不过就不迁移** |
 | R2 | 原生句柄线程亲和复发 | QuickJS 同 Context 跨线程是 `rc=3221226505` 直接带进程；SAPI 跨线程是静默死锁（本轮 6/6 挂 60s 实测）。网关是新加的一条并发来源 | 网关只调服务、绝不直接碰原生对象；护栏沿用"替身记线程 id"的手法（`tests/test_read_aloud_m4.py` 已有范例） |
 | R3 | 4 个 UI 耦合服务的拆分面被低估 | 它们今天靠注入 `page`/控件工作（`media_play.py:129,174` duck-typed flet_video；`browser_service.py:80` 收 page provider） | G0 里先给这 4 个加"无 UI 也能启动"的降级路径并测试，迁移时才有落点 |
-| R4 | 性能预期不能靠"Flutter 一定快" | 我们的大列表是实测压出来的（917 真实行 238ms→12ms，虚拟化 + resize 闸门），迁移收益要重新证 | 迁移前后各量同一份书单：首屏、1000 行滚动帧、拖窗每拍；按记忆 `ab-bench-must-interleave` A/B 交替跑 |
+| R4 | 性能预期不能靠"Flutter 一定快" | 我们的大列表是实测压出来的（917 真实行 238ms→12ms，虚拟化 + resize 闸门），迁移收益要重新证 | 迁移前后各量同一份书单：首屏、1000 行滚动帧、拖窗每拍；按记忆 `ab-bench-must-interleave` A/B 交替跑。**2026-10-08 迁移前基线已量完**（`.probe/r4_service_baseline.py` + `.probe/r4_ui_baseline.py`，同一份 920 行真库副本）：服务面 S 跨进程 p50 80.6 ms / 6.97 MB，P 同函数进程内 74.6 ms，H 小载荷 1.2 ms ⇒ 那一跳 ≈6 ms、那 920 行数据 ≈79 ms；冷启动到握手 640 ms。界面面首屏 120 + 10 + 561 ms（装配/show/行落满）；滚动每拍**下发 390 ms**，而同页同处理器**空列表 3 ms**（130×，故这是行数的钱不是这台的底价），心跳落后一起从 181 ms 塌回 ≈0；`on_resize` 处理器 **0 ms**、宽档内根树换 **0** 次（第七十八轮的闸门在位），尺寸变更送达 171 ms。本机 `EnumWindows` 25s 不返回 ⇒ OS 真拖那臂作废，改 `page.window` 下发臂并在读数里明写 |
 | R5 | 双构建链与 CI | Flutter SDK + VS/MinGW + PyInstaller 三条链；真果鉴为此把测试步骤全设成 `continue-on-error`——我们不学 | 一条流水线：`pytest -q`（硬门）+ `flutter analyze` + `flutter test`（硬门）+ 契约黄金样本；产物两侧对齐 `protocol_version` |
-| R6 | 现有 UI 测试资产作废 | 44 个文件、166 处控件树断言、Playwright 语义树探针全部失效 | 割接前把"布局契约"类断言翻成 Dart golden/尺寸测试；翻译不了的列清单**明确放弃**，别假装等价 |
+| R6 | 现有 UI 测试资产作废 | **2026-10-08 数过**（起草时那句"44 个文件、166 处控件树断言"是估的）：`tests/` 72 个文件、28 个导入 flet、这 28 个里 1854 行断言（占全库 5099 行的 36%）；且**没有一条真起过 flet 客户端**（`ft.run` 出现 0 次），断言读的全是内存对象树属性——像素/语义树那批仪器在 `.probe/`（19 支 Playwright + 37 支 `ft.run`）。清点与逐文件归堆见 `docs/界面测试资产清点.md` | 割接前把"布局契约"类断言翻成 Dart golden/尺寸测试；翻译不了的列清单**明确放弃**，别假装等价（已清点成 A 1315 / B 69 / C 470 三堆，各写了处置与"为什么没有等价物"） |
 | R7 | 移动端是新增面 | Android 上 QuickJS/pyttsx3/playwright 的可用性都要重证；Python 侧不能进 iOS | 首发 Windows；Android 作为协议验证的副产品，不承诺功能齐 |
 
 ---
@@ -280,8 +280,8 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 | 门 | 内容 | 规模 | **通过的判据（必须当场量）** |
 | --- | --- | --- | --- |
 | **G0** | `GatewayService` + action 表 + schema + `--serve` 无头 + 单循环化 + §5 六条护栏 | 1–1.5 周 | 无头进程能被 curl 驱动完成"列书架 / 起一次检测并收进度事件"；serve 路径 import flet = 0；退出码 0 且关窗→消失延迟有读数；全库回归仍全绿 |
-| **G1** | Flutter 壳 + `RpcEngineRepository` + 握手 + `bookshelf` 一屏（真数据） | 1 周 | Flutter 那屏的行数/内容与 flet 屏一致（同书单比对）；R1 竖切有结论 |
-| **G2** | 高频只读面：`find_books` / `sources` / `check` / 设置页 | 2–3 周 | R4 三项性能量过且 ≥ flet；契约测试覆盖这 4 个域的全部 action |
+| **G1** | Flutter 壳 + `RpcEngineRepository` + 握手 + `bookshelf` 一屏（真数据） | 1 周 | Flutter 那屏的行数/内容与 flet 屏一致（同书单比对——靶子：R4 那份副本上 `bookshelf.list` = **7 行 / 25,012 B**、`source.list` = 920 行 / 6,969,038 B，冷启动到握手 640 ms 也要有同臂读数）；R1 竖切有结论 |
+| **G2** | 高频只读面：`find_books` / `sources` / `check` / 设置页 | 2–3 周 | R4 三项量过且 ≥ flet：对照靶就是第八十二轮同一份 920 行副本上的读数（滚动每拍下发 390 ms、其中空列表底价 3 ms；`source.list` 跨进程 p50 80.6 ms；首屏行落满 561 ms）；契约测试覆盖这 4 个域的全部 action |
 | **G3** | **阅读器**（最大单块，排版/翻页/进度/书签/换源） | 2–3 周 | 同一本书翻页落点与 flet 版可比（按字符偏移断言）；R1 涉及的源在真机上读到正文 |
 | **G4** | `rss` / 漫画 / 朗读 / 工具域 / 老板键托盘；删 flet 依赖与 4 个 UI 耦合服务；PyInstaller spec 去 flet* | 2–3 周 | flet 从 `requirements.txt` 消失后全库仍绿；打包冒烟（照真果鉴 `smoke_windows.py` 那条：解压产物跑一次 `--package-smoke`） |
 
@@ -307,6 +307,16 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 > 顺带补上反向答复里缺的 `js_result` 那一腿（`@webjs:` 的脚本完成值此前永远回不来）。
 > 5 处源码级变异全被抓住，其中拆掉那句问话的一臂 `2 failed in 85.95s` 就是互等的形状
 > （回归 `1914 passed`，连跑两轮）。
+> **§8 R4 同日交（迁移前基线，两支新探针 + 产品代码零改动）**：服务面三臂拆开了
+> "那一跳"与"那份数据"——同一份 920 行真库副本上，跨进程 RPC p50 **80.6 ms / 6.97 MB**、
+> 同函数进程内 **74.6 ms**、小载荷 RPC 地板 **1.2 ms**，即那一跳 ≈6 ms、那 920 行 ≈79 ms，
+> 冷启动到握手 640 ms；界面面首屏 120 + 10 + 561 ms，滚动每拍**下发 390 ms**，
+> 而同页同处理器的**空列表臂 3 ms**（130× ⇒ 这是行数的钱，不是这台的底价），
+> `on_resize` 处理器 **0 ms** 且宽档内根树换 **0** 次（第七十八轮闸门的回执）。
+> 两臂载荷按 UTF-8 **字节**比（按字符数会虚出 326 KB 假差量），形状不一致就抛。
+> **§8 R6 同日交**：`tests/` 数过是 72 文件 / 28 导入 flet / 1,854 行断言（全库 36%），
+> 而**没有一条真起过 flet 客户端**（`ft.run` 0 次）——像素与语义树那批仪器都在 `.probe/`；
+> 清点与逐文件归堆见 `docs/界面测试资产清点.md`，A 1,315 / B 69 / C 470 三堆各写了处置。
 > 读数、仪器与变异核验见 `docs/dev-logs/2026-10-08.md`。
 
 ---
@@ -316,12 +326,20 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 - **契约**：每个 action 一份黄金样本（请求/schema/响应三元组，`tests/gateway/golden/*.json`），
   两侧各自比对；schema 改了没同步 → 红。按记忆 `guard-tests-assert-absence` 写"没发生"断言
   （例如"响应里出现了 `app.` 实例"、"某个 action 没有对应服务方法"），别只断言"成功返回"。
-- **Python 面**：现有 1845 passed 基本不动；网关测试全离线（`127.0.0.1` 假服务，沿用
+- **Python 面**：现有回归（2026-10-08 实测 `1914 passed, 161 subtests passed`）基本不动；
+  网关测试全离线（`127.0.0.1` 假服务，沿用
   记忆里"离线回环探针"的套路，不批量访问真实站点）。
 - **Dart 面**：`FakeEngineRepository` 喂黄金样本跑 widget 测试（真果鉴的
   `test/fixtures.dart:34` 那一手）；排版/窄窗用 golden test；`integration_test/` 打一个
   真 `--serve` 引擎跑 3 条端到端。
+  **这条不是"平移"而是"新建"**：R6 数过 `tests/` 里 `ft.run` 出现 **0** 次，现有 1,854 行
+  界面断言读的全是内存对象树属性，像素/语义树的仪器都在 `.probe/`（见
+  `docs/界面测试资产清点.md`）。所以 Dart widget/golden 那一层是本项目第一次有真客户端在
+  被测——别用"翻过去多少条"当进度，要用"这一屏的 A 堆断言有没有对应的 Dart 绿"当进度。
 - **性能**：A/B 交替，两臂同机同数据；先跑的那臂会背冷启动的钱（记忆 `ab-bench-must-interleave`）。
+  每一组对照都得有一臂**只差被测那个变量**的底价臂（R4 用的是"同一页同处理器的空列表"与
+  "同进程同出口的小载荷 RPC"），否则读数归不到因（记忆 `measurement-corpus-must-not-be-self-proving`）；
+  载荷一律按 UTF-8 **字节**比，不按字符数。
 
 ---
 
@@ -338,11 +356,15 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 ## 12. 相关
 
 - `docs/current-system-design.md`（§2 总体架构、§4 服务清单、§5 UI 层、§9 打包——本文的对照面）
+- `docs/界面测试资产清点.md`（§8 R6：A/B/C 三堆、逐文件归堆表、割接纪律）
 - `docs/桌面端重构设计.md`、`docs/阅读器UI响应式与沉浸阅读设计.md`
 - `docs/dev-logs/2026-10-07.md` §10（线程亲和修法与 0.4s 退出读数）、`docs/known-issues/004_…md`
+- `docs/dev-logs/2026-10-08.md`（第七十九~八十二轮：G0 护栏、R1/R2/R3/R4/R6 的读数与仪器坑）
 - `docs/M7打包说明.md`（PyInstaller 命令与 flet* hidden-import 清单位置）
 - 参照仓库：`github.com/jerunshi/guoapp1`（浅克隆 `D:/tmp/guoapp1`，不在本项目版本控制内）
 - 记忆：`tts-pyttsx3-com-same-thread`、`quickjs-native-crash-risk`、`engine-hub-loop-split`、
   `ui-progress-must-travel-as-events`、`refactor-regression-orphan-methods`、
   `guard-tests-assert-absence`、`ab-bench-must-interleave`、`offline-loopback-probe`、
-  `legado-analyzer-empirical-semantics`、`navigation-rail-old-architecture-shape`
+  `legado-analyzer-empirical-semantics`、`navigation-rail-old-architecture-shape`、
+  `measurement-corpus-must-not-be-self-proving`、`probe-stand-in-must-not-be-the-measured-workload`、
+  `flet-desktop-probe-instrumentation`、`flet-0-86-narrow-window-sizing-contract`
