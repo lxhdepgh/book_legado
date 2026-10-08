@@ -43,6 +43,7 @@ from app.services.gateway.service import (
     WEBVIEW_TIMEOUT, GatewayService, WebviewUnavailable)
 from app.services.sources.source_check_service import SourceCheckService
 from app.services.sources.source_service import SourceService
+from app.services.tools.browser_service import BrowserService
 
 ENVELOPE_KEYS = ["code", "data", "error", "id", "ok", "v"]
 BASE = "http://127.0.0.1"
@@ -89,7 +90,7 @@ class _StubAuditor:
 class Harness:
     """一次独立的无头装配 + 同循环驱动器。"""
 
-    def __init__(self, *, sources: int = 2) -> None:
+    def __init__(self, *, sources: int = 2, extra=()) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="gw-inproc-"))
         data = self.root / "data"
         data.mkdir(parents=True, exist_ok=True)
@@ -115,7 +116,7 @@ class Harness:
         self.hub = ServiceHub(bus=self.bus, engine=self.engine)
         for service in (self.engine, self.bus, self.storage, self.settings,
                         self.rule_engine, self.source_service, self.check_service,
-                        self.gateway):
+                        self.gateway, *extra):
             self.hub.register(service)
 
     def start(self) -> None:
@@ -566,26 +567,14 @@ class HeadlessLoopTests(unittest.TestCase):
         self.assertEqual((marshalled, inline), (1, 0))
 
 
-class WebviewReverseCallTests(unittest.TestCase):
-    """§8 R1：服务端→客户端的反向渲染（可见 WebView 归 Flutter 之后引擎怎么取正文）。
+class _FramesByType:
+    """按**类型**认 /ws 帧的两条 helper（宿主族共用）。
 
-    这一族断言的是**形状与生死**：请求帧发得出去、答复解得开、宿主不在场时当场就知道、
-    中途断线不会把预算等满。真实渲染的贵不贵是探针的事（``.probe/r1_webview_slice.py``），
-    护栏这边一次都不起浏览器。
+    ``/ws`` 上排在 request 之前的可能是服务启动时的合批（``ServiceStateChangedEvent``
+    就在 :data:`COALESCED_EVENTS` 里，与它共用一条通道），所以只能按类型认，不能按帧序认。
     """
 
-    def setUp(self) -> None:
-        self.harness = Harness()
-        self.harness.start()
-        self.addCleanup(self.harness.stop)
-
     async def _next_request(self, ws) -> dict:
-        """取下一条 request 帧。
-
-        ``/ws`` 上排在它前面的可能是服务启动时的合批（``ServiceStateChangedEvent``
-        就在 :data:`COALESCED_EVENTS` 里，与它共用一条通道），所以只能按**类型**认，
-        不能按帧序认。
-        """
         while True:
             frame = json.loads((await ws.receive(timeout=10)).data)
             if frame.get("type") == "request":
@@ -601,6 +590,20 @@ class WebviewReverseCallTests(unittest.TestCase):
         _, env = await _rpc(session, base, token,
                             _envelope("engine.webContentReady", payload))
         return env
+
+
+class WebviewReverseCallTests(_FramesByType, unittest.TestCase):
+    """§8 R1：服务端→客户端的反向渲染（可见 WebView 归 Flutter 之后引擎怎么取正文）。
+
+    这一族断言的是**形状与生死**：请求帧发得出去、答复解得开、宿主不在场时当场就知道、
+    中途断线不会把预算等满。真实渲染的贵不贵是探针的事（``.probe/r1_webview_slice.py``），
+    护栏这边一次都不起浏览器。
+    """
+
+    def setUp(self) -> None:
+        self.harness = Harness()
+        self.harness.start()
+        self.addCleanup(self.harness.stop)
 
     def test_request_frame_round_trips_into_the_fetcher_result(self) -> None:
         async def _drive(session, base, token):
@@ -748,6 +751,74 @@ class WebviewReverseCallTests(unittest.TestCase):
             with self.assertRaises(WebviewUnavailable):
                 await asyncio.wrap_future(pending)
         self.harness.drive(_drive)
+
+
+class _GateKernel:
+    """假无头内核：永远回一堵"要人"的墙，把这次渲染逼到远端宿主那条路上。"""
+
+    GATE = '<html><body><form><input type="password" name="pwd"></form></body></html>'
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def fetch(self, url, options):
+        self.calls += 1
+        return {"body": self.GATE, "headers": {"content-type": "text/html"},
+                "status": 200, "url": url}
+
+    async def aclose(self) -> None:
+        pass
+
+
+class BrowserServiceRoutingTests(_FramesByType, unittest.TestCase):
+    """§8 R3 的落点：装配好的 BrowserService（没注入 page）把墙推给宿主并拿到正文。
+
+    R1 那一刀是手搓一个引擎量的；这一条走的是**产品里那条线**——注册在册的
+    BrowserService（假内核、没 page、没 renderer）+ 真网关 + 真 ``/ws`` 会话。
+    内核仍是替身：这条量的是路由，不是渲染（渲染贵不贵见
+    ``.probe/r1_webview_slice.py``），全程不起浏览器、不外访。
+    """
+
+    def setUp(self) -> None:
+        self.kernel = _GateKernel()
+        self.browser = BrowserService(headless=self.kernel,
+                                      chromium_probe=lambda: True)
+        self.harness = Harness(extra=(self.browser,))
+        self.harness.start()
+        self.addCleanup(self.harness.stop)
+        # 装配根那条线：main._wire_headless_webview 注的就是这一个方法。
+        self.browser.set_remote_webview(self.harness.gateway.request_web_content)
+
+    def test_a_gate_reaches_the_host_and_comes_back_as_content(self) -> None:
+        async def _drive(session, base, token):
+            async with session.ws_connect(f"{base}/ws?token={token}") as ws:
+                json.loads((await ws.receive()).data)          # ready
+                pending = self.harness.engine.submit(
+                    self.browser.render_webview("https://loopback.test/gated/1",
+                                                None, {"webView": True}))
+                frame = await self._next_request(ws)
+                self.assertEqual(frame["name"], "webview.content")
+                self.assertEqual(frame["payload"]["url"],
+                                 "https://loopback.test/gated/1")
+                self.assertEqual(frame["payload"]["options"], {"webView": True})
+                env = await self._answer(session, base, token, frame,
+                                         body="<p>宿主把墙打开了</p>")
+                self.assertTrue(env["ok"], env)
+                result = await asyncio.wrap_future(pending)
+                self.assertEqual(result["body"], "<p>宿主把墙打开了</p>")
+        self.harness.drive(_drive)
+        self.assertEqual(self.kernel.calls, 1,
+                         "静默内核该被要一次：先走不要人的那条便宜路，再谈推宿主")
+        self.assertEqual(ui_dispatch_counts()[0], 0,
+                         "「墙→宿主→正文」这一趟里一次跨循环编组都没发生过（§5.4）")
+
+    def test_without_a_host_the_engine_gets_a_fast_no_host_error(self) -> None:
+        """没接宿主 = 这条线上永远不会有人回答：服务侧当场拿到类型化的"没人"。"""
+        self.browser._remote_webview = None     # 摘掉装配根那一跳，模拟没接网关
+        with self.assertRaises(WebviewUnavailable):
+            self.harness.on_loop(
+                lambda: self.browser.render_webview("https://loopback.test/gated/2",
+                                                    None, {}))
 
 
 class MediaEndpointTests(unittest.TestCase):

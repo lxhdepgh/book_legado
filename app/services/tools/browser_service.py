@@ -22,7 +22,8 @@
   ``close_page`` 一律按会话号派发；``on_frame`` 回调也在引擎循环上被调用，视图层
   要自己编组回界面循环（见 controllers/tools/browser_controller）。
 - ``async render_webview(url, source=None, options=None)``：webView/验证码请求，
-  委托 WebPageRenderer（静默无头失败后才弹窗，逻辑在该模块内）；
+  委托 WebPageRenderer（静默无头失败后才弹窗，逻辑在该模块内）；**没有界面时**走
+  :meth:`_render_without_ui`（静默内核 → 推给远端 WebView 宿主），见 §8 R3；
 - ``available_fetcher()``：降级探测——playwright/Chromium 内核缺失时返回 None，
   调用方据此退回非浏览器路径，**不报错**；
 - 回调注册表：视图层实现 :class:`~app.core.interfaces.BrowserInteractionCallback`
@@ -65,6 +66,7 @@ class BrowserService(Service):
                  interactive_factory: Callable[..., Any] | None = None,
                  renderer_factory: Callable[..., Any] | None = None,
                  page_provider: Callable[[], Any] | None = None,
+                 remote_webview: WebviewFetcher | None = None,
                  profile_root: Path | None = None) -> None:
         super().__init__()
         self._storage = storage
@@ -79,6 +81,9 @@ class BrowserService(Service):
         self._renderer: Any = None
         # 视图层注入：flet page 提供者（返回控件树里的 page），服务不 import flet。
         self._page_provider = page_provider
+        # 无头装配（``main.py --serve``）注入：把一次渲染推给远端 WebView 宿主并等回话
+        # （网关 :meth:`GatewayService.request_web_content`，形状同 WebviewFetcher）。
+        self._remote_webview = remote_webview
         self._profile_root = profile_root
         # ── 回调注册表（BrowserInteractionCallback，视图层实现注入）──
         self._interaction_cb: InteractionCallback | None = None
@@ -129,6 +134,16 @@ class BrowserService(Service):
     def set_page_provider(self, provider: Callable[[], Any] | None) -> None:
         """注入 flet page 提供者（视图层调用；服务侧不触碰 flet 类型）。"""
         self._page_provider = provider
+
+    def set_remote_webview(self, fetcher: WebviewFetcher | None) -> None:
+        """注入"把这次渲染推给远端 WebView 宿主"的可调用（无头装配调用）。
+
+        这就是设计 §8 R1 那条竖切在产品里的落点：进程一分为二之后**可见 WebView 只在
+        客户端那边**，引擎这一侧的 ``webview_fetcher`` 只能发出去等回来。装配根把
+        :meth:`GatewayService.request_web_content` 递进来，形状与 ``WebviewFetcher``
+        一致（``url, source, options``）。
+        """
+        self._remote_webview = fetcher
 
     # ------------------------------------------------------------------ #
     # 内核降级探测（§1.19：available_fetcher() 返回 None 则退回非浏览器路径）
@@ -288,13 +303,56 @@ class BrowserService(Service):
 
         ``ftw.WebView`` 分支（移动/macOS）与 CDP 投屏分支均在 web_page_renderer 内按
         平台判定，本服务不动；本方法只负责以视图层注入的 page_provider 构造 renderer。
+        没有 page_provider（无头装配）时走 :meth:`_render_without_ui`——本服务的
+        启动与这条路径都**不碰 flet**（§8 R3）。
         """
         renderer = self._ensure_renderer()
+        if renderer is None:
+            return await self._render_without_ui(url, source, options or {})
         return await renderer.render(str(url or ""), source, options or {})
+
+    async def _render_without_ui(self, url: str, source: Any,
+                                 options: dict) -> dict:
+        """没有界面时的 webView 渲染：静默内核 → 实在要人，才推给远端宿主。
+
+        两步的先后与 :meth:`WebPageRenderer.render` 一致（那里也是先 ``_render_silently``
+        再弹窗），所以"无头能答的都答了"这一条不需要新判据，用的是同一句
+        :func:`~app.services.block_pages.looks_like_gate`。远端宿主答不了（没人连
+        ``/ws``）时抛 :class:`WebviewUnavailable`，与 :meth:`available_fetcher`
+        返回 None 同一条老口径：**不是渲染失败，是根本没这个人**，引擎据此退回纯 HTTP。
+        """
+        silent = await self._silent_render(url, options)
+        if silent is not None:
+            return silent
+        if self._remote_webview is None:
+            from app.services.gateway.service import WebviewUnavailable
+            raise WebviewUnavailable(
+                "没有 WebView 宿主可接这次渲染（无头装配既无界面、也未接网关反向调用）")
+        return await self._remote_webview(url, source, options)
+
+    async def _silent_render(self, url: str, options: dict) -> dict | None:
+        """内置无头内核渲染；内核不在场、渲染失败、或回来的还是一堵墙 → None。"""
+        if not self._kernel_available():
+            return None
+        try:
+            rendered = await self.fetch(url, options)
+        except Exception:
+            logger.debug("静默浏览器渲染失败，交给 WebView 宿主：%s", url, exc_info=True)
+            return None
+        from app.services.block_pages import looks_like_gate
+        if looks_like_gate(str(rendered.get("body") or "")):
+            return None
+        return rendered
 
     async def verification_fetcher(self, image: Any, source: Any = None) -> str:
         """验证码取页入口（verification_fetcher 形状：(image, source) -> str）。"""
         renderer = self._ensure_renderer()
+        if renderer is None:
+            # 验证码要的是**一个人**：无头进程没有输入面，也没有"自动答对"这条路。
+            # 明说比静默返回空串好——空串会被 java.getVerificationCode() 当成答案，
+            # 规则继续跑、登录永远失败，现场看不出来。
+            raise RuntimeError("验证码需要人工输入：当前进程没有界面，"
+                               "请在有窗口的端打开这本书")
         return await renderer.verification_code(image, source)
 
     # ------------------------------------------------------------------ #
@@ -323,16 +381,18 @@ class BrowserService(Service):
         return headless
 
     def _ensure_renderer(self) -> Any:
-        """懒构造 WebPageRenderer（其顶部 import flet，故只在视图层就绪时触碰）。"""
+        """懒构造界面侧 renderer；**没有界面时返回 None**（降级见 :meth:`_render_without_ui`）。
+
+        ``web_page_renderer`` 顶部 import flet，所以只在真要有窗口的时候才碰它——
+        这条判据顺带就是 §8 R3 要的"无 UI 也能启动"：无头装配一行 flet 都不 import。
+        """
         if self._renderer is not None:
             return self._renderer
         if self._renderer_factory is not None:
             self._renderer = self._renderer_factory(self._page_provider, None)
             return self._renderer
         if self._page_provider is None:
-            raise RuntimeError(
-                "render_webview 需要视图层注入 page_provider"
-                "（set_page_provider / register_interaction_callback）")
+            return None
         # 懒加载 web_page_renderer（连带 flet / ftw 平台分支，平台判定分支不动）。
         from app.services.web_page_renderer import WebPageRenderer
         self._renderer = WebPageRenderer(self._page_provider)

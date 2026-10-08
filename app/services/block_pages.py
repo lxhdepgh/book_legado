@@ -9,6 +9,8 @@ every field blank.  Both cases are recognized here and reported as interception.
 """
 from __future__ import annotations
 
+import re
+
 # Local security software answers 200 with its notice page, so these markers are
 # matched on every status.
 _LOCAL_MARKERS = (
@@ -65,3 +67,19 @@ def block_reason(text, status=None) -> str | None:
         return None
     suffix = f"，HTTP {code}" if code else ""
     return f"目标站点拦截了本次访问（{hit[1]}{suffix}）"
+
+
+def looks_like_gate(html: str) -> bool:
+    """True when a rendered page is still a wall instead of the article.
+
+    A login form is the one gate a page keeps after rendering: the challenge
+    interstitials are already recognised by the shared block-page detector.
+    Living here (not in the WebView renderer) is what lets the UI-free browser
+    path ask the same question without importing flet.
+    """
+    body = str(html or "")
+    if not body.strip():
+        return True
+    if block_reason(body):
+        return True
+    return bool(re.search(r"""(?i)<input[^>]+type\s*=\s*["']?password""", body))

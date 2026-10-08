@@ -295,6 +295,11 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 > 线上开销（两臂交替、中位数），三条真形状端到端逐条与进程内一致。
 > R1 另交一条**必须先做的约束**：`reading_engine._bind_interaction` 那条同步
 > `.result()` 的 JS 桥一旦落在网关循环上就自锁（正对照在工作线程 56 ms 回）。
+> **§8 R3 同日交**：四个 UI 耦合服务各有了一条"无 UI 也能启动"的降级路径并钉进测试
+> （只记账的视频后端 / 老板键诚实拒绝 / `BrowserService` 三级链"静默内核 → 远端宿主 →
+> 当场拒" / `looks_like_gate` 搬到 flet-free 的 `block_pages`），`serve()` 里新加那一跳
+> `_wire_headless_webview` 就是 R1 那条竖切在产品里的落点；9 处源码级变异全被抓住
+> （回归 `1912 passed`，无头装配 33 个服务全 `RUNNING`、flet 模块 **0**）。
 > 读数、仪器与变异核验见 `docs/dev-logs/2026-10-08.md`。
 
 ---

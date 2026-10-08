@@ -377,12 +377,30 @@ def _install_sigint(stop_event) -> None:
             logger.debug("忽略信号 %s 的接管失败", name, exc_info=True)
 
 
+def _wire_headless_webview(hub, gateway) -> None:
+    """把引擎的 WebView 渲染口子接到网关的反向调用上（设计 §8 R1/R3）。
+
+    桌面端那一条是 :func:`_wire_browser_page`（把 flet page 交给 BrowserService，
+    验证弹窗才有地方开）；无头进程没有窗口，"可见 WebView"只剩客户端那一边，所以
+    这里交的是"发出去等回来"的那只手。两条线不共存：有窗口就弹窗，没窗口就推宿主。
+
+    注的是**未启动也行**的同步 setter（``hub.require`` 按类定位，注册即可取），
+    所以这一跳排在 ``start_all`` 之前之后都安全——排在前面是为了让"装配完整"这件事
+    在握手行打出去之前就成立。
+    """
+    from app.services.tools.browser_service import BrowserService
+
+    hub.require(BrowserService).set_remote_webview(gateway.request_web_content)
+
+
 def serve(argv: list[str] | None = None) -> int:
     """``--serve`` 无头入口（设计 §5.5）：装配照旧，**不碰 flet**。
 
-    与桌面入口的差别只有两处：
+    与桌面入口的差别只有三处：
 
     - 多注册一个 :class:`GatewayService`（``_build_hub()`` 本身一行不动）；
+    - 把 WebView 那条口子接到网关的反向调用上，而不是接到窗口上
+      （:func:`_wire_headless_webview` 对 :func:`_wire_browser_page`，§8 R1/R3）；
     - 收尾不是 ``ft.run`` 返回，而是等一个"收摊信号"——客户端主动
       ``engine.shutdown``、最后一个 WS 会话断开后空闲超时、或 Ctrl-C。
 
@@ -427,6 +445,7 @@ def serve(argv: list[str] | None = None) -> int:
     hub = _build_hub()
     gateway = GatewayService(port=port, idle_exit_seconds=idle, exit_event=stop_event)
     hub.register(gateway)
+    _wire_headless_webview(hub, gateway)
 
     engine = engine_hub()
     try:

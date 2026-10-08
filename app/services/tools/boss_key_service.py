@@ -147,7 +147,13 @@ class BossKeyService(Service):
     # 藏窗 / 回窗
     # ------------------------------------------------------------------ #
     def hide(self) -> bool:
-        """先挂托盘图标、再藏窗口。图标挂不上就什么都不做（见模块文档）。"""
+        """先挂托盘图标、再藏窗口。图标挂不上就什么都不做（见模块文档）。
+
+        反过来也成立：**窗口够不着就不留图标**。没注入 page 的进程（无头装配 §8 R3）
+        里"藏"这一步注定什么也没发生；照旧把 ``_hidden`` 记成 True 的话，
+        :meth:`handle_key` 之后每拍都直接 return（老板键就此失灵，重启才好），
+        通知区还多留一颗点了没窗口可回的墓碑——比功能没做成更像程序崩了。
+        """
         if self._hidden:
             return True
         self.error = ""
@@ -157,7 +163,10 @@ class BossKeyService(Service):
             logger.warning("老板键没藏窗口，因为%s", self.error)
             return False
         self._tray = tray
-        self._apply_visibility(False)
+        if not self._apply_visibility(False):
+            self._close_tray()
+            logger.warning("老板键没藏窗口，因为%s", self.error)
+            return False
         self._hidden = True
         return True
 
@@ -166,6 +175,8 @@ class BossKeyService(Service):
         if not self._hidden:
             return True
         self.error = ""
+        # 这里**不看** _apply_visibility 的返回值：既然要回来，窗口够不着也得把藏窗标志
+        # 和图标一起清掉，否则下一次按键又被"已经藏着"挡回去。
         self._apply_visibility(True)
         self._hidden = False
         self._close_tray()
@@ -175,18 +186,19 @@ class BossKeyService(Service):
         """托盘回调：**跑在托盘线程上**，控件只认界面循环，所以必须编组回去。"""
         _run_on_ui(self.restore)
 
-    def _apply_visibility(self, visible: bool) -> None:
+    def _apply_visibility(self, visible: bool) -> bool:
+        """把 ``page.window.visible`` 改成要的样子；成不成功回报调用方判。"""
         if self._page_provider is None:
             self.error = "还没拿到窗口（装配根未注入 page）"
-            return
+            return False
         try:
             page = self._page_provider()
         except Exception as exc:
             self.error = f"取窗口失败：{type(exc).__name__}: {exc}"
-            return
+            return False
         if page is None:
             self.error = "取到的窗口是空的"
-            return
+            return False
         try:
             window = page.window
             window.visible = bool(visible)
@@ -198,6 +210,8 @@ class BossKeyService(Service):
         except Exception as exc:
             self.error = f"{'回' if visible else '藏'}窗失败：{type(exc).__name__}: {exc}"
             logger.warning("%s", self.error)
+            return False
+        return True
 
     def _front(self, window) -> None:
         """把窗口提到最前——**等一下再发**，发之前按藏窗标志把关。

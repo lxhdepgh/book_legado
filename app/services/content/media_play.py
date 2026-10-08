@@ -8,9 +8,10 @@
 - :class:`FletVideoBackend`：flet_video 控件后端，三端默认主路径。**本类只在
   视图层实例化并注入控件**；服务层零 flet import、不持有控件，仅经鸭子类型
   调控件方法（open/play/pause/seek）。测试用 stub 后端替身。
-- :class:`SystemPlayerBackend`：降级后端（Windows ``os.startfile`` / macOS
-  ``open`` / Linux ``xdg-open``，经 subprocess 调系统命令，平台分支收敛在后端内）。
-  仅当 flet_video 不可用时可选，不进主路径（§1.4 跨平台策略）。
+- :class:`HeadlessVideoBackend`：无界面装配（``main.py --serve``，设计 §8 R3）的默认
+  后端——只记会话与位置、发状态事件，**不叫任何本机播放器**（迁移后播放归客户端，
+  §6.4 ``media_kit``）。视图层起了真控件后经 :meth:`MediaPlayService.set_backend`
+  换成 :class:`FletVideoBackend`。
 
 播放位置落 ``StorageService.books`` 表：``play_chapter_index``（播放列表里的第
 几条）+ ``play_position``（秒，v4 起）。这两列**不碰** ``chapter_index``——那一列
@@ -23,9 +24,6 @@
 from __future__ import annotations
 
 import logging
-import os
-import subprocess
-import sys
 import time
 from typing import Any
 
@@ -218,29 +216,21 @@ class FletVideoBackend(VideoBackend):
         return _as_seconds(await self._on_ui(self._call, "get_current_position"))
 
 
-class SystemPlayerBackend(VideoBackend):
-    """系统默认播放器降级后端（os.startfile / open / xdg-open）。
+class HeadlessVideoBackend(VideoBackend):
+    """无界面装配（``main.py --serve``）的默认后端：只记账，不叫任何本机播放器。
 
-    仅当 flet_video 在某平台不可用时可选，不进主路径（§1.4）。平台分支收敛在
-    本后端内：Windows 用 ``os.startfile``，macOS/Linux 经 subprocess 调系统命令。
+    为什么默认从"丢给系统默认播放器"换成这个：无头进程没有屏幕，而 ``os.startfile``
+    照样真会开一个外部窗口。界面那一侧早就否掉了同一条路——播放条建不出 flet_video
+    控件时明说"没装组件"，注释写着"悄悄丢给系统默认播放器等于凭空开一个外部窗口"
+    （``reader_controller._play_video``），服务层的默认装配却是那条被否掉的路。
+    迁移后播放归客户端（设计 §6.4：``media_kit``），本服务只剩会话、位置与状态事件
+    这一件事，所以这里做的正是它：状态照发、位置照落库、播放器一个都不碰。
     """
 
-    name = "system"
+    name = "none"
 
     async def open(self, media_url: str, headers: dict | None = None) -> None:
         self.media_url = str(media_url or "")
-        url = self.media_url
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(url)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", url])
-            else:
-                subprocess.Popen(["xdg-open", url])
-        except Exception as exc:  # 无图形环境/无关联播放器：降级为 error
-            self.state = "error"
-            logger.warning("系统播放器打开失败：%s", exc)
-            raise
         self.state = "playing"
 
     async def play(self) -> None:
@@ -250,8 +240,7 @@ class SystemPlayerBackend(VideoBackend):
         self.state = "paused"
 
     async def seek(self, position: float) -> None:
-        # 系统默认播放器不暴露跳转句柄，降级后端忽略 seek（位置仍落库）。
-        logger.debug("SystemPlayerBackend 不支持 seek，忽略 position=%s", position)
+        """跳转由拿得到声音的那一端做；服务侧的位置已由 ``MediaPlayService.seek`` 落库。"""
 
 
 class MediaPlayService(Service):
@@ -264,7 +253,7 @@ class MediaPlayService(Service):
                  rule_engine=None) -> None:
         super().__init__()
         self._storage = storage
-        self._backend = backend  # 测试注入 stub；未注入时默认降级系统播放器
+        self._backend = backend  # 测试/视图层注入；未注入时 on_start 用只记账的后端
         self._rule_engine = rule_engine
         # 当前播放会话状态。
         self._book_url = ""
@@ -281,8 +270,9 @@ class MediaPlayService(Service):
             self._storage = self.hub.require(StorageService)
         if self._backend is None:
             # 主路径 flet_video 由视图层在打开视频页时经 set_backend() 注入；
-            # 服务层默认装配降级系统播放器，保证无 flet 环境也能打开。
-            self._backend = SystemPlayerBackend()
+            # 没注入（无头装配、或界面压根没起控件）就用只记账的后端：服务照样
+            # RUNNING、状态事件照样发，但绝不打开本机播放器（§8 R3）。
+            self._backend = HeadlessVideoBackend()
         logger.info("MediaPlayService 已启动，后端=%s", self._backend.name)
 
     async def on_stop(self) -> None:

@@ -14,28 +14,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import re
 import uuid
 
 import flet as ft
 
 from app import platform_support
-from app.services.block_pages import block_reason
+from app.services.block_pages import looks_like_gate
 from app.services.headless_browser import BROWSER, available_fetcher
 from app.services.interactive_browser import VIEWPORT, InteractiveBrowser
-
-
-def looks_like_gate(html: str) -> bool:
-    """True when a rendered page is still a wall instead of the article.
-
-    A login form is the one gate a page keeps after rendering: the challenge
-    interstitials are already recognised by the shared block-page detector.
-    """
-    if not html.strip():
-        return True
-    if block_reason(html):
-        return True
-    return bool(re.search(r"""(?i)<input[^>]+type\s*=\s*["']?password""", html))
 
 
 class WebPageRenderer:

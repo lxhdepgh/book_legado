@@ -22,8 +22,8 @@ from app.core.settings import SettingsService
 from app.core.storage import StorageService
 from app.services.content.media_play import (
     FletVideoBackend,
+    HeadlessVideoBackend,
     MediaPlayService,
-    SystemPlayerBackend,
     VIDEO_EXTENSIONS,
     VideoBackend,
     is_video_url,
@@ -111,7 +111,7 @@ def test_video_extensions_reused_and_detected():
 # 2. 两后端均为 VideoBackend 子类，接口齐备
 # --------------------------------------------------------------------------- #
 def test_video_backends_are_subclasses():
-    for cls in (FletVideoBackend, SystemPlayerBackend):
+    for cls in (FletVideoBackend, HeadlessVideoBackend):
         assert issubclass(cls, VideoBackend)
         inst = cls()
         for method in ("open", "play", "pause", "seek", "stop",
