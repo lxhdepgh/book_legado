@@ -1,0 +1,82 @@
+{
+  "action": "source.get",
+  "protocol_version": 1,
+  "schema_digest": "e00531ce510d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
+  "data_shape": "object",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-source.get-1252171796000000",
+    "action": "source.get",
+    "seq": 6,
+    "payload": {
+      "url": "http://127.0.0.1:8797"
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-source.get-1252171796000000",
+    "ok": true,
+    "data": {
+      "bookSourceName": "R4健康源",
+      "bookSourceUrl": "http://127.0.0.1:8797",
+      "bookSourceGroup": "R4离线",
+      "bookSourceType": 0,
+      "enabled": true,
+      "enabledCookieJar": true,
+      "enabledExplore": false,
+      "customOrder": 0,
+      "lastUpdateTime": 0,
+      "respondTime": 180000,
+      "weight": 0,
+      "searchUrl": "/search?q={{key}}",
+      "ruleSearch": {
+        "bookList": "ul.list li",
+        "name": "a@text",
+        "bookUrl": "a@href",
+        "author": "i@text"
+      },
+      "ruleBookInfo": {
+        "name": "h1@text",
+        "intro": ".intro@text",
+        "tocUrl": "a.toc@href"
+      },
+      "ruleContent": {
+        "content": ".list@html"
+      },
+      "ruleToc": {
+        "chapterList": "li",
+        "chapterName": "a@text",
+        "chapterUrl": "a@href"
+      }
+    },
+    "error": null,
+    "code": null
+  },
+  "row_count": 1,
+  "inline_row_count": null,
+  "bytes": 566,
+  "sha256": "63a769a6965b9a7c2b8e9297d998af466d7da51a9be551ad653bece10eff9853",
+  "client_wall_ms": 0.7,
+  "wire_bytes": 714,
+  "field_names": [
+    "bookSourceGroup",
+    "bookSourceName",
+    "bookSourceType",
+    "bookSourceUrl",
+    "customOrder",
+    "enabled",
+    "enabledCookieJar",
+    "enabledExplore",
+    "lastUpdateTime",
+    "respondTime",
+    "ruleBookInfo",
+    "ruleContent",
+    "ruleSearch",
+    "ruleToc",
+    "searchUrl",
+    "weight"
+  ]
+}

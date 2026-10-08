@@ -199,24 +199,6 @@ def test_widget_key_lookalikes_are_not_mistaken_for_actions() -> None:
     assert _action_literals(sample) == ["bookshelf.list"], _action_literals(sample)
 
 
-def test_every_golden_sample_names_a_registered_action() -> None:
-    """黄金样本的 `action` 必须在表上，且样本文件名与 action 对得上。
-
-    样本是两侧的比对靶子；一份指向不存在动作的样本比没有样本更坏——它会一直绿。
-    """
-    golden = ROOT / "tests" / "gateway" / "golden"
-    if not golden.is_dir():
-        pytest.skip("还没有黄金样本")
-    import json
-
-    files = sorted(golden.glob("*.json"))
-    assert files, f"{golden} 里没有样本（`.probe/g1_golden_capture.py` 跑过吗？）"
-    for path in files:
-        sample = json.loads(path.read_text(encoding="utf-8"))
-        action = sample["action"]
-        assert action in BY_ACTION, f"{path.name} 的动作 {action} 没登记"
-        assert path.stem == action or path.stem.startswith(f"{action}--"), (
-            f"{path.name} 的文件名与它记录的 action 不符")
-        # 请求信封本身也要合法：样本是"真进程回的东西"，形状坏了就不是样本该绿。
-        assert sample["response"]["v"] == sample["protocol_version"]
-        assert sample["response"]["ok"] is True, path.name
+# 黄金样本那一族的守卫（覆盖表、时效摘要、请求合法性、账目自洽、job 的事件交付）
+# 全部住在 tests/test_gateway_golden_corpus.py：这里只留跨语言字面量那几支。
+# 搬过来的理由就是这份文件自己的主张——同一处事实不许有第二份写法。

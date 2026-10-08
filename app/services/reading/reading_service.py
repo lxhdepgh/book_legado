@@ -868,6 +868,51 @@ class ReadingService(Service):
         return [_book_item_dict(book) for book in books or []]
 
     # ------------------------------------------------------------------ #
+    # 协议门面：只吃 JSON 的找书面（设计 §4.2，G2）
+    # ------------------------------------------------------------------ #
+    async def _source_by_url(self, source_url: str):
+        """``bookSourceUrl`` → BookSource；取不到就当场说清是哪一步没了。
+
+        跨进程那一侧报不出 BookSource 对象（那是本进程的模型），只报得到 url。
+        把"换回来"这件事放在服务里而不是网关里，是为了让网关继续只认 action 表，
+        也为了让这三条门面在进程内测试里就能被跑到。
+        """
+        if self._source_service is None:
+            raise RuntimeError("SourceService 未就绪：按 url 取不到书源")
+        source = await self._source_service.load_source(str(source_url or ""))
+        if source is None:
+            raise ValueError(f"书源不存在：{source_url}")
+        return source
+
+    async def browse_categories(self, source_url: str) -> list[dict]:
+        """:meth:`explore_categories` 的按 url 版（入参与返回都是纯 JSON）。"""
+        return await self.explore_categories(await self._source_by_url(source_url))
+
+    async def browse_books(self, source_url: str, category: dict,
+                           page: int = 1) -> list[dict]:
+        """:meth:`explore_books` 的按 url 版；``category`` 用 browse_categories 回的那一条。"""
+        return await self.explore_books(
+            await self._source_by_url(source_url), category,
+            page=max(1, int(page or 1)))
+
+    async def search_in_scope(self, keyword: str, scope: str = "",
+                              search_id: int = 0) -> list[dict]:
+        """:meth:`search_books` 的门面：``sources`` 换成"当前全部书源"。
+
+        ``scope`` 的取值口径沿用控制器那套（分组名 / ``__all__`` / ``__ungrouped``），
+        过滤仍然走 :meth:`searchable_sources`——这里只补"从哪儿拿源"这一件事，
+        不另起一套范围语义。返回按 ``_book_item_dict`` 归一，与
+        ``SearchFinishedEvent`` 的 ``items`` 是**同一个形状**：同一批结果走两条路
+        回客户端却有两种字段，客户端就得写两套 fromJson（设计 §4.5 点名要避免的债）。
+        """
+        if self._source_service is None:
+            raise RuntimeError("SourceService 未就绪：搜索没有源可查")
+        items = await self.search_books(
+            str(keyword or ""), await self._source_service.list_sources(),
+            scope=scope or None, search_id=int(search_id or 0))
+        return [_book_item_dict(item) for item in items or []]
+
+    # ------------------------------------------------------------------ #
     # 换源（先本地种子、后联网扫描；见 docs/找书与换源逻辑对齐.md）
     # ------------------------------------------------------------------ #
     async def switch_seeds(self, item) -> list[dict]:

@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "description": "source.delete 入参。",
+  "properties": {
+    "url": {
+      "type": "string",
+      "description": "要删掉那条的 bookSourceUrl。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "url"
+  ]
+}

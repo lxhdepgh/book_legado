@@ -556,6 +556,23 @@ class SourceService(_LegacySourceService, Service):
                 source_id=getattr(book, "url", "") or ""))
         return added
 
+    async def shelve_by_url(self, source_url: str, book: dict,
+                            shelved: bool = True) -> bool:
+        """``shelve_book`` 的协议门面：源与书都按 JSON 交付。
+
+        跨进程那一侧报不出 ``BookSource``/``BookItem``（那是本进程的模型），只报得
+        到 ``bookSourceUrl`` 加结果流里那一行字典。还原成 BookItem 再走原动作，
+        是为了不让客户端自己拼 `add_to_bookshelf` 的字段口径——那等于把书架语义
+        写第二遍。
+        """
+        from app.services.reading.reading_service import as_book_item
+
+        source = await self.load_source(str(source_url or ""))
+        if source is None:
+            raise ValueError(f"书源不存在：{source_url}")
+        return await self.shelve_book(source, as_book_item(book),
+                                      shelved=bool(shelved))
+
     async def unshelve_book(self, source_url: str, book_url: str) -> bool:
         """移出书架并落库（UI 的"移除"必须是持久化动作，不是本地列表过滤）。"""
         removed = bool(self.remove_from_bookshelf(source_url, book_url))

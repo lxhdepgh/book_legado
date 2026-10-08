@@ -1,0 +1,31 @@
+{
+  "action": "check.cancel",
+  "protocol_version": 1,
+  "schema_digest": "e00531ce510d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "本轮已跑完：这一发回 None，钉的是「取消在收尾之后仍然可用」而不是「取消成功」",
+  "data_shape": "null",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-check.cancel-1252172765000000",
+    "action": "check.cancel",
+    "seq": 17,
+    "payload": {}
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-check.cancel-1252172765000000",
+    "ok": true,
+    "data": null,
+    "error": null,
+    "code": null
+  },
+  "row_count": 0,
+  "inline_row_count": null,
+  "bytes": 4,
+  "sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+  "client_wall_ms": 0.5,
+  "wire_bytes": 105,
+  "field_names": []
+}

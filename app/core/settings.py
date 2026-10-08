@@ -62,6 +62,14 @@ class SettingsService(Service):
         """内存缓存优先取值；未命中返回 default（无服务环境由模块访问器兜底）。"""
         return self._cache.get(key, default)
 
+    def read_keys(self, keys: list[str]) -> dict[str, Any]:
+        """按名单取值——协议面用（那边没有"列出所有键"的能力，也不该有）。
+
+        没设过的键**不出现在返回里**：界面要区分"这项没设过 → 显示默认值"与
+        "设成了 null → 显示清空后的值"，缺一整格就是把前者渲染成后者。
+        """
+        return {str(key): self._cache[key] for key in keys if key in self._cache}
+
     def set(self, key: str, value: Any) -> None:
         """写内存 + 写库 + 广播 SettingsChangedEvent + 触发键订阅。"""
         old = self._cache.get(key)

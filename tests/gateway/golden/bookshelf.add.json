@@ -1,0 +1,72 @@
+{
+  "action": "bookshelf.add",
+  "protocol_version": 1,
+  "schema_digest": "e00531ce510d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
+  "data_shape": "scalar",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-bookshelf.add-1252172343000000",
+    "action": "bookshelf.add",
+    "seq": 13,
+    "payload": {
+      "source_url": "http://127.0.0.1:8797/g2",
+      "book": {
+        "name": "基线书",
+        "author": "作者甲",
+        "intro": "",
+        "url": "http://127.0.0.1:8797/book/1.html",
+        "cover_url": "",
+        "toc_url": "",
+        "kind": "",
+        "last_chapter": "",
+        "latest_chapter_title": "",
+        "word_count": "",
+        "download_urls": null,
+        "origin": "http://127.0.0.1:8797/g2",
+        "origin_name": "G2分类源",
+        "type": 8,
+        "total_chapter_num": 0,
+        "dur_chapter_index": 0,
+        "dur_chapter_title": "",
+        "can_update": true,
+        "custom_intro": "",
+        "custom_tag": "",
+        "custom_cover_url": "",
+        "charset": "",
+        "group": 0,
+        "latest_chapter_time": 0,
+        "last_check_time": 0,
+        "last_check_count": 0,
+        "dur_chapter_pos": 0,
+        "dur_chapter_time": 0,
+        "order": 0,
+        "origin_order": 0,
+        "read_config": {},
+        "info_html": "",
+        "toc_html": "",
+        "variables": {},
+        "origins": [
+          "http://127.0.0.1:8797/g2"
+        ]
+      }
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-bookshelf.add-1252172343000000",
+    "ok": true,
+    "data": true,
+    "error": null,
+    "code": null
+  },
+  "row_count": 0,
+  "inline_row_count": null,
+  "bytes": 4,
+  "sha256": "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b",
+  "client_wall_ms": 4.9,
+  "wire_bytes": 106,
+  "field_names": []
+}

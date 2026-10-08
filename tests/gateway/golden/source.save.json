@@ -1,0 +1,87 @@
+{
+  "action": "source.save",
+  "protocol_version": 1,
+  "schema_digest": "e00531ce510d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
+  "data_shape": "object",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-source.save-1252171796000000",
+    "action": "source.save",
+    "seq": 7,
+    "payload": {
+      "source_json": {
+        "bookSourceName": "G2分类源",
+        "bookSourceUrl": "http://127.0.0.1:8797/g2",
+        "bookSourceGroup": "G2离线",
+        "bookSourceType": 0,
+        "enabled": true,
+        "enabledExplore": true,
+        "searchUrl": "/search?q={{key}}",
+        "exploreUrl": "玄幻奇幻::/g2/list?page={{page}}",
+        "ruleSearch": {
+          "bookList": "ul.list li",
+          "name": "a@text",
+          "bookUrl": "a@href",
+          "author": "i@text"
+        },
+        "ruleExplore": {
+          "bookList": "ul.list li",
+          "name": "a@text",
+          "bookUrl": "a@href"
+        },
+        "ruleBookInfo": {
+          "name": "h1@text",
+          "intro": ".intro@text",
+          "tocUrl": "a.toc@href"
+        },
+        "ruleToc": {
+          "chapterList": "li",
+          "chapterName": "a@text",
+          "chapterUrl": "a@href"
+        },
+        "ruleContent": {
+          "content": ".list@html"
+        }
+      }
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-source.save-1252171796000000",
+    "ok": true,
+    "data": {
+      "saved": true,
+      "source_id": "http://127.0.0.1:8797/g2",
+      "errors": [],
+      "audit": {
+        "source_id": "http://127.0.0.1:8797/g2",
+        "missing_java_apis": [],
+        "missing_object_apis": [],
+        "unknown_fields": [],
+        "unsupported_pseudos": [],
+        "js_syntax_errors": [],
+        "regex_errors": [],
+        "rule_syntax_errors": [],
+        "suggestions": [],
+        "not_audited": ""
+      }
+    },
+    "error": null,
+    "code": null
+  },
+  "row_count": 1,
+  "inline_row_count": null,
+  "bytes": 305,
+  "sha256": "06fb9f663ff8cab3e8526f8420c854097e5e7aee9057af0d84eb76132f935913",
+  "client_wall_ms": 297.4,
+  "wire_bytes": 431,
+  "field_names": [
+    "audit",
+    "errors",
+    "saved",
+    "source_id"
+  ]
+}

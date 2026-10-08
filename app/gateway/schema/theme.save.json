@@ -1,0 +1,34 @@
+{
+  "type": "object",
+  "description": "theme.save 入参：三格各自可缺省。",
+  "properties": {
+    "skin_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "皮肤 id；null=不改这一格。认不出的值由服务侧折回默认皮肤，不是报错。"
+    },
+    "mode": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "light",
+        "dark",
+        "system",
+        null
+      ],
+      "description": "明暗档；null=不改这一格。"
+    },
+    "eink": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "墨水屏模式；null=不改这一格。"
+    }
+  },
+  "additionalProperties": false
+}

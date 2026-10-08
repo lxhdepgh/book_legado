@@ -2,8 +2,9 @@
 ///
 /// 这一支是"字段在三处手写重复"那条反面样本的解药：`BookshelfItem` 读的键、
 /// 黄金样本里的键、以及服务端 action 表说的形状，三者任一处漂了就得有人红。
-/// 样本本身由 `.probe/g1_golden_capture.py` 从真 `main.py --serve` 子进程抓，
-/// 不在这里手改——手改样本等于把契约改成自己想要的样子。
+/// 样本本身由 `.probe/g2_golden_capture.py` 从真 `main.py --serve` 子进程抓
+/// （G1 那一支已被它取代），不在这里手改——手改样本等于把契约改成自己想要的样子，
+/// 而 `tests/test_gateway_golden_corpus.py` 会拿样本自己重算的 sha256 当场抓住。
 library;
 
 import 'dart:convert';
