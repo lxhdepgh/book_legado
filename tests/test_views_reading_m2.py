@@ -1204,5 +1204,66 @@ class ReaderRepairOfferTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(controller._failed_chapter)
 
 
+class ScopeDialogTests(unittest.TestCase):
+    """搜索范围对话框的选项表来自服务端口径（``ReadingService.scope_table``）。
+
+    这条钉的是"只有一份算法"：控制器从前自己切分组、自己 ``len(searchable_sources)``
+    数一遍，协议面的 ``search.scopes`` 又数一遍，改一处规则就得记得改两处。
+    语料里刻意放一条"C组只有停用源"和一条"组名是空白"的——前者证明可选范围
+    来自全部源而条数来自可搜源（不混成一个口径），后者证明空白组归"未分组"。
+    """
+
+    def _sources(self):
+        return [
+            SimpleNamespace(bookSourceUrl="ung", bookSourceName="无组",
+                            enabled=True, searchUrl="/q", bookSourceGroup=""),
+            SimpleNamespace(bookSourceUrl="blank", bookSourceName="空白组",
+                            enabled=True, searchUrl="/q", bookSourceGroup="  "),
+            SimpleNamespace(bookSourceUrl="both", bookSourceName="跨两组",
+                            enabled=True, searchUrl="/q", bookSourceGroup="B组,A组"),
+            SimpleNamespace(bookSourceUrl="offgrp", bookSourceName="停用源",
+                            enabled=False, searchUrl="/q", bookSourceGroup="C组"),
+            SimpleNamespace(bookSourceUrl="nosearch", bookSourceName="没搜索规则",
+                            enabled=True, searchUrl="  ", bookSourceGroup="D组"),
+        ]
+
+    def _controller(self, page):
+        controller = FindBooksController(_FakeHub(_stub_services()))
+        controller.attach(FindBooksView())
+        controller._page = lambda: page
+        controller._sources = self._sources()
+        return controller
+
+    def test_dialog_rows_are_the_server_scope_table(self):
+        page = _FakeDialogPage()
+        controller = self._controller(page)
+        try:
+            controller.open_scope()
+            self.assertEqual(len(page.shown), 1, "范围对话框没开出或叠了层")
+            titles = [tile.title.value
+                      for tile in page.shown[0].content.controls]
+            # 「D组」只有那条没配 searchUrl 的源：范围照样列出（0 源），
+            # 因为可选范围来自全部源；把它从下拉里抹掉就是"我的组没了"。
+            self.assertEqual(titles, [
+                "全部书源（3 源）", "未分组（2 源）",
+                "A组（1 源）", "B组（1 源）", "C组（0 源）", "D组（0 源）"])
+        finally:
+            controller.detach()
+
+    def test_picking_a_row_switches_scope_and_closes_the_dialog(self):
+        page = _FakeDialogPage()
+        controller = self._controller(page)
+        try:
+            controller.open_scope()
+            ungrouped = page.shown[0].content.controls[1]
+            ungrouped.on_click(None)
+            self.assertEqual(controller._scope, "__ungrouped__")
+            self.assertEqual(controller._scope_name, "未分组")
+            self.assertEqual(controller._view._search_scope_label.value, "未分组")
+            self.assertEqual(page.pop_count, 1, "选完没收摊")
+        finally:
+            controller.detach()
+
+
 if __name__ == "__main__":
     unittest.main()

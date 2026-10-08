@@ -1,16 +1,16 @@
 {
   "action": "import.text",
   "protocol_version": 1,
-  "schema_digest": "e00531ce510d",
+  "schema_digest": "45add13d80dc",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-import.text-1252172765000000",
+    "id": "r4-import.text-1258553109000000",
     "action": "import.text",
-    "seq": 18,
+    "seq": 19,
     "payload": {
       "text": "[{\"bookSourceName\": \"G2导入源\", \"bookSourceUrl\": \"http://127.0.0.1:8798/imported\", \"bookSourceGroup\": \"G2离线\", \"bookSourceType\": 0, \"enabled\": true, \"enabledExplore\": true, \"searchUrl\": \"/search?q={{key}}\", \"exploreUrl\": \"玄幻奇幻::/g2/list?page={{page}}\", \"ruleSearch\": {\"bookList\": \"ul.list li\", \"name\": \"a@text\", \"bookUrl\": \"a@href\", \"author\": \"i@text\"}, \"ruleExplore\": {\"bookList\": \"ul.list li\", \"name\": \"a@text\", \"bookUrl\": \"a@href\"}, \"ruleBookInfo\": {\"name\": \"h1@text\", \"intro\": \".intro@text\", \"tocUrl\": \"a.toc@href\"}, \"ruleToc\": {\"chapterList\": \"li\", \"chapterName\": \"a@text\", \"chapterUrl\": \"a@href\"}, \"ruleContent\": {\"content\": \".list@html\"}}]",
       "kind": "book_source",
@@ -19,7 +19,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-import.text-1252172765000000",
+    "id": "r4-import.text-1258553109000000",
     "ok": true,
     "data": {
       "kind": "book_source",
@@ -35,7 +35,7 @@
   "inline_row_count": null,
   "bytes": 78,
   "sha256": "3c27e4b66d8a9fd681fff6a77331c2c21154d6bf05402f8e4be0936511323d86",
-  "client_wall_ms": 107.0,
+  "client_wall_ms": 114.0,
   "wire_bytes": 187,
   "field_names": [
     "count",

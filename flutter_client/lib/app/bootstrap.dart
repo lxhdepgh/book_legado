@@ -12,6 +12,7 @@ import 'dart:ui' show AppExitResponse;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../core/di/providers.dart';
 import '../core/rpc/engine_process.dart';
@@ -20,6 +21,9 @@ import '../core/rpc/envelope.dart';
 import '../core/rpc/fake_engine_repository.dart';
 import '../core/rpc/rpc_client.dart';
 import '../core/rpc/rpc_engine_repository.dart';
+import '../features/settings/data/app_theme.dart';
+import '../features/settings/data/theme_preferences.dart';
+import '../features/settings/domain/appearance_notifier.dart';
 import 'router.dart';
 
 /// 已经拉起来的那个引擎子进程：跟着 App 活，退出时负责发 `engine.shutdown`。
@@ -92,6 +96,10 @@ Widget bootFailureScope(EngineFailure failure) => ProviderScope(
       child: MaterialApp(
         title: 'Legado 书源管理工具',
         debugShowCheckedModeBanner: false,
+        // 连不上引擎时**不读偏好**（读了也只会再抛一遍），走默认那一套：
+        // 这一屏要的是"连的是哪儿、哪一步没通"，配色不在它的活里。
+        theme: lightThemeFor(skinById(kDefaultSkinId)),
+        darkTheme: darkThemeFor(skinById(kDefaultSkinId)),
         home: EngineUnavailablePage(failure: failure),
       ),
     );
@@ -139,6 +147,10 @@ class _LegodoAppState extends ConsumerState<LegodoApp> {
   /// 唯一的注入口，再开第二条线就等于同一件事在两个地方各写一遍。
   late final AppLifecycleListener _lifecycle;
 
+  /// 路由表**只建一次**：主题现在会让这一发重建（下面 watch 了外观偏好），
+  /// 而每次 build 新 GoRouter 会把导航状态冲掉——用户换个皮肤就跳回首页。
+  late final GoRouter _router = buildRouter();
+
   @override
   void initState() {
     super.initState();
@@ -162,13 +174,21 @@ class _LegodoAppState extends ConsumerState<LegodoApp> {
   }
 
   @override
-  Widget build(BuildContext context) => MaterialApp.router(
-        title: 'Legado 书源管理工具',
-        debugShowCheckedModeBanner: false,
-        theme: ThemeData(
-          colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF3F51B5)),
-          useMaterial3: true,
-        ),
-        routerConfig: buildRouter(),
-      );
+  Widget build(BuildContext context) {
+    // 主题的**唯一**持有者在这里，不在外观那一屏里：flet 那边是
+    // `apply_page_theme(page, data)` 打到整页（三件套一起下发，只设一面在深色桌面上
+    // 等于什么都没改）。待存的那一份赢过已存的（预览即所见），所以 watch 的是
+    // pending 而不是 saved —— 见 `features/settings/domain/appearance_notifier.dart`。
+    final pref = ref.watch(appearanceProvider).value?.pending ??
+        ThemePreferences.defaults;
+    final theme = appThemeFor(pref);
+    return MaterialApp.router(
+      title: 'Legado 书源管理工具',
+      debugShowCheckedModeBanner: false,
+      theme: theme.theme,
+      darkTheme: theme.darkTheme,
+      themeMode: theme.themeMode,
+      routerConfig: _router,
+    );
+  }
 }

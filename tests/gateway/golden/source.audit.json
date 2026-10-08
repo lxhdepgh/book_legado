@@ -1,14 +1,14 @@
 {
   "action": "source.audit",
   "protocol_version": 1,
-  "schema_digest": "e00531ce510d",
+  "schema_digest": "45add13d80dc",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-source.audit-1252172093000000",
+    "id": "r4-source.audit-1258552406000000",
     "action": "source.audit",
     "seq": 8,
     "payload": {
@@ -50,7 +50,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-source.audit-1252172093000000",
+    "id": "r4-source.audit-1258552406000000",
     "ok": true,
     "data": {
       "source_id": "http://127.0.0.1:8797/g2",

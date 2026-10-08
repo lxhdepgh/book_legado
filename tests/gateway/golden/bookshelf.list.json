@@ -1,21 +1,21 @@
 {
   "action": "bookshelf.list",
   "protocol_version": 1,
-  "schema_digest": "e00531ce510d",
+  "schema_digest": "45add13d80dc",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库副本里原有的书架行",
   "data_shape": "list",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-bookshelf.list-1252171609000000",
+    "id": "r4-bookshelf.list-1258551937000000",
     "action": "bookshelf.list",
     "seq": 3,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-bookshelf.list-1252171609000000",
+    "id": "r4-bookshelf.list-1258551937000000",
     "ok": true,
     "data": [
       {
@@ -317,7 +317,7 @@
   "inline_row_count": 7,
   "bytes": 24368,
   "sha256": "05600247c67131d5d20bd221836751376b2b2a96a19d1b9ef971d39f01cae3a5",
-  "client_wall_ms": 1.3,
+  "client_wall_ms": 1.9,
   "wire_bytes": 25012,
   "field_names": [
     "author",

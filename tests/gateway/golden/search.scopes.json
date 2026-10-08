@@ -1,0 +1,111 @@
+{
+  "action": "search.scopes",
+  "protocol_version": 1,
+  "schema_digest": "45add13d80dc",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
+  "data_shape": "list",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-search.scopes-1258552437000000",
+    "action": "search.scopes",
+    "seq": 11,
+    "payload": {}
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-search.scopes-1258552437000000",
+    "ok": true,
+    "data": [
+      {
+        "scope": "__all__",
+        "count": 920
+      },
+      {
+        "scope": "__ungrouped__",
+        "count": 0
+      },
+      {
+        "scope": "G2离线",
+        "count": 1
+      },
+      {
+        "scope": "R4离线",
+        "count": 3
+      },
+      {
+        "scope": "下载书源 📥",
+        "count": 17
+      },
+      {
+        "scope": "代理书源 🌍",
+        "count": 7
+      },
+      {
+        "scope": "出版书源 🏛",
+        "count": 3
+      },
+      {
+        "scope": "同人书源 🎭",
+        "count": 4
+      },
+      {
+        "scope": "图片书源 📷",
+        "count": 11
+      },
+      {
+        "scope": "影视频源 🎬",
+        "count": 19
+      },
+      {
+        "scope": "快速书源 ⚡",
+        "count": 240
+      },
+      {
+        "scope": "有声书源 🔊",
+        "count": 17
+      },
+      {
+        "scope": "有验证源 🔑",
+        "count": 1
+      },
+      {
+        "scope": "正版书源 🏷",
+        "count": 30
+      },
+      {
+        "scope": "漫画书源 🎨",
+        "count": 79
+      },
+      {
+        "scope": "特殊书源 🔞",
+        "count": 169
+      },
+      {
+        "scope": "聚合书源 📚",
+        "count": 2
+      },
+      {
+        "scope": "轻文书源 📘",
+        "count": 6
+      },
+      {
+        "scope": "通常书源 📂",
+        "count": 593
+      }
+    ],
+    "error": null,
+    "code": null
+  },
+  "row_count": 19,
+  "inline_row_count": 19,
+  "bytes": 742,
+  "sha256": "0c8ff005a396b85fd19dab1696b05214e6dec5f1816d7f455c44c38999f4215e",
+  "client_wall_ms": 6.8,
+  "wire_bytes": 919,
+  "field_names": [
+    "count",
+    "scope"
+  ]
+}

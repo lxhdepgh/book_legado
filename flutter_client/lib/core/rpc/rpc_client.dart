@@ -17,6 +17,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import 'action_budgets.dart';
 import 'engine_endpoint.dart';
 import 'envelope.dart';
 
@@ -30,7 +31,8 @@ class RpcClient {
   final EngineEndpoint endpoint;
   final http.Client _client;
 
-  /// 客户端预算。服务端对每个 action 另有一条自己的预算（`methods.py` 的 timeout 列），
+  /// 客户端**默认**预算：`action_budgets.dart` 那张表之外的动作都走它。
+  /// 服务端对每个 action 另有一条自己的预算（`methods.py` 的 timeout 列），
   /// **谁先响都行**：客户端这条只管"别再干等"，真断靠服务端那条。
   final Duration timeout;
 
@@ -57,8 +59,14 @@ class RpcClient {
   ///
   /// [singleFlight] 为真时同 action 的旧在飞会被顶掉（顶掉表现为旧那一发抛
   /// `cancelled`，与新那一发的 `cancelled` 错误码同源）。
+  ///
+  /// [budget] 覆盖这一发的预算；不给就走 [clientBudgetFor]（那条长预算的表），
+  /// 表外才是构造时那条默认水池——见 `action_budgets.dart` 文件头那条"谁先响都行"。
   Future<RpcData> call(String action,
-      {Map<String, Object?>? payload, bool singleFlight = true}) async {
+      {Map<String, Object?>? payload,
+      bool singleFlight = true,
+      Duration? budget}) async {
+    final effective = budget ?? clientBudgetFor(action) ?? timeout;
     final seq = ++_seq;
     if (singleFlight) {
       _inFlight[action] = seq;
@@ -73,10 +81,10 @@ class RpcClient {
     RpcData data;
     try {
       final response = await _post(jsonEncode(request))
-          .timeout(timeout,
+          .timeout(effective,
               onTimeout: () => throw EngineFailure(
                   EngineFailureKind.timeout,
-                  '客户端预算 $timeout 内没等到 $action 的回话',
+                  '客户端预算 $effective 内没等到 $action 的回话',
                   action: action));
       data = response;
     } on EngineFailure {

@@ -1,14 +1,14 @@
 {
   "action": "engine.shutdown",
   "protocol_version": 1,
-  "schema_digest": "e00531ce510d",
+  "schema_digest": "45add13d80dc",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "子进程收到后自行收摊，rc 见下",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-engine.shutdown-1252173406000000",
+    "id": "r4-engine.shutdown-1258553750000000",
     "action": "engine.shutdown",
     "seq": 0,
     "payload": {
@@ -17,7 +17,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-engine.shutdown-1252173406000000",
+    "id": "r4-engine.shutdown-1258553750000000",
     "ok": true,
     "data": {
       "stopping": true,

@@ -260,16 +260,23 @@ class FindBooksController(BaseController):
         else:
             self._view.set_status(f"已找到 {len(items)} 条结果，继续搜索中…")
 
+    #: 两个哨兵的展示名；分组名的 label 就是组名本身。
+    _SCOPE_LABELS = {_SCOPE_ALL: "全部书源", _SCOPE_UNGROUPED: "未分组"}
+
     def open_scope(self, _=None) -> None:
-        """搜索范围选择：全部 / 未分组 / 各书源分组。"""
+        """搜索范围选择：全部 / 未分组 / 各书源分组。
+
+        选项表和"各范围内几条源"都取自 :meth:`ReadingService.scope_table`——
+        同一份算法也喂协议面的 ``search.scopes``。这里再数一遍就是两个界面两套口径
+        （改一条规则要记得改两处的那种）。
+        """
         page = self._page()
         if page is None:
             return
-        groups = sorted({g.strip() for source in self._sources
-                         for g in str(getattr(source, "bookSourceGroup", "") or "")
-                         .split(",") if g.strip()})
-        options = [(_SCOPE_ALL, "全部书源"), (_SCOPE_UNGROUPED, "未分组")]
-        options += [(g, g) for g in groups]
+        options = [(row["scope"],
+                    self._SCOPE_LABELS.get(row["scope"], row["scope"]),
+                    row["count"])
+                   for row in ReadingService.scope_table(self._sources)]
 
         def pick(key: str, label: str) -> None:
             self._scope, self._scope_name = key, label
@@ -283,14 +290,11 @@ class FindBooksController(BaseController):
                     dense=True, leading=ft.Icon(
                         ft.Icons.RADIO_BUTTON_CHECKED if key == self._scope
                         else ft.Icons.RADIO_BUTTON_UNCHECKED),
-                    title=ft.Text(f"{label}（{self._scope_count(key)} 源）"),
+                    title=ft.Text(f"{label}（{count} 源）"),
                     on_click=lambda e, k=key, l=label: pick(k, l))
-                for key, label in options
+                for key, label, count in options
             ], tight=True, width=360))
         page.show_dialog(dialog)
-
-    def _scope_count(self, scope: str) -> int:
-        return len(ReadingService.searchable_sources(self._sources, scope))
 
     # ------------------------------------------------------------------ #
     # 详情 / 开读 / 入架

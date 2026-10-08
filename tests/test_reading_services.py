@@ -91,11 +91,11 @@ def _book(url="book-1", name="书名", author="作者"):
                            cover_url="", kind="text", variables={})
 
 
-def _source(url="src-1"):
+def _source(url="src-1", group="", enabled=True, search_url="/q={{key}}"):
     """可搜书源替身：search_books 只派发 enabled 且配了 searchUrl 的源。"""
     return SimpleNamespace(bookSourceUrl=url, bookSourceName="源",
-                           enabled=True, searchUrl="/q={{key}}",
-                           bookSourceGroup="")
+                           enabled=enabled, searchUrl=search_url,
+                           bookSourceGroup=group)
 
 
 class _StubEngine:
@@ -667,3 +667,61 @@ def test_image_book_service_chapter_images_and_filter(env):
     assert gray.mode == "RGB"
     ink = ImageBookService.apply_color_filter(img, "ink")
     assert ink.mode == "RGB"
+
+
+# --------------------------------------------------------------------------- #
+# 15. 搜索范围口径（search.scopes 的唯一算法来源）
+# --------------------------------------------------------------------------- #
+def _scope_corpus():
+    """四种形状各一条：无组 / 空白组 / 跨两组 / 组里只有停用源。
+
+    刻意不造"每条源只属一个组"的语料：那种形状下 `__ungrouped__` 与"各组并集"
+    会给出同一个答案，一个把未分组判成全部书源的实现也能全绿（记忆
+    measurement-corpus-must-not-be-self-proving）。
+    """
+    return [
+        _source("ung", group=""),
+        _source("blank", group="  "),
+        _source("both", group="B组,A组"),
+        _source("offgrp", group="C组", enabled=False),
+        _source("nosearch", group="", search_url="  "),
+    ]
+
+
+def test_scope_ungrouped_is_not_the_same_as_all():
+    sources = _scope_corpus()
+    names = lambda pool: [s.bookSourceUrl for s in pool]
+
+    everything = names(ReadingService.searchable_sources(sources, "__all__"))
+    ungrouped = names(ReadingService.searchable_sources(sources, "__ungrouped__"))
+
+    # 三条可搜源；"未分组"只能拿到那两条没有任何组名的。
+    assert everything == ["ung", "blank", "both"]
+    assert ungrouped == ["ung", "blank"]
+    # 反面的反面：把哨兵当成"不过滤"的实现，这两栏会长成一样。
+    assert ungrouped != everything
+
+    # 空值与 __all__ 同义（控制器那边传过空串来）。
+    assert names(ReadingService.searchable_sources(sources, "")) == everything
+    # 组名两侧都 strip：源侧 "B组,A组"、筛选侧 " A组 " 命中同一条。
+    assert names(ReadingService.searchable_sources(sources, " A组 ")) == ["both"]
+    # 不存在的组是"一条都不搜"，不是"退化成全部"。
+    assert ReadingService.searchable_sources(sources, "D组") == []
+
+
+def test_scope_table_lists_every_selectable_scope_with_searchable_counts():
+    rows = ReadingService.scope_table(_scope_corpus())
+
+    # 顺序 = 下拉顺序：两个哨兵在前，组名排序去重在后（flet 那侧同样 sorted(set)）。
+    assert [r["scope"] for r in rows] == ["__all__", "__ungrouped__",
+                                          "A组", "B组", "C组"]
+    assert [r["count"] for r in rows] == [3, 2, 1, 1, 0]
+    # C组 那一格是 0：**可选范围来自全部源，条数来自可搜源**。把两者混成一个口径
+    # （先过滤再列组）会让"C组"整个从下拉里消失，用户看到的是"我的组没了"。
+
+    # 空白组不算一个组：分组名集合里没有 ""，也没有 "  "。
+    assert all(r["scope"].strip() for r in rows)
+
+    # 没有源就没有组：只剩两个哨兵，各 0 条。
+    assert ReadingService.scope_table([]) == [
+        {"scope": "__all__", "count": 0}, {"scope": "__ungrouped__", "count": 0}]

@@ -27,9 +27,13 @@ enum Breakpoint {
 /// 一条目的地：文案、路由、图标。
 typedef ShellDestination = ({String label, String route, IconData icon});
 
-/// G1 的目的地表：只有书架。加第二个入口时把这张表补满，别在 build 里现写。
+/// 顶级入口 = **分组**，不是屏（`NAV_META` 的三组，顺序照旧单体的
+/// 书源 / 阅读 / 配置，图标照 `navigation.py::_GROUP_ICONS`）。
+/// 组内的屏走页签（`core/widgets/tabbed_group.dart`），不在这里各占一行。
 const List<ShellDestination> kDestinations = <ShellDestination>[
-  (label: '书架', route: bookshelfRoute, icon: Icons.book_outlined),
+  (label: '书源', route: sourcesGroupRoute, icon: Icons.library_books_outlined),
+  (label: '阅读', route: readingGroupRoute, icon: Icons.menu_book_outlined),
+  (label: '配置', route: settingsGroupRoute, icon: Icons.settings_outlined),
 ];
 
 class AppShell extends StatelessWidget {

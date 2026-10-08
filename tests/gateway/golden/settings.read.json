@@ -1,16 +1,16 @@
 {
   "action": "settings.read",
   "protocol_version": 1,
-  "schema_digest": "e00531ce510d",
+  "schema_digest": "45add13d80dc",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-settings.read-1252173406000000",
+    "id": "r4-settings.read-1258553750000000",
     "action": "settings.read",
-    "seq": 26,
+    "seq": 27,
     "payload": {
       "keys": [
         "reader.max_width",
@@ -22,7 +22,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-settings.read-1252173406000000",
+    "id": "r4-settings.read-1258553750000000",
     "ok": true,
     "data": {
       "reader.max_width": 700.0,

@@ -187,6 +187,10 @@ void main() {
       addTearDown(() => tester.binding.setSurfaceSize(null));
       await tester.pumpWidget(_shellHost(fake));
       await tester.pumpAndSettle();
+      // G2 之后起手落在阅读组的「找书」那一签，所以这一臂必须自己切过来：
+      // 少这一跳，两条断言量的是找书页，"宽屏整屏空白"那条护栏就静默失效了。
+      await tester.tap(find.byKey(const ValueKey('tab-$readingGroupRoute-书架')));
+      await tester.pumpAndSettle();
       expect(find.text('书架共 7 本'), findsOneWidget, reason: '$size 那一档');
       expect(find.byType(ListTile), findsNWidgets(7), reason: '$size 那一档');
     }

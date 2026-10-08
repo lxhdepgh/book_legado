@@ -20,6 +20,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:legodo_client/app/bootstrap.dart';
 import 'package:legodo_client/core/di/providers.dart';
+import 'package:legodo_client/core/events/engine_event.dart';
 import 'package:legodo_client/core/rpc/engine_endpoint.dart';
 import 'package:legodo_client/core/rpc/engine_process.dart';
 import 'package:legodo_client/core/rpc/fake_engine_repository.dart';
@@ -61,18 +62,49 @@ class _FakeProcess implements Process {
   Stream<List<int>> get stderr => const Stream<void>.empty().cast<List<int>>();
 }
 
-/// 按 action 回合法信封：`bookshelf.list` 回**空数组**（空书架是真形状，`data: null`
-/// 不是——仓库层会把它当坏形状报 transport，那条错误路径不该混进收摊那两条臂里）。
+/// 按 action 回**形状合法**的空载荷：数组类回 `[]`，`theme.preferences` 回 `{}`
+/// （= 全默认偏好），其余回 null。
+///
+/// 空数组是真形状，`data: null` 不是——仓库层会把它当坏形状报 transport，
+/// 那条错误路径不该混进收摊那两条臂里（书架那臂同理）。
 http.Response _okFor(String action) => http.Response(
     jsonEncode(<String, Object?>{
       'v': 1,
       'id': 'd-1',
       'ok': true,
-      'data': action == 'bookshelf.list' ? <Object?>[] : null,
+      'data': switch (action) {
+        'theme.preferences' => const <String, Object?>{},
+        'bookshelf.list' || 'source.list' || 'search.scopes' || 'category.list' ||
+            'engine.status' => const <Object?>[],
+        _ => null,
+      },
       'error': null,
       'code': null,
     }), 200,
     headers: const {'content-type': 'application/json'});
+
+/// 起手那一批调用（排序后比）：根上的主题偏好 + 落地页「找书」的两发。
+///
+/// 为什么排序再比：这三发在同一帧里各走自己的 await，谁先落字节没定数；
+/// 而"不该有第四条"这条护栏读的是**集合与条数**，不是顺序。
+const List<String> _startupActions = <String>[
+  'search.scopes',
+  'source.list',
+  'theme.preferences',
+];
+
+/// 把根挂起来：收摊那两臂测的是"退出有没有喊引擎"，不测 `/ws`。
+/// 落地页（找书）会订阅事件流，而 [RpcEngineRepository.events] 一被订阅就真去连
+/// `ws://127.0.0.1:59999` —— 测试的假时钟里那次 connect 永不完成，
+/// 留下的 5s 超时定时器让整条臂以"Pending timers"红掉（不是回归，是仪器没接上）。
+/// 所以这一臂把事件流换成空流，`/ws` 自己那一支另有测试。
+Widget _app(BootstrapResult boot) => boot.scope(ProviderScope(
+      overrides: [
+        engineEventsProvider
+            .overrideWith((_) => const Stream<EngineEvent>.empty()),
+      ],
+      child: const LegodoApp(),
+    ));
 
 void main() {
   testWidgets('关窗那一发：engine.shutdown 真发出去、进程真收到 SIGTERM', (tester) async {
@@ -90,12 +122,16 @@ void main() {
         client,
         repository);
 
-    await tester.pumpWidget(
-        BootstrapResult(repository: repository, handle: handle).scope(const LegodoApp()));
+    await tester.pumpWidget(_app(
+        BootstrapResult(repository: repository, handle: handle)));
     await tester.pumpAndSettle();
 
-    // 起手那一发是书架（路由落在 /bookshelf）；退出前不该有第二条业务调用。
-    expect(sent.map((Map<String, Object?> m) => m['action']), ['bookshelf.list']);
+    // 起手那一批是"根上的主题偏好 + 落地页找书的两发"；退出前不该有第四条业务调用。
+    expect(
+        sent.map((Map<String, Object?> m) => m['action']! as String).toList()
+          ..sort(),
+        _startupActions,
+        reason: '多出来的那一条就是收摊前多打的业务调用');
     expect(process.kills, isEmpty);
 
     final response = await tester.binding.handleRequestAppExit();
@@ -122,8 +158,8 @@ void main() {
         client,
         repository);
 
-    await tester.pumpWidget(
-        BootstrapResult(repository: repository, handle: handle).scope(const LegodoApp()));
+    await tester.pumpWidget(_app(
+        BootstrapResult(repository: repository, handle: handle)));
     final response = await tester.binding.handleRequestAppExit();
 
     expect(response, AppExitResponse.exit);

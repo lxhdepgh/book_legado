@@ -95,6 +95,8 @@ METHODS: tuple[Method, ...] = (
        summary="该书源的分类清单（静态与 @js: 动态都在引擎里解析）"),
     _m("browse.books", _READING, "browse_books", ("source_url", "category", "page"),
        30.0, summary="分类下一页书单；category 用 browse.categories 回的那一条原样传回"),
+    _m("search.scopes", _READING, "search_scopes", (), 5.0,
+       summary="搜索范围表（全部/未分组/各分组）与各自的可搜源数；口径见 searchable_sources"),
     _m("search.start", _READING, "search_in_scope",
        ("keyword", "scope", "search_id"), 30.0, mode="job",
        summary="多源找书：结果逐批走 SearchFinishedEvent，同一 search_id 再调即翻页"),

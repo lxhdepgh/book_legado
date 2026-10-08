@@ -11,6 +11,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/rpc/envelope.dart';
+import '../../../core/widgets/failure_banner.dart';
+import '../../../core/widgets/state_bar.dart';
 import '../data/bookshelf_item.dart';
 import '../domain/bookshelf_notifier.dart';
 
@@ -34,9 +36,9 @@ class BookshelfScreen extends ConsumerWidget {
       ),
       body: Column(
         children: <Widget>[
-          _FailureBanner(stream: ref.read(bookshelfProvider.notifier).failures),
+          FailureBanner(stream: ref.read(bookshelfProvider.notifier).failures),
           Expanded(child: _body(ref, state)),
-          _StatusBar(state: state),
+          _ShelfStatus(state: state),
         ],
       ),
     );
@@ -126,24 +128,21 @@ class _EmptyShelf extends StatelessWidget {
 
 /// 状态行：与 flet 的 `set_status_text(f"书架共 {N} 本")` 同文案。
 /// 加载失败时那一条**不许**报"书架共 0 本"——那会把"没拿到数据"说成"没有书"。
-class _StatusBar extends StatelessWidget {
-  const _StatusBar({required this.state});
+/// 这一格四屏共用一份实现（`core/widgets/state_bar.dart`），这里只给那三句文案。
+class _ShelfStatus extends StatelessWidget {
+  const _ShelfStatus({required this.state});
 
   final AsyncValue<List<BookshelfItem>> state;
 
   @override
   Widget build(BuildContext context) {
     final items = state.value;
-    final text = switch (state) {
-      AsyncError() => '书架加载失败',
-      _ when items == null => '正在加载书架…',
-      _ => '书架共 ${items.length} 本',
-    };
-    return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-        child: Text(text, style: Theme.of(context).textTheme.bodySmall),
-      ),
+    return StateBar(
+      message: '',
+      state: state,
+      failedText: '书架加载失败',
+      loadingText: '正在加载书架…',
+      dataText: items == null ? null : '书架共 ${items.length} 本',
     );
   }
 }
@@ -193,63 +192,4 @@ class _LoadFailure extends StatelessWidget {
 
   static String _clip(String text) =>
       text.length <= 400 ? text : '${text.substring(0, 400)}…';
-}
-
-/// 刷新失败的那条横幅：错误不进 state，所以这里自己收流。
-class _FailureBanner extends StatefulWidget {
-  const _FailureBanner({required this.stream});
-
-  final Stream<EngineFailure> stream;
-
-  @override
-  State<_FailureBanner> createState() => _FailureBannerState();
-}
-
-class _FailureBannerState extends State<_FailureBanner> {
-  EngineFailure? _last;
-  StreamSubscription<EngineFailure>? _sub;
-
-  @override
-  void initState() {
-    super.initState();
-    _listen();
-  }
-
-  void _listen() {
-    _sub = widget.stream.listen((failure) {
-      if (mounted) setState(() => _last = failure);
-    });
-  }
-
-  @override
-  void didUpdateWidget(_FailureBanner old) {
-    super.didUpdateWidget(old);
-    if (!identical(old.stream, widget.stream)) {
-      _sub?.cancel();
-      _listen();
-    }
-  }
-
-  @override
-  void dispose() {
-    _sub?.cancel();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final failure = _last;
-    if (failure == null) return const SizedBox.shrink();
-    return Material(
-      color: Theme.of(context).colorScheme.errorContainer,
-      child: ListTile(
-        dense: true,
-        title: Text('刷新失败：${failure.message}'),
-        trailing: IconButton(
-          icon: const Icon(Icons.close),
-          onPressed: () => setState(() => _last = null),
-        ),
-      ),
-    );
-  }
 }

@@ -807,7 +807,8 @@ class ReadingService(Service):
     def searchable_sources(sources, scope: str | None = None) -> list:
         """按搜索范围过滤：只留已启用且配了搜索规则的书源。
 
-        ``scope`` 为书源分组名；``__all__``/空值表示全部启用书源。
+        ``scope`` 取书源分组名，或两个哨兵：``__all__``（空值同义）= 全部可搜源，
+        ``__ungrouped__`` = 一个组名都没有的那些源。
         """
         scope = str(scope or "").strip()
         result = []
@@ -816,15 +817,37 @@ class ReadingService(Service):
                 continue
             if not str(getattr(source, "searchUrl", "") or "").strip():
                 continue
-            if scope and scope != _SCOPE_ALL and scope != _SCOPE_UNGROUPED:
+            # "未分组"不能豁免在外层守卫里：排掉它等于什么组都不筛、与 __all__
+            # 混成一件事（inner 那一支根本到不了）。哨兵只豁免 __all__。
+            if scope and scope != _SCOPE_ALL:
                 group = str(getattr(source, "bookSourceGroup", "") or "")
                 if scope == _SCOPE_UNGROUPED:
-                    if group:
+                    # 判"有没有组"按**切完 strip 再丢空**，不按原串 truthiness：
+                    # bookSourceGroup=" " 在分组下拉里不算一个组（那边同样切丢），
+                    # 按原串判会让这条源既不属于任何组、也不属于"未分组"，两头都搜不到。
+                    if [g for g in (p.strip() for p in group.split(",")) if g]:
                         continue
                 elif scope not in [g.strip() for g in group.split(",")]:
                     continue
             result.append(source)
         return result
+
+    @staticmethod
+    def scope_table(sources) -> list[dict]:
+        """搜索范围下拉的那张表：两个哨兵 + 排序去重的分组名，各带可搜源数。
+
+        放在服务侧而不是客户端侧，是因为"这个范围里有几条源"这个问题只有
+        :meth:`searchable_sources` 一个答案来源；客户端各自数一遍，就是各自
+        抄一遍那条规则（停用 / 没配 searchUrl 的源进不进数，两侧会飘）。
+        分组名的切法与 :meth:`searchable_sources` 判定"未分组"用的是同一条
+        （strip 后丢空），所以这里列出的组与"未分组"那一格不会重叠、不会漏。
+        """
+        groups = sorted({g.strip() for source in sources or []
+                         for g in str(getattr(source, "bookSourceGroup", "") or "")
+                         .split(",") if g.strip()})
+        return [{"scope": scope,
+                 "count": len(ReadingService.searchable_sources(sources, scope))}
+                for scope in [_SCOPE_ALL, _SCOPE_UNGROUPED, *groups]]
 
     async def search_books(self, keyword: str, sources, scope=None,
                            search_id: int = 0):
@@ -911,6 +934,16 @@ class ReadingService(Service):
             str(keyword or ""), await self._source_service.list_sources(),
             scope=scope or None, search_id=int(search_id or 0))
         return [_book_item_dict(item) for item in items or []]
+
+    async def search_scopes(self) -> list[dict]:
+        """:meth:`scope_table` 的门面：源从 ``SourceService.list_sources()`` 现拿。
+
+        客户端只拿这张表画下拉、只把 ``scope`` 那一格原样传回 ``search.start``，
+        所以"哪些范围可选、各带几条可搜源"始终只有服务端一份算法。
+        """
+        if self._source_service is None:
+            raise RuntimeError("SourceService 未就绪：算不出搜索范围")
+        return self.scope_table(await self._source_service.list_sources())
 
     # ------------------------------------------------------------------ #
     # 换源（先本地种子、后联网扫描；见 docs/找书与换源逻辑对齐.md）
