@@ -502,15 +502,94 @@ class GatewayEventStreamTests(unittest.TestCase):
         self.assertTrue(self.harness.exit_event.is_set(),
                         "最后一个会话断开后必须自杀（§4.6：不留无头进程）")
 
-    def test_no_session_never_arms_the_idle_timer(self) -> None:
-        """纯 curl 试跑不该被一段倒计时打断：没连过 WS 就不武装。"""
+    def test_rpc_client_that_goes_quiet_lets_the_engine_exit(self) -> None:
+        """known-issues 005：纯 HTTP 客户端没有"会话断开"这个事件，安静就是空闲。
+
+        症状是引擎永留——客户端崩了、被杀了、忘了发 ``engine.shutdown``，进程就
+        一直占着一个回环端口。G1 那条实弹臂走的正是纯 /rpc，所以它今天就漏。
+        """
+        self.harness.gateway._idle_exit_seconds = 0.2
+
         async def _coro(session, base, token):
             _, env = await _rpc(session, base, token, _envelope("engine.hello"))
-            return env
-        self.harness.gateway._idle_exit_seconds = 0.3
+            self.assertTrue(env["ok"], env)
+            await asyncio.sleep(0.6)
         self.harness.drive(_coro)
-        time.sleep(0.6)
-        self.assertFalse(self.harness.exit_event.is_set())
+        self.assertTrue(self.harness.exit_event.is_set(),
+                        "一次成功动作之后没人再来，就必须自杀（§4.6：不留无头进程）")
+
+    def test_rpc_client_that_keeps_calling_is_not_cut_off(self) -> None:
+        """正对照：上一条的自杀必须由**安静**触发，不是由"有过一次调用"触发。
+
+        没有这一条，把 ``_arm_idle_timer`` 挪到请求入口（不 cancel）也能让上一条绿，
+        而那样每个活着的客户端都会在 N 秒后被自己掐死。
+        """
+        self.harness.gateway._idle_exit_seconds = 0.2
+
+        async def _coro(session, base, token):
+            for index in range(6):
+                _, env = await _rpc(session, base, token, _envelope("engine.hello"))
+                self.assertTrue(env["ok"], env)
+                if index < 5:
+                    await asyncio.sleep(0.1)   # 间隔 < 窗口：每发都该把倒计时掐回去
+        self.harness.drive(_coro)
+        self.assertFalse(self.harness.exit_event.is_set(),
+                         "一直在说话的客户端被倒计时打断 = cancel 没接在请求上")
+
+    def test_actions_that_never_succeed_never_arm_the_idle_timer(self) -> None:
+        """探针豁免还在，只是收窄了：一次动作都没办成过 = 没跟引擎说过话。"""
+        self.harness.gateway._idle_exit_seconds = 0.2
+
+        async def _coro(session, base, token):
+            async with session.post(
+                    f"{base}/rpc", data=b"not json",
+                    headers={"Authorization": f"Bearer {token}"}) as bad:
+                self.assertEqual(bad.status, 200, "坏 JSON 也得是信封，不是错误页")
+                self.assertFalse((await bad.json())["ok"])
+            _, unknown = await _rpc(session, base, token, _envelope("no.such.action"))
+            self.assertFalse(unknown["ok"])
+            async with session.post(f"{base}/rpc",
+                                    json=_envelope("engine.hello")) as anon:
+                self.assertEqual(anon.status, 401, "没令牌连处理器都进不来")
+            await asyncio.sleep(0.6)
+        self.harness.drive(_coro)
+        self.assertEqual(self.harness.gateway._clients_seen, 0,
+                         "失败的调用不该被记成见过客户端")
+        self.assertFalse(self.harness.exit_event.is_set(),
+                         "只出错就武装倒计时 = 一次手滑的 curl 把引擎带走了")
+
+    def test_inflight_job_defers_the_idle_exit(self) -> None:
+        """job 动作一发就回受理凭据、本体还在跑：这时候安静下来不许收摊。
+
+        两段都要断言：先证"在途时不死"，再证"活儿干完还是没人回来就真死"——
+        只断前一段的话，把推迟写成无条件 return 也能绿，而那等于永久免死。
+        """
+        self.harness.gateway._idle_exit_seconds = 0.2
+        began: list[int] = []
+
+        async def slow_checker(sources, *, concurrency, timeout, on_result,
+                               auto_disable, depth=None):
+            began.append(len(sources))
+            await asyncio.sleep(1.0)
+            return []
+
+        self.harness.check_service._checker = slow_checker
+
+        async def _coro(session, base, token):
+            _, env = await _rpc(session, base, token,
+                                _envelope("check.start", {"groups": ["护栏组"]}))
+            self.assertTrue(env["ok"], env)
+            await asyncio.sleep(0.6)   # 三个窗口过去了，任务还在跑
+        self.harness.drive(_coro)
+        self.assertEqual(began, [2], "正对照：检测真派下去了，不是回了个空受理")
+        self.assertFalse(self.harness.exit_event.is_set(),
+                         "在途动作没完就自杀 = 把用户的活半程杀掉，且没人记账")
+
+        deadline = time.time() + 15
+        while not self.harness.exit_event.is_set() and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(self.harness.exit_event.is_set(),
+                        "推迟不是免死金牌：任务收尾后客户端还是没回来，就得收摊")
 
 
 class HeadlessLoopTests(unittest.TestCase):
@@ -967,6 +1046,35 @@ class MediaEndpointTests(unittest.TestCase):
     def test_missing_file_is_404_not_a_crash(self) -> None:
         status, _, _ = self._get("ffffffffffffffff.jpg")
         self.assertEqual(status, 404)
+
+    def test_media_reads_keep_the_idle_countdown_at_bay(self) -> None:
+        """只拉封面不发动作的客户端也是活人：``/media`` 同样要把倒计时掐回去。
+
+        三段都得断言，少一段这条就是纸糊的：先一发成功动作把表**武装起来**，
+        再证一串 /media 把它压住，最后证闭嘴之后它真会响——只断中间那段的话，
+        "从没上过弦"和"被封面压住了"两种情况都绿。
+        """
+        self.harness.gateway._idle_exit_seconds = 0.2
+
+        async def _coro(session, base, token):
+            _, env = await _rpc(session, base, token, _envelope("engine.hello"))
+            self.assertTrue(env["ok"], env)
+            self.assertEqual(self.harness.gateway._clients_seen, 1,
+                             "成功动作要把客户端记上，否则后面两段无从谈起")
+            for index in range(8):
+                async with session.get(
+                        f"{base}/media/{self.KEY}?token={token}") as resp:
+                    self.assertEqual(resp.status, 200)
+                    await resp.read()
+                self.assertFalse(self.harness.exit_event.is_set(),
+                                 f"第 {index} 发封面就把引擎收摊了：一屏封面拉得比"
+                                 f"窗口久时，只看 /rpc 会切掉活着的客户端")
+                await asyncio.sleep(0.1)
+            await asyncio.sleep(0.6)
+        self.harness.drive(_coro)
+        self.assertTrue(self.harness.exit_event.is_set(),
+                        "封面拉完、客户端闭嘴之后倒计时必须响：不响就说明前面压住的"
+                        "是一段从没武装过的表")
 
 
 class ServeImportTests(unittest.TestCase):

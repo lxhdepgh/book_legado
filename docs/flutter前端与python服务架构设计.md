@@ -339,7 +339,13 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 > 跨语言守卫新加一臂"书架那三处文案以 flet 源码为准"（两个方向各变异一次，都被抓住）、
 > Python 全库 `1923 passed, 161 subtests passed in 124.92s`。
 > G1 同时暴露一条服务语义缺口：`--idle-seconds` 在 RPC-only 这条路上**从没武装过**，
-> 客户端不告而别时引擎永留——走法等拍板，见 `docs/known-issues/005`。
+> 客户端不告而别时引擎永留。同日第八十四轮已修（走法一的收窄版：只有**成功办完的动作**
+> 才算见过客户端，`/rpc` 与 `/media` 都掐表/武装，在途 job 推迟一个窗口再看；
+> 探针豁免搬去 `--idle-seconds 0`）。现场臂（真子进程、不发 `engine.shutdown` 直接闭嘴）
+> 10 发里 8 发 `1.06–1.08s` 自己收摊、rc 全 0、端口全拒连；Python 全库随之变成
+> `1928 passed, 161 subtests passed in 152.08s`。见 `docs/known-issues/005`。
+> 修完才看得见的一条新问题（收尾偶发 +5.00s，49 发 4 发，`engine_worker.py:228` 的
+> join 走满，归因未定）另记 `docs/known-issues/006`。
 > 读数、仪器与变异核验见 `docs/dev-logs/2026-10-08.md`。
 
 ---
@@ -352,9 +358,13 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
   G1 另外立了 `tests/gateway/projection/*.json`：那一摞不是信封样本而是**flet 那屏自己算出来的
   参照表**（书名/副标题/状态行的逐行文本），它没有请求也没有响应，混进 `golden/` 只会逼
   守卫为它开一条特例。
-- **Python 面**：现有回归（2026-10-08 G1 交付后实测 `1923 passed, 161 subtests passed`）基本不动；
+- **Python 面**：现有回归（2026-10-08 第八十四轮后实测 `1928 passed, 161 subtests passed`）基本不动；
   网关测试全离线（`127.0.0.1` 假服务，沿用
   记忆里"离线回环探针"的套路，不批量访问真实站点）。
+  一条跑法上的坑：一次全量会在机器上留下约 **1100 个 TIME_WAIT**（Windows 默认 120s 退），
+  紧接着再跑一遍或紧跟一轮多进程探针，就会在随机的某条用例上撞 `WinError 10055`
+  （建 loop 时 `socket.socketpair()` 拿不到缓冲区），受害者每次都不一样、且都与网关无关。
+  看到"随机的 loop/socket 建立失败"先数 TIME_WAIT，别先怀疑代码。
 - **Dart 面**：`FakeEngineRepository` 喂黄金样本跑 widget 测试（真果鉴的
   `test/fixtures.dart:34` 那一手）；排版/窄窗用 golden test；`integration_test/` 打一个
   真 `--serve` 引擎跑 3 条端到端。

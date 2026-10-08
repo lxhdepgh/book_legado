@@ -150,7 +150,10 @@ class GatewayService(Service):
         self._flush_handle: Any = None
         self._snapshots: dict[str, dict] = {}
         self._idle_timer: Any = None
-        self._sessions_seen = 0
+        #: 见过几个客户端：连上过 /ws，或者**成功办完过一次动作**的 /rpc 调用方。
+        #: 只出错的动作不算（坏 JSON、未知 action、schema 不符的探针不该给自己上一段
+        #: 倒计时）；令牌不对的连处理器都进不来，天然也算不上。
+        self._clients_seen = 0
         #: 在跑的 job 任务：不留引用会被 GC 悄悄回收（协程中途蒸发）。
         self._jobs: set[asyncio.Task] = set()
         #: §8 R1 反向调应在途表：``request_id`` → future（结果由 ``engine.webContentReady`` 落）。
@@ -408,6 +411,9 @@ class GatewayService(Service):
     # ------------------------------------------------------------------ #
     async def _h_rpc(self, request: web.Request) -> web.Response:
         request_id: Any = None
+        # 进来先掐掉倒计时、回完话再武装一次：HTTP 客户端没有"会话断开"这个事件
+        # （known-issues 005），它的空闲只能读成"最后一次成功动作之后安静了 N 秒"。
+        self._cancel_idle_timer()
         try:
             raw = await request.read()
             try:
@@ -419,7 +425,10 @@ class GatewayService(Service):
                 return self._reply(err_envelope(
                     request_id, CODE_BAD_REQUEST, "信封必须是 JSON 对象"))
             request_id = envelope.get("id")
-            return self._reply(await self._dispatch(envelope))
+            reply = await self._dispatch(envelope)
+            if reply.get("ok"):
+                self._clients_seen += 1
+            return self._reply(reply)
         except web.HTTPRequestEntityTooLarge:
             # client_max_size 先于 read() 返回体抛到这里：这一条也得是信封，
             # 不能是 aiohttp 那坨 HTML 错误页（客户端按 JSON 解析就是解析异常）。
@@ -430,6 +439,8 @@ class GatewayService(Service):
             logger.exception("GatewayService /rpc 未捕获异常")
             return self._reply(err_envelope(
                 request_id, CODE_ENGINE, f"{type(exc).__name__}: {exc}"))
+        finally:
+            self._arm_idle_timer()
 
     async def _dispatch(self, envelope: dict) -> dict:
         request_id = envelope.get("id")
@@ -528,7 +539,7 @@ class GatewayService(Service):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         self._ws_clients.add(ws)
-        self._sessions_seen += 1
+        self._clients_seen += 1
         self._cancel_idle_timer()
         try:
             await ws.send_json({
@@ -626,11 +637,16 @@ class GatewayService(Service):
             self._arm_idle_timer()
 
     # ------------------------------------------------------------------ #
-    # 空闲自杀：最后一个会话断开后 N 秒收摊（§4.6）
+    # 空闲自杀：最后一个客户端安静下来 N 秒后收摊（§4.6）
+    # WS 的"安静"是会话断开，HTTP 的"安静"是最后一次成功动作之后没人再来。
     # ------------------------------------------------------------------ #
     def _arm_idle_timer(self) -> None:
-        """只在**曾经有过会话**之后武装：纯 curl 试跑不该被一段倒计时打断。"""
-        if self._sessions_seen == 0 or self._idle_timer is not None:
+        """只在**有过客户端**之后武装：一次动作都没办成过的探针不该被倒计时打断。
+
+        要一段永不打断的运行（手动 curl 慢慢试）用 ``--idle-seconds 0``，那才是
+        关掉倒计时的开关；这里拦的是"从没跟人说过话"这一种情况。
+        """
+        if self._clients_seen == 0 or self._idle_timer is not None:
             return
         if self._idle_exit_seconds <= 0:
             return
@@ -649,7 +665,17 @@ class GatewayService(Service):
         self._idle_timer = None
         if self._ws_clients:
             return
-        logger.info("网关空闲超过 %.0fs（最后一个会话已断开），请求进程收摊",
+        if self._jobs:
+            # job 动作一发就回受理凭据，本体还在跑；这时候收摊等于把用户的活
+            # 半程杀掉，而且没人记账（进度只从事件流走，客户端可能正在等）。
+            # 改判成"N 秒后再看一眼"。代价要说清楚：任务本体没有服务端预算
+            # （``mode="job"`` 不受 ``method.timeout`` 约束），所以一个挂死的任务
+            # 会让这条推迟一直推迟下去——真要收摊走 ``engine.shutdown``。
+            logger.info("网关空闲但仍有 %d 个在途动作，推迟 %.0fs 再看",
+                        len(self._jobs), self._idle_exit_seconds)
+            self._arm_idle_timer()
+            return
+        logger.info("网关空闲超过 %.0fs（最后一个客户端已安静），请求进程收摊",
                     self._idle_exit_seconds)
         self.request_exit("idle")
 
@@ -657,6 +683,16 @@ class GatewayService(Service):
     # GET /media/{key} —— 二进制不走 RPC（§4.4）
     # ------------------------------------------------------------------ #
     async def _h_media(self, request: web.Request) -> web.Response:
+        # 拉封面也算"有人在用"：一屏封面拉得比窗口久时，只看 /rpc 会把活着的
+        # 客户端切掉。这里只掐表/武装，不给 `_clients_seen` 加数——一次动作都没
+        # 办成过的探针仍然豁免。
+        self._cancel_idle_timer()
+        try:
+            return await self._media(request)
+        finally:
+            self._arm_idle_timer()
+
+    async def _media(self, request: web.Request) -> web.Response:
         key = request.match_info["key"]
         if not _MEDIA_KEY_RE.match(key):
             return web.Response(status=404, text="unknown media key")
