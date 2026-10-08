@@ -300,6 +300,13 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 > 当场拒" / `looks_like_gate` 搬到 flet-free 的 `block_pages`），`serve()` 里新加那一跳
 > `_wire_headless_webview` 就是 R1 那条竖切在产品里的落点；9 处源码级变异全被抓住
 > （回归 `1912 passed`，无头装配 33 个服务全 `RUNNING`、flet 模块 **0**）。
+> **§8 R2 同日交**：R1 留下的那一笔同步桥拆成两半、各钉一条——`@webjs:` 那条分支改成
+> `await asyncio.to_thread(...)`（不再把脚下这条循环交出去等一次 WebView 渲染），
+> 新的 `_bridge_from_js` 进桥先问"调用线程正在跑的就是我要等的那条循环吗"、是则当场抛，
+> 护栏族 `JsBridgeThreadAffinityTests` 的正对照是同一条桥从工作线程给得出结果；
+> 顺带补上反向答复里缺的 `js_result` 那一腿（`@webjs:` 的脚本完成值此前永远回不来）。
+> 5 处源码级变异全被抓住，其中拆掉那句问话的一臂 `2 failed in 85.95s` 就是互等的形状
+> （回归 `1914 passed`，连跑两轮）。
 > 读数、仪器与变异核验见 `docs/dev-logs/2026-10-08.md`。
 
 ---

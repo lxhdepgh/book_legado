@@ -538,15 +538,34 @@ class LegadoReadingEngine(ReaderEngine):
         return await asyncio.wrap_future(
             asyncio.run_coroutine_threadsafe(func(*args), loop))
 
+    def _bridge_from_js(self, coro_factory, loop):
+        """QuickJS 那条**同步**桥：派到 ``loop`` 上，然后原地等回话。
+
+        等的时候调用线程不能是 ``loop`` 自己——那一次 ``.result()`` 占着的正是唯一
+        能把结果送回来的地方（§8 R1 实测：同一条调用在工作线程 56 ms 回、落在网关
+        循环上 10 s 不回）。无头装配里这条 ``loop`` 与引擎循环是同一条，所以
+        ``evaluate_async`` 的 ``@webjs:`` 分支已经先跳去工作线程；这里当场拒，是给
+        下一个忘了跳的人留的名字，不是一次挂死十分钟的现场。
+        """
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            raise RuntimeError(
+                "WebView/验证码的同步桥不能在它自己等的那条循环上调用"
+                "（两边互等 = 挂死）；改从工作线程进来，或用 await 的异步路径")
+        return asyncio.run_coroutine_threadsafe(coro_factory(), loop).result()
+
     def _bind_interaction(self, source, loop):
         if self.webview_fetcher:
             self.js.browser_fetcher = lambda url, _title="", options=None: (
-                asyncio.run_coroutine_threadsafe(
-                    self.webview_fetcher(url, source, options or {}), loop).result())
+                self._bridge_from_js(
+                    lambda: self.webview_fetcher(url, source, options or {}), loop))
         if self.verification_fetcher:
             self.js.verification_code_provider = lambda image: (
-                asyncio.run_coroutine_threadsafe(
-                    self.verification_fetcher(image, source), loop).result())
+                self._bridge_from_js(
+                    lambda: self.verification_fetcher(image, source), loop))
 
     def _unbind_interaction(self):
         self.js.browser_fetcher = None

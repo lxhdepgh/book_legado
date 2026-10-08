@@ -821,6 +821,110 @@ class BrowserServiceRoutingTests(_FramesByType, unittest.TestCase):
                                                     None, {}))
 
 
+class JsBridgeThreadAffinityTests(_FramesByType, unittest.TestCase):
+    """§8 R2：``@webjs:`` 那条同步 ``.result()`` 桥不能冻住它自己等的那条循环。
+
+    上一轮 R1 量到的是**互等**（`docs/dev-logs/2026-10-08.md` §6.5）：同一条调用在
+    工作线程 56 ms 回、落在网关循环上 10 s 不回——被冻住的那条循环正是唯一能收下
+    ``engine.webContentReady`` 那条 POST 的。修法有两半，这里各钉一条：
+    ``evaluate_async`` 的 ``@webjs:`` 分支先跳去工作线程（往返真通），
+    ``_bridge_from_js`` 在"调用线程 == 目标循环"时当场拒（下一个忘跳的人得的是一句话，
+    不是一次十分钟的互等）。
+    """
+
+    def setUp(self) -> None:
+        self.harness = Harness()
+        self.harness.start()
+        self.addCleanup(self.harness.stop)
+
+    def _engine(self, webview_fetcher=None):
+        """在**引擎循环上**建一台真引擎：``aiohttp.CookieJar()`` 要 running loop，
+        生产里它本来就是 RuleEngineService 在那条循环上懒建的（测试线程里 new 出来
+        当场 RuntimeError，不是被测代码的问题）。"""
+        from app.services.engine.reading_engine import LegadoReadingEngine
+
+        fetcher = webview_fetcher or self.harness.gateway.request_web_content
+        box: dict = {}
+
+        async def _build():
+            box["engine"] = LegadoReadingEngine(webview_fetcher=fetcher)
+
+        self.harness.on_loop(_build)
+        return box["engine"]
+
+    def test_webjs_awaited_on_the_gateway_loop_comes_back(self) -> None:
+        from app.services.engine.legado_js import JsContext
+
+        engine = self._engine()
+
+        async def _run():
+            # 无头装配的形状：没有 UI 循环，_interaction_target_loop() 就是脚下这条，
+            # 也正是网关 handler 所在的那条——所以这一趟是 R1 那条"最坏臂"的原样。
+            engine._bind_interaction(None, engine._interaction_target_loop())
+            try:
+                return await engine.js.evaluate_async(
+                    "@webjs:result",
+                    JsContext(source=None, result="", src="",
+                              base_url="https://loopback.test/w"))
+            finally:
+                engine._unbind_interaction()
+
+        async def _drive(session, base, token):
+            async with session.ws_connect(f"{base}/ws?token={token}") as ws:
+                json.loads((await ws.receive()).data)          # ready
+                pending = self.harness.engine.submit(_run())
+                frame = await self._next_request(ws)
+                self.assertEqual(frame["name"], "webview.content")
+                self.assertIn("javaScript", frame["payload"]["options"],
+                              "反向帧没把 @webjs 的脚本递出去，宿主无从跑起")
+                # 等回话的这段时间里循环还必须答得出别的 RPC：冻住的话这一发就永远进不来
+                status, env = await _rpc(session, base, token,
+                                         _envelope("engine.status"))
+                self.assertEqual((status, env["ok"]), (200, True),
+                                 "@webjs: 在等宿主时把网关循环钉住了（§8 R2 那一笔）")
+                env = await self._answer(session, base, token, frame,
+                                         js_result="正文回来了")
+                self.assertEqual(env["data"], {"delivered": True}, env)
+                return await asyncio.wait_for(asyncio.wrap_future(pending), 10.0)
+
+        self.assertEqual(self.harness.drive(_drive), "正文回来了")
+
+    def test_the_bridge_refuses_to_wait_on_its_own_loop(self) -> None:
+        engine = self._engine()
+
+        async def _from_the_loop():
+            loop = asyncio.get_running_loop()
+            engine._bind_interaction(None, loop)
+            started = time.monotonic()
+            try:
+                with self.assertRaises(RuntimeError) as caught:
+                    engine.js.browser_fetcher("https://loopback.test/w", "", {})
+                return time.monotonic() - started, str(caught.exception)
+            finally:
+                engine._unbind_interaction()
+
+        elapsed, message = self.harness.on_loop(_from_the_loop)
+        self.assertLess(elapsed, 1.0,
+                        f"说是当场拒，却等了 {elapsed:.1f}s——那就是互等，只是换了个名字")
+        self.assertIn("互等", message)
+
+        # 正对照：同一条桥从**工作线程**进来是给得出结果的。没有这一条，上面那句
+        # "拒"可能只是桥本身坏了（R1 的工作线程那一臂量到的就是这个形状）。
+        async def _render(url, source=None, options=None):
+            return {"body": f"渲染 {url}"}
+
+        worker = self._engine(_render)
+        worker._bind_interaction(None, self.harness.engine.loop())
+        box: dict = {}
+        thread = threading.Thread(
+            target=lambda: box.__setitem__("v", worker.js.browser_fetcher(
+                "https://loopback.test/w", "", {})), daemon=True)
+        thread.start()
+        thread.join(5.0)
+        self.assertFalse(thread.is_alive(), "工作线程上进那次等待没回来")
+        self.assertEqual(box.get("v"), {"body": "渲染 https://loopback.test/w"})
+
+
 class MediaEndpointTests(unittest.TestCase):
     """``GET /media/{key}``：二进制不走 RPC，key 被正则钉死，Range 是真语义。"""
 

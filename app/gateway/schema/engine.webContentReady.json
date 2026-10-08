@@ -29,6 +29,10 @@
     "error": {
       "type": "string",
       "description": "客户端渲染失败的原因；非空时这一次请求按失败折给业务。"
+    },
+    "js_result": {
+      "type": ["string", "object", "array", "number", "boolean", "null"],
+      "description": "@webjs: 那条分支的脚本完成值（请求帧的 options.javaScript 就是给它跑的）。引擎侧读的是返回字典里的 jsResult 键。缺省=宿主没跑脚本，与\"脚本返回了空\"是两件事。"
     }
   },
   "additionalProperties": false

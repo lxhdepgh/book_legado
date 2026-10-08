@@ -68,7 +68,8 @@ METHODS: tuple[Method, ...] = (
     _m("check.cancel", _CHECK, "cancel", (), 5.0, mode="sync",
        summary="取消在跑的批量检测"),
     _m("engine.webContentReady", _SELF, "web_content_ready",
-       ("request_id", "body", "headers", "status", "url", "cookie", "error"), 5.0,
+       ("request_id", "body", "headers", "status", "url", "cookie", "error",
+        "js_result"), 5.0,
        summary="WebView 渲染结果交回：解开一次服务端→客户端的 webview.content 反向请求"),
 )
 

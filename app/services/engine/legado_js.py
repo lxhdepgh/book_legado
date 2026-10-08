@@ -807,8 +807,16 @@ class LegadoJsRuntime:
         outright when the caller is cancelled before it ever starts.
         """
         stripped = str(script or "").strip()
-        if (stripped.lower().startswith("@webjs:") or
-                getattr(self._QUICKJS_THREAD, "active", False)):
+        if stripped.lower().startswith("@webjs:"):
+            # 这一跳走的是**同步**桥（``reading_engine._bind_interaction`` 的
+            # ``.result()``）：谁调它谁就被冻在那次 WebView 渲染上。原地跑等于把
+            # 当前这条循环交出去，而无头装配里这条循环正是唯一能收下宿主回话
+            # （``engine.webContentReady``）的那条——实测工作线程 56 ms 回、落在
+            # 网关循环上 10 s 不回（docs/dev-logs/2026-10-08.md §6.5）。
+            # ``@webjs:`` 全程不碰 QuickJS（脚本在页面里跑），所以换线程没有原生
+            # 亲和问题；下面那条"求值线程已活动"的分叉留着，它本来就在 worker 上。
+            return await asyncio.to_thread(self.evaluate, script, context)
+        if getattr(self._QUICKJS_THREAD, "active", False):
             return self.evaluate(script, context)
         return await asyncio.wrap_future(self._submit_job(script, context))
 

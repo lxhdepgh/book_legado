@@ -364,12 +364,18 @@ class GatewayService(Service):
     async def web_content_ready(self, request_id: str, body: str = "",
                                 headers: dict | None = None, status: int = 200,
                                 url: str = "", cookie: str = "",
-                                error: str = "") -> dict:
+                                error: str = "", js_result: Any = None) -> dict:
         """客户端交回渲染结果：解开 :meth:`request_web_content` 那次等待。
 
         回晚了（引擎侧已经按预算超时走人）也算成功送达但**没人要了**——回
         ``{"delivered": false}`` 而不是抛错，因为这不是客户端的错，把 20s 之后
         才回来的渲染折成 ``engine`` 错误只会让人去查错地方。
+
+        ``js_result`` 是 ``@webjs:`` 那条分支的完成值：请求帧里已经把脚本递过去
+        （``options.javaScript``），宿主在页面里跑完要把它带回来——引擎侧
+        ``LegadoJsRuntime._evaluate_webjs`` 读的就是这个键。没带就不塞这个键：
+        空串会被读成"脚本没返回结果"，而"宿主压根没跑脚本"和"脚本返回了空"
+        是两件事，别把前者写成后者。
         """
         future = self._pending_webviews.get(str(request_id or ""))
         if future is None or future.done():
@@ -378,13 +384,16 @@ class GatewayService(Service):
         if str(error or "").strip():
             future.set_exception(RuntimeError(f"客户端渲染失败：{error}"))
         else:
-            future.set_result({
+            result = {
                 "body": str(body or ""),
                 "headers": {str(k).lower(): str(v) for k, v in (headers or {}).items()},
                 "status": int(status or 200),
                 "url": str(url or ""),
                 "cookie": str(cookie or ""),
-            })
+            }
+            if js_result is not None:
+                result["jsResult"] = js_result
+            future.set_result(result)
         return {"delivered": True}
 
     def _fail_pending_webviews(self, reason: str) -> None:
