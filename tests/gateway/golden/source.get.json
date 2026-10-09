@@ -1,14 +1,14 @@
 {
   "action": "source.get",
   "protocol_version": 1,
-  "schema_digest": "45add13d80dc",
+  "schema_digest": "ffef64386bec",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-source.get-1258552109000000",
+    "id": "r4-source.get-1293297562000000",
     "action": "source.get",
     "seq": 6,
     "payload": {
@@ -17,7 +17,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-source.get-1258552109000000",
+    "id": "r4-source.get-1293297562000000",
     "ok": true,
     "data": {
       "bookSourceName": "R4健康源",
@@ -59,7 +59,7 @@
   "inline_row_count": null,
   "bytes": 566,
   "sha256": "63a769a6965b9a7c2b8e9297d998af466d7da51a9be551ad653bece10eff9853",
-  "client_wall_ms": 0.8,
+  "client_wall_ms": 0.9,
   "wire_bytes": 714,
   "field_names": [
     "bookSourceGroup",

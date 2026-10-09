@@ -227,6 +227,127 @@ class SerializeBoundaryTests(unittest.TestCase):
         self.assertEqual(to_json(_Broken()), {"value": 1})
 
 
+class ExitProjectionTests(unittest.TestCase):
+    """出口投影（``Method.fields``）：那一发到底带哪些键，是**表**说了算。
+
+    为什么单独钉一族：``source.list`` 投影前 920 行是 6,969,039 B，其中
+    ``exploreUrl`` 40.1% + ``jsLib`` 23.5% + 五组 ``rule*`` 24.0%
+    （逐键字节账当场数的：``.probe/g2f_payload_anatomy.py``），
+    列表那一屏一根都不显示，却全由客户端付钱。裁完之后同跨度之比从
+    1.7 倍回到 1.39 倍。这一族钉三件事：
+
+    1. 白名单里的键必须**真是模型字段**——拼错一格不会报错，只会让那一格永远为空，
+       界面读出"这条源没名字"（记忆 ``guard-tests-assert-absence``：要钉的是没发生）；
+    2. 白名单必须**盖住界面在读的那几格**——少一格就是 Dart 侧解出默认值，
+       而两侧测试各自对着各自样本绿；
+    3. 投影不许**静默放行**错形状：载荷不是行列表、行不是 dict，都要当场抛，
+       否则"裁了"与"没裁"长得一模一样。
+    """
+
+    LIST_ACTION = "source.list"
+
+    def setUp(self) -> None:
+        from app.gateway.methods import BY_ACTION
+
+        self.method = BY_ACTION[self.LIST_ACTION]
+        self.fields = self.method.fields
+
+    def test_projected_keys_are_real_model_fields(self) -> None:
+        """拼错的键名在这一发里永远不会出现——只有这条守卫认得出来。"""
+        from app.models.book_source import BookSource
+
+        model_fields = set(BookSource.__dataclass_fields__)
+        missing = sorted(set(self.fields or ()) - model_fields)
+        self.assertEqual(missing, [],
+                         f"{self.LIST_ACTION} 投影声明了模型没有的键：{missing}")
+
+    def test_whitelist_covers_every_key_the_list_screen_reads(self) -> None:
+        """白名单 ⊇ flet 那一屏在读的键。出处写在每一条后面，改界面要同步改这里。
+
+        - ``bookSourceName`` / ``bookSourceUrl`` / ``bookSourceGroup`` / ``enabled``：
+          ``book_source_list_view.py:208-211`` 那一行的标题与副标题；
+        - ``bookSourceComment``：搜索框扫的 haystack
+          （``book_source_list_controller.py:137-141``）；
+        - ``loginUrl``：登录入口的可见性（``find_books_controller.py:127`` 读的是
+          ``getattr(source, "loginUrl", "")``），Dart 侧 ``source_record.dart:35-37``
+          同口径。
+        """
+        self.assertIsNotNone(self.fields, f"{self.LIST_ACTION} 没有投影，这一族在空转")
+        needed = {"bookSourceName", "bookSourceUrl", "bookSourceGroup", "enabled",
+                  "bookSourceComment", "loginUrl"}
+        dropped = sorted(needed - set(self.fields or ()))
+        self.assertEqual(dropped, [], f"投影把界面在读的键裁掉了：{dropped}")
+
+    def test_projected_row_loses_the_rule_fields_and_keeps_the_view_keys(self) -> None:
+        from app.gateway.serialize import project, to_json
+        from app.models.book_source import BookSource
+
+        source = BookSource.from_dict({
+            "bookSourceUrl": "https://x.example", "bookSourceName": "投影靶",
+            "bookSourceGroup": "G", "bookSourceComment": "备注", "enabled": True,
+            "loginUrl": "https://x.example/login", "exploreUrl": "@js:一大段",
+            "jsLib": "function 一大段() {}", "ruleSearch": {"bookList": "ul li"},
+        })
+        row = project(to_json([source]), self.fields)[0]
+        self.assertEqual(sorted(row), sorted(self.fields or ()))
+        for heavy in ("exploreUrl", "jsLib", "ruleSearch", "searchUrl", "header"):
+            self.assertNotIn(heavy, row, f"规则原文还在这一发里：{heavy}")
+        self.assertEqual(row["bookSourceName"], "投影靶")
+
+    def test_projection_is_loud_when_the_shape_is_not_rows(self) -> None:
+        """静默原样返回等于"这一格没跑"：载荷形状不对必须抛，而不是绿着过去。"""
+        from app.gateway.serialize import project
+
+        with self.assertRaises(TypeError):
+            project({"bookSourceUrl": "x"}, ("bookSourceUrl",))
+        with self.assertRaises(TypeError):
+            project(["不是 dict 的一行"], ("bookSourceUrl",))
+
+    def test_a_key_the_row_does_not_carry_is_not_invented(self) -> None:
+        """``to_dict`` 按 Gson 丢 null：没设备注的行就该**没有**那一格。
+
+        补一个 ``None`` 会让客户端把"这条源没备注"读成"备注是空"，两种形状在
+        Dart 侧的 `?? ''` 上分不出来——这里钉的是投影不制造字段。
+        """
+        from app.gateway.serialize import project
+
+        rows = project([{"bookSourceUrl": "u", "bookSourceName": "n",
+                         "bookSourceGroup": "g", "enabled": True,
+                         "exploreUrl": "不该有的"}], self.fields)
+        self.assertEqual(rows, [{"bookSourceUrl": "u", "bookSourceName": "n",
+                                 "bookSourceGroup": "g", "enabled": True}])
+
+    def test_the_editors_own_action_is_not_projected(self) -> None:
+        """``source.get`` 必须**不裁**：编辑器存回去要整条，裁了就等于保存会抹掉规则。
+
+        这一条是投影唯一的反方向风险：列表行少了规则，谁要是拿它当底本调
+        ``source.save``，``exploreUrl``/``jsLib`` 就以空值落库。列表行不许当底本，
+        界面上那条线只能走 ``source.get``。
+        """
+        from app.gateway.methods import BY_ACTION
+        from app.models.book_source import BookSource
+
+        self.assertIsNone(BY_ACTION["source.get"].fields)
+        heavy = set(BookSource.__dataclass_fields__) - set(self.fields or ())
+        self.assertIn("exploreUrl", heavy)
+        self.assertIn("jsLib", heavy)
+
+    def test_schema_digest_moves_when_only_the_projection_changes(self) -> None:
+        """摘要必须把 ``fields`` 算进去：白名单动一格，握手就该不同意。"""
+        import dataclasses
+        import unittest.mock
+
+        from app.services.gateway import service as service_module
+
+        live = service_module.GatewayService.schema_digest()
+        alt = dataclasses.replace(self.method, fields=("bookSourceUrl",))
+        with unittest.mock.patch.dict(service_module.BY_ACTION,
+                                      {self.LIST_ACTION: alt}):
+            moved = service_module.GatewayService.schema_digest()
+        self.assertNotEqual(live, moved,
+                            "改了出口投影而握手摘要没动：旧客户端会绿着解新形状")
+
+
 def _accepts_kwargs(func, names: tuple[str, ...]) -> bool:
     target = inspect.unwrap(func)
     try:

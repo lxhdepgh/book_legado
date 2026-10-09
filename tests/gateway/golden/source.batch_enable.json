@@ -1,14 +1,14 @@
 {
   "action": "source.batch_enable",
   "protocol_version": 1,
-  "schema_digest": "45add13d80dc",
+  "schema_digest": "ffef64386bec",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "scalar",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-source.batch_enable-1258553437000000",
+    "id": "r4-source.batch_enable-1293298968000000",
     "action": "source.batch_enable",
     "seq": 23,
     "payload": {
@@ -20,7 +20,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-source.batch_enable-1258553437000000",
+    "id": "r4-source.batch_enable-1293298968000000",
     "ok": true,
     "data": 1,
     "error": null,
@@ -30,7 +30,7 @@
   "inline_row_count": null,
   "bytes": 1,
   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
-  "client_wall_ms": 100.7,
+  "client_wall_ms": 112.0,
   "wire_bytes": 109,
   "field_names": []
 }

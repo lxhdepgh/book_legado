@@ -1,21 +1,21 @@
 {
   "action": "check.snapshot",
   "protocol_version": 1,
-  "schema_digest": "45add13d80dc",
+  "schema_digest": "ffef64386bec",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "本轮跑完之后拍的那一份",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-check.snapshot-1258553109000000",
+    "id": "r4-check.snapshot-1293298593000000",
     "action": "check.snapshot",
     "seq": 17,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-check.snapshot-1258553109000000",
+    "id": "r4-check.snapshot-1293298593000000",
     "ok": true,
     "data": {
       "running": false,
@@ -54,7 +54,7 @@
             "raw_url": "http://127.0.0.1:8797/g2",
             "status": "ok",
             "status_code": 200,
-            "response_time_ms": 0.7078999187797308,
+            "response_time_ms": 0.7574001792818308,
             "error": null,
             "search_status": "ok",
             "book_count": 1,
@@ -143,7 +143,7 @@
   "row_count": 1,
   "inline_row_count": null,
   "bytes": 1819,
-  "sha256": "63fef1dc1fa4f2de33c29ffc48904290d9c91a72a7cc2734ef21a5304a26a5a6",
+  "sha256": "cc6f5bac708a876931a8b46694a9b22c34ceab5523180b676f4d357066d08f69",
   "client_wall_ms": 0.9,
   "wire_bytes": 2103,
   "field_names": [

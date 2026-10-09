@@ -72,6 +72,24 @@ def to_json(value: Any) -> Any:
                     if not name.startswith("_")})
 
 
+def project(value: Any, fields: tuple[str, ...]) -> Any:
+    """按 action 表声明的白名单裁掉**行列表**里每一行的键（``Method.fields``）。
+
+    只做"留哪些键"，不做任何形状改造：行必须是 dict，否则当场抛——
+    静默原样返回等于把裁剪写成一件没发生的事，而那正是这一格存在的唯一理由。
+    键在某一行里不存在就**不补**（``BookSource.to_dict`` 按 Gson 丢 null，
+    ``loginUrl`` 属于"这条源设了才有"的那一类）。
+    """
+    if not isinstance(value, list):
+        raise TypeError(f"出口投影只吃行列表，收到 {type(value).__name__}")
+    kept = []
+    for row in value:
+        if not isinstance(row, dict):
+            raise TypeError(f"出口投影的行必须是 dict，收到 {type(row).__name__}")
+        kept.append({name: row[name] for name in fields if name in row})
+    return kept
+
+
 def find_leak(value: Any, path: str = "$") -> str | None:
     """返回第一个"不是 JSON 原生值"的叶子路径；干净则返回 None。
 

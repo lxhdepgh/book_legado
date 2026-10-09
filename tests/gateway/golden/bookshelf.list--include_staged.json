@@ -1,14 +1,14 @@
 {
   "action": "bookshelf.list",
   "protocol_version": 1,
-  "schema_digest": "45add13d80dc",
+  "schema_digest": "ffef64386bec",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "同一发 action、带 include_staged 的请求形状",
   "data_shape": "list",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-bookshelf.list-1258551937000000",
+    "id": "r4-bookshelf.list-1293297375000000",
     "action": "bookshelf.list",
     "seq": 4,
     "payload": {
@@ -17,7 +17,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-bookshelf.list-1258551937000000",
+    "id": "r4-bookshelf.list-1293297375000000",
     "ok": true,
     "data": [
       {
@@ -319,7 +319,7 @@
   "inline_row_count": 7,
   "bytes": 24368,
   "sha256": "05600247c67131d5d20bd221836751376b2b2a96a19d1b9ef971d39f01cae3a5",
-  "client_wall_ms": 1.2,
+  "client_wall_ms": 1.0,
   "wire_bytes": 25012,
   "field_names": [
     "author",

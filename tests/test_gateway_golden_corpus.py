@@ -225,6 +225,49 @@ def test_mutation_controls_show_the_guards_are_not_deaf() -> None:
             schema.validate(payload, schema.load(with_required["action"]))
 
 
+def test_projected_actions_deliver_exactly_their_declared_keys() -> None:
+    """表里声明了出口投影的动作，样本里的键必须**正好**是那几格。
+
+    这一支钉的是"投影真的在现场生效"，不是"投影函数写得对"（那半在
+    ``tests/test_gateway_contract.py`` 的 ``ExitProjectionTests``）：样本来自真进程，
+    键集与表不符只有两种可能——表动了没重抓，或者出口那格根本没接上。
+    两边都不许绿着过去，因为 Dart 的 ``SourceRecord`` 就照这一发建模型。
+    """
+    projected = {a: m for a, m in BY_ACTION.items() if m.fields}
+    assert projected, "action 表里一条投影都没有：这一支在空转"
+    for path, sample in _samples():
+        method = projected.get(_action_of(path, sample))
+        if method is None:
+            continue
+        assert sorted(sample["field_names"]) == sorted(method.fields), (
+            f"{path.name} 的键集 {sample['field_names']} 与表里声明的投影 "
+            f"{sorted(method.fields)} 不符")
+        rows = sample["response"]["data"]
+        if isinstance(rows, list):
+            for row in rows:
+                assert set(row) <= set(method.fields), (
+                    f"{path.name} 里有一行带着投影之外的键：{sorted(set(row) - set(method.fields))}")
+
+
+def test_an_unprojected_action_still_delivers_the_heavy_fields() -> None:
+    """正对照：同一份语料上，没投影的那一发**必须**还带着规则原文。
+
+    少了这一支，上一条就可能是"两边都裁了所以一样"——真裁剪失效时它反而自洽。
+    编辑器那条线（``source.get``）靠的就是这些格子，它们在列表那一发里没有、
+    在这一发里必须有。
+    """
+    by_action = {_action_of(path, sample): sample for path, sample in _samples()}
+    lean = set(BY_ACTION["source.list"].fields or ())
+    sample = by_action["source.get"]
+    extra = set(sample["field_names"]) - lean
+    assert extra, ("source.get 的键集与列表那一发一模一样 = 出口那格把两条动作裁成"
+                   "了同一发，编辑器再没有别的来源")
+    assert any(name.startswith("rule") for name in extra), (
+        f"source.get 只多带了 {sorted(extra)}：一条规则字段都没有，"
+        "编辑器的底本就不完整（Gson 丢 null，这条源得至少设一条规则）")
+    assert {"bookSourceUrl", "bookSourceName", "enabled"} <= set(sample["field_names"])
+
+
 def test_job_actions_carry_their_event_delivery_and_others_do_not() -> None:
     """``mode=job`` 的样本必须带 ``event_sample``，非 job 的不许带。
 

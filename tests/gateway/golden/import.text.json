@@ -1,14 +1,14 @@
 {
   "action": "import.text",
   "protocol_version": 1,
-  "schema_digest": "45add13d80dc",
+  "schema_digest": "ffef64386bec",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-import.text-1258553109000000",
+    "id": "r4-import.text-1293298609000000",
     "action": "import.text",
     "seq": 19,
     "payload": {
@@ -19,7 +19,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-import.text-1258553109000000",
+    "id": "r4-import.text-1293298609000000",
     "ok": true,
     "data": {
       "kind": "book_source",
@@ -35,7 +35,7 @@
   "inline_row_count": null,
   "bytes": 78,
   "sha256": "3c27e4b66d8a9fd681fff6a77331c2c21154d6bf05402f8e4be0936511323d86",
-  "client_wall_ms": 114.0,
+  "client_wall_ms": 119.9,
   "wire_bytes": 187,
   "field_names": [
     "count",

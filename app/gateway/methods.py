@@ -37,12 +37,32 @@ class Method:
     #: ``sync`` = 同步方法就地调用（停止/取消这类，本来就不该排队等 loop）。
     mode: str = "call"
     summary: str = ""
+    #: 出口字段白名单（只用于**行列表**载荷）：None = 原样出，元组 = 每行只留这些键。
+    #:
+    #: 为什么要在这一格声明而不是改服务的返回：``SourceService.list_sources()`` 返回
+    #: 的是 ``list[BookSource]``，出口按 ``to_dict()`` 折平就是 30 个键，920 行那一发的
+    #: data 是 6,969,039 B（响应体同量，投影前 G2-F 那一趟线上读数），其中
+    #: ``exploreUrl`` 40.1 % + ``jsLib`` 23.5 % + 五组 ``rule*`` 24.0 % 是规则原文
+    #: （逐键字节账见 ``.probe/g2f_payload_anatomy.py``——它自己那份副本 6,896,985 B，
+    #: 绝对值随库里有没有备注/登录页漂，占比取这一支、绝对值取线上那一趟）。
+    #: 列表那一屏一根都不显示（flet 那侧同样只读
+    #: ``book_source_list_view.py:208-211`` 的四格 + 搜索框的备注）。
+    #: 跨进程时这笔字节钱全由客户端付——投影前实测：Dart 解那 6.97 MB 是
+    #: 转码 13.4 ms + `jsonDecode` 64.4 ms，而 Python 侧整发（含解）才 101.2 ms，
+    #: 总账 1.7 倍；投影后同一发 351,554 B，总账回到 1.39 倍。
+    #:
+    #: 裁剪是**单向**的：规则原文仍然在库里，编辑器按 ``source.get`` 取回全文，
+    #: 保存那条线（``source.save`` 吃整条 ``source_json``）绝不能拿列表行当底本，
+    #: 否则 ``exploreUrl``/``jsLib`` 会被空值盖掉。护栏见
+    #: ``tests/test_gateway_contract.py`` 的投影那组。
+    fields: tuple[str, ...] | None = None
 
 
 def _m(action: str, service: str, method: str, params: tuple[str, ...],
-       timeout: float, mode: str = "call", summary: str = "") -> Method:
+       timeout: float, mode: str = "call", summary: str = "",
+       fields: tuple[str, ...] | None = None) -> Method:
     return Method(action=action, service=service, method=method, params=params,
-                  timeout=timeout, mode=mode, summary=summary)
+                  timeout=timeout, mode=mode, summary=summary, fields=fields)
 
 
 #: 网关自己实现的动作（握手/状态/停服）——它们的"服务类"就是 GatewayService。
@@ -68,7 +88,9 @@ METHODS: tuple[Method, ...] = (
        ("source_url", "book", "shelved"), 20.0,
        summary="把搜索结果那一行放进书架；书以字典快照交付，模型对象在服务侧还原"),
     _m("source.list", _SOURCES, "list_sources", (), 30.0,
-       summary="全部书源；返回的是 BookSource 对象，出口序列化在边界上折成 dict"),
+       summary="书源列表行：只带列表那一屏读的字段，规则原文按 source.get 取",
+       fields=("bookSourceUrl", "bookSourceName", "bookSourceGroup",
+               "bookSourceComment", "enabled", "loginUrl")),
     _m("source.get", _SOURCES, "load_source", ("url",), 10.0,
        summary="单条书源全文（编辑器打开一条要读回它的全部规则字段）"),
     _m("source.save", _SOURCES, "save_source", ("source_json",), 20.0,

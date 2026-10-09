@@ -1,14 +1,14 @@
 {
   "action": "settings.write",
   "protocol_version": 1,
-  "schema_digest": "45add13d80dc",
+  "schema_digest": "ffef64386bec",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "null",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-settings.write-1258553734000000",
+    "id": "r4-settings.write-1293299296000000",
     "action": "settings.write",
     "seq": 26,
     "payload": {
@@ -18,7 +18,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-settings.write-1258553734000000",
+    "id": "r4-settings.write-1293299296000000",
     "ok": true,
     "data": null,
     "error": null,
@@ -28,7 +28,7 @@
   "inline_row_count": null,
   "bytes": 4,
   "sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
-  "client_wall_ms": 3.4,
+  "client_wall_ms": 4.8,
   "wire_bytes": 107,
   "field_names": []
 }

@@ -1,14 +1,14 @@
 {
   "action": "theme.save",
   "protocol_version": 1,
-  "schema_digest": "45add13d80dc",
+  "schema_digest": "ffef64386bec",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-theme.save-1258553750000000",
+    "id": "r4-theme.save-1293299312000000",
     "action": "theme.save",
     "seq": 29,
     "payload": {
@@ -19,7 +19,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-theme.save-1258553750000000",
+    "id": "r4-theme.save-1293299312000000",
     "ok": true,
     "data": {
       "skin_id": "warm_amber",
@@ -33,7 +33,7 @@
   "inline_row_count": null,
   "bytes": 51,
   "sha256": "acbde8a63646452561012fd0a51908ffee610277372e2f8e6b7fc4104956c47d",
-  "client_wall_ms": 3.3,
+  "client_wall_ms": 3.5,
   "wire_bytes": 155,
   "field_names": [
     "eink",

@@ -189,6 +189,36 @@ class GatewayRpcTests(unittest.TestCase):
             self.assertIsNone(find_leak(env["data"]))
         self.harness.drive(_drive)
 
+    def test_source_list_rows_are_projected_but_source_get_is_not(self) -> None:
+        """出口投影在**真派发**上生效，而且只裁列表那一发。
+
+        静态那一族（``ExitProjectionTests``）证不了派发那一步接没接上：这一条用的是
+        真网关、真 ``SourceService``、真种进去的两条源，而那两条源的底本里
+        **确实带** ``ruleSearch``/``searchUrl``（``_source_dict``）。所以：
+
+        - 列表那一发要是还留着规则键 = 出口那格根本没跑；
+        - ``source.get`` 那一发要是也没了规则键 = 投影管到了编辑器头上，
+          保存一条源就会把 ``exploreUrl``/``jsLib`` 以空值写回库。
+
+        两条一起才是"只裁那一发"。
+        """
+        async def _drive(session, base, token):
+            _, env = await _rpc(session, base, token, _envelope("source.list"))
+            rows = env["data"]
+            self.assertEqual(len(rows), 2, "正对照：这两行是真读出来的，不是空表")
+            declared = set(BY_ACTION["source.list"].fields or ())
+            self.assertTrue(declared, "action 表没声明投影，这条守卫在空转")
+            for row in rows:
+                self.assertEqual(set(row) - declared, set(),
+                                 f"列表行还带着投影之外的键：{sorted(set(row) - declared)}")
+            _, full = await _rpc(session, base, token,
+                                 _envelope("source.get", {"url": rows[0]["bookSourceUrl"]}))
+            self.assertTrue(full["ok"], full["error"])
+            self.assertIn("ruleSearch", full["data"],
+                          "编辑器那条线的规则没了：投影管到了 source.get")
+            self.assertIn("searchUrl", full["data"])
+        self.harness.drive(_drive)
+
     def test_find_leak_is_the_instrument_that_works(self) -> None:
         """上一条里的"反证"单独钉一次：漏检才是真的危险。"""
         self.assertIsNotNone(find_leak({"a": [self.harness.gateway]}))

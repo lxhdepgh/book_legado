@@ -41,7 +41,7 @@ from app.gateway.protocol import (
     CODE_UNAVAILABLE, MAX_BODY_BYTES, PROTOCOL_VERSION, digest, err_envelope,
     ok_envelope,
 )
-from app.gateway.serialize import to_json
+from app.gateway.serialize import project, to_json
 
 logger = logging.getLogger(__name__)
 
@@ -289,11 +289,16 @@ class GatewayService(Service):
 
     @staticmethod
     def schema_digest() -> str:
-        """action 表 + 全部入参 schema 的摘要：改任何一个字段都会改这个串。"""
+        """action 表 + 全部入参 schema 的摘要：改任何一个字段都会改这个串。
+
+        ``fields``（出口投影）也在摘要里：它决定客户端能不能解出一行，
+        白名单少一格就必须让握手不同意，而不是等客户端把空字段读成"这条源没名字"。
+        """
         payload = {
             "actions": {
                 action: {"params": list(method.params), "mode": method.mode,
-                         "timeout": method.timeout}
+                         "timeout": method.timeout,
+                         "fields": list(method.fields) if method.fields else None}
                 for action, method in BY_ACTION.items()
             },
             "schema": {action: schema.load(action) for action in sorted(BY_ACTION)},
@@ -487,7 +492,10 @@ class GatewayService(Service):
         except Exception as exc:
             return err_envelope(request_id, CODE_ENGINE,
                                 f"{type(exc).__name__}: {exc}")
-        return ok_envelope(request_id, to_json(result))
+        data = to_json(result)
+        if method.fields is not None:
+            data = project(data, method.fields)
+        return ok_envelope(request_id, data)
 
     def _target(self, method: Method):
         """解析出可调用目标（服务没注册/方法不存在 → 抛，由调用方折成错误信封）。"""
