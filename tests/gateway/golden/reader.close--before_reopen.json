@@ -1,0 +1,41 @@
+{
+  "action": "reader.close",
+  "protocol_version": 1,
+  "schema_digest": "34822a1a5e7e",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "不收进度地关：这一发只为清空预取窗口，别顶掉主样本",
+  "data_shape": "object",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-reader.close-1301814312000000",
+    "action": "reader.close",
+    "seq": 6,
+    "payload": {
+      "source_url": "http://127.0.0.1:8797/g3",
+      "book_url": "http://127.0.0.1:8797/g3/book/1.html",
+      "save_progress": false
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-reader.close-1301814312000000",
+    "ok": true,
+    "data": {
+      "closed": true,
+      "staged": null
+    },
+    "error": null,
+    "code": null
+  },
+  "row_count": 1,
+  "inline_row_count": null,
+  "bytes": 29,
+  "sha256": "f86b112036f7caf0a0b42959564498736f8920c9d27f06153eaea974e068cabd",
+  "client_wall_ms": 2.0,
+  "wire_bytes": 133,
+  "field_names": [
+    "closed",
+    "staged"
+  ]
+}

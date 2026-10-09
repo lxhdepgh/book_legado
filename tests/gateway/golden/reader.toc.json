@@ -1,0 +1,104 @@
+{
+  "action": "reader.toc",
+  "protocol_version": 1,
+  "schema_digest": "34822a1a5e7e",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
+  "data_shape": "list",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-reader.toc-1301814125000000",
+    "action": "reader.toc",
+    "seq": 4,
+    "payload": {
+      "source_url": "http://127.0.0.1:8797/g3",
+      "book_url": "http://127.0.0.1:8797/g3/book/1.html"
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-reader.toc-1301814125000000",
+    "ok": true,
+    "data": [
+      {
+        "name": "第1章 测试章",
+        "url": "http://127.0.0.1:8797/g3/ch/1.html",
+        "index": 0,
+        "isVolume": false,
+        "isVip": false,
+        "isPay": false,
+        "tag": "",
+        "wordCount": ""
+      },
+      {
+        "name": "第2章 测试章",
+        "url": "http://127.0.0.1:8797/g3/ch/2.html",
+        "index": 1,
+        "isVolume": false,
+        "isVip": false,
+        "isPay": false,
+        "tag": "",
+        "wordCount": ""
+      },
+      {
+        "name": "第3章 测试章",
+        "url": "http://127.0.0.1:8797/g3/ch/3.html",
+        "index": 2,
+        "isVolume": false,
+        "isVip": false,
+        "isPay": false,
+        "tag": "",
+        "wordCount": ""
+      },
+      {
+        "name": "第4章 测试章",
+        "url": "http://127.0.0.1:8797/g3/ch/4.html",
+        "index": 3,
+        "isVolume": false,
+        "isVip": false,
+        "isPay": false,
+        "tag": "",
+        "wordCount": ""
+      },
+      {
+        "name": "第5章 测试章",
+        "url": "http://127.0.0.1:8797/g3/ch/5.html",
+        "index": 4,
+        "isVolume": false,
+        "isVip": false,
+        "isPay": false,
+        "tag": "",
+        "wordCount": ""
+      },
+      {
+        "name": "第6章 测试章",
+        "url": "http://127.0.0.1:8797/g3/ch/6.html",
+        "index": 5,
+        "isVolume": false,
+        "isVip": false,
+        "isPay": false,
+        "tag": "",
+        "wordCount": ""
+      }
+    ],
+    "error": null,
+    "code": null
+  },
+  "row_count": 6,
+  "inline_row_count": 6,
+  "bytes": 907,
+  "sha256": "dd7986dc2c7dbd2937ba23a3f2c8977eb58d55961bd4d60d372ae7401609183b",
+  "client_wall_ms": 1.6,
+  "wire_bytes": 1101,
+  "field_names": [
+    "index",
+    "isPay",
+    "isVip",
+    "isVolume",
+    "name",
+    "tag",
+    "url",
+    "wordCount"
+  ]
+}

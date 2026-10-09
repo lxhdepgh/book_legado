@@ -1,41 +1,38 @@
 {
   "action": "source.save",
   "protocol_version": 1,
-  "schema_digest": "ffef64386bec",
+  "schema_digest": "34822a1a5e7e",
   "captured_from": "main.py --serve（真子进程，回环）",
-  "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
+  "corpus": "G3 阅读面语料源（四页齐全，127.0.0.1）",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-source.save-1293297562000000",
+    "id": "r4-source.save-1301813796000000",
     "action": "source.save",
-    "seq": 7,
+    "seq": 1,
     "payload": {
       "source_json": {
-        "bookSourceName": "G2分类源",
-        "bookSourceUrl": "http://127.0.0.1:8797/g2",
-        "bookSourceGroup": "G2离线",
+        "bookSourceName": "G3阅读源",
+        "bookSourceUrl": "http://127.0.0.1:8797/g3",
+        "bookSourceGroup": "G3离线",
         "bookSourceType": 0,
         "enabled": true,
-        "enabledExplore": true,
-        "searchUrl": "/search?q={{key}}",
-        "exploreUrl": "玄幻奇幻::/g2/list?page={{page}}",
+        "enabledExplore": false,
+        "searchUrl": "http://127.0.0.1:8797/g3/search?key={{key}}",
         "ruleSearch": {
           "bookList": "ul.list li",
           "name": "a@text",
           "bookUrl": "a@href",
-          "author": "i@text"
-        },
-        "ruleExplore": {
-          "bookList": "ul.list li",
-          "name": "a@text",
-          "bookUrl": "a@href"
+          "author": "i@text",
+          "kind": "span@text"
         },
         "ruleBookInfo": {
           "name": "h1@text",
+          "author": "p.author@text",
           "intro": ".intro@text",
-          "tocUrl": "a.toc@href"
+          "tocUrl": "a.toc@href",
+          "lastChapter": "p.last@text"
         },
         "ruleToc": {
           "chapterList": "li",
@@ -43,21 +40,22 @@
           "chapterUrl": "a@href"
         },
         "ruleContent": {
-          "content": ".list@html"
+          "content": ".list@html",
+          "nextContentUrl": "a.next@href"
         }
       }
     }
   },
   "response": {
     "v": 1,
-    "id": "r4-source.save-1293297562000000",
+    "id": "r4-source.save-1301813796000000",
     "ok": true,
     "data": {
       "saved": true,
-      "source_id": "http://127.0.0.1:8797/g2",
+      "source_id": "http://127.0.0.1:8797/g3",
       "errors": [],
       "audit": {
-        "source_id": "http://127.0.0.1:8797/g2",
+        "source_id": "http://127.0.0.1:8797/g3",
         "missing_java_apis": [],
         "missing_object_apis": [],
         "unknown_fields": [],
@@ -75,8 +73,8 @@
   "row_count": 1,
   "inline_row_count": null,
   "bytes": 305,
-  "sha256": "06fb9f663ff8cab3e8526f8420c854097e5e7aee9057af0d84eb76132f935913",
-  "client_wall_ms": 336.4,
+  "sha256": "ba3823f84905f92b9f8c0349ed097d9e0dda3679ea393b872adf6b4a150d0aca",
+  "client_wall_ms": 104.5,
   "wire_bytes": 431,
   "field_names": [
     "audit",

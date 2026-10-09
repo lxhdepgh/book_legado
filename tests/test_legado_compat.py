@@ -8161,6 +8161,9 @@ class ReadingPaginationTests(unittest.IsolatedAsyncioTestCase):
                       lambda **_kwargs: object()):
             await engine._load_protected_images(document, source)
         self.assertEqual(document.blocks[0].value, b"")
+        # 字节盖掉 value 时地址必须还在：reader.content 只给地址（设计 §4.4），
+        # 这一格丢了，跨进程那侧就只剩一张永远空白的图。
+        self.assertEqual(document.blocks[0].url, "https://x/encrypted.jpg")
 
     async def test_replace_regex_runs_after_content_pages_are_combined(self):
         class Engine(LegadoReadingEngine):

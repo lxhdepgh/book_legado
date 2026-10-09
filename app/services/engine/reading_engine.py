@@ -5,7 +5,7 @@ import asyncio
 import ast
 import aiohttp
 import base64
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import html
 from http.cookies import SimpleCookie
 import json
@@ -57,6 +57,11 @@ class ContentBlock:
     value: str | bytes
     headers: dict[str, str] = field(default_factory=dict)
     title: str = ""
+    # flet 的 Image 没有请求头 API，所以 ``_load_protected_images`` 会把受保护图的
+    # ``value`` 换成字节串——跨进程那侧（``reader.content``）要的恰恰是那个地址
+    # （``Image.network``/``media_kit`` 自己带 headers 取），字节按设计 §4.4 不过协议面。
+    # 地址在这一发被覆盖掉之前先抄在这里，媒体块的 ``value`` 从此可以是 bytes 而不丢寻址。
+    url: str = ""
 
 
 @dataclass(slots=True)
@@ -259,6 +264,43 @@ def render_use_html_spans(value: str) -> str:
     """
     return _USE_HTML_PATTERN.sub(
         lambda match: html_to_text(match.group(1)), str(value or ""))
+
+
+def display_blocks(document) -> list["ContentBlock"]:
+    """正文块 → 可显示形态（``<usehtml>`` 交渲染器），**只有这一份**。
+
+    为什么收在服务侧而不是控制器里：这个改写会改**字数**。flet 的控制器原来自己
+    做这一步（红线"视图不 import 服务"，清洗只能放控制器），迁移 G3 之后 Dart 也要
+    渲染同一章——如果只有 flet 那侧渲染，两侧算出的自然段就不一样长，而章内字符偏移
+    正是两侧比对翻页落点的那把尺（``app.core.text_layout``）。同一份口径留两处，
+    迟早给出两个答案（记忆 ``refactor-regression-orphan-methods`` 那一族）。
+
+    媒体块的 URL 原样传下去：对着一串地址跑 HTML 清洗，等于给图片路径埋一条未知改写
+    的路。返回的仍是 :class:`ContentBlock`，字段与引擎那份一一对应。
+    """
+    return [ContentBlock(
+        kind=str(getattr(block, "kind", "") or ""),
+        value=(render_use_html_spans(getattr(block, "value", "") or "")
+               if str(getattr(block, "kind", "") or "") == "text"
+               else getattr(block, "value", "") or ""),
+        title=str(getattr(block, "title", "") or ""),
+        # headers 原样带过：媒体那头的播放器按它的大小写不敏感查找取 Range，
+        # dict() 一转就把那层行为换掉了。
+        headers=getattr(block, "headers", None) or {},
+        # url 也原样带过：图已被换成字节的那一块只剩这一格知道地址，
+        # 而跨进程那侧渲染靠的就是它。
+        url=str(getattr(block, "url", "") or ""),
+    ) for block in (getattr(document, "blocks", None) or [])]
+
+
+def display_document(document):
+    """整份正文文档的可显示形态：``image_style`` 原样带过，块走 :func:`display_blocks`。"""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        image_style=str(getattr(document, "image_style", "") or ""),
+        title=str(getattr(document, "title", "") or ""),
+        blocks=display_blocks(document))
 
 
 def _format_content_page(value: str, redirect_url: str) -> str:
@@ -1737,9 +1779,10 @@ class LegadoReadingEngine(ReaderEngine):
             if need_save:
                 try:
                     cached_document = ChapterContent(
-                        blocks=[ContentBlock(
-                            block.kind, block.value, dict(block.headers), block.title)
-                            for block in document.blocks],
+                        # headers 复制一份就够，其余字段整块带走：replace 按字段名走，
+                        # 模型以后加一列不会在这里默默丢一半（缓存读回半截的形状）。
+                        blocks=[replace(block, headers=dict(block.headers))
+                                for block in document.blocks],
                         title=document.title, image_style=document.image_style,
                         raw_content=document.raw_content)
                     await self._load_protected_images(
@@ -1779,6 +1822,10 @@ class LegadoReadingEngine(ReaderEngine):
                      isinstance(block.value, str)]
         if not protected:
             return
+        # 地址先落进 ``url`` 这一格：``value`` 马上要被字节串覆盖，而跨进程那侧
+        # （reader.content → Image.network）要的恰恰是地址，字节按设计 §4.4 不过协议面。
+        for block in protected:
+            block.url = str(block.value or "")
         protected_urls = {id(block): block.value for block in protected}
         headers = dict(self.headers)
         headers.update(source_headers)

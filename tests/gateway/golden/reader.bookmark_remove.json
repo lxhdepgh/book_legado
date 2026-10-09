@@ -1,0 +1,34 @@
+{
+  "action": "reader.bookmark_remove",
+  "protocol_version": 1,
+  "schema_digest": "34822a1a5e7e",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
+  "data_shape": "scalar",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-reader.bookmark_remove-1301814328000000",
+    "action": "reader.bookmark_remove",
+    "seq": 11,
+    "payload": {
+      "book_url": "http://127.0.0.1:8797/g3/book/1.html",
+      "bookmark_id": 1
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-reader.bookmark_remove-1301814328000000",
+    "ok": true,
+    "data": true,
+    "error": null,
+    "code": null
+  },
+  "row_count": 0,
+  "inline_row_count": null,
+  "bytes": 4,
+  "sha256": "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b",
+  "client_wall_ms": 6.4,
+  "wire_bytes": 115,
+  "field_names": []
+}

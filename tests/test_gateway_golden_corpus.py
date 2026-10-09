@@ -134,12 +134,20 @@ def test_sample_envelopes_are_legal_and_pair_with_their_request() -> None:
     for path, sample in _samples():
         response = sample["response"]
         assert sorted(response) == ENVELOPE_KEYS, f"{path.name} 信封键不是冻结那六格"
-        assert response["ok"] is True, f"{path.name} 不是成功信封：{response['error']}"
         assert response["v"] == sample["protocol_version"] == PROTOCOL_VERSION
         assert sample["request"]["v"] == PROTOCOL_VERSION
         # 请求与响应必须成对：教客户端"发了就算"而不比对 id，正是断线重连时
         # 把上一轮的迟到结果当本轮渲染的那类事故。
         assert sample["request"]["id"] == response["id"], f"{path.name} 收发 id 不配对"
+        if response["ok"] is False:
+            # 失败信封也是契约的一部分（``reader.toc--no-session`` 钉的就是它）：
+            # 客户端按 error 那句里的**异常名**决定要不要重开会话，所以判据是
+            # "有名字、没 data"，而不是"也给我一份能解析的 data"。
+            assert str(response.get("error") or ""), f"{path.name} 失败却不给原因"
+            assert response["data"] is None, f"{path.name} 失败却带着 data"
+            continue
+        assert response["ok"] is True, (
+            f"{path.name} 的 ok 既不是 true 也不是 false：{response['ok']!r}")
 
 
 def test_counters_and_field_names_recompute_from_the_sample_itself() -> None:
@@ -238,6 +246,9 @@ def test_projected_actions_deliver_exactly_their_declared_keys() -> None:
     for path, sample in _samples():
         method = projected.get(_action_of(path, sample))
         if method is None:
+            continue
+        if sample["response"]["ok"] is False:
+            # 失败那一发没有行，投影没得上场；它的契约在信封那一条里钉着。
             continue
         assert sorted(sample["field_names"]) == sorted(method.fields), (
             f"{path.name} 的键集 {sample['field_names']} 与表里声明的投影 "

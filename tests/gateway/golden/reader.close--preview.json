@@ -1,0 +1,41 @@
+{
+  "action": "reader.close",
+  "protocol_version": 1,
+  "schema_digest": "34822a1a5e7e",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "收尾：把这本试读转正后的会话关掉（关的是会话那本，不是第一本）",
+  "data_shape": "object",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-reader.close-1301814421000000",
+    "action": "reader.close",
+    "seq": 26,
+    "payload": {
+      "source_url": "http://127.0.0.1:8797/g3",
+      "book_url": "http://127.0.0.1:8797/g3/book/preview.html",
+      "save_progress": true
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-reader.close-1301814421000000",
+    "ok": true,
+    "data": {
+      "closed": true,
+      "staged": null
+    },
+    "error": null,
+    "code": null
+  },
+  "row_count": 1,
+  "inline_row_count": null,
+  "bytes": 29,
+  "sha256": "f86b112036f7caf0a0b42959564498736f8920c9d27f06153eaea974e068cabd",
+  "client_wall_ms": 4.9,
+  "wire_bytes": 133,
+  "field_names": [
+    "closed",
+    "staged"
+  ]
+}

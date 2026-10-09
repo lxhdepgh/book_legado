@@ -1,0 +1,54 @@
+{
+  "action": "reader.position_get",
+  "protocol_version": 1,
+  "schema_digest": "34822a1a5e7e",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
+  "data_shape": "object",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-reader.position_get-1301814375000000",
+    "action": "reader.position_get",
+    "seq": 17,
+    "payload": {
+      "source_url": "http://127.0.0.1:8797/g3",
+      "book_url": "http://127.0.0.1:8797/g3/book/1.html"
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-reader.position_get-1301814375000000",
+    "ok": true,
+    "data": {
+      "chapter_url": "",
+      "chapter_name": "",
+      "chapter_index": 1,
+      "scroll_offset": 321.0,
+      "scroll_ratio": 1.0,
+      "chapter_pos": 5802,
+      "chapter_paragraph": 7,
+      "font_size": 18,
+      "last_read_at": 1791520941
+    },
+    "error": null,
+    "code": null
+  },
+  "row_count": 1,
+  "inline_row_count": null,
+  "bytes": 177,
+  "sha256": "0a1f22adddb74bcab6e844b6ddc0c852a17bade959212fe8a787097c5f224c29",
+  "client_wall_ms": 0.6,
+  "wire_bytes": 302,
+  "field_names": [
+    "chapter_index",
+    "chapter_name",
+    "chapter_paragraph",
+    "chapter_pos",
+    "chapter_url",
+    "font_size",
+    "last_read_at",
+    "scroll_offset",
+    "scroll_ratio"
+  ]
+}

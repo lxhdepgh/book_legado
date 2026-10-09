@@ -1,0 +1,6 @@
+{
+  "type": "object",
+  "description": "reader.staged_promote 入参：无。把当前会话的试读暂存记录原地转正为书架记录（进度、逐源变量、目录缓存一律不动）。没有暂存记录时回 false。",
+  "properties": {},
+  "additionalProperties": false
+}

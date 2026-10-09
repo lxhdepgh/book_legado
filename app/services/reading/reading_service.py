@@ -27,6 +27,7 @@ from app.core.events import (
     SearchFinishedEvent,
 )
 from app.core.lifecycle import Service
+from app.core.text_layout import chapter_paragraphs, chapter_text_length
 from app.services.block_pages import SiteBlockedError
 from app.services.engine.rule_engine import (
     ChapterItem,
@@ -34,7 +35,11 @@ from app.services.engine.rule_engine import (
     RequestTimeoutError,
     UnsupportedRule,
 )
-from app.services.engine.reading_engine import ChapterContent
+from app.services.engine.reading_engine import (
+    ChapterContent,
+    display_blocks,
+    display_document,
+)
 from app.services.reading_cache import ReadingCache
 from app.services.search_model import SearchModel, SearchBookStore
 
@@ -68,6 +73,14 @@ SEARCH_STORE_TTL_MS = 24 * 60 * 60 * 1000
 PREFETCH_CHAPTER_COUNT = 10
 #: 预取正文的内存预算。超预算只是"这次不再留副本"，落盘缓存照写，等于退回旧行为。
 PREFETCH_CACHE_LIMIT = 64 * 1024 * 1024
+
+
+class ReaderSessionError(RuntimeError):
+    """``reader.*`` 的调用顺序错了：动作要的是某一本书，但会话不是它。
+
+    网关把异常名折进错误信封（``CODE_ENGINE`` + ``"ReaderSessionError: ..."``），
+    客户端据此重开——它比"返回空目录"好查得多：空目录看起来像书坏了。
+    """
 
 
 def _local_source_for(origin: str, book):
@@ -205,6 +218,10 @@ class ChapterViewport:
     #: 这一章的第一段在**整篇文档**里的段序号（连续阅读时前面还挂着别的章）。
     #: 落库的段序号必须是章内的，所以像素段号要减掉这个起点（#88）。
     paragraph_start: int = 0
+    #: 本章每段段首在章内字符流里的偏移（``text_layout.paragraph_offsets``）。
+    #: 空 = 这一章没算过坐标（老调用方、只挂控件不读正文的替身），那时字符偏移
+    #: 退回旧的像素插值口径——那条口径 #88 实测连同尺差 7 段，只当兜底不当真相。
+    paragraph_offsets: tuple[int, ...] = ()
 
 
 class ReadingSession:
@@ -227,12 +244,14 @@ class ReadingSession:
                     ReadingPosition.from_reading(source_url, book_url, reading))
         self.reset(source_url, book_url, chapters, position)
 
-    def mount(self, chapter, document_start, text_length, paragraph_start=0):
+    def mount(self, chapter, document_start, text_length, paragraph_start=0,
+              paragraph_offsets=()):
         self.viewports[str(chapter.url)] = ChapterViewport(
             chapter=chapter,
             document_start=max(0.0, float(document_start or 0)),
             text_length=max(0, int(text_length or 0)),
-            paragraph_start=max(0, int(paragraph_start or 0)))
+            paragraph_start=max(0, int(paragraph_start or 0)),
+            paragraph_offsets=tuple(int(item) for item in (paragraph_offsets or ())))
 
     def track(self, document_offset, document_extent, font_size,
               paragraph_index=None):
@@ -260,16 +279,37 @@ class ReadingSession:
         local_paragraph = _paragraph_or_none(paragraph_index)
         if local_paragraph is not None:
             local_paragraph = max(0, local_paragraph - selected.paragraph_start)
+        # 字符偏移的**正解**：知道落在第几段，就按段首偏移算（章内字符流是两侧的
+        # 同一把尺，见 app.core.text_layout）。量不到段号时才退回旧的像素插值——
+        # 那一格是估算不是事实，#88 取证一实测它连同差 7 段。
+        if local_paragraph is not None and selected.paragraph_offsets:
+            character_offset = self._character_offset_at(
+                selected.paragraph_offsets, local_paragraph, ratio)
+        else:
+            character_offset = int(selected.text_length * ratio)
         self.position = ReadingPosition(
             source_url=self.source_url, book_url=self.book_url,
             chapter_url=str(chapter.url or ""),
             chapter_name=str(chapter.name or ""),
             chapter_index=int(chapter.index or 0),
             chapter_offset=local_offset, chapter_ratio=ratio,
-            character_offset=int(selected.text_length * ratio),
+            character_offset=character_offset,
             chapter_paragraph=local_paragraph,
             font_size=int(font_size), updated_at=int(time.time()))
         return self.position, chapter
+
+    @staticmethod
+    def _character_offset_at(offsets, paragraph: int, ratio: float) -> int:
+        """段号 → 章内字符偏移：段首是事实，段内那一截按像素比例估且**不越过段尾**。
+
+        越过段尾就不是估算误差了——它会把人送进下一段，两侧于是各认一个段。
+        最后一段没有下界（后面没有别的段可减），那一格就只认段首，不猜。
+        """
+        anchor = max(0, min(int(paragraph), len(offsets) - 1))
+        start = int(offsets[anchor])
+        span = (int(offsets[anchor + 1] - offsets[anchor]) - 1
+                if anchor + 1 < len(offsets) else 0)
+        return max(0, start + int(span * max(0.0, min(1.0, float(ratio)))))
 
     def enter(self, chapter, font_size, offset=0.0, ratio=0.0,
               character_offset=0, paragraph=None):
@@ -1090,6 +1130,276 @@ class ReadingService(Service):
         except Exception as exc:
             logger.warning("换源写回失败：%s", exc)
             return False
+
+    # ------------------------------------------------------------------ #
+    # 阅读面（§9 门 G3：协议面上的 reader.*）
+    #
+    # 这一族门面的共同点：**身份全部按 url 显式传进来**。会话态
+    # (``_current_source`` / ``_current_book``) 是进程内单例上的属性，跨进程那侧
+    # 看不见它，也不该靠"上一次调用留了什么"来猜这一章属于哪本书——那是
+    # ``refactor-regression-orphan-methods`` 那一族最难查的形状（服务在跑、方法在、
+    # 接线断在隐式状态上）。
+    # ------------------------------------------------------------------ #
+    async def open_by_url(self, source_url: str, book, shelve: bool = True,
+                          resume: bool = True) -> dict:
+        """开会话的 JSON 面：回会话快照，**目录不在这一发里**（几千章另说）。
+
+        ``chapters`` 那条走 ``reader.toc``：目录是行列表，投影白名单管得住形状，
+        但把 3,000 行挂在"点开一本书"这一发上是 G2 那笔载荷账的原样重演。
+        """
+        source = await self._source_by_url(source_url)
+        session = await self.open_book(source, book, shelve=bool(shelve),
+                                       resume=bool(resume))
+        position = session.position
+        return {
+            "book": _book_item_dict(as_book_item(book)),
+            "sourceUrl": str(position.source_url or ""),
+            "bookUrl": str(position.book_url or ""),
+            "chapterCount": len(session.chapters),
+            "position": position.as_reading(),
+        }
+
+    async def close_by_url(self, source_url: str, book_url: str,
+                           save_progress: bool = True) -> dict:
+        """结束会话：先收试读收尾要的那条记录，再关（关完 ``_session_key`` 就空了）。
+
+        要求 url 对上才关：会话是单例，若客户端 A 关的是 B 那本书，就会把 A
+        自己那一份进度落到别人的行上——而 ``books`` 是 ``ON CONFLICT DO UPDATE``。
+        """
+        if not self._session_matches(source_url, book_url):
+            return {"closed": False, "staged": None}
+        staged = self.staged_record()
+        await self.close_book(save_progress=bool(save_progress))
+        return {"closed": True, "staged": _book_item_dict(staged) if staged else None}
+
+    async def chapter_rows(self, source_url: str, book_url: str,
+                           refresh: bool = False) -> list[dict]:
+        """目录行：按 url 取书、按 url 取源，返回**纯 dict 行**（投影吃的是行列表）。
+
+        ``book`` 用书架/搜索快照里那条；这里只需要它的 url/name/author 去问目录，
+        所以取不到完整快照时按 ``book_url`` 造一条最小 BookItem——引擎按 url 走规则。
+        """
+        self._require_session(source_url, book_url)
+        source = await self._source_by_url(source_url)
+        book = self._book_for(source_url, book_url)
+        chapters = await self.load_chapters(book, force_refresh=bool(refresh))
+        return [_chapter_row(chapter) for chapter in chapters or []]
+
+    async def chapter_document(self, source_url: str, book_url: str,
+                               chapter_url: str) -> dict:
+        """一章正文的 JSON 面：出**可显示形态**的块，并顺手起一轮预取。
+
+        为什么在服务侧就渲染掉 ``<usehtml>``：那一步会改字数，而章内字符偏移是
+        flet 与 Dart 比对翻页落点的尺（见 ``app.core.text_layout`` 抬头）。留到
+        客户端各自渲染，两侧数出来的就不是同一串字。
+
+        二进制块不走这一发（设计 §4.4）：值不是 str 时只报 ``binary``，
+        内容由 ``/media`` 那条路取——把 JPEG 塞进 JSON 信封会同时炸内存和延迟。
+
+        必须先 ``reader.open``：``load_content`` 的缓存键取自会话上的
+        ``(source, book)``，会话不是这本书时键就错了——会把 A 书的正文当成
+        B 书的一章去读缓存、去发请求。所以这里显式检查，而不是靠调用顺序。
+        """
+        self._require_session(source_url, book_url)
+        source = await self._source_by_url(source_url)
+        book = self._book_for(source_url, book_url)
+        chapter = await self._chapter_by_url(book_url, chapter_url, source)
+        document = await self.load_content(chapter)
+        await self.prefetch_chapters(chapter)
+        shown = display_document(document)
+        paragraphs = chapter_paragraphs(shown.blocks)
+        return {
+            "chapterUrl": str(chapter_url or ""),
+            "chapterIndex": int(getattr(chapter, "index", 0) or 0),
+            "chapterName": str(getattr(chapter, "name", "") or ""),
+            "title": str(getattr(shown, "title", "") or ""),
+            "imageStyle": str(getattr(shown, "image_style", "") or ""),
+            "blocks": [_block_row(block) for block in shown.blocks],
+            "paragraphCount": len(paragraphs),
+            "totalChars": chapter_text_length(paragraphs),
+        }
+
+    async def read_position(self, source_url: str, book_url: str) -> dict | None:
+        """续读位置的 JSON 面：没有记录就是 None（不是"位置为 0"）。
+
+        **回的是存档形状**：``books`` 表按 book_url 存 chapter_index/偏移/段号，
+        没有 chapter_url 这一列（设计 §3.9 的口径），所以 ``chapter_url`` 照会是
+        空串——续读的那一章由 ``chapter_index`` 在目录里定位。这不是缺陷，两侧
+        （flet 的 ``restore_position``、Dart 的 ``reader.position.get``）读到的
+        是同一份存档，别再各写一套"猜章"的逻辑。
+        """
+        position = await self.restore_position(self._book_for(source_url, book_url))
+        return position.as_reading() if position is not None else None
+
+    async def save_position(self, source_url: str, book_url: str,
+                            position_json: dict) -> dict:
+        """落一篇阅读位置：客户端报什么段、什么偏移，这里**按章内字符流核一遍**。
+
+        三件事必须在这一发里做完，否则两侧各写各的：
+
+        1. **章按 index 认**：``books`` 不存 chapter_url，而会话的缓存键按 url 走，
+           所以落库前把客户端报的 url 换成目录里那一条（index 对不上就退回
+           会话当前位置那一章），否则下一次 ``reader.content`` 会读到另一章。
+        2. **补得回来的字段补回来**：``save_progress`` 的 name/author 取自会话上的
+           book，因此这一发要求会话就是这本书（见 :meth:`_require_session`）——
+           否则会把 A 书的名字写到 B 书那一行，而 ``books`` 是
+           ``ON CONFLICT DO UPDATE``，写坏是静默的。
+        3. **收口客户端的估算**：偏移越界、段号超出段数、负数，都在落库前夹回，
+           并回一份落库后的形状（客户端据此知道自己存进去的是什么）。
+        """
+        self._require_session(source_url, book_url)
+        incoming = dict(position_json or {})
+        position = ReadingPosition.from_reading(source_url, book_url, incoming)
+        position = self._anchored(position)
+        position = self._clamped(position)
+        await self.save_progress(position.chapter_index, position)
+        # 落库的那一份同时写回会话：``reader.close(save_progress=true)`` 落的是
+        # **会话上**那份，而跨进程客户端的位置只在这发里出现过。不写回，退出那一发
+        # 就把刚存的落点换成会话默认值（chapter 0、偏移 0）——G3 收样本的活臂现场撞到的。
+        self._session.position = position
+        return position.as_reading()
+
+    def _anchored(self, position: ReadingPosition) -> ReadingPosition:
+        """chapter_url 按 chapter_index 从目录里重新取；目录里没有这个 index 就不动。"""
+        chapters = self._session.chapters
+        index = int(position.chapter_index or 0)
+        if not chapters or not 0 <= index < len(chapters):
+            return position
+        chapter = chapters[index]
+        if str(chapter.url or "") == str(position.chapter_url or ""):
+            return position
+        return ReadingPosition(
+            source_url=position.source_url, book_url=position.book_url,
+            chapter_url=str(chapter.url or ""), chapter_name=str(chapter.name or ""),
+            chapter_index=index, chapter_offset=position.chapter_offset,
+            chapter_ratio=position.chapter_ratio,
+            character_offset=position.character_offset,
+            chapter_paragraph=position.chapter_paragraph,
+            font_size=position.font_size, updated_at=position.updated_at)
+
+    def _clamped(self, position: ReadingPosition) -> ReadingPosition:
+        """偏移与段号按本章的可显示自然段收口；这一章不在缓存里时**不动值**。
+
+        "不动值"是有意的：客户端可能在翻到一章的很远位置后才落进度，而预取窗口
+        只有几章。宁可存一个未核过的偏移，也不要为了核它去联网拉一整章——
+        落点读回来时按 :func:`app.core.text_layout.paragraph_at_offset` 还会再收口一次。
+        """
+        key = (position.source_url, position.book_url, position.chapter_url)
+        document = self._prefetch_cache.get(key)
+        if document is None and self._cache is not None:
+            document = self._cache.load_content(*key)
+        if document is None:
+            return position
+        paragraphs = chapter_paragraphs(display_blocks(document))
+        total = chapter_text_length(paragraphs)
+        index = position.chapter_paragraph
+        if index is not None:
+            index = max(0, min(int(index), max(0, len(paragraphs) - 1)))
+        return ReadingPosition(
+            source_url=position.source_url, book_url=position.book_url,
+            chapter_url=position.chapter_url, chapter_name=position.chapter_name,
+            chapter_index=position.chapter_index,
+            chapter_offset=position.chapter_offset,
+            chapter_ratio=position.chapter_ratio,
+            character_offset=max(0, min(int(position.character_offset), total)),
+            chapter_paragraph=index,
+            font_size=position.font_size, updated_at=position.updated_at)
+
+    def _session_matches(self, source_url: str, book_url: str) -> bool:
+        """当前会话是不是这一本书（按 ``_session_key`` 那对 url 比）。"""
+        current_source, current_book = self._session_key()
+        return (str(book_url or "") == current_book
+                and (not current_source or not source_url
+                     or str(source_url or "") == current_source))
+
+    def _require_session(self, source_url: str, book_url: str) -> None:
+        """会话不是这本书就抛：协议面的每个动作都吃 url，隐式状态不能替它猜。"""
+        if not self._session_matches(source_url, book_url):
+            raise ReaderSessionError(
+                f"当前会话不是这本书，先调 reader.open：source={source_url!r} "
+                f"book={book_url!r}（会话={self._session_key()!r}）")
+
+    def _book_for(self, source_url: str, book_url: str):
+        """当前会话就是这本书则复用会话对象，否则按 url 造一条最小 BookItem。
+
+        不能直接返回 None：``load_chapters`` 与进度落盘都要读 ``book.url``，
+        拿到 None 会一路取空串，目录与进度会静默对不上号。
+        """
+        current = self._current_book
+        if (current is not None and str(getattr(current, "url", "") or "") ==
+                str(book_url or "")):
+            return current
+        record = None
+        if self._source_service is not None:
+            try:
+                record = self._source_service.find_bookshelf_item(
+                    {"source_url": source_url, "url": book_url})
+            except Exception as exc:      # 查不到书架记录不影响按 url 开书
+                logger.debug("书架记录反查失败 %s：%s", book_url, exc)
+        merged = dict(record or {})
+        merged.setdefault("url", str(book_url or ""))
+        merged.setdefault("origin", str(source_url or ""))
+        return as_book_item(merged)
+
+    async def _chapter_by_url(self, book_url: str, chapter_url: str, source):
+        """按 url 找回目录里那一章（会话里的行与客户端传回的 url 同一个来源）。"""
+        chapters = await self.load_chapters(self._book_for(
+            str(getattr(source, "bookSourceUrl", "") or ""), book_url))
+        for chapter in chapters or []:
+            if str(chapter.url or "") == str(chapter_url or ""):
+                return chapter
+        raise ValueError(f"目录里没有这一章：{chapter_url}")
+
+
+def _chapter_row(chapter) -> dict:
+    """目录行的显式表：16 个字段一个个点名（与 ChapterItem 的字段一一对应），
+    不靠 dataclass 反射上协议面。
+
+    ``start``/``end``/``*_fragment_id``/``variables`` 是正文切片与逐源变量，
+    客户端要拿它们做的是"这一章的 url 带不带片段锚点"，而目录那一屏只读
+    名字/序号/是否卷标题/是否 VIP/字数。白名单在 action 表里（``reader.toc``
+    的 ``fields``），这里给全是为了 ``reader.toc`` 之外的调用方不丢字段。
+    """
+    return {
+        "name": str(chapter.name or ""),
+        "url": str(chapter.url or ""),
+        "index": int(chapter.index or 0),
+        "isVolume": bool(chapter.is_volume),
+        "isVip": bool(chapter.is_vip),
+        "isPay": bool(chapter.is_pay),
+        "tag": str(chapter.tag or ""),
+        "wordCount": str(chapter.word_count or ""),
+        "baseUrl": str(chapter.base_url or ""),
+        "bookUrl": str(chapter.book_url or ""),
+        "resourceUrl": str(chapter.resource_url or ""),
+        "start": chapter.start,
+        "end": chapter.end,
+        "startFragmentId": chapter.start_fragment_id,
+        "endFragmentId": chapter.end_fragment_id,
+        "variables": dict(chapter.variables or {}),
+    }
+
+
+def _block_row(block) -> dict:
+    """正文块上协议面的形状：文本给原文，媒体给地址，二进制只给"我是二进制"。
+
+    ``url`` 与 ``value`` 分两格是有原因的：受保护图在引擎里会被换成字节串好让 flet
+    显示（见 ``ContentBlock.url`` 那一格），此时 ``value`` 是 None 而地址还在——
+    跨进程那侧（``Image.network``/``media_kit``）用的就是这一格加 ``headers``。
+    字节本身按设计 §4.4 不过协议面。
+    """
+    value = getattr(block, "value", "")
+    is_binary = isinstance(value, (bytes, bytearray))
+    kind = str(getattr(block, "kind", "") or "")
+    raw_url = str(getattr(block, "url", "") or "")
+    return {
+        "kind": kind,
+        "value": None if is_binary else str(value or ""),
+        "url": (raw_url or ("" if is_binary or kind == "text" else str(value or ""))),
+        "binary": bool(is_binary),
+        "title": str(getattr(block, "title", "") or ""),
+        "headers": dict(getattr(block, "headers", None) or {}),
+    }
 
 
 #: 搜索范围特殊值（与找书页面的范围选择器一致）。

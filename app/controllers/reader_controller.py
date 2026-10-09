@@ -28,6 +28,7 @@ import flet as ft
 
 from app.core.events import (BookmarkChangedEvent, MediaPlayStateEvent,
                              ReadAloudStateEvent, ReadingSessionChangedEvent)
+from app.core.text_layout import chapter_paragraphs, paragraph_offsets
 from app.controllers.base import BaseController
 from app.services.reading.reading_service import ReadingService
 from app.services.reading.bookmark_service import BookmarkService
@@ -414,7 +415,8 @@ class ReaderController(BaseController):
             self.flush()
         try:
             document = await self._reading.load_content(raw, append=append)
-            plan = await asyncio.to_thread(self._content_plan, document)
+            plan, chapter_offsets = await asyncio.to_thread(
+                self._content_plan, document)
             if self._view is None:
                 # 正文读回来的路上切了页：控件没地方挂，进度也不该记
                 return
@@ -447,7 +449,8 @@ class ReaderController(BaseController):
                                 font_size=self._current_font_size(),
                                 offset=0.0 if append else restore_offset,
                                 paragraph_start=paragraph_start,
-                                paragraph=None if append else restore_paragraph)
+                                paragraph=None if append else restore_paragraph,
+                                paragraph_offsets=chapter_offsets)
             self._continuous_loaded.add(chapter["url"])
             if not append:
                 self._chapter_index = index
@@ -561,7 +564,8 @@ class ReaderController(BaseController):
 
     def _mount_chapter(self, raw, document_start: float, text_length: int,
                        reset: bool, font_size: int, offset: float,
-                       paragraph_start: int = 0, paragraph=None) -> None:
+                       paragraph_start: int = 0, paragraph=None,
+                       paragraph_offsets=()) -> None:
         """把一章登记进阅读会话的视口表（滚动 track 全靠它）。
 
         ``raw`` 可能为 None（服务层还没建会话，例如离线替身）：那时只能显示
@@ -570,6 +574,9 @@ class ReaderController(BaseController):
         ``paragraph_start`` 是本章第一段在整篇文档里的段序号；``paragraph`` 是这次
         续读回到的**章内**段序号——不带上它，用户一滚都不滚就退出时，落库会把已经
         存好的段序号抹成未知（#88）。
+
+        ``paragraph_offsets`` 是本章各段的段首字符偏移：会话用它把"落在第几段"换成
+        落库的字符偏移（G3 位置契约）。空 = 沿用旧的像素插值口径。
         """
         session = getattr(self._reading, "current_session", None)
         if raw is None or session is None or not hasattr(session, "mount"):
@@ -583,7 +590,8 @@ class ReaderController(BaseController):
                          getattr(session, "book_url", ""),
                          getattr(session, "chapters", []),
                          getattr(session, "position", None))
-        session.mount(raw, document_start, text_length, paragraph_start)
+        session.mount(raw, document_start, text_length, paragraph_start,
+                      tuple(paragraph_offsets or ()))
         session.enter(raw, font_size, offset=offset, paragraph=paragraph)
 
     def _readable_index(self, url: str) -> int:
@@ -637,34 +645,29 @@ class ReaderController(BaseController):
         return int(getattr(self._view, "_font_size", 16) or 16)
 
     def _display_document(self, document):
-        """正文块 → 可显示形态：``<usehtml>`` 段交渲染器，视图不碰服务。
+        """正文块 → 可显示形态：口径与 RPC 那条路同一个函数（见 ``display_document``）。
 
-        红线：视图不许 import app.services.*；清洗放控制器，喂给视图的仍是鸭子
-        类型 ``.blocks``（kind/value/title/headers）。媒体块的 URL 原样传下去——
-        对着一串地址跑 HTML 清洗，等于给图片路径埋一条未知改写的路。
+        这一步原来在控制器里自己做（红线：视图不许 import 服务，清洗只能放控制器）。
+        迁移 G3 之后 Dart 侧也要渲染同一章，而**章内字符偏移**是两侧比对翻页落点的
+        那把尺——字数被改写过一次和没被改写过一次，算出来的偏移就差，所以口径只能
+        留一份、放在两边都够得着的地方。
         """
-        from types import SimpleNamespace
-
-        from app.services.engine.reading_engine import render_use_html_spans
-        blocks = getattr(document, "blocks", None) or []
-        return SimpleNamespace(
-            image_style=str(getattr(document, "image_style", "") or ""),
-            blocks=[SimpleNamespace(
-                kind=getattr(b, "kind", ""),
-                value=(render_use_html_spans(getattr(b, "value", "") or "")
-                       if getattr(b, "kind", "") == "text"
-                       else getattr(b, "value", "") or ""),
-                title=getattr(b, "title", "") or "",
-                headers=getattr(b, "headers", None) or {})
-                for b in blocks])
+        from app.services.engine.reading_engine import display_document
+        return display_document(document)
 
     def _content_plan(self, document):
-        """清洗 + 切段一起放到后台线程：视图只拿计划建控件。
+        """清洗 + 切段 + 章内字符坐标，一起放到后台线程。
 
-        这两步都是纯计算（不碰控件、不碰服务），一章几千行时是几十上百毫秒，
+        这三步都是纯计算（不碰控件、不碰服务），一章几千行时是几十上百毫秒，
         压在界面循环上就是一次可感知的卡顿（旧实现同样丢给线程跑）。
+
+        坐标单独算一遍而**不从 plan 里读**：plan 的段文本带段首缩进（显示的事），
+        缩进每段多两个字，落库的偏移就会整体漂；坐标必须取自不缩进的那一把尺
+        （``text_layout.chapter_paragraphs``），两侧才数得出同一个数。
         """
-        return self._view.content_plan(self._display_document(document))
+        display = self._display_document(document)
+        plan = self._view.content_plan(display)
+        return plan, list(paragraph_offsets(chapter_paragraphs(display.blocks)))
 
     def _chapter_by_url(self, url: str):
         session = getattr(self._reading, "current_session", None)
@@ -958,15 +961,17 @@ class ReaderController(BaseController):
 
     async def _run_content_search(self, keyword: str) -> None:
         # 索引由书内搜索第一次用时建：ContentSearchService.rebuild_index 在生产里
-        # 原本没有任何调用方（服务面齐全、界面永远"无命中"）。ensure_index 按
-        # "已缓存章数 > 索引覆盖章数"补齐，所以整书缓存收尾不必再挂一个钩子。
+        # 原本没有任何调用方（服务面齐全、界面永远"无命中"）。search_ensured 把
+        # "按需补索引 + 查"并作一发——协议面（reader.searchContent）与这条 flet
+        # 路径共用同一个实现，否则两侧各记一遍"先建再查"的顺序，早晚有一侧忘。
         session = getattr(self._reading, "current_session", None)
         source_url = str(getattr(session, "source_url", "") or "")
-        await self._content_search.ensure_index(self._book_url, source_url)
-        hits = await self._content_search.search(self._book_url, keyword)
+        result = await self._content_search.search_ensured(
+            self._book_url, keyword, source_url)
         if self._view is None:
             return    # 全书扫一遍要几秒，这期间切页是常规操作不是意外
-        self._view.content_search_bar.render_results(list(hits or []))
+        self._view.content_search_bar.render_results(
+            list(result.get("hits") or []))
 
     def jump_to_hit(self, hit: dict, _=None) -> None:
         self._interrupt_read_aloud()
@@ -977,7 +982,8 @@ class ReaderController(BaseController):
 
         ``para_index`` 是**章内**段序号：命中跳转走 :meth:`_open_index` 的整篇替换，
         屏幕上挂的就是这一章，序号与 :class:`ContentSearchService` 建行时数出来的
-        第几段是同一个数（两边都用 ``app.core.text_layout.paragraph_lines`` 切段）。
+        第几段是同一个数（两边都从位置契约那把尺数段：
+        ``chapter_paragraphs(display_blocks(...))``，见 ``app.core.text_layout``）。
         """
         index = int(hit.get("chapter_index", 0) or 0)
         paragraph = int(hit.get("para_index", 0) or 0)

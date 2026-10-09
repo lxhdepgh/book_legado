@@ -1,0 +1,65 @@
+{
+  "action": "reader.position_save",
+  "protocol_version": 1,
+  "schema_digest": "34822a1a5e7e",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "越界的一发：偏移夹到本章字符流总长、段号夹到最后一段、比例夹到 1",
+  "data_shape": "object",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-reader.position_save-1301814359000000",
+    "action": "reader.position_save",
+    "seq": 14,
+    "payload": {
+      "source_url": "http://127.0.0.1:8797/g3",
+      "book_url": "http://127.0.0.1:8797/g3/book/1.html",
+      "position_json": {
+        "chapter_index": 1,
+        "chapter_url": "http://127.0.0.1:8797/g3/ch/2.html",
+        "chapter_name": "第2章 测试章",
+        "scroll_offset": 321.0,
+        "scroll_ratio": 3.5,
+        "chapter_pos": 15801,
+        "chapter_paragraph": 48,
+        "font_size": 18,
+        "last_read_at": 1791520941
+      }
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-reader.position_save-1301814359000000",
+    "ok": true,
+    "data": {
+      "chapter_url": "http://127.0.0.1:8797/g3/ch/2.html",
+      "chapter_name": "第2章 测试章",
+      "chapter_index": 1,
+      "scroll_offset": 321.0,
+      "scroll_ratio": 1.0,
+      "chapter_pos": 5802,
+      "chapter_paragraph": 7,
+      "font_size": 18,
+      "last_read_at": 1791520941
+    },
+    "error": null,
+    "code": null
+  },
+  "row_count": 1,
+  "inline_row_count": null,
+  "bytes": 228,
+  "sha256": "45b41c16a3af6fe60f0f90fdca5560fff3431b222d3561d03f38b117c0fa0670",
+  "client_wall_ms": 4.0,
+  "wire_bytes": 354,
+  "field_names": [
+    "chapter_index",
+    "chapter_name",
+    "chapter_paragraph",
+    "chapter_pos",
+    "chapter_url",
+    "font_size",
+    "last_read_at",
+    "scroll_offset",
+    "scroll_ratio"
+  ]
+}

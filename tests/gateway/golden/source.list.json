@@ -1,21 +1,21 @@
 {
   "action": "source.list",
   "protocol_version": 1,
-  "schema_digest": "ffef64386bec",
+  "schema_digest": "34822a1a5e7e",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "list",
   "data_truncated": true,
   "request": {
     "v": 1,
-    "id": "r4-source.list-1293297343000000",
+    "id": "r4-source.list-1301811937000000",
     "action": "source.list",
     "seq": 2,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-source.list-1293297343000000",
+    "id": "r4-source.list-1301811937000000",
     "ok": true,
     "data": [
       {
@@ -58,7 +58,7 @@
   "inline_row_count": 5,
   "bytes": 351554,
   "sha256": "e1f63b739f0c14d372a03219c9a9c513a38ec97b016ae8d806ab41fa2cacaa6b",
-  "client_wall_ms": 20.9,
+  "client_wall_ms": 19.7,
   "wire_bytes": 360699,
   "field_names": [
     "bookSourceComment",

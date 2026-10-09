@@ -1,37 +1,37 @@
 {
   "action": "engine.shutdown",
   "protocol_version": 1,
-  "schema_digest": "ffef64386bec",
+  "schema_digest": "34822a1a5e7e",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "子进程收到后自行收摊，rc 见下",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-engine.shutdown-1293299328000000",
+    "id": "r4-engine.shutdown-1301814531000000",
     "action": "engine.shutdown",
     "seq": 0,
     "payload": {
-      "reason": "G2 黄金样本抓完"
+      "reason": "G2+G3 黄金样本抓完"
     }
   },
   "response": {
     "v": 1,
-    "id": "r4-engine.shutdown-1293299328000000",
+    "id": "r4-engine.shutdown-1301814531000000",
     "ok": true,
     "data": {
       "stopping": true,
-      "reason": "G2 黄金样本抓完"
+      "reason": "G2+G3 黄金样本抓完"
     },
     "error": null,
     "code": null
   },
   "row_count": 1,
   "inline_row_count": null,
-  "bytes": 50,
-  "sha256": "c845f857c75da7965d6fafdcb8173d8ad47ca16cf9f5f065926a1833ead2d0c7",
+  "bytes": 53,
+  "sha256": "57a68753bdfc5664eb5b9a7b25dd7652672a0e121fd1d72884dd49f65adf82ab",
   "client_wall_ms": 0.8,
-  "wire_bytes": 157,
+  "wire_bytes": 160,
   "field_names": [
     "reason",
     "stopping"

@@ -105,7 +105,8 @@ def _reader_view():
     controller._reading = reading
     controller._bookmarks = SimpleNamespace(list_bookmarks=Value([]))
     controller._content_search = SimpleNamespace(
-        search=Value([]), ensure_index=Value(0))
+        search_ensured=Value({"hits": [], "written": 0, "indexedChapters": 0,
+                              "ftsAvailable": True}))
     controller._tts = None
     controller._media = None
     controller._book_url = "http://127.0.0.1:1/book/1"
@@ -138,8 +139,9 @@ def test_content_search_does_not_render_hits_after_detach():
     """全书扫一遍要几秒，中途切页是常规操作不是意外。"""
     view, controller, _ = _reader_view()
     drawn = _spy(view.content_search_bar, ("render_results",))
-    controller._content_search.search = DetachThen(controller, after=[
-        {"chapter_index": 0, "line": 3, "text": "命中"}])
+    controller._content_search.search_ensured = DetachThen(controller, after={
+        "hits": [{"chapter_index": 0, "para_index": 3, "text": "命中"}],
+        "written": 0, "indexedChapters": 1, "ftsAvailable": True})
     asyncio.run(controller._run_content_search("关键词"))
     assert drawn == [], "detach 之后还往搜索条画命中"
 

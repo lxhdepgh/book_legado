@@ -1,21 +1,21 @@
 {
   "action": "search.stop",
   "protocol_version": 1,
-  "schema_digest": "ffef64386bec",
+  "schema_digest": "34822a1a5e7e",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "null",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-search.stop-1293298140000000",
+    "id": "r4-search.stop-1301812718000000",
     "action": "search.stop",
     "seq": 13,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-search.stop-1293298140000000",
+    "id": "r4-search.stop-1301812718000000",
     "ok": true,
     "data": null,
     "error": null,

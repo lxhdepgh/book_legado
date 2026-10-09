@@ -1,25 +1,25 @@
 {
   "action": "search.start",
   "protocol_version": 1,
-  "schema_digest": "ffef64386bec",
+  "schema_digest": "34822a1a5e7e",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-search.start-1293297937000000",
+    "id": "r4-search.start-1301812500000000",
     "action": "search.start",
     "seq": 12,
     "payload": {
       "keyword": "基线书",
       "scope": "G2离线",
-      "search_id": 12424
+      "search_id": 20939
     }
   },
   "response": {
     "v": 1,
-    "id": "r4-search.start-1293297937000000",
+    "id": "r4-search.start-1301812500000000",
     "ok": true,
     "data": {
       "started": true,
@@ -32,7 +32,7 @@
   "inline_row_count": null,
   "bytes": 40,
   "sha256": "f97c131101136796573bf314ae721f076261bdf10d589cffe46971bc8fe83dc2",
-  "client_wall_ms": 0.9,
+  "client_wall_ms": 0.5,
   "wire_bytes": 144,
   "field_names": [
     "action",
@@ -41,7 +41,7 @@
   "event_sample": {
     "name": "SearchFinishedEvent",
     "payload": {
-      "search_id": "12424",
+      "search_id": "20939",
       "items": [
         {
           "name": "基线书",
@@ -83,7 +83,7 @@
           ]
         }
       ],
-      "timestamp": 1791512424.6280115,
+      "timestamp": 1791520939.1889353,
       "finished": true
     },
     "payload_bytes": 762,

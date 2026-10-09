@@ -4,8 +4,10 @@
   **不进版本化迁移**（虚表随索引重建，契约 §9 末段）；
 - 索引只进主库（红线 8，无散落文件），文本来源复用 reader-cache 已缓存章节；
 - **一行 = 一个自然段**（不是引擎给的一个 text block）：正文整章常常只有一两个
-  ``<p>``，按块建行等于"章级偏移"，命中段落根本定位不到；切段口径与阅读器排版共用
-  :func:`app.core.text_layout.paragraph_lines`（红线 §7.5：视图不许 import 服务，
+  ``<p>``，按块建行等于"章级偏移"，命中段落根本定位不到；切段与段首偏移都取自
+  位置契约那把尺（:func:`app.core.text_layout.chapter_paragraphs` 配
+  :func:`~app.core.text_layout.paragraph_offsets`，底层仍是
+  :func:`~app.core.text_layout.paragraph_lines`；红线 §7.5：视图不许 import 服务，
   两边都够得着的只有 core）；
 - 未缓存章节不建索引（rebuild 时跳过，调用方应提示"先缓存"）；
 - 建索引的触发点是书内搜索第一次用（:meth:`ensure_index`），不是整书缓存收尾；
@@ -19,8 +21,8 @@ import sqlite3
 
 from app.core.lifecycle import Service
 from app.core.storage import LockedConnection, StorageService
-from app.core.text_layout import paragraph_lines
-from app.services.engine.reading_engine import render_use_html_spans
+from app.core.text_layout import chapter_paragraphs, paragraph_offsets
+from app.services.engine.reading_engine import display_blocks
 from app.services.reading_cache import ReadingCache
 
 logger = logging.getLogger(__name__)
@@ -119,21 +121,15 @@ class ContentSearchService(Service):
                 if document is None:  # 未缓存章节不建索引
                     continue
                 index = int(getattr(chapter, "index", 0) or 0)
-                running = 0
-                # 一章的段序号从 0 连续数过去（跨 text block 不重置）：阅读器把整章
-                # 正文平铺成一列段，跳转要的"第几段"是这个连续序号。
-                paragraph = 0
-                for block in document.blocks:
-                    if block.kind != "text" or not isinstance(block.value, str):
-                        continue
-                    # 与阅读器挂载的**同一份**文本：控制器喂给视图的是
-                    # ``render_use_html_spans(value)``（reader_controller._display_document），
-                    # 段序号要能对上屏幕上第几段，索引就不能按原文里的 <usehtml> 标记去数。
-                    for line in paragraph_lines(render_use_html_spans(block.value)):
-                        rows.append((book_url, index, float(running),
-                                     paragraph, line))
-                        running += len(line)
-                        paragraph += 1
+                # 段序号与段首偏移都取自**位置契约那把尺**（app.core.text_layout）：
+                # 命中跳转要把 para_index/offset 交回阅读器定位，而它落进度用的是
+                # 同一把尺导出的字符偏移。自己数一遍（旧写法 ``running += len(line)``）
+                # 每段少算一个换行格，跳过去就偏一段——偏差还随段数线性增长。
+                paragraphs = chapter_paragraphs(display_blocks(document))
+                offsets = paragraph_offsets(paragraphs)
+                for paragraph, line in enumerate(paragraphs):
+                    rows.append((book_url, index, float(offsets[paragraph]),
+                                 paragraph, line))
         # 清旧索引与写新索引是**一笔**：中途失败不会留下"半本书"的索引，
         # 而 transaction() 在别人事务里只加入、不会把别人夹在中间的写一起回滚。
         with conn.transaction():
@@ -209,3 +205,24 @@ class ContentSearchService(Service):
             }
             for row in rows
         ]
+
+    async def search_ensured(self, book_url: str, keyword: str,
+                             source_url: str = "") -> dict:
+        """书内搜索的一发面：先按需建索引，再查，并回"为什么可能是 0 条"。
+
+        把这两步拆给客户端是留陷阱：索引还没建时 ``search`` 回空列表，跨进程那侧
+        看起来与"这本书里没有这个词"一模一样（记忆 ``zero-counts-need-a-positive-control``）。
+        所以这一发把 ``indexed_chapters``（索引覆盖了几章）与 ``fts_available``
+        （这台机器有没有 FTS5）一起报回去，界面据此说"只搜了已缓存的 N 章"。
+        """
+        written = await self.ensure_index(book_url, source_url)
+        hits = await self.search(book_url, keyword)
+        conn = self._conn()
+        indexed = (await asyncio.to_thread(self._indexed_chapters, conn, book_url)
+                   if conn is not None and self._fts_available else 0)
+        return {
+            "hits": hits,
+            "written": int(written),
+            "indexedChapters": int(indexed),
+            "ftsAvailable": bool(conn is not None and self._fts_available),
+        }

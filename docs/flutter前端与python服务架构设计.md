@@ -291,7 +291,7 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 | **G0** | `GatewayService` + action 表 + schema + `--serve` 无头 + 单循环化 + §5 六条护栏 | 1–1.5 周 | 无头进程能被 curl 驱动完成"列书架 / 起一次检测并收进度事件"；serve 路径 import flet = 0；退出码 0 且关窗→消失延迟有读数；全库回归仍全绿 |
 | **G1** | Flutter 壳 + `RpcEngineRepository` + 握手 + `bookshelf` 一屏（真数据） | 1 周 | Flutter 那屏的行数/内容与 flet 屏一致（同书单比对——靶子：R4 那份副本上 `bookshelf.list` = **7 行 / 25,012 B**、`source.list` = 920 行 / 6,969,038 B（**这是 §4.2 出口投影之前的载荷**），冷启动到握手 640 ms 也要有同臂读数）；R1 竖切有结论 |
 | **G2** | 高频只读面：`find_books` / `sources` / `check` / 设置页 | 2–3 周 | R4 三项量过且 ≥ flet：对照靶就是第八十二轮同一份 920 行副本上的读数（滚动每拍下发 390 ms、其中空列表底价 3 ms；`source.list` 跨进程 p50 80.6 ms；首屏行落满 561 ms）；契约测试覆盖这 4 个域的全部 action。**2026-10-09 第八十五轮交**：三项各有 Dart 侧读数与自己的底价臂（跨进程 Dart A 30.9 ms / Python 同副本重测 20.5 + 1.7，界面两臂只与自家底价比——口径不同不许直读）；31 条动作 30 份真进程靶子；那 1.7 倍归因到载荷后用 §4.2 的出口投影改判成 1.39 倍 |
-| **G3** | **阅读器**（最大单块，排版/翻页/进度/书签/换源） | 2–3 周 | 同一本书翻页落点与 flet 版可比（按字符偏移断言）；R1 涉及的源在真机上读到正文 |
+| **G3** | **阅读器**（最大单块，排版/翻页/进度/书签/换源） | 2–3 周 | 同一本书翻页落点与 flet 版可比（按字符偏移断言）；R1 涉及的源在真机上读到正文。**底座那一半已交（2026-10-09 第八十六轮）**：位置契约这把尺立起来了（章内字符偏移由段号导出，进度/FTS/flet 命中跳转三口共用），`reader.*` 13 条动作各有真进程靶子；**两条判据都要等 G3-C 的 Dart 屏**才第一次有两条读数可比 |
 | **G4** | `rss` / 漫画 / 朗读 / 工具域 / 老板键托盘；删 flet 依赖与 4 个 UI 耦合服务；PyInstaller spec 去 flet* | 2–3 周 | flet 从 `requirements.txt` 消失后全库仍绿；打包冒烟（照真果鉴 `smoke_windows.py` 那条：解压产物跑一次 `--package-smoke`） |
 
 累计 **9–12 周**单人全职（G0 之外）。参照系：真果鉴这条路线做出来的是
@@ -388,6 +388,25 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 > `1956 passed, 161 subtests passed in 188.44s`；Dart `164 passed / 3 skipped`、
 > `flutter analyze` 只剩 6 条既有 info。读数、仪器坑（含"每行键数固定"这个被 Gson 丢 null
 > 打死的假守卫、探针里的字节底价该换成现读键集）见 `docs/dev-logs/2026-10-09.md`。
+> **G3-A + G3-B 同日交（2026-10-09，第八十六轮）**：先立**一把尺**再开协议面——
+> 章内字符偏移 = `"\n".join(chapter_paragraphs(display_blocks(...)))` 的下标
+> （`app/core/text_layout.py`，段间那 1 个字符叫 `PARAGRAPH_JOINER_LEN`），三个此前各数一遍的
+> 读数口（进度存读、FTS 索引的段首偏移、flet 命中跳转）现在共用它；17 条守卫 + 13 发变异全红。
+> `reader.*` 那 **13 条动作**（表从 31 长到 **44**：`call` 35 / `sync` 7 / `job` 2，10 个命名空间）
+> 各配一份入参 schema（`app/gateway/schema/*.json` 44 份）、一根真进程靶子：会话是**单例**，
+> 所以门面**显式吃 url**、对不上就抛 `ReaderSessionError`（不靠隐式状态猜），出参
+> `ChapterItem`/`ChapterContent`/`ReadingPosition` 全部序列化成 dict（二进制块只报
+> `binary`+`url` 不给值，§4.4）。语料 56 份 / `digest=34822a1a5e7e`，reader 面读数
+> **目录 6 章 / 正文 8 段 5,802 字 / 书内命中 4 条**，`reader.toc` 走 §4.2 那格出口投影
+> （8 格），并收下语料里**第一发故意失败**的信封（`reader.toc--no-session`：拒答而不是回空目录，
+> 回空目录看起来像书坏了）。三处产品缺陷是活臂撞出来的：RPC 存的位置被 `reader.close` 盖回默认值、
+> 受保护插图过协议面就失去可渲染地址（`GET /media/{key}` 尚未建，地址是客户端唯一把手）、
+> `to_json` 不按类型泄漏所以泄漏守卫必须打裸返回值；第四条是**仪器自己造信号**——扫 Dart
+> 调用点那把尺把 `action_budgets.dart` 的表键读成调用点，"每一发都有人调"当场失去牙齿。
+> 协议先行、界面未接的那 13 发记在**具名欠据表** `_UNWIRED_PENDING_GATE`（判据仍是键集相等，
+> 两个方向都咬）。变异核验 **39 发全红 / 26 条守卫各有靶子**。回归：Python
+> `1995 passed, 161 subtests passed in 141.61s`；Dart `164 passed / 3 skipped`、
+> `flutter analyze` 仍是 6 条既有 info。账见 `docs/dev-logs/2026-10-09.md` 第八十六轮。
 
 ---
 
@@ -399,7 +418,7 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
   G1 另外立了 `tests/gateway/projection/*.json`：那一摞不是信封样本而是**flet 那屏自己算出来的
   参照表**（书名/副标题/状态行的逐行文本），它没有请求也没有响应，混进 `golden/` 只会逼
   守卫为它开一条特例。
-- **Python 面**：现有回归（2026-10-09 第八十五轮后实测 `1956 passed, 161 subtests passed`）基本不动；
+- **Python 面**：现有回归（2026-10-09 第八十六轮后实测 `1995 passed, 161 subtests passed`）基本不动；
   网关测试全离线（`127.0.0.1` 假服务，沿用
   记忆里"离线回环探针"的套路，不批量访问真实站点）。
   一条跑法上的坑：一次全量会在机器上留下约 **1100 个 TIME_WAIT**（Windows 默认 120s 退），

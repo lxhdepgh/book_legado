@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "description": "reader.position_get 入参：读一本书的续读位置。这一发不需要会话（直接查 books 表），书架那一屏问「读到哪了」走的就是它。",
+  "properties": {
+    "source_url": {
+      "type": "string",
+      "description": "bookSourceUrl。"
+    },
+    "book_url": {
+      "type": "string",
+      "description": "books/bookUrl。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "book_url",
+    "source_url"
+  ]
+}

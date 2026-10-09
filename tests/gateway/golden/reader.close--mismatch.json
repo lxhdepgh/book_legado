@@ -1,0 +1,41 @@
+{
+  "action": "reader.close",
+  "protocol_version": 1,
+  "schema_digest": "34822a1a5e7e",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "会话已经不是这本书：这一发必须什么都不关",
+  "data_shape": "object",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-reader.close-1301814375000000",
+    "action": "reader.close",
+    "seq": 16,
+    "payload": {
+      "source_url": "http://127.0.0.1:8797/g3",
+      "book_url": "http://127.0.0.1:9/没开过的书",
+      "save_progress": true
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-reader.close-1301814375000000",
+    "ok": true,
+    "data": {
+      "closed": false,
+      "staged": null
+    },
+    "error": null,
+    "code": null
+  },
+  "row_count": 1,
+  "inline_row_count": null,
+  "bytes": 30,
+  "sha256": "5031519063e44cc0e25281b4f84f83eb6f2a518bc709cd72e7b94c5feb30b46c",
+  "client_wall_ms": 0.5,
+  "wire_bytes": 134,
+  "field_names": [
+    "closed",
+    "staged"
+  ]
+}

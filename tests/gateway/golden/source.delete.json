@@ -1,23 +1,23 @@
 {
   "action": "source.delete",
   "protocol_version": 1,
-  "schema_digest": "ffef64386bec",
+  "schema_digest": "34822a1a5e7e",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "scalar",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-source.delete-1293299187000000",
+    "id": "r4-source.delete-1301814421000000",
     "action": "source.delete",
-    "seq": 25,
+    "seq": 27,
     "payload": {
-      "url": "http://127.0.0.1:8797/g2"
+      "url": "http://127.0.0.1:8797/g3"
     }
   },
   "response": {
     "v": 1,
-    "id": "r4-source.delete-1293299187000000",
+    "id": "r4-source.delete-1301814421000000",
     "ok": true,
     "data": true,
     "error": null,
@@ -27,7 +27,7 @@
   "inline_row_count": null,
   "bytes": 4,
   "sha256": "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b",
-  "client_wall_ms": 107.6,
+  "client_wall_ms": 101.3,
   "wire_bytes": 106,
   "field_names": []
 }

@@ -1,0 +1,70 @@
+{
+  "action": "reader.search_content",
+  "protocol_version": 1,
+  "schema_digest": "34822a1a5e7e",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
+  "data_shape": "object",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-reader.search_content-1301814343000000",
+    "action": "reader.search_content",
+    "seq": 12,
+    "payload": {
+      "book_url": "http://127.0.0.1:8797/g3/book/1.html",
+      "keyword": "第3段",
+      "source_url": "http://127.0.0.1:8797/g3"
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-reader.search_content-1301814343000000",
+    "ok": true,
+    "data": {
+      "hits": [
+        {
+          "chapter_index": 1,
+          "para_index": 2,
+          "offset": 1578.0,
+          "snippet": "第2章<mark>第3段</mark>字句读纸张看灯下山风月夜…"
+        },
+        {
+          "chapter_index": 2,
+          "para_index": 2,
+          "offset": 1578.0,
+          "snippet": "第3章<mark>第3段</mark>字句读纸张看灯下山风月夜…"
+        },
+        {
+          "chapter_index": 3,
+          "para_index": 2,
+          "offset": 1578.0,
+          "snippet": "第4章<mark>第3段</mark>字句读纸张看灯下山风月夜…"
+        },
+        {
+          "chapter_index": 4,
+          "para_index": 2,
+          "offset": 1578.0,
+          "snippet": "第5章<mark>第3段</mark>字句读纸张看灯下山风月夜…"
+        }
+      ],
+      "written": 32,
+      "indexedChapters": 4,
+      "ftsAvailable": true
+    },
+    "error": null,
+    "code": null
+  },
+  "row_count": 1,
+  "inline_row_count": null,
+  "bytes": 583,
+  "sha256": "120a51ad562d17952d00e7f696a223bdfe262da11450cce787e775b3bcfc3488",
+  "client_wall_ms": 19.9,
+  "wire_bytes": 731,
+  "field_names": [
+    "ftsAvailable",
+    "hits",
+    "indexedChapters",
+    "written"
+  ]
+}

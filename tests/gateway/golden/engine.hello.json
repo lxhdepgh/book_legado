@@ -1,21 +1,21 @@
 {
   "action": "engine.hello",
   "protocol_version": 1,
-  "schema_digest": "ffef64386bec",
+  "schema_digest": "34822a1a5e7e",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-engine.hello-1293297343000000",
+    "id": "r4-engine.hello-1301811937000000",
     "action": "engine.hello",
     "seq": 1,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-engine.hello-1293297343000000",
+    "id": "r4-engine.hello-1301811937000000",
     "ok": true,
     "data": {
       "protocol_version": 1,
@@ -27,7 +27,7 @@
         "job.actions",
         "webview.reverse"
       ],
-      "schema_digest": "ffef64386bec",
+      "schema_digest": "34822a1a5e7e",
       "actions": [
         "bookshelf.add",
         "bookshelf.list",
@@ -43,6 +43,19 @@
         "engine.webContentReady",
         "import.text",
         "import.url",
+        "reader.bookmark_add",
+        "reader.bookmark_remove",
+        "reader.bookmarks",
+        "reader.close",
+        "reader.content",
+        "reader.open",
+        "reader.position_get",
+        "reader.position_save",
+        "reader.search_content",
+        "reader.staged",
+        "reader.staged_discard",
+        "reader.staged_promote",
+        "reader.toc",
         "search.scopes",
         "search.start",
         "search.stop",
@@ -61,17 +74,17 @@
         "theme.preferences",
         "theme.save"
       ],
-      "pid": 84940
+      "pid": 79888
     },
     "error": null,
     "code": null
   },
   "row_count": 1,
   "inline_row_count": null,
-  "bytes": 676,
-  "sha256": "d1174aca652a84e5a644290a107ae2edddd2b7ab05b452fe132ab9e363a2a47b",
-  "client_wall_ms": 6.6,
-  "wire_bytes": 822,
+  "bytes": 934,
+  "sha256": "ea0002ec515ed67eed286731065568a3b1ba2d445d13ce3cade49234740d457c",
+  "client_wall_ms": 6.2,
+  "wire_bytes": 1093,
   "field_names": [
     "actions",
     "build",

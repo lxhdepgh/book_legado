@@ -1,0 +1,6 @@
+{
+  "type": "object",
+  "description": "reader.staged_discard 入参：无。放弃当前会话那条试读暂存记录（连同它的进度与目录缓存一起删）。没有暂存记录时回 false。",
+  "properties": {},
+  "additionalProperties": false
+}

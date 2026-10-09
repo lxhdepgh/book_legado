@@ -1,0 +1,137 @@
+{
+  "action": "search.start",
+  "protocol_version": 1,
+  "schema_digest": "34822a1a5e7e",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "G3 阅读面取书那一发：reader.open 的 book 快照来自这里（单独一个名字，别把 G2 那份带事件交付的样本顶掉）",
+  "data_shape": "object",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-search.start-1301813906000000",
+    "action": "search.start",
+    "seq": 2,
+    "payload": {
+      "keyword": "阅读基线书",
+      "scope": "G3离线",
+      "search_id": 20940
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-search.start-1301813906000000",
+    "ok": true,
+    "data": {
+      "started": true,
+      "action": "search.start"
+    },
+    "error": null,
+    "code": null
+  },
+  "row_count": 1,
+  "inline_row_count": null,
+  "bytes": 40,
+  "sha256": "f97c131101136796573bf314ae721f076261bdf10d589cffe46971bc8fe83dc2",
+  "client_wall_ms": 0.6,
+  "wire_bytes": 144,
+  "field_names": [
+    "action",
+    "started"
+  ],
+  "event_sample": {
+    "name": "SearchFinishedEvent",
+    "payload": {
+      "search_id": "20940",
+      "items": [
+        {
+          "name": "阅读基线书",
+          "author": "作者戊",
+          "intro": "",
+          "url": "http://127.0.0.1:8797/g3/book/1.html",
+          "cover_url": "",
+          "toc_url": "",
+          "kind": "连载",
+          "last_chapter": "",
+          "latest_chapter_title": "",
+          "word_count": "",
+          "download_urls": null,
+          "origin": "http://127.0.0.1:8797/g3",
+          "origin_name": "G3阅读源",
+          "type": 8,
+          "total_chapter_num": 0,
+          "dur_chapter_index": 0,
+          "dur_chapter_title": "",
+          "can_update": true,
+          "custom_intro": "",
+          "custom_tag": "",
+          "custom_cover_url": "",
+          "charset": "",
+          "group": 0,
+          "latest_chapter_time": 0,
+          "last_check_time": 0,
+          "last_check_count": 0,
+          "dur_chapter_pos": 0,
+          "dur_chapter_time": 0,
+          "order": 0,
+          "origin_order": 0,
+          "read_config": {},
+          "info_html": "",
+          "toc_html": "",
+          "variables": {},
+          "origins": [
+            "http://127.0.0.1:8797/g3"
+          ]
+        }
+      ],
+      "timestamp": 1791520940.5950482,
+      "finished": true
+    },
+    "payload_bytes": 777,
+    "payload_list_key": "items",
+    "row_count": 1,
+    "inline_row_count": 1,
+    "event_field_names": [
+      "author",
+      "can_update",
+      "charset",
+      "cover_url",
+      "custom_cover_url",
+      "custom_intro",
+      "custom_tag",
+      "download_urls",
+      "dur_chapter_index",
+      "dur_chapter_pos",
+      "dur_chapter_time",
+      "dur_chapter_title",
+      "group",
+      "info_html",
+      "intro",
+      "kind",
+      "last_chapter",
+      "last_check_count",
+      "last_check_time",
+      "latest_chapter_time",
+      "latest_chapter_title",
+      "name",
+      "order",
+      "origin",
+      "origin_name",
+      "origin_order",
+      "origins",
+      "read_config",
+      "toc_html",
+      "toc_url",
+      "total_chapter_num",
+      "type",
+      "url",
+      "variables",
+      "word_count"
+    ],
+    "payload_field_names": [
+      "finished",
+      "items",
+      "search_id",
+      "timestamp"
+    ]
+  }
+}

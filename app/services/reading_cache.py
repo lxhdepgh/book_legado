@@ -89,7 +89,9 @@ class ReadingCache:
                     value = base64.b64decode(value)
                 blocks.append(ContentBlock(
                     str(item.get("kind") or "text"), value,
-                    dict(item.get("headers") or {}), str(item.get("title") or "")))
+                    dict(item.get("headers") or {}), str(item.get("title") or ""),
+                    # 旧缓存文件没有 url 这一格：取空串，等于这块本来就没被换成字节。
+                    str(item.get("url") or "")))
             return ChapterContent(
                 blocks=blocks, title=str(data.get("title") or ""),
                 image_style=str(data.get("image_style") or ""),
@@ -107,6 +109,9 @@ class ReadingCache:
             blocks.append({
                 "kind": block.kind, "value": value, "bytes": is_bytes,
                 "headers": block.headers, "title": block.title,
+                # 字节块的地址只剩这一格认得（value 已被 _load_protected_images 换掉），
+                # 不落盘等于让跨进程那侧渲染不出图。
+                "url": str(getattr(block, "url", "") or ""),
             })
         self._write(self._content_path(source_url, book_url, chapter_url), {
             "version": self.VERSION,

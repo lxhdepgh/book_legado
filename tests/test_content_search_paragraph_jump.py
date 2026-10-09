@@ -112,8 +112,17 @@ def test_one_block_with_three_paragraphs_becomes_three_rows(svc, cache):
     lines = paragraph_lines(THREE_PARAGRAPHS)
     assert [int(r[0]) for r in rows] == [0, 1, 2], f"段序号不连续：{rows}"
     assert [r[2] for r in rows] == lines, "索引存的段文本与切段结果不一致"
-    assert [float(r[1]) for r in rows] == [0.0, float(len(lines[0])),
-                                           float(len(lines[0]) + len(lines[1]))]
+    # 段首偏移把"段间那一个换行格"算进去：0 / len0+1 / len0+1+len1+1。
+    # 改前这里写的是 len(lines[0]) 与 len(lines[0])+len(lines[1])——每往后一段少一格，
+    # 索引报的 offset 与位置契约那把尺（章内字符流 = "\n".join(段)）就不是同一个数，
+    # 命中跳过去偏的段数随段号线性增长。+1 写成字面量，不读被测常量。
+    assert [float(r[1]) for r in rows] == [
+        0.0, float(len(lines[0])) + 1,
+        float(len(lines[0])) + 1 + len(lines[1]) + 1], (
+        f"段首偏移没按章内字符流数：{[r[1] for r in rows]} vs {lines}")
+    # 反证：旧那把尺（不含换行格）不许同时通过，否则这条守卫是聋的。
+    assert [float(r[1]) for r in rows] != [
+        0.0, float(len(lines[0])), float(len(lines[0]) + len(lines[1]))]
 
 
 def test_search_reports_the_paragraph_that_contains_the_keyword(svc, cache):

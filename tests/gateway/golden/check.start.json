@@ -1,14 +1,14 @@
 {
   "action": "check.start",
   "protocol_version": 1,
-  "schema_digest": "ffef64386bec",
+  "schema_digest": "34822a1a5e7e",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-check.start-1293298171000000",
+    "id": "r4-check.start-1301812734000000",
     "action": "check.start",
     "seq": 16,
     "payload": {
@@ -19,7 +19,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-check.start-1293298171000000",
+    "id": "r4-check.start-1301812734000000",
     "ok": true,
     "data": {
       "started": true,
@@ -32,7 +32,7 @@
   "inline_row_count": null,
   "bytes": 39,
   "sha256": "717c8da837b1426f8b28fdf23250fc5b98c08eff5f02eb1116090eb3db88c103",
-  "client_wall_ms": 0.7,
+  "client_wall_ms": 0.5,
   "wire_bytes": 142,
   "field_names": [
     "action",
@@ -46,7 +46,7 @@
       "summary": "G2分类源：list_usable（本轮快速检测，未验正文）",
       "done": 1,
       "total": 1,
-      "timestamp": 1791512424.8689477
+      "timestamp": 1791520939.4315772
     },
     "payload_bytes": 195,
     "payload_list_key": null,

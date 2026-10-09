@@ -161,20 +161,25 @@ _DART_EXTENSIONS = (".dart", ".py", ".json", ".yaml", ".site")
 
 
 def _action_literals(text: str) -> list[str]:
-    """扫出**像 action** 的字符串字面量，排掉两类同形状的邻居。
+    """扫出**像 action 的调用点**的字符串字面量，排掉三类同形状的邻居。
 
     - `import 'router.dart'`：文件名也是 `小写.小写`，靠后缀排掉；
     - `Key('bookshelf.refresh')`：控件键与 action 用的是同一个 `域.名词` 形状，
-      但它不是协议面上的东西，靠 `Key(` 前缀排掉。
+      但它不是协议面上的东西，靠 `Key(` 前缀排掉；
+    - `'reader.open': 60`：`action_budgets.dart` 里那是一张**预算表**，字面量后面
+      跟冒号的是"给某个动作定预算"，不是"调这个动作"。这一条是 G3-B 现场抓到的：
+      只给协议面登记、界面还没接的动作一进预算表，就被读成"客户端在调"，
+      "每一发都有人调"那半边当场失去牙齿（记忆里 `measurement-corpus-must-not-be-self-proving`
+      的同形：仪器自己造出了它要读的那个信号）。
 
-    排掉的两条都必须窄：宽到"整个文件跳过"就把真调用点也一起藏了。
+    排掉的三条都必须窄：宽到"整个文件跳过"就把真调用点也一起藏了。
 
     **段里允许下划线**（`source.batch_enable`）：这一条是 G2-E 补的——原来那版只认
     `[a-zA-Z]*`，于是两条带下划线的动作对扫描器**完全隐形**，
     "客户端有没有调它"读出来是"没调"，而 Dart 那边其实早就在调。
     """
     shape = re.compile(
-        r"(?<!Key\()'([a-z][a-zA-Z_]*\.[a-zA-Z][a-zA-Z_0-9]*)'")
+        r"(?<!Key\()'([a-z][a-zA-Z_]*\.[a-zA-Z][a-zA-Z_0-9]*)'(?!\s*:)")
     return [m for m in shape.findall(text)
             if not any(m.endswith(ext) for ext in _DART_EXTENSIONS)]
 
@@ -187,17 +192,44 @@ def test_widget_key_lookalikes_are_not_mistaken_for_actions() -> None:
 
     第二行 `source.batch_enable` 是 G2-E 加的第二种形状：段里带下划线的那批动作
     曾经对扫描器完全隐形，只喂 `bookshelf.list` 这种"干净"的名字照不出这个洞。
+
+    第三行 `'reader.open': 60` 是 G3-B 加的第三种形状：预算表里的键不是调用点。
+    同一发动作在第四行真的被调用，它必须照样被扫出来——不然这一条就成了
+    "把 reader 整族排掉"，方向正好反过来。
     """
     sample = ("  final a = client.call('bookshelf.list');\n"
               "  key: const Key('bookshelf.refresh'),\n"
               "  await client.call('source.batch_enable', payload: x);\n"
+              "  'reader.open': 60,\n"
+              "  await client.call('reader.open', payload: x);\n"
               "import 'router.dart';\n")
-    assert _action_literals(sample) == ["bookshelf.list", "source.batch_enable"], \
-        _action_literals(sample)
+    assert _action_literals(sample) == [
+        "bookshelf.list", "source.batch_enable", "reader.open"], _action_literals(sample)
 
 
 #: 反向通道那一发不是客户端能调的（是引擎求客户端渲染 `<useweb>`，§8 R1，G3 才接）。
 _REVERSE_CHANNEL = {"engine.webContentReady"}
+
+#: 协议面先落地、界面还没接的那几发：每条**必须写明是哪一门欠的**。
+#:
+#: 这一张表是"欠据"，不是逃生口——下面那条判据比的是**键集相等**，所以
+#: ① 新加动作既没接界面又没在这里具名 → 红；② 门到了、界面接上了却没把这一格划掉
+#: → 一样红。两头都咬，欠据就悄悄不成长期账单。
+_UNWIRED_PENDING_GATE = {
+    "reader.open": "G3-C",
+    "reader.close": "G3-C",
+    "reader.toc": "G3-C",
+    "reader.content": "G3-C",
+    "reader.position_get": "G3-C",
+    "reader.position_save": "G3-C",
+    "reader.staged": "G3-C",
+    "reader.staged_promote": "G3-C",
+    "reader.staged_discard": "G3-C",
+    "reader.bookmarks": "G3-C",
+    "reader.bookmark_add": "G3-C",
+    "reader.bookmark_remove": "G3-C",
+    "reader.search_content": "G3-C",
+}
 
 
 def _dart_action_calls() -> dict[str, list[str]]:
@@ -215,8 +247,9 @@ def test_action_table_and_dart_callers_cover_each_other() -> None:
     前半个方向：表外动作在服务端回 `bad_request`，用户看到的是"点了没反应"。
     后半个方向是 G2-E 才补上的，查"服务端建好了、Dart 一行都没调"——
     那种动作不会报错，只会让某一屏永远缺一块（`refactor-regression-orphan-methods`
-    的同一条：接线断了，测试全绿）。今天允许的例外只有反向通道那一条，
-    而且例外必须是**具名**的：加动作时忘了接界面，这里当场红。
+    的同一条：接线断了，测试全绿）。今天允许的例外只有两类，而且都必须**具名**：
+    反向通道那一条（客户端本来就不会调它），和 `_UNWIRED_PENDING_GATE` 那几张欠据
+    （协议面先行、写明哪一门来接）。加动作时忘了接界面，这里当场红。
     """
     used = _dart_action_calls()
     assert used, "Dart 里一个 action 都没扫到——仪器没接上"
@@ -224,9 +257,14 @@ def test_action_table_and_dart_callers_cover_each_other() -> None:
     assert not unknown, f"客户端在调用没登记过的动作：{unknown}"
 
     never_called = sorted(set(BY_ACTION) - set(used))
-    assert never_called == sorted(_REVERSE_CHANNEL), (
-        f"这些动作登记在服务端却没有任何 Dart 调用点：{never_called}\n"
-        f"（唯一该在的是 {sorted(_REVERSE_CHANNEL)}；新接上界面就把它从例外表里删掉）")
+    pending = sorted(_REVERSE_CHANNEL | set(_UNWIRED_PENDING_GATE))
+    # 这一条是**双向**咬的：动作从表上没了、欠据还挂着，或者界面接上了、欠据没划掉，
+    # 两个方向都会让这两个集合不相等（后一个方向的牙齿由变异核验钉着，
+    # 见 ``.probe/g3b_mutation_check.py`` 的"表上删掉一条 reader 动作"那一发）。
+    assert never_called == pending, (
+        f"这些动作登记在服务端却没有 Dart 调用点，与欠据表不符：{never_called}\n"
+        f"（该在的是 {pending}；接上界面就把 _UNWIRED_PENDING_GATE 里那一格划掉，"
+        f"加了动作还没接就补一张具名欠据）")
 
 
 #: Dart 那条默认水池（`RpcClient.timeout` 的默认值）。表外的动作都走它。

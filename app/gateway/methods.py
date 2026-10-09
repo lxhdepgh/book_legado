@@ -70,6 +70,8 @@ _SELF = "app.services.gateway.service.GatewayService"
 _SOURCES = "app.services.sources.source_service.SourceService"
 _CHECK = "app.services.sources.source_check_service.SourceCheckService"
 _READING = "app.services.reading.reading_service.ReadingService"
+_BOOKMARK = "app.services.reading.bookmark_service.BookmarkService"
+_CONTENT_SEARCH = "app.services.reading.content_search.ContentSearchService"
 _IMPORT = "app.services.sources.online_import_service.OnlineImportService"
 _AUDIT = "app.services.sources.compat_audit_service.CompatAuditService"
 _SETTINGS = "app.core.settings.SettingsService"
@@ -113,6 +115,47 @@ METHODS: tuple[Method, ...] = (
        summary="本地文本导入（kind=book_source 才真落库，其余登记说明不动数据）"),
     _m("import.url", _IMPORT, "import_from_url", ("url", "kind", "mode"), 120.0,
        summary="按 URL 拉取再导入；拉不到记一条 error 而不是抛穿"),
+    _m("reader.open", _READING, "open_by_url",
+       ("source_url", "book", "shelve", "resume"), 60.0,
+       summary="开阅读会话：按 url 取回书源、载目录、恢复进度、按需入书架；"
+               "目录不在这一发里（几千章另走 reader.toc）"),
+    _m("reader.close", _READING, "close_by_url",
+       ("source_url", "book_url", "save_progress"), 20.0,
+       summary="结束会话并按需落最后一篇进度；url 对不上当前会话就什么都不关"),
+    _m("reader.toc", _READING, "chapter_rows",
+       ("source_url", "book_url", "refresh"), 60.0,
+       summary="目录行：只带目录那一屏要的字段，正文与逐源变量不过协议面",
+       fields=("name", "url", "index", "isVolume", "isVip", "isPay", "tag",
+               "wordCount")),
+    _m("reader.content", _READING, "chapter_document",
+       ("source_url", "book_url", "chapter_url"), 60.0,
+       summary="一章正文（已是可显示形态，``<usehtml>`` 在服务侧渲染掉）；"
+               "顺带起一轮预取，二进制块只报 binary 不给值"),
+    _m("reader.position_get", _READING, "read_position",
+       ("source_url", "book_url"), 10.0,
+       summary="续读位置：回的是 books 表那一份存档的形状，没有记录就是 null"),
+    _m("reader.position_save", _READING, "save_position",
+       ("source_url", "book_url", "position_json"), 10.0,
+       summary="落一篇阅读位置：章按 index 认、偏移与段号按本章字符流收口，"
+               "回落库后的形状（客户端据此知道自己存进去的是什么）"),
+    _m("reader.staged", _READING, "staged_record", (), 5.0, mode="sync",
+       summary="当前书若是 notShelf 试读暂存给出那条书架记录，在架的书回 null"),
+    _m("reader.staged_promote", _READING, "promote_staged_book", (), 10.0,
+       summary="试读转正：暂存记录原地变书架记录，进度/变量/目录缓存不动"),
+    _m("reader.staged_discard", _READING, "discard_staged_book", (), 10.0,
+       summary="试读放弃：删掉那条暂存记录"),
+    _m("reader.bookmarks", _BOOKMARK, "list_bookmarks", ("book_url",), 10.0,
+       summary="按书列书签（创建时间升序）"),
+    _m("reader.bookmark_add", _BOOKMARK, "add_bookmark",
+       ("book_url", "chapter_index", "offset", "summary"), 10.0,
+       summary="加一条书签，回它的 id"),
+    _m("reader.bookmark_remove", _BOOKMARK, "remove_bookmark",
+       ("book_url", "bookmark_id"), 10.0,
+       summary="删一条书签；回是否真删到（可能已被另一侧删过）"),
+    _m("reader.search_content", _CONTENT_SEARCH, "search_ensured",
+       ("book_url", "keyword", "source_url"), 120.0,
+       summary="书内全文检索：先按需补索引再查，并回索引覆盖几章——"
+               "0 命中要分得清『没缓存』与『真没有』"),
     _m("browse.categories", _READING, "browse_categories", ("source_url",), 30.0,
        summary="该书源的分类清单（静态与 @js: 动态都在引擎里解析）"),
     _m("browse.books", _READING, "browse_books", ("source_url", "category", "page"),

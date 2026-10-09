@@ -339,7 +339,7 @@ void main() {
     });
   });
 
-  test('每一发样本都是合法信封、且服务端认账（31 发全覆盖）', () {
+  test('每一发样本都是合法信封、且服务端认账（56 发全覆盖）', () {
     final dir = Directory('${_repoRoot.path}/tests/gateway/golden');
     final names = dir
         .listSync()
@@ -349,7 +349,16 @@ void main() {
         .toList()
         ..sort();
     // 正对照：样本面塌了（目录空/改名）这格会假绿，所以先钉数量。
-    expect(names.length, greaterThanOrEqualTo(31), reason: '黄金样本只剩 ${names.length} 发');
+    expect(names.length, greaterThanOrEqualTo(56), reason: '黄金样本只剩 ${names.length} 发');
+
+    // 语料里有一族**故意失败**的信封：协议面必须有一发让客户端看清"错误信封长什么样"
+    // （会话不是这本书 → 拒答而不是回空目录，回空目录看起来像书坏了）。
+    // 这一族必须**具名**：表外的样本一律按成功信封要求，所以"整批都成了失败"
+    // 这条路是走不通的；反过来，具名的那一发如果哪天真的成功了，这里也红。
+    const errorSamples = <String>{'reader.toc--no-session'};
+    for (final name in errorSamples) {
+      expect(names, contains(name), reason: '欠着的错误样本 $name 不在语料里');
+    }
 
     final hello = _envelopeOf(_load('engine.hello'))['data']! as Map;
     final advertised = (hello['actions']! as List).cast<String>();
@@ -357,7 +366,17 @@ void main() {
       final sample = _load(name);
       final envelope = RpcEnvelope.decode(
           Map<String, Object?>.from(sample['response']! as Map), action: name);
-      expect(envelope.ok, isTrue, reason: '$name：样本存的是一发失败，客户端没道理拿它当契约');
+      if (errorSamples.contains(name)) {
+        expect(envelope.ok, isFalse, reason: '$name：这一发存的就是失败信封');
+        expect(envelope.error, isNotNull, reason: '$name：失败信封没带原因');
+        expect(envelope.error!.isNotEmpty, isTrue, reason: '$name：失败信封的原因是空串');
+        expect(envelope.data, isNull, reason: '$name：失败信封还带着 data');
+        expect(() => envelope.dataOrThrow(action: name), throwsA(isA<EngineFailure>()),
+            reason: '$name：客户端拿它不当失败处理');
+      } else {
+        expect(envelope.ok, isTrue,
+            reason: '$name：样本存的是一发失败，客户端没道理拿它当契约');
+      }
       expect(envelope.v, kProtocolVersion, reason: name);
       // 样本名 = `action`（带 `--参数` 的那几发除外，它们的 action 是主干）。
       expect(advertised, contains(sample['action']),

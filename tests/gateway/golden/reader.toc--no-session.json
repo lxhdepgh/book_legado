@@ -1,0 +1,34 @@
+{
+  "action": "reader.toc",
+  "protocol_version": 1,
+  "schema_digest": "34822a1a5e7e",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "会话不是这本书：服务端拒答而不是回空目录（回空目录看起来像书坏了）",
+  "data_shape": "null",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "g3-reader.toc-1301814421000000",
+    "action": "reader.toc",
+    "seq": 0,
+    "payload": {
+      "source_url": "http://127.0.0.1:8797/g3",
+      "book_url": "http://127.0.0.1:9/没开过的书"
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "g3-reader.toc-1301814421000000",
+    "ok": false,
+    "data": null,
+    "error": "ReaderSessionError: 当前会话不是这本书，先调 reader.open：source='http://127.0.0.1:8797/g3' book='http://127.0.0.1:9/没开过的书'（会话=('http://127.0.0.1:8797/g3', 'http://127.0.0.1:8797/g3/book/preview.html')）",
+    "code": "engine"
+  },
+  "row_count": 0,
+  "inline_row_count": null,
+  "bytes": 4,
+  "sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+  "client_wall_ms": 0.5,
+  "wire_bytes": 339,
+  "field_names": []
+}

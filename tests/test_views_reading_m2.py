@@ -105,8 +105,8 @@ def _stub_services():
         remove_bookmark=AsyncMock(return_value=True),
     )
     content_search = SimpleNamespace(
-        search=AsyncMock(return_value=[]),
-        ensure_index=AsyncMock(return_value=0),
+        search_ensured=AsyncMock(return_value={
+            "hits": [], "written": 0, "indexedChapters": 0, "ftsAvailable": True}),
     )
     download = SimpleNamespace(
         enqueue=lambda *a, **k: "task-1",
@@ -883,8 +883,10 @@ class ContentSearchBarPathTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view.content_search_bar.on_search, controller.search_in_book)
         # ui_call 会派到真 engine loop；直接跑内部协程断言服务调用路径。
         await controller._run_content_search("命运")
-        services[ContentSearchService].search.assert_awaited_once_with(
-            "https://x/book", "命运")
+        # 走的是 search_ensured 那一发：flet 路径与协议面（reader.search_content）
+        # 共用同一个"先按需建索引再查"的实现，两侧各记一遍顺序早晚有一侧忘。
+        services[ContentSearchService].search_ensured.assert_awaited_once_with(
+            "https://x/book", "命运", "")
         controller.detach()
 
 
