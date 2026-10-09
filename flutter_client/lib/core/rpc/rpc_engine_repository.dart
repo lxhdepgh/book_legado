@@ -1,4 +1,4 @@
-/// [EngineRepository] 的 RPC 实现：把契约面上那 29 发落到 §4.1 那一个动词上。
+/// [EngineRepository] 的 RPC 实现：把契约面上那 43 发落到 §4.1 那一个动词上。
 ///
 /// 每一发都做**形状检查**（数组就该是数组、对象就该是对象），检查不过抛
 /// `EngineFailureKind.transport`。这不是防御癖：服务端回 `null` 与回 `[]`
@@ -14,6 +14,13 @@ import '../../features/check/data/check_models.dart';
 import '../../features/find_books/data/book_row.dart';
 import '../../features/find_books/data/category_row.dart';
 import '../../features/find_books/data/search_scope.dart';
+import '../../features/reader/data/bookmark_row.dart';
+import '../../features/reader/data/chapter_document.dart';
+import '../../features/reader/data/chapter_row.dart';
+import '../../features/reader/data/content_search_result.dart';
+import '../../features/reader/data/reading_position.dart';
+import '../../features/reader/data/reader_session.dart';
+import '../../features/reader/data/staged_record.dart';
 import '../../features/settings/data/theme_preferences.dart';
 import '../../features/sources/data/import_outcome.dart';
 import '../../features/sources/data/source_audit.dart';
@@ -270,6 +277,156 @@ class RpcEngineRepository implements EngineRepository {
             'source_json': sourceJson,
             'depth': depth,
           }), 'check.source'));
+
+  // ------------------------------------------------------------------ #
+  // reader.*
+  // ------------------------------------------------------------------ #
+  // 这一族的两条形状规矩：
+  // 1. **没记录与空记录是两件事**——`reader.position_get` 与 `reader.staged` 的
+  //    `null` 都是合法回话（"这本书从没读过"/"这本书不是试读，别问"），所以它们
+  //    不走 `_asMap`；与 `source.get` 同一族。
+  // 2. **发出去的坐标不算数**——`reader.position_save` 回的是服务端夹回、认章之后
+  //    的那一份，界面拿回话更新自己，而不是拿请求那份直接落。
+  @override
+  Future<ReaderSession> openReader({
+    required String sourceUrl,
+    required Map<String, Object?> book,
+    bool shelve = true,
+    bool resume = true,
+  }) async =>
+      ReaderSession.fromJson(_asMap(await client.call('reader.open',
+          payload: <String, Object?>{
+            'source_url': sourceUrl,
+            'book': book,
+            'shelve': shelve,
+            'resume': resume,
+          }), 'reader.open'));
+
+  @override
+  Future<CloseOutcome> closeReader({
+    required String sourceUrl,
+    required String bookUrl,
+    bool saveProgress = true,
+  }) async =>
+      CloseOutcome.fromJson(_asMap(await client.call('reader.close', payload: <String, Object?>{
+        'source_url': sourceUrl,
+        'book_url': bookUrl,
+        'save_progress': saveProgress,
+      }), 'reader.close'));
+
+  @override
+  Future<List<ChapterRow>> chapterRows({
+    required String sourceUrl,
+    required String bookUrl,
+    bool refresh = false,
+  }) async =>
+      _rows(await client.call('reader.toc', payload: <String, Object?>{
+        'source_url': sourceUrl,
+        'book_url': bookUrl,
+        'refresh': refresh,
+      }), 'reader.toc')
+          .map(ChapterRow.fromJson)
+          .toList(growable: false);
+
+  @override
+  Future<ChapterDocument> chapterDocument({
+    required String sourceUrl,
+    required String bookUrl,
+    required String chapterUrl,
+  }) async =>
+      ChapterDocument.fromJson(_asMap(await client.call('reader.content',
+          payload: <String, Object?>{
+            'source_url': sourceUrl,
+            'book_url': bookUrl,
+            'chapter_url': chapterUrl,
+          }), 'reader.content'));
+
+  @override
+  Future<ReadingPosition?> readPosition({
+    required String sourceUrl,
+    required String bookUrl,
+  }) async {
+    final data = await client.call('reader.position_get',
+        payload: <String, Object?>{'source_url': sourceUrl, 'book_url': bookUrl});
+    if (data == null) return null;
+    return ReadingPosition.fromJson(_asMap(data, 'reader.position_get'));
+  }
+
+  @override
+  Future<ReadingPosition> savePosition({
+    required String sourceUrl,
+    required String bookUrl,
+    required Map<String, Object?> positionJson,
+  }) async =>
+      ReadingPosition.fromJson(_asMap(await client.call('reader.position_save',
+          payload: <String, Object?>{
+            'source_url': sourceUrl,
+            'book_url': bookUrl,
+            'position_json': positionJson,
+          }), 'reader.position_save'));
+
+  @override
+  Future<StagedRecord?> stagedRecord() async {
+    final data = await client.call('reader.staged');
+    if (data == null) return null;
+    return StagedRecord.fromJson(_asMap(data, 'reader.staged'));
+  }
+
+  @override
+  Future<bool> promoteStaged() async =>
+      _asBool(await client.call('reader.staged_promote'), 'reader.staged_promote');
+
+  @override
+  Future<bool> discardStaged() async =>
+      _asBool(await client.call('reader.staged_discard'), 'reader.staged_discard');
+
+  @override
+  Future<List<BookmarkRow>> listBookmarks(String bookUrl) async =>
+      _rows(await client.call('reader.bookmarks',
+          payload: <String, Object?>{'book_url': bookUrl}), 'reader.bookmarks')
+          .map(BookmarkRow.fromJson)
+          .toList(growable: false);
+
+  @override
+  Future<int> addBookmark({
+    required String bookUrl,
+    required int chapterIndex,
+    double offset = 0,
+    String summary = '',
+  }) async =>
+      // offset/summary **不许省略**：服务端那一发的签名没有默认值
+      // （`bookmark_service.py:45`），少传一个键是 TypeError、不是"用默认值"。
+      _asInt(await client.call('reader.bookmark_add', payload: <String, Object?>{
+        'book_url': bookUrl,
+        'chapter_index': chapterIndex,
+        'offset': offset,
+        'summary': summary,
+      }), 'reader.bookmark_add');
+
+  @override
+  Future<bool> removeBookmark({
+    required String bookUrl,
+    required int bookmarkId,
+  }) async =>
+      _asBool(await client.call('reader.bookmark_remove', payload: <String, Object?>{
+        'book_url': bookUrl,
+        'bookmark_id': bookmarkId,
+      }), 'reader.bookmark_remove');
+
+  @override
+  Future<ContentSearchResult> searchBookContent({
+    required String bookUrl,
+    required String keyword,
+    String? sourceUrl,
+  }) async =>
+      ContentSearchResult.fromJson(_asMap(
+          await client.call('reader.search_content', payload: <String, Object?>{
+            'book_url': bookUrl,
+            'keyword': keyword,
+            // 不给 = 服务端那一发的默认值（用当前会话那条源建索引），传空串与省键同值。
+            'source_url': sourceUrl ?? '',
+          }),
+          'reader.search_content'));
 
   // ------------------------------------------------------------------ #
   // settings.* / theme.*

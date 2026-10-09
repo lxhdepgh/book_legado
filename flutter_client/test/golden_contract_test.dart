@@ -18,6 +18,13 @@ import 'package:legodo_client/features/check/data/check_models.dart';
 import 'package:legodo_client/features/find_books/data/book_row.dart';
 import 'package:legodo_client/features/find_books/data/category_row.dart';
 import 'package:legodo_client/features/find_books/data/search_scope.dart';
+import 'package:legodo_client/features/reader/data/bookmark_row.dart';
+import 'package:legodo_client/features/reader/data/chapter_document.dart';
+import 'package:legodo_client/features/reader/data/chapter_row.dart';
+import 'package:legodo_client/features/reader/data/content_search_result.dart';
+import 'package:legodo_client/features/reader/data/reading_position.dart';
+import 'package:legodo_client/features/reader/data/reader_session.dart';
+import 'package:legodo_client/features/reader/data/staged_record.dart';
 import 'package:legodo_client/features/settings/data/theme_preferences.dart';
 import 'package:legodo_client/features/sources/data/import_outcome.dart';
 import 'package:legodo_client/features/sources/data/source_audit.dart';
@@ -227,7 +234,7 @@ Object? _nodeAt(Object? data, List<String> path) {
   return node;
 }
 
-/// 绑定表：15 个模型类 ↔ 12 发样本。少一格就是有一批键没人核（正对照在下面的计数里）。
+/// 绑定表：25 个模型类 ↔ 20 发样本。少一格就是有一批键没人核（正对照在下面的计数里）。
 const List<_Feed> _feeds = <_Feed>[
   _Feed('features/bookshelf/data/bookshelf_item.dart', 'BookshelfItem', 'bookshelf.list'),
   _Feed('features/find_books/data/book_row.dart', 'BookRow', 'browse.books'),
@@ -244,6 +251,17 @@ const List<_Feed> _feeds = <_Feed>[
   _Feed('features/check/data/check_models.dart', 'CheckSourceReport', 'check.source'),
   _Feed('features/settings/data/theme_preferences.dart', 'ThemePreferences', 'theme.preferences'),
   _Feed('core/rpc/engine_status.dart', 'ServiceStatus', 'engine.status'),
+  // reader 那一族（G3-C2）：13 发动作、7 个模型类，每个类都钉在自己那一发的真载荷上。
+  _Feed('features/reader/data/reading_position.dart', 'ReadingPosition', 'reader.position_get'),
+  _Feed('features/reader/data/chapter_row.dart', 'ChapterRow', 'reader.toc'),
+  _Feed('features/reader/data/chapter_document.dart', 'ChapterDocument', 'reader.content'),
+  _Feed('features/reader/data/chapter_document.dart', 'ContentBlock', 'reader.content', ['blocks']),
+  _Feed('features/reader/data/bookmark_row.dart', 'BookmarkRow', 'reader.bookmarks'),
+  _Feed('features/reader/data/staged_record.dart', 'StagedRecord', 'reader.staged'),
+  _Feed('features/reader/data/reader_session.dart', 'ReaderSession', 'reader.open'),
+  _Feed('features/reader/data/reader_session.dart', 'CloseOutcome', 'reader.close'),
+  _Feed('features/reader/data/content_search_result.dart', 'ContentSearchResult', 'reader.search_content'),
+  _Feed('features/reader/data/content_search_result.dart', 'ContentHit', 'reader.search_content', ['hits']),
 ];
 
 void main() {
@@ -387,15 +405,15 @@ void main() {
         reason: '这些样本与 engine.hello 的 schema_digest 不一致——重抓样本');
   });
 
-  group('模型吃的每一个键都在真载荷里（15 个类 ↔ 12 发样本）', () {
+  group('模型吃的每一个键都在真载荷里（25 个类 ↔ 20 发样本）', () {
     test('绑定表与扫描器都接上了（正对照）', () {
-      expect(_feeds.length, greaterThanOrEqualTo(15),
+      expect(_feeds.length, greaterThanOrEqualTo(25),
           reason: '绑定表只剩 ${_feeds.length} 格——删一格就是有一批键没人核');
       final total = _feeds.fold<int>(
           0, (sum, feed) => sum + feed.consumedKeys().length);
-      // 实测 91 个键（15 个类各自读的 `['key']` 之和）。留 6 的余量给模型加字段，
-      // 但绑定表被人删一格（最少 2 个键）一定跌破。
-      expect(total, greaterThanOrEqualTo(85),
+      // 实测 158 个键（25 个类各自读的 `['key']` 之和：reader 那一族这轮带进 67 个）。
+      // 留 8 的余量给模型加字段，但绑定表被人删一格（最少 2 个键）一定跌破。
+      expect(total, greaterThanOrEqualTo(150),
           reason: '只抽到 $total 个键——扫描器或类名不对，这条不是在放行');
     });
 
@@ -576,6 +594,275 @@ void main() {
       final snapshot = Map<String, Object?>.from(data['appearance.snapshot']! as Map);
       final prefs = ThemePreferences.fromJson(snapshot);
       expect(prefs.toJson(), equals(snapshot), reason: 'settings.read 的那个快照与三格对不上');
+    });
+  });
+
+  group('reader.* 那一族解得开，且那把尺跨端是同一个数（G3-C2）', () {
+    Map<String, Object?> data(String name) =>
+        Map<String, Object?>.from(_envelopeOf(_load(name))['data']! as Map);
+
+    Map<String, Object?> requestPayload(String name) =>
+        Map<String, Object?>.from((_load(name)['request']! as Map)['payload']! as Map);
+
+    List<Map<String, Object?>> rows(String name) {
+      final node = _envelopeOf(_load(name))['data'];
+      if (node is! List) {
+        throw StateError('$name 的载荷不是数组——这一格测的东西变了');
+      }
+      final decoded = node.cast<Map<String, Object?>>().toList();
+      expect(decoded, isNotEmpty, reason: '$name 一行都没有');
+      return decoded;
+    }
+
+    test('reader.open 的 chapterCount 与 reader.toc 的行数对上', () {
+      final chapters = rows('reader.toc');
+      for (final name in <String>[
+        'reader.open', 'reader.open--reopen', 'reader.open--preview'
+      ]) {
+        final session = ReaderSession.fromJson(data(name));
+        expect(session.bookUrl, session.book.url,
+            reason: '$name：会话坐标的两格对不上。后续每一发都按 (source_url, book_url) '
+                '找会话，界面拿 book.url 拼请求会撞上 reader.toc--no-session 那份错误信封');
+        expect(session.sourceUrl, isNotEmpty, reason: name);
+        // 三发 open 都对着同一份目录（假源只有一本 6 章的书），所以这一格是跨发比对，不是自证。
+        expect(session.chapterCount, chapters.length,
+            reason: '$name：会话自报的章数与目录行数不一致 = 投影那边丢了行或多算了行');
+        expect(chapters.length, greaterThan(0));
+      }
+    });
+
+    test('位置的九键往返：fromJson→toJson 与样本逐格同形，段号 null 不读成 0', () {
+      final positions = <String, Map<String, Object?>>{
+        for (final name in <String>[
+          'reader.position_get', 'reader.position_save', 'reader.position_save--clamped'
+        ])
+          name: data(name),
+        'reader.open.position': Map<String, Object?>.from(
+            data('reader.open')['position']! as Map),
+      };
+      expect(positions.length, greaterThanOrEqualTo(4), reason: '正对照：位置样本得有两真一夹一回话');
+      for (final entry in positions.entries) {
+        final json = entry.value;
+        expect(ReadingPosition.fromJson(json).toJson(), equals(json),
+            reason: '${entry.key}：往返少一格或改一格 = 下一次 position_save 会把服务端那一格覆盖成默认值。'
+                'from_reading 按这九个名字取值，键名漂了不报错');
+      }
+      // null 与 0 是两件事：reader.open 那一发的 chapter_paragraph 实测就是 null（新会话没段号），
+      // 而 position_save 那发是 2。少这一格证人，上面那条往返就成了唯一的一条腿。
+      expect(ReadingPosition.fromJson(positions['reader.open.position']!).paragraphIndex, isNull);
+      expect(ReadingPosition.fromJson(positions['reader.position_save']!).paragraphIndex, isNotNull);
+      // 键名逐一对上样本的 field_names（蛇形那九个，不是驼形）。
+      expect(positions['reader.position_get']!.keys.toSet(),
+          Set<String>.from(_fieldNamesOf(_load('reader.position_get'))));
+    });
+
+    test('存档没有 chapter_url：续读按 chapter_index 认章，右端点是 content 的 totalChars', () {
+      final saved = ReadingPosition.fromJson(data('reader.position_save'));
+      final clamped = ReadingPosition.fromJson(data('reader.position_save--clamped'));
+      final stored = ReadingPosition.fromJson(data('reader.position_get'));
+      final chapters = rows('reader.toc').map(ChapterRow.fromJson).toList();
+      final doc = ChapterDocument.fromJson(data('reader.content'));
+
+      expect(stored.chapterUrl, isEmpty,
+          reason: 'books 表不存 chapter_url（设计 §3.9），读档那一发实测回空串。'
+              '客户端按 chapter_url 找章会在重启后落到空 url，reader.content 读到另一章');
+      // 三发样本对着同一章：落库回话里的 url == 目录里那个 index 的 url。
+      expect(doc.chapterUrl, chapters[clamped.chapterIndex].url,
+          reason: '正文样本与位置样本不是同一章，下面那三条比对就成了自证');
+      expect(saved.chapterUrl, chapters[saved.chapterIndex].url);
+      expect(stored.characterOffset, clamped.characterOffset,
+          reason: '读回来的与落库回话在尺上必须是同一个数，否则界面显示的位置不是存进去的位置');
+      expect(stored.paragraphIndex, clamped.paragraphIndex);
+
+      // 收口在**回话**里：请求送 3.5/15801/48，服务端夹完整数落库再回话（实测）。
+      final sent = Map<String, Object?>.from(requestPayload('reader.position_save--clamped')
+          ['position_json']! as Map);
+      expect((sent['scroll_ratio']! as num).toDouble(), greaterThan(1.0));
+      expect(clamped.scrollRatio, 1.0);
+      expect((sent['chapter_pos']! as num).toInt(), greaterThan(doc.totalChars));
+      expect(clamped.characterOffset, doc.totalChars,
+          reason: '那把尺的右端点就是 reader.content 的 totalChars（实测夹完 5802=5802）。'
+              '进度条与夹偏移用这一格，别拿 blocks.length 或段数当右端点');
+    });
+
+    test('reader.content：字数这把尺只有服务端量得准，现取与走缓存同形同数', () {
+      final liveSample = _load('reader.content');
+      final cachedSample = _load('reader.content--from-cache');
+      expect(cachedSample['field_names'], equals(liveSample['field_names']),
+          reason: '走缓存那一发换了形状：客户端只认一套键');
+      final live = ChapterDocument.fromJson(data('reader.content'));
+      final cached = ChapterDocument.fromJson(data('reader.content--from-cache'));
+      expect(live.blocks, isNotEmpty);
+      expect(cached.totalChars, live.totalChars);
+      expect(cached.paragraphCount, live.paragraphCount);
+
+      final rawChars = live.blocks
+          .where((b) => b.isText)
+          .fold<int>(0, (sum, b) => sum + (b.value?.length ?? 0));
+      expect(rawChars, greaterThan(0),
+          reason: '正对照：一个文本块都没有的话，下面那条比的是 0 与 0');
+      expect(rawChars, isNot(live.totalChars),
+          reason: '客户端把 value 直接拼起来自己数是 $rawChars 字，服务端那把尺 ${live.totalChars} 字'
+              '（实测差 ${rawChars - live.totalChars}：切段时去掉的空白与段首缩进）。'
+              '两侧各自数一遍，翻页落点就不是同一个数——这一条不等号就是"别在 Dart 侧数"的证人');
+      expect(live.paragraphCount, isNot(live.blocks.length),
+          reason: '一个 text 块里是好几个段（实测 3 块 8 段），把块数当段数会把偏移算短');
+    });
+
+    test('内容块 kind 全在客户端词汇表里，且 text 与 media 两支都有活样本', () {
+      final doc = ChapterDocument.fromJson(data('reader.content'));
+      final kinds = doc.blocks.map((b) => b.kind).toSet();
+      expect(kinds.difference(kContentBlockKinds), isEmpty,
+          reason: '服务端吐了表外的 kind：$kinds——那一种在界面上根本没有画法');
+      expect(kinds, contains('text'), reason: '正对照：没有文本块的话 isText 那一支没人走过');
+      expect(kinds, contains('image'), reason: '正对照：没有媒体块的话 isMedia/url 那一支没人走过');
+      final image = doc.blocks.firstWhere((b) => b.isMedia);
+      expect(image.binary, isTrue);
+      expect(image.value, isNull,
+          reason: 'binary=true 的块 value 是 null（字节不过协议面，设计 §4.4），取内容只认 url+headers');
+      expect(image.headers, isEmpty);
+      expect(Uri.tryParse(image.url)?.hasScheme, isTrue,
+          reason: '相对地址过完协议面就找不回根：Image.network 直接挂（第八十六轮补 url 那一格救的就是它）');
+      // audio/video 两支语料里没有证人（假源只挂了一张 .jpg）；表里有它们是为了对齐
+      // 服务端 `_MEDIA_EXTENSIONS` 那三个键。那一支的画法在 G3-C3/G4 现场再对。
+      expect(kinds.intersection(<String>{'audio', 'video'}), isEmpty);
+    });
+
+    test('目录行的八键白名单就是全部：index 连续，付费与卷标题两支在语料里没有证人', () {
+      final raw = rows('reader.toc');
+      const allowed = <String>{
+        'name', 'url', 'index', 'isVolume', 'isVip', 'isPay', 'tag', 'wordCount'
+      };
+      for (final row in raw) {
+        expect(row.keys.toSet(), allowed,
+            reason: '样本行的键与 action 表 `fields=` 不一致——要么投影改了没重抓样本，要么这格测的东西变了');
+      }
+      final chapters = raw.map(ChapterRow.fromJson).toList();
+      expect(chapters.map((c) => c.index).toList(),
+          equals(List.generate(chapters.length, (i) => i)),
+          reason: '进度按 index 认章（books 不存 chapter_url），跳号或重号会读到另一章');
+      expect(chapters.every((c) => c.url.isNotEmpty), isTrue,
+          reason: 'reader.content 按 chapter_url 取正文，空 url = 点了没反应');
+      expect(chapters.every((c) => !c.paywalled && !c.isVolume), isTrue,
+          reason: '语料全是免费真章 → 下面那格用合成行走，别把"没走到"读成"走过"');
+      // 合成行（非黄金证人）：两旗任一都算付费墙，卷标题不是真章。
+      final flagged = ChapterRow.fromJson(Map<String, Object?>.from(raw.first)
+        ..['isVip'] = true
+        ..['isVolume'] = true);
+      expect(flagged.paywalled, isTrue);
+      expect(flagged.isVolume, isTrue);
+      // wordCount 服务端给的是字符串（有的源根本不填）：空串不许显示成"0 字"。
+      expect(chapters.first.wordCount, isEmpty);
+    });
+
+    test('书签的 offset 是章内比例，不是那把尺；写进去与读回来是同一个数', () {
+      final bookmarks = rows('reader.bookmarks').map(BookmarkRow.fromJson).toList();
+      final sent = requestPayload('reader.bookmark_add');
+      expect(bookmarks.first.offset, greaterThan(0.0));
+      expect(bookmarks.first.offset, lessThan(1.0),
+          reason: '这一列是 chapter_ratio（0~1）。当成字符偏移用会差整屏');
+      expect(sent['offset'], bookmarks.first.offset,
+          reason: 'add 送的比例与 bookmarks 读回来的不是同一个数：这一列是界面唯一拿得到的落点');
+      expect(sent['summary'], bookmarks.first.summary);
+      expect(sent['chapter_index'], bookmarks.first.chapterIndex);
+      expect(sent['book_url'], bookmarks.first.bookUrl);
+
+      final position = ReadingPosition.fromJson(data('reader.position_save'));
+      expect(position.characterOffset, greaterThan(1),
+          reason: '正对照：那把尺上的数与比例是两个量纲，两回事都得有证人');
+      // 空 summary 那一支语料里没有（样本全是"G3 样本书签"），合成行走（非黄金证人）。
+      final anonymous = BookmarkRow.fromJson(
+          Map<String, Object?>.from(rows('reader.bookmarks').first)..['summary'] = '');
+      expect(anonymous.label, '第 ${anonymous.chapterIndex + 1} 章');
+    });
+
+    test('暂存那一发：回 null 是合法答案，close 的 closed 有真假两支', () {
+      for (final name in <String>['reader.staged--shelved', 'reader.staged--after_promote']) {
+        final envelope = RpcEnvelope.decode(_envelopeOf(_load(name)), action: name);
+        expect(envelope.ok, isTrue, reason: name);
+        expect(envelope.dataOrThrow(action: name), isNull,
+            reason: '$name：这一发存的就是"没有待询问记录"。把它当形状变了报错，'
+                '退出试读那一屏每次都得弹一条错误');
+      }
+      final outcomes = <String, CloseOutcome>{
+        for (final name in <String>[
+          'reader.close', 'reader.close--preview', 'reader.close--mismatch',
+          'reader.close--before_reopen'
+        ])
+          name: CloseOutcome.fromJson(data(name)),
+      };
+      expect(outcomes['reader.close--mismatch']!.closed, isFalse,
+          reason: 'url 对不上会话时 closed=false 且什么都不动——界面不许读成"关失败了"');
+      expect(outcomes.values.where((o) => o.closed).length, greaterThan(0));
+      expect(outcomes.values.every((o) => o.staged == null), isTrue,
+          reason: '语料里 close 的 staged 四发全是 null：下面那条"同形状"主张在黄金样本里没有证人，'
+              '靠合成行 + `tests/test_reader_rpc_surface.py` 那条活体守卫（记忆 zero-counts…）');
+    });
+
+    test('close 的 staged 与 reader.staged 同形状：一条记录两处回，键集不许漂（合成行，非黄金证人）', () {
+      final stagedRow = data('reader.staged');
+      final direct = StagedRecord.fromJson(stagedRow);
+      final outcome = CloseOutcome.fromJson(<String, Object?>{
+        'closed': true, 'staged': stagedRow
+      });
+      expect(outcome.staged, isNotNull,
+          reason: '那一格是对象却读成 null = 退出试读不弹询问，那本书静默丢了');
+      expect(outcome.staged!.raw, equals(stagedRow),
+          reason: '转正/放弃要把整份记录原样传回 bookshelf.add，读的时候丢格就传回一份残缺快照');
+      expect(outcome.staged!.name, direct.name);
+      expect(outcome.staged!.url, stagedRow['url']);
+      expect(outcome.staged!.sourceUrl, stagedRow['source_url']);
+      expect(outcome.staged!.displayName, 'G3 试读书');
+      expect(outcome.staged!.inBookshelf, isFalse,
+          reason: '在架的书那一发根本回 null；这里为 true 是异常形状，界面不许省掉询问');
+
+      // 它和 bookshelf.list 的行**不是同一套键**（staged_record.dart 文件头的主张）。
+      final shelf = _fieldNamesOf(_load('bookshelf.list'));
+      final stagedFields = _fieldNamesOf(_load('reader.staged'));
+      expect(stagedFields, contains('in_bookshelf'));
+      expect(shelf, isNot(contains('in_bookshelf')));
+      for (final key in <String>['reading', 'updateError', 'cacheUpdatedAt']) {
+        expect(shelf, contains(key), reason: '$key：bookshelf 那侧的形状变了，这条比对要重看');
+        expect(stagedFields, isNot(contains(key)),
+            reason: '$key：暂存记录开始带这一格了——那"进度归一"在暂存这一支就不是没输入，'
+                'staged_record.dart 的注释和界面都得重看');
+      }
+      // 空名兜底那一支：语料那发有名字，合成行走（非黄金证人）。
+      expect(StagedRecord.fromJson(Map<String, Object?>.from(stagedRow)..['name'] = '')
+          .displayName, '这本书');
+    });
+
+    test('书内搜索：命中偏移落在那把尺上，written 与命中数是两个计数器', () {
+      final result = ContentSearchResult.fromJson(data('reader.search_content'));
+      final doc = ChapterDocument.fromJson(data('reader.content'));
+      expect(result.hits, isNotEmpty, reason: '正对照：零命中时下面每条循环都在比 0');
+      expect(result.ftsAvailable, isTrue);
+      expect(result.indexedChapters, greaterThan(0));
+      for (final hit in result.hits) {
+        expect(hit.characterOffset, greaterThan(0),
+            reason: 'offset 全 0 = 那一列没导出来，跳过去会每次都落到段首');
+        expect(hit.snippet, contains('<mark>'),
+            reason: '高亮标记在服务端打，客户端在协议面剥掉就没有"命中在哪几个字"了');
+      }
+      final overlap = result.hits.where((h) => h.chapterIndex == doc.chapterIndex).toList();
+      expect(overlap, isNotEmpty, reason: '搜索样本与正文样本不再重叠同一章：下面两条比对就成了自证');
+      for (final hit in overlap) {
+        expect(hit.characterOffset, lessThanOrEqualTo(doc.totalChars),
+            reason: '命中偏移与 chapter_pos 是同一把尺，右端点就是 reader.content 的 totalChars');
+        expect(hit.paraIndex, lessThan(doc.paragraphCount));
+      }
+      expect(result.written, isNot(equals(result.hits.length)),
+          reason: '实测 written=32（新写进索引的段数 = 4 章 × 8 段）与 4 条命中不是一回事；'
+              '并成一个计数器就分不清"建索引花了多久"与"这本书里有没有这个词"');
+      expect(requestPayload('reader.search_content')['keyword'], '第3段',
+          reason: '关键词是请求里那一格原文，服务端不猜');
+      // 0 命中的两种解释语料里没有（这一发命中 4 条），合成行走（非黄金证人）：
+      // 界面必须能分清"这台机器没 FTS5"与"只搜了已缓存的 N 章"。
+      final noFts = ContentSearchResult.fromJson(<String, Object?>{
+        'hits': <Object?>[], 'written': 0, 'indexedChapters': 0, 'ftsAvailable': false,
+      });
+      expect(noFts.hits, isEmpty);
+      expect(noFts.ftsAvailable, isFalse);
     });
   });
 }

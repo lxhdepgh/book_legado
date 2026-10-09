@@ -210,26 +210,17 @@ def test_widget_key_lookalikes_are_not_mistaken_for_actions() -> None:
 #: 反向通道那一发不是客户端能调的（是引擎求客户端渲染 `<useweb>`，§8 R1，G3 才接）。
 _REVERSE_CHANNEL = {"engine.webContentReady"}
 
-#: 协议面先落地、界面还没接的那几发：每条**必须写明是哪一门欠的**。
+#: 协议面先落地、Dart 侧还没人落的那几发：每条**必须写明是哪一门欠的**。
 #:
 #: 这一张表是"欠据"，不是逃生口——下面那条判据比的是**键集相等**，所以
-#: ① 新加动作既没接界面又没在这里具名 → 红；② 门到了、界面接上了却没把这一格划掉
+#: ① 新加动作既没接 Dart 又不具名 → 红；② Dart 接上了却没把这一格划掉
 #: → 一样红。两头都咬，欠据就悄悄不成长期账单。
-_UNWIRED_PENDING_GATE = {
-    "reader.open": "G3-C",
-    "reader.close": "G3-C",
-    "reader.toc": "G3-C",
-    "reader.content": "G3-C",
-    "reader.position_get": "G3-C",
-    "reader.position_save": "G3-C",
-    "reader.staged": "G3-C",
-    "reader.staged_promote": "G3-C",
-    "reader.staged_discard": "G3-C",
-    "reader.bookmarks": "G3-C",
-    "reader.bookmark_add": "G3-C",
-    "reader.bookmark_remove": "G3-C",
-    "reader.search_content": "G3-C",
-}
+#:
+#: 第八十八轮（G3-C2）把那 13 条 reader 欠据划完了：现在表是空的，而**判据照跑**——
+#: 它的作用是下一门（G3-D 的换源、G4 的那几族）落地时的同一张嘴，不是历史装饰。
+#: 口径提醒：这里数的"Dart 侧有人落"是**协议面在 Dart 有实现**（`core/rpc/` 那三个文件
+#: 里的字面量），不是"界面调了它"；后者由 widget/golden 测试那一面负责（G3-C3）。
+_UNWIRED_PENDING_GATE: dict[str, str] = {}
 
 
 def _dart_action_calls() -> dict[str, list[str]]:

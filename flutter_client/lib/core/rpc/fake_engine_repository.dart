@@ -17,6 +17,13 @@ import '../../features/check/data/check_models.dart';
 import '../../features/find_books/data/book_row.dart';
 import '../../features/find_books/data/category_row.dart';
 import '../../features/find_books/data/search_scope.dart';
+import '../../features/reader/data/bookmark_row.dart';
+import '../../features/reader/data/chapter_document.dart';
+import '../../features/reader/data/chapter_row.dart';
+import '../../features/reader/data/content_search_result.dart';
+import '../../features/reader/data/reading_position.dart';
+import '../../features/reader/data/reader_session.dart';
+import '../../features/reader/data/staged_record.dart';
 import '../../features/settings/data/theme_preferences.dart';
 import '../../features/sources/data/import_outcome.dart';
 import '../../features/sources/data/source_audit.dart';
@@ -48,6 +55,14 @@ class FakeEngineRepository implements EngineRepository {
     this.settings = SettingsMap.empty,
     this.theme = ThemePreferences.defaults,
     this.statuses = const [],
+    this.session,
+    this.toc = const [],
+    this.document,
+    this.position,
+    this.staged,
+    this.closeOutcome,
+    this.bookmarks = const [],
+    this.contentSearch,
     this.saveOutcome = const SaveOutcome(
         saved: true, sourceId: '', errors: [], audit: _cleanAudit),
     this.importOutcome = const ImportOutcome(
@@ -93,6 +108,25 @@ class FakeEngineRepository implements EngineRepository {
   SettingsMap settings;
   ThemePreferences theme;
   List<ServiceStatus> statuses;
+
+  // ---------------- reader.* 那八格的替身数据 ----------------
+  // **null 与"空的那一格"在这里同样分两种**：[staged]=null 是"在架的书，别问"，
+  // [position]=null 是"这本书从没读过"。把它们替成空对象就等于界面永远看不到
+  // 那两条分支（记忆里 `zero-counts-need-a-positive-control` 同一族）。
+  //
+  // 没给 [session]/[document] 时那一发回**一份空形状**而不是抛：界面测试要的是
+  // "开书失败/开了本空书"能各测各的，抛错那一支由 [failure] 走。
+  ReaderSession? session;
+  List<ChapterRow> toc;
+  ChapterDocument? document;
+
+  /// `reader.position_get` 回它；`reader.position_save` 也回它（服务端那一发回的是
+  /// **落库并收口后**的形状，替身照这一条办：给测试一个"回话与请求不同"的入口）。
+  ReadingPosition? position;
+  StagedRecord? staged;
+  CloseOutcome? closeOutcome;
+  List<BookmarkRow> bookmarks;
+  ContentSearchResult? contentSearch;
   SaveOutcome saveOutcome;
   ImportOutcome importOutcome;
   GatewayInfo info;
@@ -344,6 +378,192 @@ class FakeEngineRepository implements EngineRepository {
         checkState: 'list_usable',
         autoDisabled: false,
         raw: <String, Object?>{},
+      );
+
+  // ------------------------------------------------------------------ #
+  // reader.*
+  // ------------------------------------------------------------------ #
+  @override
+  Future<ReaderSession> openReader({
+    required String sourceUrl,
+    required Map<String, Object?> book,
+    bool shelve = true,
+    bool resume = true,
+  }) =>
+      _guard(() => session ?? _emptySession(book), 'reader.open',
+          <String, Object?>{
+            'source_url': sourceUrl,
+            'book': book,
+            'shelve': shelve,
+            'resume': resume,
+          });
+
+  @override
+  Future<CloseOutcome> closeReader({
+    required String sourceUrl,
+    required String bookUrl,
+    bool saveProgress = true,
+  }) =>
+      _guard(() => closeOutcome ?? CloseOutcome(closed: true, staged: staged),
+          'reader.close', <String, Object?>{
+        'source_url': sourceUrl,
+        'book_url': bookUrl,
+        'save_progress': saveProgress,
+      });
+
+  @override
+  Future<List<ChapterRow>> chapterRows({
+    required String sourceUrl,
+    required String bookUrl,
+    bool refresh = false,
+  }) =>
+      _guard(() => toc, 'reader.toc', <String, Object?>{
+        'source_url': sourceUrl,
+        'book_url': bookUrl,
+        'refresh': refresh,
+      });
+
+  @override
+  Future<ChapterDocument> chapterDocument({
+    required String sourceUrl,
+    required String bookUrl,
+    required String chapterUrl,
+  }) =>
+      _guard(() => document ?? _emptyDocument(chapterUrl), 'reader.content',
+          <String, Object?>{
+            'source_url': sourceUrl,
+            'book_url': bookUrl,
+            'chapter_url': chapterUrl,
+          });
+
+  @override
+  Future<ReadingPosition?> readPosition({
+    required String sourceUrl,
+    required String bookUrl,
+  }) =>
+      _guard(() => position, 'reader.position_get', <String, Object?>{
+        'source_url': sourceUrl,
+        'book_url': bookUrl,
+      });
+
+  @override
+  Future<ReadingPosition> savePosition({
+    required String sourceUrl,
+    required String bookUrl,
+    required Map<String, Object?> positionJson,
+  }) =>
+      // 服务端那一发回的是**落库并收口后**的那一份，替身照这一条办：
+      // 给了 [position] 就回它（测试据此造出"请求 900 字、落库夹回 12 字"那一臂），
+      // 没给就原样回读请求那份。
+      _guard(
+          () => position ??
+              ReadingPosition.fromJson(Map<String, Object?>.from(positionJson)),
+          'reader.position_save', <String, Object?>{
+        'source_url': sourceUrl,
+        'book_url': bookUrl,
+        'position_json': positionJson,
+      });
+
+  @override
+  Future<StagedRecord?> stagedRecord() => _guard(() => staged, 'reader.staged');
+
+  @override
+  Future<bool> promoteStaged() => _guard(() {
+        staged = null;
+        return true;
+      }, 'reader.staged_promote');
+
+  @override
+  Future<bool> discardStaged() => _guard(() {
+        staged = null;
+        return true;
+      }, 'reader.staged_discard');
+
+  @override
+  Future<List<BookmarkRow>> listBookmarks(String bookUrl) =>
+      _guard(() => bookmarks, 'reader.bookmarks',
+          <String, Object?>{'book_url': bookUrl});
+
+  /// 加书签的自增 id（真引擎那边是 SQLite 的 lastrowid）。
+  int addBookmarkSeq = 0;
+
+  @override
+  Future<int> addBookmark({
+    required String bookUrl,
+    required int chapterIndex,
+    double offset = 0,
+    String summary = '',
+  }) =>
+      _guard(() {
+        final id = ++addBookmarkSeq;
+        bookmarks = [
+          ...bookmarks,
+          BookmarkRow(
+              bookmarkId: id,
+              bookUrl: bookUrl,
+              chapterIndex: chapterIndex,
+              offset: offset,
+              summary: summary,
+              createdAt: id.toDouble()),
+        ];
+        return id;
+      }, 'reader.bookmark_add', <String, Object?>{
+        'book_url': bookUrl,
+        'chapter_index': chapterIndex,
+        'offset': offset,
+        'summary': summary,
+      });
+
+  @override
+  Future<bool> removeBookmark({
+    required String bookUrl,
+    required int bookmarkId,
+  }) =>
+      _guard(() {
+        final kept = bookmarks.where((b) => b.bookmarkId != bookmarkId).toList();
+        final removed = kept.length != bookmarks.length;
+        bookmarks = kept;
+        return removed;
+      }, 'reader.bookmark_remove', <String, Object?>{
+        'book_url': bookUrl,
+        'bookmark_id': bookmarkId,
+      });
+
+  @override
+  Future<ContentSearchResult> searchBookContent({
+    required String bookUrl,
+    required String keyword,
+    String? sourceUrl,
+  }) =>
+      _guard(
+          () => contentSearch ??
+              const ContentSearchResult(
+                  hits: [], written: 0, indexedChapters: 0, ftsAvailable: true),
+          'reader.search_content', <String, Object?>{
+        'book_url': bookUrl,
+        'keyword': keyword,
+        'source_url': sourceUrl ?? '',
+      });
+
+  /// 没给替身时的那一份"开了会话但什么都没有"：目录 0 章、位置是默认那份。
+  /// 它**不是**错误——`chapterCount == 0` 是一批真源的样子（flet 那边同样能打开）。
+  static ReaderSession _emptySession(Map<String, Object?> book) => ReaderSession(
+        book: BookRow.fromJson(Map<String, Object?>.from(book)),
+        sourceUrl: '${book['origin'] ?? ''}',
+        bookUrl: '${book['url'] ?? ''}',
+        chapterCount: 0,
+        position: const ReadingPosition(),
+      );
+
+  static ChapterDocument _emptyDocument(String chapterUrl) => ChapterDocument(
+        chapterUrl: chapterUrl,
+        chapterIndex: 0,
+        chapterName: '',
+        title: '',
+        imageStyle: '',
+        blocks: const [],
+        paragraphCount: 0,
+        totalChars: 0,
       );
 
   @override

@@ -1429,11 +1429,19 @@ def _book_item_dict(item) -> dict:
 
     整字段快照而不是挑几个字段：换源/开读要从快照原样还原 BookItem，漏掉的
     ``toc_url``/``last_chapter``/``kind`` 会让目录、漫画通道和书架记录变哑。
+
+    **已经是 dict 的那一支必须是浅复制原样返回**（``rank_switch_matches`` 里那句
+    ``item if isinstance(item, dict)`` 早就认了这一条）。它原来会掉到下面那个
+    getattr 兜底，而 ``getattr({...}, "name", "")`` 对字典恒为空串——于是 ``reader.close`` 的 ``staged`` 是一整份**键齐全但全空**的壳，
+    界面上表现为退出试读时那句"《》放入书架"。那一发不在语料里（四发 ``reader.close``
+    抓的都是在架的书，``staged`` 全是 null），所以 ``is not None`` 那类断言照不出它。
     """
     from dataclasses import asdict, is_dataclass
 
     if item is None:
         return {}
+    if isinstance(item, dict):
+        return dict(item)
     if is_dataclass(item):
         return asdict(item)
     return {

@@ -535,10 +535,45 @@ def test_staged_round_trip_reports_the_record_then_nothing() -> None:
     _run(main())
 
 
+def test_close_reports_the_staged_record_in_its_own_shape() -> None:
+    """退出试读那一发的 ``staged`` 必须是**那条记录本身**，不是它的空壳。
+
+    这一族里唯一没被真进程语料跑到的分支：四发 ``reader.close`` 抓的都是**在架**的书，
+    ``staged`` 全是 null（而 null 在那一发是合法回话）。被它罩住的是一个真缺陷——
+    ``_book_item_dict`` 对 dict 走 ``getattr`` 兜底，而 ``getattr({...}, "name", "")``
+    恒为空串，回出来的是一份**键齐全、值全空**的壳。所以这里的靶子必须是
+    "名字是那个真名字"：``is not None`` 那一断言在缺陷版本上照样绿。
+
+    与 ``reader.staged`` 那一发比的是**键集相等**：同一条记录不许有两种形状，
+    否则客户端得写两套 ``fromJson``（记忆里 `legado-search-changesource-alignment`
+    那条"两边同一套键"的规矩，这是它的第三个读数口）。
+    """
+    async def main():
+        rig = await _rig(open_the_book=False)
+        try:
+            await rig.reading.open_by_url(SOURCE_URL, _book_dict(), shelve=False,
+                                          resume=False)
+            before = rig.reading.staged_record()
+            assert isinstance(before, dict) and before.get("name") == "G3 样本书", before
+            result = await rig.reading.close_by_url(SOURCE_URL, BOOK_URL,
+                                                    save_progress=True)
+            assert result["closed"] is True, result
+            staged = result["staged"]
+            assert isinstance(staged, dict), f"待询问的那一发回的不是记录：{staged!r}"
+            assert staged.get("name") == "G3 样本书", (
+                f"空壳那一支又回来了：{staged!r}")
+            assert set(staged) == set(before), (
+                f"close 的 staged 与 reader.staged 键集不同：{set(staged) ^ set(before)}")
+            assert staged == before
+        finally:
+            await rig.close()
+
+    _run(main())
+
+
 # --------------------------------------------------------------------------- #
 # 五、载荷形状：整族出参都不许漏模型对象；open 那一发不带目录
 # --------------------------------------------------------------------------- #
-
 def test_open_snapshot_carries_no_chapter_rows() -> None:
     """reader.open 的返回里不许有目录：把几千章挂在"点开一本书"上是 G2 那笔账的重演。"""
     async def main():

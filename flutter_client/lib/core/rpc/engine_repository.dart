@@ -17,6 +17,13 @@ import '../../features/check/data/check_models.dart';
 import '../../features/find_books/data/book_row.dart';
 import '../../features/find_books/data/category_row.dart';
 import '../../features/find_books/data/search_scope.dart';
+import '../../features/reader/data/bookmark_row.dart';
+import '../../features/reader/data/chapter_document.dart';
+import '../../features/reader/data/chapter_row.dart';
+import '../../features/reader/data/content_search_result.dart';
+import '../../features/reader/data/reading_position.dart';
+import '../../features/reader/data/reader_session.dart';
+import '../../features/reader/data/staged_record.dart';
 import '../../features/settings/data/theme_preferences.dart';
 import '../../features/sources/data/import_outcome.dart';
 import '../../features/sources/data/source_audit.dart';
@@ -223,6 +230,109 @@ abstract class EngineRepository {
     String depth = 'list',
   }) async =>
       throw _missing('check.source');
+
+  // ------------------------------------------------------------------ #
+  // reader.*（阅读会话）
+  // ------------------------------------------------------------------ #
+  // 这一族每一条都**显式吃 source_url + book_url**：会话是引擎里的单例，而跨进程
+  // 客户端可以带着任意 url 来。对不上当前会话的那一发回错误信封
+  // （`reader.toc--no-session` 那份样本）或 `closed:false`，不靠隐式状态猜。
+  //
+  // [openReader] 的 [book] 是**字典快照**（`BookRow.raw`）：模型对象不许进协议面。
+  Future<ReaderSession> openReader({
+    required String sourceUrl,
+    required Map<String, Object?> book,
+    bool shelve = true,
+    bool resume = true,
+  }) async =>
+      throw _missing('reader.open');
+
+  Future<CloseOutcome> closeReader({
+    required String sourceUrl,
+    required String bookUrl,
+    bool saveProgress = true,
+  }) async =>
+      throw _missing('reader.close');
+
+  /// 目录那一屏的行（8 格白名单，出口在服务侧投影）。**目录不在 `reader.open` 上**。
+  Future<List<ChapterRow>> chapterRows({
+    required String sourceUrl,
+    required String bookUrl,
+    bool refresh = false,
+  }) async =>
+      throw _missing('reader.toc');
+
+  /// 一章正文：回的是**已渲染形态**（`<usehtml>` 在服务侧渲染掉了，因为那一步改字数，
+  /// 而段数/总字数是两侧比翻页落点那把尺的读数）。这一发**会真的发网络请求**。
+  Future<ChapterDocument> chapterDocument({
+    required String sourceUrl,
+    required String bookUrl,
+    required String chapterUrl,
+  }) async =>
+      throw _missing('reader.content');
+
+  /// 存档的续读位置。**没记录 = null**，与"记录在第 0 章第 0 字"是两种形状
+  /// （后者是"这本书刚开过"，前者是"这本书从没读过"）。
+  Future<ReadingPosition?> readPosition({
+    required String sourceUrl,
+    required String bookUrl,
+  }) async =>
+      throw _missing('reader.position_get');
+
+  /// 落一篇位置。[positionJson] 用 [ReadingPosition.toJson]（服务端 `from_reading`
+  /// 按那九个蛇形键取值）。回的是**落库并收口后的形状**——界面上"存进去了什么"
+  /// 以这一发的回话为准，不是以发出去的那份为准（越界的偏移会被夹回来）。
+  ///
+  /// 必须先 `openReader`：会话不是这本书时这一发拒答，否则会把 A 书的名字写到
+  /// B 书那一行，而 `books` 是 `ON CONFLICT DO UPDATE`，写坏是静默的。
+  Future<ReadingPosition> savePosition({
+    required String sourceUrl,
+    required String bookUrl,
+    required Map<String, Object?> positionJson,
+  }) async =>
+      throw _missing('reader.position_save');
+
+  /// 当前书若是试读暂存（Legado notShelf）给出那条记录；**在架的书回 null**
+  /// （否则每次退出都被问一遍"要放入书架吗"）。
+  Future<StagedRecord?> stagedRecord() async => throw _missing('reader.staged');
+
+  /// 试读转正：暂存记录原地变书架记录，进度/变量/目录缓存不动。
+  Future<bool> promoteStaged() async => throw _missing('reader.staged_promote');
+
+  /// 试读放弃：记录、进度与缓存一起删（只删书架行等于删了个寂寞）。
+  Future<bool> discardStaged() async => throw _missing('reader.staged_discard');
+
+  /// 按书列书签（服务端按创建时间升序排好；客户端不重排）。
+  Future<List<BookmarkRow>> listBookmarks(String bookUrl) async =>
+      throw _missing('reader.bookmarks');
+
+  /// 加一条书签，回它的 id（`reader.bookmark_remove` 吃的就是它）。
+  ///
+  /// [offset] 是**章内比例**（0~1），与 `reader.position_save` 那把字符偏移的尺
+  /// 不是同一个量——服务端那一列当初就是给"大概翻到哪儿"用的，别混。
+  Future<int> addBookmark({
+    required String bookUrl,
+    required int chapterIndex,
+    double offset = 0,
+    String summary = '',
+  }) async =>
+      throw _missing('reader.bookmark_add');
+
+  /// 回**是否真删到**（可能已被另一侧删过），不是"请求受理了没有"。
+  Future<bool> removeBookmark({
+    required String bookUrl,
+    required int bookmarkId,
+  }) async =>
+      throw _missing('reader.bookmark_remove');
+
+  /// 书内全文检索：先按需补索引再查。0 命中要拿 `ftsAvailable` + `indexedChapters`
+  /// 分清"这台机器搜不了""只搜了已缓存的 N 章""真没有这个词"。
+  Future<ContentSearchResult> searchBookContent({
+    required String bookUrl,
+    required String keyword,
+    String? sourceUrl,
+  }) async =>
+      throw _missing('reader.search_content');
 
   // ------------------------------------------------------------------ #
   // settings.* / theme.*
