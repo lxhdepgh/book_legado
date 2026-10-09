@@ -1,0 +1,66 @@
+{
+  "source_sample": "合成输入",
+  "note": "synthesized_input：整章只有媒体（段数 0，屏上仍有 1 行）",
+  "input": {
+    "title": "只有插图的一章",
+    "imageStyle": "",
+    "blocks": [
+      {
+        "kind": "image",
+        "value": "http://127.0.0.1:8797/g3/pic.jpg",
+        "url": "",
+        "binary": false,
+        "title": "图",
+        "headers": {}
+      }
+    ]
+  },
+  "preferences": {
+    "font_size": 16,
+    "font_family": "",
+    "line_height": 1.7,
+    "paragraph_spacing": 12,
+    "max_width": 760.0,
+    "indent": true,
+    "text_align": "start",
+    "background": "follow",
+    "show_status": true,
+    "text_selection": true
+  },
+  "paragraph_count": 0,
+  "total_chars": 0,
+  "offsets": [],
+  "paragraphs": [],
+  "rows": [
+    {
+      "row": 0,
+      "kind": "image",
+      "paragraph_index": null,
+      "heading": false,
+      "display": "",
+      "ruler": null,
+      "meta": ""
+    }
+  ],
+  "position_round_trip": [],
+  "offset_probes": [
+    {
+      "offset": 0,
+      "expect": "章尾之后（夹回末尾）",
+      "paragraph_index": 0,
+      "local": 0
+    },
+    {
+      "offset": -7,
+      "expect": "负数（夹回 0）",
+      "paragraph_index": 0,
+      "local": 0
+    },
+    {
+      "offset": 9999,
+      "expect": "越界（夹回末尾）",
+      "paragraph_index": 0,
+      "local": 0
+    }
+  ]
+}

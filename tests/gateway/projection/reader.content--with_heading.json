@@ -1,0 +1,236 @@
+{
+  "source_sample": "合成输入",
+  "note": "synthesized_input：章首一行是小标题（显示认标题、尺上仍是第 0 段）",
+  "input": {
+    "title": "夹标题的一章",
+    "imageStyle": "",
+    "blocks": [
+      {
+        "kind": "text",
+        "value": "第一节 风起\n\n正文第一段，够长够长够长够长够长。\n\n正文第二段。",
+        "url": "",
+        "binary": false,
+        "title": "",
+        "headers": {}
+      },
+      {
+        "kind": "text",
+        "value": "　　全角空格开头的那一段。",
+        "url": "",
+        "binary": false,
+        "title": "",
+        "headers": {}
+      }
+    ]
+  },
+  "preferences": {
+    "font_size": 16,
+    "font_family": "",
+    "line_height": 1.7,
+    "paragraph_spacing": 12,
+    "max_width": 760.0,
+    "indent": true,
+    "text_align": "start",
+    "background": "follow",
+    "show_status": true,
+    "text_selection": true
+  },
+  "paragraph_count": 4,
+  "total_chars": 43,
+  "offsets": [
+    0,
+    7,
+    25,
+    32
+  ],
+  "paragraphs": [
+    {
+      "index": 0,
+      "offset": 0,
+      "length": 6,
+      "head": "第一节 风起"
+    },
+    {
+      "index": 1,
+      "offset": 7,
+      "length": 17,
+      "head": "正文第一段，够长够长够长够长够长"
+    },
+    {
+      "index": 2,
+      "offset": 25,
+      "length": 6,
+      "head": "正文第二段。"
+    },
+    {
+      "index": 3,
+      "offset": 32,
+      "length": 11,
+      "head": "全角空格开头的那一段。"
+    }
+  ],
+  "rows": [
+    {
+      "row": 0,
+      "kind": "text",
+      "paragraph_index": 0,
+      "heading": true,
+      "display": "第一节 风起",
+      "ruler": "第一节 风起",
+      "meta": ""
+    },
+    {
+      "row": 1,
+      "kind": "text",
+      "paragraph_index": 1,
+      "heading": false,
+      "display": "　　正文第一段，够长够长够长够长够长。",
+      "ruler": "正文第一段，够长够长够长够长够长。",
+      "meta": ""
+    },
+    {
+      "row": 2,
+      "kind": "text",
+      "paragraph_index": 2,
+      "heading": false,
+      "display": "　　正文第二段。",
+      "ruler": "正文第二段。",
+      "meta": ""
+    },
+    {
+      "row": 3,
+      "kind": "text",
+      "paragraph_index": 3,
+      "heading": false,
+      "display": "　　全角空格开头的那一段。",
+      "ruler": "全角空格开头的那一段。",
+      "meta": ""
+    }
+  ],
+  "position_round_trip": [
+    {
+      "paragraph_index": 0,
+      "offset": 0,
+      "back_to": [
+        0,
+        0
+      ]
+    },
+    {
+      "paragraph_index": 1,
+      "offset": 7,
+      "back_to": [
+        1,
+        0
+      ]
+    },
+    {
+      "paragraph_index": 2,
+      "offset": 25,
+      "back_to": [
+        2,
+        0
+      ]
+    },
+    {
+      "paragraph_index": 3,
+      "offset": 32,
+      "back_to": [
+        3,
+        0
+      ]
+    }
+  ],
+  "offset_probes": [
+    {
+      "offset": 0,
+      "expect": "段首",
+      "paragraph_index": 0,
+      "local": 0
+    },
+    {
+      "offset": 6,
+      "expect": "段尾",
+      "paragraph_index": 0,
+      "local": 6
+    },
+    {
+      "offset": 3,
+      "expect": "段中",
+      "paragraph_index": 0,
+      "local": 3
+    },
+    {
+      "offset": 7,
+      "expect": "段首",
+      "paragraph_index": 1,
+      "local": 0
+    },
+    {
+      "offset": 24,
+      "expect": "段尾",
+      "paragraph_index": 1,
+      "local": 17
+    },
+    {
+      "offset": 15,
+      "expect": "段中",
+      "paragraph_index": 1,
+      "local": 8
+    },
+    {
+      "offset": 25,
+      "expect": "段首",
+      "paragraph_index": 2,
+      "local": 0
+    },
+    {
+      "offset": 31,
+      "expect": "段尾",
+      "paragraph_index": 2,
+      "local": 6
+    },
+    {
+      "offset": 28,
+      "expect": "段中",
+      "paragraph_index": 2,
+      "local": 3
+    },
+    {
+      "offset": 32,
+      "expect": "段首",
+      "paragraph_index": 3,
+      "local": 0
+    },
+    {
+      "offset": 43,
+      "expect": "段尾",
+      "paragraph_index": 3,
+      "local": 11
+    },
+    {
+      "offset": 37,
+      "expect": "段中",
+      "paragraph_index": 3,
+      "local": 5
+    },
+    {
+      "offset": 43,
+      "expect": "章尾之后（夹回末尾）",
+      "paragraph_index": 3,
+      "local": 11
+    },
+    {
+      "offset": -7,
+      "expect": "负数（夹回 0）",
+      "paragraph_index": 0,
+      "local": 0
+    },
+    {
+      "offset": 10042,
+      "expect": "越界（夹回末尾）",
+      "paragraph_index": 3,
+      "local": 11
+    }
+  ]
+}
