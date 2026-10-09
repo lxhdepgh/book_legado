@@ -8,19 +8,22 @@
 ///
 /// - **没有「登录书源」按钮**：`login_schema` / `submit_login` 还没上 action 表
 ///   （G2 那 31 发里没有这一条），放上去就是一颗点了不发任何请求的按钮。
-/// - **没有「开始阅读」**：详情框那一格要的是 G3 的阅读器。flet 那边长按结果是试读，
-///   这里同样不接——接了就是"动作发生在一个还不存在的地方"。
 /// - **结果行没有封面**：`BookRow.coverUrl` 有值，但远程封面要走 `GET /media/{key}`
 ///   （§4.4），那条线在 G2 之后。书架那一屏已经立着同一个槽位，形状照它。
+///
+/// 详情框的「试读」是 G3-C3 接上的：`reader.open` 带 `shelve: false`，
+/// 于是这本书只建暂存记录，退出阅读时由阅读器问那一句「放入书架吗」。
 library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../app/router.dart';
 import '../../../core/events/event_listener.dart';
 import '../../../core/events/event_names.dart';
 import '../../../core/widgets/failure_banner.dart';
 import '../../../core/widgets/state_bar.dart';
+import '../../reader/domain/reader_controller.dart';
 import '../../sources/data/source_record.dart';
 import '../data/book_intro.dart';
 import '../data/book_row.dart';
@@ -345,6 +348,20 @@ class _FindBooksScreenState extends ConsumerState<FindBooksScreen> {
             },
             icon: const Icon(Icons.bookmark_add),
             label: const Text('加入书架'),
+          ),
+          // 「试读」= `shelve: false`：这本书不入架，退出阅读时由阅读器问那一句
+          // 「放入书架吗」（记忆 `findbook-ui-layout-preference` 那条方向）。
+          // 顺序是硬的：**先收弹窗再压路由**，反过来的话弹窗会挂在阅读器上面。
+          TextButton.icon(
+            key: const Key('findbooks.detail.preview'),
+            onPressed: () {
+              final args = ReaderArgs(
+                  sourceUrl: row.origin, book: row.raw, shelve: false);
+              Navigator.pop(dialogContext);
+              openReaderBook(context, args);
+            },
+            icon: const Icon(Icons.menu_open),
+            label: const Text('试读'),
           ),
         ],
       ),

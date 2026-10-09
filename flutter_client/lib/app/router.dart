@@ -7,12 +7,15 @@
 library;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../core/widgets/tabbed_group.dart';
 import '../features/bookshelf/presentation/bookshelf_screen.dart';
 import '../features/check/presentation/check_screen.dart';
 import '../features/find_books/presentation/find_books_screen.dart';
+import '../features/reader/domain/reader_controller.dart';
+import '../features/reader/presentation/reader_screen.dart';
 import '../features/settings/presentation/appearance_screen.dart';
 import '../features/sources/presentation/sources_screen.dart';
 import 'shell.dart';
@@ -22,11 +25,25 @@ const String sourcesGroupRoute = '/sources';
 const String readingGroupRoute = '/reading';
 const String settingsGroupRoute = '/settings';
 
+/// 阅读器：`NAV_META` 里 `hidden=True` 的那一位**整页目的地**（`DEST_READER`）。
+/// 它不是分组、也不在页签表里——开读时独占内容区，所以它是 ShellRoute 的兄弟，
+/// 用根导航器压在壳之上（`context.push`，返回就落回原来那一屏）。
+const String readerRoute = '/reader';
+
+/// 开一本书：把 [ReaderArgs] 作为 `extra` 递进路由。
+///
+/// 为什么不走 `go_named` 的 query 参数：`reader.open` 吃的是一份**字典快照**
+/// （书名/作者/封面/origin 十几格），把它压进 url 字符串等于在边界上再造一次编解码，
+/// 而中文书名还要先过 URL 转义——那正是 `legado-http-session-pooling` 那一族
+/// "编码口径不一致"的错法。
+Future<void> openReaderBook(BuildContext context, ReaderArgs args) =>
+    context.push(readerRoute, extra: args);
+
 /// 「阅读」组的页签表（`NAV_META` 里 GROUP_READING 的非整页成员）。
 ///
 /// 顺序照 flet：找书在书架之前（`DEST_FIND_BOOKS` 是那一组的第一个）。
-/// 阅读器/漫画是**整页目的地**（`hidden=True`：不在页签里，开读时独占内容区），
-/// 那一条是 G3 的活，这里不预告。
+/// 阅读器是**整页目的地**（`hidden=True`：不在页签里，开读时独占内容区），
+/// 走 `readerRoute` 那条与壳同级的路由；漫画阅读器还在 G4。
 List<GroupTab> readingTabs() => const <GroupTab>[
       GroupTab(
         label: '找书',
@@ -135,6 +152,33 @@ GoRouter buildRouter() => GoRouter(
               ),
             ),
           ],
+        ),
+        // 阅读器：与壳同级的整页目的地（上面 openReaderBook 那条推它）。
+        // `ProviderScope` 套在这里而不是套在 App 根：一本书一套 args，
+        // 退出时这一发随路由一起 dispose，下一次开别的书不会带着上一本的快照。
+        GoRoute(
+          path: readerRoute,
+          name: 'reader',
+          pageBuilder: (context, state) => MaterialPage<void>(
+            name: 'reader',
+            child: ProviderScope(
+              // 不写 `List<Override>`：Riverpod 3.4.3 没导出 `Override` 这个类型名
+              // （同 `app/bootstrap.dart` 那处），字面量自己推。
+              overrides: [
+                readerArgsProvider.overrideWithValue(state.extra is ReaderArgs
+                    ? state.extra as ReaderArgs
+                    : const ReaderArgs.empty()),
+                // **这一行不是多余的**：Riverpod 把没被覆盖的 provider 元素放在
+                // **根容器**里，而那个元素的 `ref.read(readerArgsProvider)` 读的也是根容器
+                // ——只覆盖 args 的话，控制器读到的永远是默认那份空快照
+                // （屏幕上写"阅读器没有收到书"，而 `extra` 明明传进来了）。
+                // 连着 `readerProvider` 一起覆盖，这一本书的状态机才落在**这个**容器里，
+                // 上面注释那句"随路由一起 dispose"也才真的成立。
+                readerProvider.overrideWith(ReaderNotifier.new),
+              ],
+              child: const ReaderScreen(),
+            ),
+          ),
         ),
       ],
     );

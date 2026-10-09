@@ -140,6 +140,8 @@ class FakeEngineRepository implements EngineRepository {
 
   final Map<String, int> _calls = {};
   final Map<String, Map<String, Object?>?> _payloads = {};
+  final Map<String, List<Map<String, Object?>?>> _payloadHistory = {};
+  final List<String> _order = <String>[];
 
   final StreamController<EngineEvent> _events =
       StreamController<EngineEvent>.broadcast();
@@ -149,6 +151,20 @@ class FakeEngineRepository implements EngineRepository {
 
   /// 最近一次打过来的 payload（没带参数的动作是 null，与"带了空对象"是两件事）。
   Map<String, Object?>? payloadFor(String action) => _payloads[action];
+
+  /// 每一次打过来的 payload，按先后。
+  ///
+  /// 为什么 [payloadFor] 不够：`reader.position_save` 在一个动作里会发两发
+  /// （翻章前先把**旧章**那一格写完，新章之后还有自己那一格），而"写完的是旧章那一条"
+  /// 这条断言吃的就是**第一发**——只留最后一发，读出来永远是新章的序号。
+  List<Map<String, Object?>?> payloadsFor(String action) =>
+      List<Map<String, Object?>?>.unmodifiable(
+          _payloadHistory[action] ?? const <Map<String, Object?>?>[]);
+
+  /// 打过的动作**按先后**各记一条。[callsFor] 只数得出次数，答不出"谁先"——
+  /// 而退出那一族的硬约束恰恰是先后（`reader.staged_promote` 必须排在
+  /// `reader.close` 之前，关完会话服务就认不出那条暂存记录了）。
+  List<String> get callOrder => List<String>.unmodifiable(_order);
 
   // G1 那三处记账的旧名字：留 getter，不留第二份计数器。
   int get listBookshelfCalls => callsFor('bookshelf.list');
@@ -163,6 +179,8 @@ class FakeEngineRepository implements EngineRepository {
       [Map<String, Object?>? payload]) async {
     _calls[action] = callsFor(action) + 1;
     _payloads[action] = payload;
+    (_payloadHistory[action] ??= <Map<String, Object?>?>[]).add(payload);
+    _order.add(action);
     final thrown = failure;
     if (thrown != null) {
       await Future<void>.delayed(delay);
@@ -615,6 +633,7 @@ class FakeEngineRepository implements EngineRepository {
   Future<void> dispose() async {
     _calls.clear();
     _payloads.clear();
+    _payloadHistory.clear();
     if (!_events.isClosed) await _events.close();
   }
 }

@@ -10,9 +10,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../app/router.dart';
 import '../../../core/rpc/envelope.dart';
 import '../../../core/widgets/failure_banner.dart';
 import '../../../core/widgets/state_bar.dart';
+import '../../reader/domain/reader_controller.dart';
 import '../data/bookshelf_item.dart';
 import '../domain/bookshelf_notifier.dart';
 
@@ -78,7 +80,13 @@ class BookshelfRow extends StatelessWidget {
       subtitle: item.subtitle.isEmpty
           ? null
           : Text(item.subtitle, maxLines: 1, overflow: TextOverflow.ellipsis),
-      // G1 还没有"开读"这条线（§9 的 G3 阅读器）。占位不行——占位会被当成已接上。
+      // 点一行就是开读（§9 门 G3「从书架开一本书」）。`book` 传的是**行快照原样那份字典**：
+      // 服务端 `as_book_item` 认字典，界面不许在这里重拼字段（少一格就是少一格，
+      // 而 `reader.open` 的回话会告诉你它认成了什么）。
+      onTap: () => openReaderBook(
+        context,
+        ReaderArgs(sourceUrl: item.sourceUrl, book: item.raw),
+      ),
     );
   }
 }

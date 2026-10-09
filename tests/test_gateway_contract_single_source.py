@@ -161,48 +161,58 @@ _DART_EXTENSIONS = (".dart", ".py", ".json", ".yaml", ".site")
 
 
 def _action_literals(text: str) -> list[str]:
-    """扫出**像 action 的调用点**的字符串字面量，排掉三类同形状的邻居。
+    """只扫**调用位上的** action 字面量（``.call('…'`` 那一族），其余一律不算调用点。
 
-    - `import 'router.dart'`：文件名也是 `小写.小写`，靠后缀排掉；
-    - `Key('bookshelf.refresh')`：控件键与 action 用的是同一个 `域.名词` 形状，
-      但它不是协议面上的东西，靠 `Key(` 前缀排掉；
-    - `'reader.open': 60`：`action_budgets.dart` 里那是一张**预算表**，字面量后面
-      跟冒号的是"给某个动作定预算"，不是"调这个动作"。这一条是 G3-B 现场抓到的：
-      只给协议面登记、界面还没接的动作一进预算表，就被读成"客户端在调"，
-      "每一发都有人调"那半边当场失去牙齿（记忆里 `measurement-corpus-must-not-be-self-proving`
-      的同形：仪器自己造出了它要读的那个信号）。
+    这一条口径在第八十九轮（G3-C3）从"认字面量、排掉几种邻居"改成"只认调用位"，
+    因为要排掉的邻居一直在长：
 
-    排掉的三条都必须窄：宽到"整个文件跳过"就把真调用点也一起藏了。
+    - `import 'router.dart'`：文件名也是 `小写.小写`（后缀排掉，这一条留着，
+      调用位上也可能会出现带后缀的字面量）；
+    - `Key('bookshelf.refresh')`：控件键与 action 同形；
+    - `'reader.open': 60`：`action_budgets.dart` 那张**预算表**——G3-B 现场抓到的：
+      只登记、界面还没接的动作一进预算表就被读成"客户端在调"，
+      "每一发都有人调"那半边当场失去牙齿（记忆 `measurement-corpus-must-not-be-self-proving`
+      的同形：仪器自己造出了它要读的那个信号）；
+    - `heroTag: 'reader.prev'`（G3-C3 的阅读屏： FloatingActionButton 要 heroTag，
+      它与控件键同值，但不长在 `Key(` 后面，那一条前缀排不掉）；
+    - `static const String kFontSizeMode = 'reader.font_size'`（同轮：排版偏好的
+      两个**模式名**，Dart 侧自己的命名空间，压根不过协议面）。
 
-    **段里允许下划线**（`source.batch_enable`）：这一条是 G2-E 补的——原来那版只认
-    `[a-zA-Z]*`，于是两条带下划线的动作对扫描器**完全隐形**，
-    "客户端有没有调它"读出来是"没调"，而 Dart 那边其实早就在调。
+    后三条的形状不同、道理相同：**字面量出现在声明位/命名参数位就不是调用点**。
+    逐个加前缀是打地鼠（`Key(` 那条已经被 `heroTag` 顶穿一次），改成"必须跟在调用动词
+    之后"是一句话的口径，而且它更贴判据本来的问法——问的是客户端**在不在调**这一发。
+
+    **段里允许下划线**（`source.batch_enable`）：G2-E 补的——原来那版只认 `[a-zA-Z]*`，
+    两条带下划线的动作对扫描器完全隐形，读出来是"没调"，而 Dart 那边其实早就在调。
+
+    代价写在这里：谁把动作名提成常量再 `call(kAction)`，这一版就看不见它——那一条
+    会当"没人调"报红。这是有意的：调用点要能被这张表数出来，就得留在字面量那一档。
     """
-    shape = re.compile(
-        r"(?<!Key\()'([a-z][a-zA-Z_]*\.[a-zA-Z][a-zA-Z_0-9]*)'(?!\s*:)")
+    shape = re.compile(r"(?:\bcall\(|callFor\(|_call\(|invoke\()\s*"
+                       r"'([a-z][a-zA-Z_]*\.[a-zA-Z][a-zA-Z_0-9]*)'")
     return [m for m in shape.findall(text)
             if not any(m.endswith(ext) for ext in _DART_EXTENSIONS)]
 
 
 def test_widget_key_lookalikes_are_not_mistaken_for_actions() -> None:
-    """上面那条排掉 `Key('bookshelf.refresh')` 的手必须**窄**到只排键。
+    """"只认调用位"这只手必须**窄**到只认调用位：五种同形邻居都排掉，真调用点照扫。
 
-    正对照：拿一行真调用点喂同一个解析器，它必须被扫出来。否则"排键"其实是
+    正对照：拿一行真调用点喂同一个解析器，它必须被扫出来。否则"排邻居"其实是
     "整个不扫"，前一支就永远绿着（记忆里 `guard-tests-assert-absence` 那一族）。
 
-    第二行 `source.batch_enable` 是 G2-E 加的第二种形状：段里带下划线的那批动作
-    曾经对扫描器完全隐形，只喂 `bookshelf.list` 这种"干净"的名字照不出这个洞。
-
-    第三行 `'reader.open': 60` 是 G3-B 加的第三种形状：预算表里的键不是调用点。
-    同一发动作在第四行真的被调用，它必须照样被扫出来——不然这一条就成了
-    "把 reader 整族排掉"，方向正好反过来。
+    第 4 行 `source.batch_enable` 是 G2-E 的形状（段里带下划线）；第 5-6 行是 G3-B 的
+    预算表 + 同一发动作被真调（这行是这一支的牙齿：排掉预算表不许顺手把 reader 整族排掉）；
+    第 7-8 行是 G3-C3 阅读屏带来的两种新形状——`heroTag` 顶穿过 `Key(` 那条前缀，
+    模式常量 `kFontSizeMode` 是第三种，两者都必须在"只认调用位"这一条口径下自动出局。
     """
     sample = ("  final a = client.call('bookshelf.list');\n"
               "  key: const Key('bookshelf.refresh'),\n"
+              "  import 'router.dart';\n"
               "  await client.call('source.batch_enable', payload: x);\n"
               "  'reader.open': 60,\n"
               "  await client.call('reader.open', payload: x);\n"
-              "import 'router.dart';\n")
+              "  heroTag: 'reader.prev',\n"
+              "  static const String kFontSizeMode = 'reader.font_size';\n")
     assert _action_literals(sample) == [
         "bookshelf.list", "source.batch_enable", "reader.open"], _action_literals(sample)
 
