@@ -1,0 +1,737 @@
+{
+  "renderer": "app/controllers/source/check_controller.py::_summary_line",
+  "payload_from": "tests/gateway/golden/check.snapshot.json 的 response.data",
+  "rows": [
+    {
+      "case": "as_captured",
+      "why": "黄金样本原样：浅遍 + 待深检都在",
+      "payload": {
+        "running": false,
+        "cancelled": false,
+        "total": 1,
+        "depth": "auto",
+        "tiering": {
+          "plan_total": 1,
+          "shallow": 1,
+          "deep": 0,
+          "slice_limit": 12,
+          "carried": 0,
+          "by_reason": {
+            "list_usable": 1
+          },
+          "deferred": 1,
+          "queued": 1
+        },
+        "deep_queue": [
+          {
+            "raw_url": "http://127.0.0.1:8797/g2",
+            "reason": "list_usable",
+            "attempts": 0,
+            "exhausted": false
+          }
+        ],
+        "summary": {
+          "total": 1,
+          "finished": 1,
+          "usable": 1,
+          "blocked": 0,
+          "results": [
+            {
+              "idx": 1,
+              "name": "G2分类源",
+              "raw_url": "http://127.0.0.1:8797/g2",
+              "status": "ok",
+              "status_code": 200,
+              "response_time_ms": 0.7574001792818308,
+              "error": null,
+              "search_status": "ok",
+              "book_count": 1,
+              "search_keyword": "我的",
+              "search_method": "rule-engine",
+              "search_error": null,
+              "reading_status": "skip",
+              "reading_stage": "none",
+              "reading_error": null,
+              "chapter_count": null,
+              "sample_book": null,
+              "sample_chapter": null,
+              "sample_chapter_urls": [],
+              "reading_tried": 0,
+              "reading_check_skipped": "list",
+              "category_results": [
+                {
+                  "title": "玄幻奇幻",
+                  "url": "/g2/list?page={{page}}",
+                  "valid": true,
+                  "status_code": null,
+                  "item_count": 2,
+                  "error": null,
+                  "pagination_valid": true,
+                  "page_results": [
+                    {
+                      "page": 1,
+                      "valid": true,
+                      "status_code": null,
+                      "item_count": 2,
+                      "content_type": "rule-engine",
+                      "error": null,
+                      "attempts": 1,
+                      "persistent_rate_limit": false
+                    },
+                    {
+                      "page": 2,
+                      "valid": true,
+                      "status_code": null,
+                      "item_count": 2,
+                      "content_type": "rule-engine",
+                      "error": null,
+                      "attempts": 1,
+                      "persistent_rate_limit": false
+                    }
+                  ]
+                }
+              ],
+              "tag_check_timeout": false,
+              "tag_check_skipped": false,
+              "unsupported_java_packages": [],
+              "tag_total": 1,
+              "tag_valid": 1,
+              "tag_invalid": 0,
+              "check_state": "list_usable",
+              "usable": true,
+              "auto_disabled": false,
+              "tier": "list"
+            }
+          ],
+          "tiering": {
+            "plan_total": 1,
+            "shallow": 1,
+            "deep": 0,
+            "slice_limit": 12,
+            "carried": 0,
+            "by_reason": {
+              "list_usable": 1
+            },
+            "deferred": 1,
+            "queued": 1
+          }
+        },
+        "results": [
+          {
+            "source_id": "http://127.0.0.1:8797/g2",
+            "state_class": "list_usable",
+            "summary": "G2分类源：list_usable（本轮快速检测，未验正文）",
+            "sample_chapter_urls": []
+          }
+        ]
+      },
+      "expected": "检测完成：可用 1/1，阻断 0（快检 1 源、补验正文 0 源，待深检 1 源）"
+    },
+    {
+      "case": "cancelled",
+      "why": "取消那一支优先，结论再齐全也不许盖掉它",
+      "payload": {
+        "running": false,
+        "cancelled": true,
+        "total": 1,
+        "depth": "auto",
+        "tiering": {
+          "plan_total": 1,
+          "shallow": 1,
+          "deep": 0,
+          "slice_limit": 12,
+          "carried": 0,
+          "by_reason": {
+            "list_usable": 1
+          },
+          "deferred": 1,
+          "queued": 1
+        },
+        "deep_queue": [
+          {
+            "raw_url": "http://127.0.0.1:8797/g2",
+            "reason": "list_usable",
+            "attempts": 0,
+            "exhausted": false
+          }
+        ],
+        "summary": {
+          "total": 1,
+          "finished": 1,
+          "usable": 1,
+          "blocked": 0,
+          "results": [
+            {
+              "idx": 1,
+              "name": "G2分类源",
+              "raw_url": "http://127.0.0.1:8797/g2",
+              "status": "ok",
+              "status_code": 200,
+              "response_time_ms": 0.7574001792818308,
+              "error": null,
+              "search_status": "ok",
+              "book_count": 1,
+              "search_keyword": "我的",
+              "search_method": "rule-engine",
+              "search_error": null,
+              "reading_status": "skip",
+              "reading_stage": "none",
+              "reading_error": null,
+              "chapter_count": null,
+              "sample_book": null,
+              "sample_chapter": null,
+              "sample_chapter_urls": [],
+              "reading_tried": 0,
+              "reading_check_skipped": "list",
+              "category_results": [
+                {
+                  "title": "玄幻奇幻",
+                  "url": "/g2/list?page={{page}}",
+                  "valid": true,
+                  "status_code": null,
+                  "item_count": 2,
+                  "error": null,
+                  "pagination_valid": true,
+                  "page_results": [
+                    {
+                      "page": 1,
+                      "valid": true,
+                      "status_code": null,
+                      "item_count": 2,
+                      "content_type": "rule-engine",
+                      "error": null,
+                      "attempts": 1,
+                      "persistent_rate_limit": false
+                    },
+                    {
+                      "page": 2,
+                      "valid": true,
+                      "status_code": null,
+                      "item_count": 2,
+                      "content_type": "rule-engine",
+                      "error": null,
+                      "attempts": 1,
+                      "persistent_rate_limit": false
+                    }
+                  ]
+                }
+              ],
+              "tag_check_timeout": false,
+              "tag_check_skipped": false,
+              "unsupported_java_packages": [],
+              "tag_total": 1,
+              "tag_valid": 1,
+              "tag_invalid": 0,
+              "check_state": "list_usable",
+              "usable": true,
+              "auto_disabled": false,
+              "tier": "list"
+            }
+          ],
+          "tiering": {
+            "plan_total": 1,
+            "shallow": 1,
+            "deep": 0,
+            "slice_limit": 12,
+            "carried": 0,
+            "by_reason": {
+              "list_usable": 1
+            },
+            "deferred": 1,
+            "queued": 1
+          }
+        },
+        "results": [
+          {
+            "source_id": "http://127.0.0.1:8797/g2",
+            "state_class": "list_usable",
+            "summary": "G2分类源：list_usable（本轮快速检测，未验正文）",
+            "sample_chapter_urls": []
+          }
+        ]
+      },
+      "expected": "检测已停止"
+    },
+    {
+      "case": "running",
+      "why": "summary 还没生成 → 空串（调用方保留“尚未检测”）",
+      "payload": {
+        "running": false,
+        "cancelled": false,
+        "total": 1,
+        "depth": "auto",
+        "tiering": {
+          "plan_total": 1,
+          "shallow": 1,
+          "deep": 0,
+          "slice_limit": 12,
+          "carried": 0,
+          "by_reason": {
+            "list_usable": 1
+          },
+          "deferred": 1,
+          "queued": 1
+        },
+        "deep_queue": [
+          {
+            "raw_url": "http://127.0.0.1:8797/g2",
+            "reason": "list_usable",
+            "attempts": 0,
+            "exhausted": false
+          }
+        ],
+        "summary": null,
+        "results": [
+          {
+            "source_id": "http://127.0.0.1:8797/g2",
+            "state_class": "list_usable",
+            "summary": "G2分类源：list_usable（本轮快速检测，未验正文）",
+            "sample_chapter_urls": []
+          }
+        ]
+      },
+      "expected": ""
+    },
+    {
+      "case": "no_tiering",
+      "why": "两处都没有分档 → 尾巴整段不出现",
+      "payload": {
+        "running": false,
+        "cancelled": false,
+        "total": 1,
+        "depth": "auto",
+        "deep_queue": [
+          {
+            "raw_url": "http://127.0.0.1:8797/g2",
+            "reason": "list_usable",
+            "attempts": 0,
+            "exhausted": false
+          }
+        ],
+        "summary": {
+          "total": 1,
+          "finished": 1,
+          "usable": 1,
+          "blocked": 0,
+          "results": [
+            {
+              "idx": 1,
+              "name": "G2分类源",
+              "raw_url": "http://127.0.0.1:8797/g2",
+              "status": "ok",
+              "status_code": 200,
+              "response_time_ms": 0.7574001792818308,
+              "error": null,
+              "search_status": "ok",
+              "book_count": 1,
+              "search_keyword": "我的",
+              "search_method": "rule-engine",
+              "search_error": null,
+              "reading_status": "skip",
+              "reading_stage": "none",
+              "reading_error": null,
+              "chapter_count": null,
+              "sample_book": null,
+              "sample_chapter": null,
+              "sample_chapter_urls": [],
+              "reading_tried": 0,
+              "reading_check_skipped": "list",
+              "category_results": [
+                {
+                  "title": "玄幻奇幻",
+                  "url": "/g2/list?page={{page}}",
+                  "valid": true,
+                  "status_code": null,
+                  "item_count": 2,
+                  "error": null,
+                  "pagination_valid": true,
+                  "page_results": [
+                    {
+                      "page": 1,
+                      "valid": true,
+                      "status_code": null,
+                      "item_count": 2,
+                      "content_type": "rule-engine",
+                      "error": null,
+                      "attempts": 1,
+                      "persistent_rate_limit": false
+                    },
+                    {
+                      "page": 2,
+                      "valid": true,
+                      "status_code": null,
+                      "item_count": 2,
+                      "content_type": "rule-engine",
+                      "error": null,
+                      "attempts": 1,
+                      "persistent_rate_limit": false
+                    }
+                  ]
+                }
+              ],
+              "tag_check_timeout": false,
+              "tag_check_skipped": false,
+              "unsupported_java_packages": [],
+              "tag_total": 1,
+              "tag_valid": 1,
+              "tag_invalid": 0,
+              "check_state": "list_usable",
+              "usable": true,
+              "auto_disabled": false,
+              "tier": "list"
+            }
+          ]
+        },
+        "results": [
+          {
+            "source_id": "http://127.0.0.1:8797/g2",
+            "state_class": "list_usable",
+            "summary": "G2分类源：list_usable（本轮快速检测，未验正文）",
+            "sample_chapter_urls": []
+          }
+        ]
+      },
+      "expected": "检测完成：可用 1/1，阻断 0（待深检 1 源）"
+    },
+    {
+      "case": "queue_drained",
+      "why": "深检队列清空 → 只剩快检那一段",
+      "payload": {
+        "running": false,
+        "cancelled": false,
+        "total": 1,
+        "depth": "auto",
+        "tiering": {
+          "plan_total": 1,
+          "shallow": 1,
+          "deep": 0,
+          "slice_limit": 12,
+          "carried": 0,
+          "by_reason": {
+            "list_usable": 1
+          },
+          "deferred": 1,
+          "queued": 1
+        },
+        "deep_queue": [],
+        "summary": {
+          "total": 1,
+          "finished": 1,
+          "usable": 1,
+          "blocked": 0,
+          "results": [
+            {
+              "idx": 1,
+              "name": "G2分类源",
+              "raw_url": "http://127.0.0.1:8797/g2",
+              "status": "ok",
+              "status_code": 200,
+              "response_time_ms": 0.7574001792818308,
+              "error": null,
+              "search_status": "ok",
+              "book_count": 1,
+              "search_keyword": "我的",
+              "search_method": "rule-engine",
+              "search_error": null,
+              "reading_status": "skip",
+              "reading_stage": "none",
+              "reading_error": null,
+              "chapter_count": null,
+              "sample_book": null,
+              "sample_chapter": null,
+              "sample_chapter_urls": [],
+              "reading_tried": 0,
+              "reading_check_skipped": "list",
+              "category_results": [
+                {
+                  "title": "玄幻奇幻",
+                  "url": "/g2/list?page={{page}}",
+                  "valid": true,
+                  "status_code": null,
+                  "item_count": 2,
+                  "error": null,
+                  "pagination_valid": true,
+                  "page_results": [
+                    {
+                      "page": 1,
+                      "valid": true,
+                      "status_code": null,
+                      "item_count": 2,
+                      "content_type": "rule-engine",
+                      "error": null,
+                      "attempts": 1,
+                      "persistent_rate_limit": false
+                    },
+                    {
+                      "page": 2,
+                      "valid": true,
+                      "status_code": null,
+                      "item_count": 2,
+                      "content_type": "rule-engine",
+                      "error": null,
+                      "attempts": 1,
+                      "persistent_rate_limit": false
+                    }
+                  ]
+                }
+              ],
+              "tag_check_timeout": false,
+              "tag_check_skipped": false,
+              "unsupported_java_packages": [],
+              "tag_total": 1,
+              "tag_valid": 1,
+              "tag_invalid": 0,
+              "check_state": "list_usable",
+              "usable": true,
+              "auto_disabled": false,
+              "tier": "list"
+            }
+          ],
+          "tiering": {
+            "plan_total": 1,
+            "shallow": 1,
+            "deep": 0,
+            "slice_limit": 12,
+            "carried": 0,
+            "by_reason": {
+              "list_usable": 1
+            },
+            "deferred": 1,
+            "queued": 1
+          }
+        },
+        "results": [
+          {
+            "source_id": "http://127.0.0.1:8797/g2",
+            "state_class": "list_usable",
+            "summary": "G2分类源：list_usable（本轮快速检测，未验正文）",
+            "sample_chapter_urls": []
+          }
+        ]
+      },
+      "expected": "检测完成：可用 1/1，阻断 0（快检 1 源、补验正文 0 源）"
+    },
+    {
+      "case": "tiering_only_in_summary",
+      "why": "分档只写在 summary 里：嵌套那份赢（客户端读顶层就是另一种说法）",
+      "payload": {
+        "running": false,
+        "cancelled": false,
+        "total": 1,
+        "depth": "auto",
+        "tiering": {
+          "plan_total": 9,
+          "shallow": 9,
+          "deep": 0
+        },
+        "deep_queue": [
+          {
+            "raw_url": "http://127.0.0.1:8797/g2",
+            "reason": "list_usable",
+            "attempts": 0,
+            "exhausted": false
+          }
+        ],
+        "summary": {
+          "total": 1,
+          "finished": 1,
+          "usable": 1,
+          "blocked": 0,
+          "results": [
+            {
+              "idx": 1,
+              "name": "G2分类源",
+              "raw_url": "http://127.0.0.1:8797/g2",
+              "status": "ok",
+              "status_code": 200,
+              "response_time_ms": 0.7574001792818308,
+              "error": null,
+              "search_status": "ok",
+              "book_count": 1,
+              "search_keyword": "我的",
+              "search_method": "rule-engine",
+              "search_error": null,
+              "reading_status": "skip",
+              "reading_stage": "none",
+              "reading_error": null,
+              "chapter_count": null,
+              "sample_book": null,
+              "sample_chapter": null,
+              "sample_chapter_urls": [],
+              "reading_tried": 0,
+              "reading_check_skipped": "list",
+              "category_results": [
+                {
+                  "title": "玄幻奇幻",
+                  "url": "/g2/list?page={{page}}",
+                  "valid": true,
+                  "status_code": null,
+                  "item_count": 2,
+                  "error": null,
+                  "pagination_valid": true,
+                  "page_results": [
+                    {
+                      "page": 1,
+                      "valid": true,
+                      "status_code": null,
+                      "item_count": 2,
+                      "content_type": "rule-engine",
+                      "error": null,
+                      "attempts": 1,
+                      "persistent_rate_limit": false
+                    },
+                    {
+                      "page": 2,
+                      "valid": true,
+                      "status_code": null,
+                      "item_count": 2,
+                      "content_type": "rule-engine",
+                      "error": null,
+                      "attempts": 1,
+                      "persistent_rate_limit": false
+                    }
+                  ]
+                }
+              ],
+              "tag_check_timeout": false,
+              "tag_check_skipped": false,
+              "unsupported_java_packages": [],
+              "tag_total": 1,
+              "tag_valid": 1,
+              "tag_invalid": 0,
+              "check_state": "list_usable",
+              "usable": true,
+              "auto_disabled": false,
+              "tier": "list"
+            }
+          ],
+          "tiering": {
+            "plan_total": 2,
+            "shallow": 2,
+            "deep": 1
+          }
+        },
+        "results": [
+          {
+            "source_id": "http://127.0.0.1:8797/g2",
+            "state_class": "list_usable",
+            "summary": "G2分类源：list_usable（本轮快速检测，未验正文）",
+            "sample_chapter_urls": []
+          }
+        ]
+      },
+      "expected": "检测完成：可用 1/1，阻断 0（快检 2 源、补验正文 1 源，待深检 1 源）"
+    },
+    {
+      "case": "plan_total_zero",
+      "why": "plan_total=0 是“真值 0”不是缺键：整段分档说明不出现",
+      "payload": {
+        "running": false,
+        "cancelled": false,
+        "total": 1,
+        "depth": "auto",
+        "tiering": {
+          "plan_total": 0,
+          "shallow": 0,
+          "deep": 0
+        },
+        "deep_queue": [
+          {
+            "raw_url": "http://127.0.0.1:8797/g2",
+            "reason": "list_usable",
+            "attempts": 0,
+            "exhausted": false
+          }
+        ],
+        "summary": {
+          "total": 1,
+          "finished": 1,
+          "usable": 1,
+          "blocked": 0,
+          "results": [
+            {
+              "idx": 1,
+              "name": "G2分类源",
+              "raw_url": "http://127.0.0.1:8797/g2",
+              "status": "ok",
+              "status_code": 200,
+              "response_time_ms": 0.7574001792818308,
+              "error": null,
+              "search_status": "ok",
+              "book_count": 1,
+              "search_keyword": "我的",
+              "search_method": "rule-engine",
+              "search_error": null,
+              "reading_status": "skip",
+              "reading_stage": "none",
+              "reading_error": null,
+              "chapter_count": null,
+              "sample_book": null,
+              "sample_chapter": null,
+              "sample_chapter_urls": [],
+              "reading_tried": 0,
+              "reading_check_skipped": "list",
+              "category_results": [
+                {
+                  "title": "玄幻奇幻",
+                  "url": "/g2/list?page={{page}}",
+                  "valid": true,
+                  "status_code": null,
+                  "item_count": 2,
+                  "error": null,
+                  "pagination_valid": true,
+                  "page_results": [
+                    {
+                      "page": 1,
+                      "valid": true,
+                      "status_code": null,
+                      "item_count": 2,
+                      "content_type": "rule-engine",
+                      "error": null,
+                      "attempts": 1,
+                      "persistent_rate_limit": false
+                    },
+                    {
+                      "page": 2,
+                      "valid": true,
+                      "status_code": null,
+                      "item_count": 2,
+                      "content_type": "rule-engine",
+                      "error": null,
+                      "attempts": 1,
+                      "persistent_rate_limit": false
+                    }
+                  ]
+                }
+              ],
+              "tag_check_timeout": false,
+              "tag_check_skipped": false,
+              "unsupported_java_packages": [],
+              "tag_total": 1,
+              "tag_valid": 1,
+              "tag_invalid": 0,
+              "check_state": "list_usable",
+              "usable": true,
+              "auto_disabled": false,
+              "tier": "list"
+            }
+          ],
+          "tiering": {
+            "plan_total": 0,
+            "shallow": 0,
+            "deep": 0
+          }
+        },
+        "results": [
+          {
+            "source_id": "http://127.0.0.1:8797/g2",
+            "state_class": "list_usable",
+            "summary": "G2分类源：list_usable（本轮快速检测，未验正文）",
+            "sample_chapter_urls": []
+          }
+        ]
+      },
+      "expected": "检测完成：可用 1/1，阻断 0（待深检 1 源）"
+    }
+  ]
+}

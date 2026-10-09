@@ -140,6 +140,15 @@ POST /rpc   {"v":1,"id":"c-17","action":"bookshelf.list","seq":17,"payload":{...
 dict.* replace.* font.* backup.* webdav.* theme.* boss.* bridge.* engine.*`。
 **显式表是硬要求**：反射扫 32 个服务会把 `-> list[BookSource]` 这类泄漏直接顶上协议面。
 
+表里还有一格 `fields` = **出口字段白名单**（只对"行列表"载荷生效，在 `to_json` 之后、
+发信封之前由 `serialize.project` 逐行收口）。它不是为了好看：第八十五轮 G2-F 量过，
+`source.list` 那 920 行的 data 是 6,969,039 B，其中列表那一屏从不显示的 `exploreUrl` 占
+40.1 %、`jsLib` 占 23.5 %、五组 `rule*` 占 24.0 %（逐键字节账：`.probe/g2f_payload_anatomy.py`），
+Dart 解它要转码 13.4 ms + `jsonDecode` 64.4 ms，而 Python 侧整发（含解）才 101.2 ms ⇒ 客户端付的是服务端的 1.7 倍。收成六格后同一发是 351,554 B，
+总账回到 1.39 倍。**这一格算进 `schema_digest`**：改白名单就是改契约，老客户端会在握手时被拒，
+不会悄悄拿到一份字段变薄的载荷。`source.get` **故意不投影**——编辑器的回填以它为底本，
+把瘦身行存回去等于把 `exploreUrl`/`jsLib` 写成空。
+
 ### 4.3 事件流（不轮询）
 `GET /ws`（沿用 `web_bridge_service.py:344-352`），帧：
 `{type:"event", name:"RssRefreshProgress", payload:{...}}`。事件名 = `app/core/events.py`
@@ -182,7 +191,7 @@ dict.* replace.* font.* backup.* webdav.* theme.* boss.* bridge.* engine.*`。
 | --- | --- | --- | --- |
 | 5.1 | `GatewayService`（注册进 hub，依赖 EventBus/Storage/Settings） | 新 `app/services/gateway/service.py`；复用 `web_bridge_service.py` 的 runner/token 中间件形态 | 无头启动 → 真发一个 RPC → 事件按序到达；断连重连能拿到状态快照 |
 | 5.2 | 显式 action 表 + JSON Schema | 新 `app/gateway/methods.py`、`app/gateway/schema/` | "表里的 action 必须能反射到真方法"（防记忆里"孤儿方法"那一族）；schema 与 dataclass 字段一致 |
-| 5.3 | 出口序列化：`-> list[BookSource]` 这类在**边界**转 dict | `source_service.py:288` 等 27 个 dataclass；统一 `gateway/serialize.py` | 断言 RPC 响应里不含任何 `app.*` 实例（`type(...) is dict/list/str/int/float/bool/None`） |
+| 5.3 | 出口序列化：`-> list[BookSource]` 这类在**边界**转 dict，再按 §4.2 的 `fields` 白名单**逐行收口** | `source_service.py:288` 等 27 个 dataclass；统一 `gateway/serialize.py`（`to_json` + `project`） | 断言 RPC 响应里不含任何 `app.*` 实例（`type(...) is dict/list/str/int/float/bool/None`）；白名单里的键必须真是模型字段、必须盖住界面在读的那几格、错形状必须抛、改白名单必须让 `schema_digest` 跟着动（`tests/test_gateway_contract.py::ExitProjectionTests`） |
 | 5.4 | 单循环化：`set_ui_loop` / `call_on_ui` 在无头模式退化为恒等 | `engine_worker.py:245,253,258`、`base.py:193,218,236` | 无头模式下断言"没有任何回调试图投递 UI 循环"；原生句柄仍只在自己的线程上被碰（QuickJS 派发线程、`tts-system`，见记忆 `tts-pyttsx3-com-same-thread`、`quickjs-native-crash-risk`） |
 | 5.5 | 无头入口 `main.py --serve` | `main.py:99-208` 装配不变，去掉 `ft.run`（`:384`） | 护栏：**serve 路径 `import flet` 必须为 0**（扫 AST，不许豁免） |
 | 5.6 | 关闭路径 | 复用今天定的规矩：原生对象由**自己的拥有线程**释放，`close()` 只排活不 join | 实测退出码 0 + 关窗→消失延迟读数（今天基线 0.4/0.5s，迁移后必须重新量再写进文档） |
@@ -280,8 +289,8 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 | 门 | 内容 | 规模 | **通过的判据（必须当场量）** |
 | --- | --- | --- | --- |
 | **G0** | `GatewayService` + action 表 + schema + `--serve` 无头 + 单循环化 + §5 六条护栏 | 1–1.5 周 | 无头进程能被 curl 驱动完成"列书架 / 起一次检测并收进度事件"；serve 路径 import flet = 0；退出码 0 且关窗→消失延迟有读数；全库回归仍全绿 |
-| **G1** | Flutter 壳 + `RpcEngineRepository` + 握手 + `bookshelf` 一屏（真数据） | 1 周 | Flutter 那屏的行数/内容与 flet 屏一致（同书单比对——靶子：R4 那份副本上 `bookshelf.list` = **7 行 / 25,012 B**、`source.list` = 920 行 / 6,969,038 B，冷启动到握手 640 ms 也要有同臂读数）；R1 竖切有结论 |
-| **G2** | 高频只读面：`find_books` / `sources` / `check` / 设置页 | 2–3 周 | R4 三项量过且 ≥ flet：对照靶就是第八十二轮同一份 920 行副本上的读数（滚动每拍下发 390 ms、其中空列表底价 3 ms；`source.list` 跨进程 p50 80.6 ms；首屏行落满 561 ms）；契约测试覆盖这 4 个域的全部 action |
+| **G1** | Flutter 壳 + `RpcEngineRepository` + 握手 + `bookshelf` 一屏（真数据） | 1 周 | Flutter 那屏的行数/内容与 flet 屏一致（同书单比对——靶子：R4 那份副本上 `bookshelf.list` = **7 行 / 25,012 B**、`source.list` = 920 行 / 6,969,038 B（**这是 §4.2 出口投影之前的载荷**），冷启动到握手 640 ms 也要有同臂读数）；R1 竖切有结论 |
+| **G2** | 高频只读面：`find_books` / `sources` / `check` / 设置页 | 2–3 周 | R4 三项量过且 ≥ flet：对照靶就是第八十二轮同一份 920 行副本上的读数（滚动每拍下发 390 ms、其中空列表底价 3 ms；`source.list` 跨进程 p50 80.6 ms；首屏行落满 561 ms）；契约测试覆盖这 4 个域的全部 action。**2026-10-09 第八十五轮交**：三项各有 Dart 侧读数与自己的底价臂（跨进程 Dart A 30.9 ms / Python 同副本重测 20.5 + 1.7，界面两臂只与自家底价比——口径不同不许直读）；31 条动作 30 份真进程靶子；那 1.7 倍归因到载荷后用 §4.2 的出口投影改判成 1.39 倍 |
 | **G3** | **阅读器**（最大单块，排版/翻页/进度/书签/换源） | 2–3 周 | 同一本书翻页落点与 flet 版可比（按字符偏移断言）；R1 涉及的源在真机上读到正文 |
 | **G4** | `rss` / 漫画 / 朗读 / 工具域 / 老板键托盘；删 flet 依赖与 4 个 UI 耦合服务；PyInstaller spec 去 flet* | 2–3 周 | flet 从 `requirements.txt` 消失后全库仍绿；打包冒烟（照真果鉴 `smoke_windows.py` 那条：解压产物跑一次 `--package-smoke`） |
 
@@ -347,6 +356,38 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 > 修完才看得见的一条新问题（收尾偶发 +5.00s，49 发 4 发，`engine_worker.py:228` 的
 > join 走满，归因未定）另记 `docs/known-issues/006`。
 > 读数、仪器与变异核验见 `docs/dev-logs/2026-10-08.md`。
+> **G2 同日交（2026-10-09，第八十五轮）**：action 表从 9 条长到 **31 条**
+> （`call` 23 / `sync` 6 / `job` 2，9 个命名空间），模型不过 RPC——服务侧补了 5 条 JSON 门面
+> （`shelve_by_url`、`browse_categories`、`browse_books`、`search_in_scope`、`read_keys`），
+> 外加一条 `search.scopes`（`ReadingService.scope_table`：**"哪些源能动"只留一份算法**）。
+> 语料库立了新规矩：**每份样本盖着抓取那趟握手的 `schema_digest`**（现值 `ffef64386bec`），
+> 改表或改 schema 不重抓就全库红；真 `--serve` 子进程一趟落 **31** 份样本（30 条动作各有靶子，
+> 唯一例外 `engine.webContentReady` 的理由写死在例外表里，覆盖那支钉的是"缺的集合**恰好等于**
+> 例外表"），`mode=job` 的两份另带 `/ws` 那一段交付。
+> Dart 面：仓库面 29 发 + `find_books`/`sources`/`check`/`appearance` 四屏 + `/ws` 事件流，
+> `golden_widget_test.dart` 用 `FakeEngineRepository` **吃黄金样本的原始 dict**、答案与
+> **flet 自己渲染出来的**投影表逐字比（`.probe/g2e_projection_tables.py` 直接调
+> `_summary_line` / `BookSourceListView()._row` 再读回 `ft.Text.value`，答案不许手填）。
+> **§9 G2 判据（R4 三项 ≥ flet）的读数**——靶子在同一份 920 行副本上**当天重测**
+> （`.probe/g2f_dart_baseline.py`，输出 `.probe/g2f_dart_baseline_run8.log`）：
+> 跨进程那发 Dart **A 全程 p50 30.9 ms**（B 只到线 22.6，与 Python S 同跨度之比 1.1 倍），
+> 底价臂 `engine.status` 2.4 ms；首屏 Dart 920 行 **110.5 ms** 对空列表底价 **35.0 ms**
+> （Δ75.5，一帧只挂 7/920 行）；滚动每拍 **62.7 ms** 对"落点不动"底价 **1.3 ms**
+> （Δ61.4，24/24 拍一格没换）。界面那两臂与 flet 的数**不可直读**（`flutter_test` 无 GPU
+> 光栅化 + ListView 虚拟化），只与各臂自己的底价比，日志末尾明写这一条口径。
+> **量出来的那 1.7 倍不是 Dart 的错，是载荷的错**：`.probe/g2f_payload_anatomy.py` 逐键数字节，
+> 那一发 6,969,039 B 里 `exploreUrl` 40.1 % + `jsLib` 23.5 % + 五组 `rule*` 24.0 % 全是列表屏
+> 不显示的规则原文（Dart 解它：转码 13.4 + `jsonDecode` 64.4 ms，而 Python 侧整发才 101.2 ms）。
+> 于是 §4.2 那张显式表新增一格 `fields`（**出口字段白名单**，`serialize.project` 在 `to_json`
+> 之后、发信封之前逐行收口，且**算进 `schema_digest`**），`source.list` 从 6,969,039 B 到
+> **351,554 B（5.1 %）**，总账 **1.7 倍 → 1.39 倍**；`source.get` 故意不投影（编辑器的回填底本），
+> flet 投影表重生成后那 920 行的 `title`/`subtitle` **一字节没变**。
+> 变异核验四批 **45 发全红**（跨语言守卫 10 / Dart 测试面 14 / 出口投影 6 / 基准仪器 15，
+> 每批先做选择器自检），语料库那五笔账的变异证据长在守卫里
+> （`test_mutation_controls_show_the_guards_are_not_deaf`）。回归：Python
+> `1956 passed, 161 subtests passed in 188.44s`；Dart `164 passed / 3 skipped`、
+> `flutter analyze` 只剩 6 条既有 info。读数、仪器坑（含"每行键数固定"这个被 Gson 丢 null
+> 打死的假守卫、探针里的字节底价该换成现读键集）见 `docs/dev-logs/2026-10-09.md`。
 
 ---
 
@@ -358,7 +399,7 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
   G1 另外立了 `tests/gateway/projection/*.json`：那一摞不是信封样本而是**flet 那屏自己算出来的
   参照表**（书名/副标题/状态行的逐行文本），它没有请求也没有响应，混进 `golden/` 只会逼
   守卫为它开一条特例。
-- **Python 面**：现有回归（2026-10-08 第八十四轮后实测 `1928 passed, 161 subtests passed`）基本不动；
+- **Python 面**：现有回归（2026-10-09 第八十五轮后实测 `1956 passed, 161 subtests passed`）基本不动；
   网关测试全离线（`127.0.0.1` 假服务，沿用
   记忆里"离线回环探针"的套路，不批量访问真实站点）。
   一条跑法上的坑：一次全量会在机器上留下约 **1100 个 TIME_WAIT**（Windows 默认 120s 退），
@@ -395,7 +436,9 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 - `docs/界面测试资产清点.md`（§8 R6：A/B/C 三堆、逐文件归堆表、割接纪律）
 - `docs/桌面端重构设计.md`、`docs/阅读器UI响应式与沉浸阅读设计.md`
 - `docs/dev-logs/2026-10-07.md` §10（线程亲和修法与 0.4s 退出读数）、`docs/known-issues/004_…md`
-- `docs/dev-logs/2026-10-08.md`（第七十九~八十二轮：G0 护栏、R1/R2/R3/R4/R6 的读数与仪器坑）
+- `docs/dev-logs/2026-10-08.md`（第七十九~八十四轮：G0 护栏、R1/R2/R3/R4/R6 的读数与仪器坑、G1、005）
+- `docs/dev-logs/2026-10-09.md`（第八十五轮：**G2 整道门**——31 条动作、语料库被现契约钉住、
+  Dart 四屏、R4 三项复量，以及那个把 1.7 倍改判成 1.39 倍的出口投影）
 - `docs/M7打包说明.md`（PyInstaller 命令与 flet* hidden-import 清单位置）
 - 参照仓库：`github.com/jerunshi/guoapp1`（浅克隆 `D:/tmp/guoapp1`，不在本项目版本控制内）
 - 记忆：`tts-pyttsx3-com-same-thread`、`quickjs-native-crash-risk`、`engine-hub-loop-split`、

@@ -1,0 +1,45 @@
+{
+  "renderer": "app/controllers/source/book_source_list_controller.py::_names_of",
+  "payload_from": "tests/gateway/golden/source.list.json 的 response.data",
+  "rows": [
+    {
+      "urls": [
+        "https://m.lvsexs.com"
+      ],
+      "expected": "📂绿色小说"
+    },
+    {
+      "urls": [
+        "http://127.0.0.1:8797",
+        "https://m.lvsexs.com"
+      ],
+      "expected": "R4健康源、📂绿色小说"
+    },
+    {
+      "urls": [
+        "http://127.0.0.1:8797",
+        "http://127.0.0.1:8797/nosuch",
+        "https://m.lvsexs.com"
+      ],
+      "expected": "R4健康源、R4搜不到书、📂绿色小说"
+    },
+    {
+      "urls": [
+        "http://127.0.0.1:8797",
+        "http://127.0.0.1:8797/nosuch",
+        "http://127.0.0.1:8799",
+        "https://api-bc.wtzw.com",
+        "https://m.lvsexs.com"
+      ],
+      "expected": "R4健康源、R4搜不到书、R4连不上 等 5 条"
+    },
+    {
+      "urls": [
+        "http://127.0.0.1:1/不在表里",
+        "https://m.lvsexs.com"
+      ],
+      "expected": "http://127.0.0.1:1/不在表里、📂绿色小说",
+      "why": "表外的 url 退回 url 本体（不是名字、也不是空串）"
+    }
+  ]
+}

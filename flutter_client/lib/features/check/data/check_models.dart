@@ -1,16 +1,21 @@
 /// 检测那一屏的三块数据：逐源结果行、运行快照、收尾文案。
 ///
-/// 键名从真响应取：`tests/gateway/golden/check.snapshot.json`（9 个顶层键）、
+/// 键名从真响应取：`tests/gateway/golden/check.snapshot.json`（顶层 8 个键，
+/// `field_names` 与 `data.keys()` 数出来一样多）、
 /// `check.source.json`（31 个）、以及样本里 `check.start` 那份 `event_sample`
 /// （`CheckFinishedEvent` 的 6 个字段）。
 ///
-/// [checkSummaryLine] 是 flet `app/controllers/source/check_controller.py:30-54`
+/// [checkSummaryLine] 是 flet `app/controllers/source/check_controller.py:29-51`
 /// 的 `_summary_line` 的 port——**逐条对照**，包括"空串表示还没结论、别盖掉尚未检测"
-/// 那条：那一格文案在两边都出现过"把没跑过说成跑完了"的形状，所以它值得原样搬。
+/// 那条：**整句逐字**的比对在投影表那一臂
+/// （`tests/gateway/projection/check.snapshot.summary_line.json`，同一份载荷两边各渲染一次，
+/// 七发里含 `plan_total=0` 与"分档只在 summary 里"这两种拼法），
+/// 这里的 `test_check_summary_line_uses_the_same_words_in_both_languages` 只比用词。
 library;
 
-/// 九态中文标签（照 `app/views/source/check_view.py:16-25` 的 `CHECK_STATE_LABELS`；
-/// 跨语言守卫在 `tests/test_gateway_contract_single_source.py` 逐项比对）。
+/// 中文标签表（照 `app/views/source/check_view.py:16-25` 的 `CHECK_STATE_LABELS`，
+/// 表长 8 档；项目里沿用"九态"这个叫法，但**表长由分类器的返回值定**，
+/// 跨语言守卫在 `tests/test_gateway_contract_single_source.py` 两个方向都查）。
 const Map<String, String> kCheckStateLabels = <String, String>{
   'fully_usable': '完整可用',
   'list_usable': '列表可用',
@@ -166,16 +171,24 @@ class CheckSnapshot {
 
   factory CheckSnapshot.fromJson(Map<String, Object?> json) {
     final summary = json['summary'];
-    final tiering = json['tiering'];
     final deepQueue = json['deep_queue'];
     final results = json['results'];
+    // 分档那一份**先看 summary 再看快照顶层**（`check_controller.py:40` 的
+    // `summary.get("tiering") or snap.get("tiering") or {}`）：真快照两处都带
+    // （`tests/gateway/golden/check.snapshot.json`），只读顶层在"summary 带、
+    // 顶层不带"那一发上就会把分档说明丢掉——Python 那个 `or` 还把**空字典**当没有，
+    // 所以这里也照 `isNotEmpty` 往下落，不是照 `!= null`。
+    final tieringInSummary = summary is Map ? summary['tiering'] : null;
+    final tieringSource = (tieringInSummary is Map && tieringInSummary.isNotEmpty)
+        ? tieringInSummary
+        : json['tiering'];
     return CheckSnapshot(
       running: json['running'] == true,
       cancelled: json['cancelled'] == true,
       total: _asInt(json['total']),
       depth: '${json['depth'] ?? ''}',
-      tiering: tiering is Map
-          ? CheckTiering.fromMap(tiering)
+      tiering: tieringSource is Map
+          ? CheckTiering.fromMap(tieringSource)
           : CheckTiering.empty,
       deepQueueCount: deepQueue is List ? deepQueue.length : 0,
       summary: summary is Map ? CheckSummary.fromMap(summary) : null,

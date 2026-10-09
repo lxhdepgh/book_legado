@@ -49,11 +49,16 @@ class EngineProcess {
     return (fromRuntime == null || fromRuntime.isEmpty) ? null : fromRuntime;
   }
 
+  /// [environment] 只**增补/覆盖**那几个键，父进程的环境照旧传下去
+  /// （`Process.start` 的 `includeParentEnvironment` 默认 true）。
+  /// 这一条是给基准测量用的：现网语料由 `LEGADO_BOOKSOURCE_DATA_DIR` 选，
+  /// R4 的 920 源那份就靠这里注入，不去动用户自己那本库。
   static Future<StartedEngine> start({
     String? python,
     String? mainPy,
     Duration timeout = defaultTimeout,
     List<String> extraArgs = const [],
+    Map<String, String> environment = const {},
   }) async {
     final interpreter = python ?? _fromEnvironment('LEGODO_PYTHON');
     final script = mainPy ?? _fromEnvironment('LEGODO_MAIN');
@@ -73,7 +78,7 @@ class EngineProcess {
       '--idle-seconds',
       '15',
       ...extraArgs,
-    ], workingDirectory: File(script).parent.path);
+    ], workingDirectory: File(script).parent.path, environment: environment);
 
     final handshake = Completer<EngineEndpoint>();
     final stderrTail = <String>[];

@@ -6,12 +6,15 @@
 
 规矩：这一支只读 Dart 源文件里的**字面量**，不 import 任何东西到 Python 侧来"转换"——
 一旦这里开始解析 Dart 的类型系统，守卫自己就成了第二个要维护的实现。
+Python 侧那张表**从 AST/源文本抽**，不在这里手抄：手抄等于同一句话抄第三遍，
+flet 改了字样两份抄本跟着改，比对就永远绿。
 
 flutter_client 目录不存在时（比如 CI 只跑 Python 面）**跳过而不是失败**：
 G1 之前这条守卫不该把全库回归拦住。
 """
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -19,6 +22,7 @@ import pytest
 
 from app.gateway.methods import BY_ACTION
 from app.gateway.protocol import ERROR_CODES, PROTOCOL_VERSION
+from app.themes.builtin_themes import BUILTIN_SKINS
 from app.views.navigation import NARROW_WIDTH_THRESHOLD
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -164,27 +168,15 @@ def _action_literals(text: str) -> list[str]:
       但它不是协议面上的东西，靠 `Key(` 前缀排掉。
 
     排掉的两条都必须窄：宽到"整个文件跳过"就把真调用点也一起藏了。
+
+    **段里允许下划线**（`source.batch_enable`）：这一条是 G2-E 补的——原来那版只认
+    `[a-zA-Z]*`，于是两条带下划线的动作对扫描器**完全隐形**，
+    "客户端有没有调它"读出来是"没调"，而 Dart 那边其实早就在调。
     """
-    shape = re.compile(r"(?<!Key\()'([a-z][a-zA-Z]*\.[a-zA-Z][a-zA-Z]*)'")
+    shape = re.compile(
+        r"(?<!Key\()'([a-z][a-zA-Z_]*\.[a-zA-Z][a-zA-Z_0-9]*)'")
     return [m for m in shape.findall(text)
             if not any(m.endswith(ext) for ext in _DART_EXTENSIONS)]
-
-
-def test_dart_only_calls_actions_that_exist() -> None:
-    """Dart 里出现的每个 `域.动词` 字面量都必须在 action 表上。
-
-    表外动作在服务端回 `bad_request`，用户看到的是"点了没反应"——这正是
-    `refactor-regression-orphan-methods` 那一族的反向版本（那边是方法还在没人调，
-    这边是客户端在调一个从来没登记过的动作）。
-    """
-    used: dict[str, list[str]] = {}
-    for path in _dart_files():
-        for name in _action_literals(path.read_text(encoding="utf-8")):
-            used.setdefault(name, []).append(
-                str(path.relative_to(DART_LIB)).replace("\\", "/"))
-    assert used, "Dart 里一个 action 都没扫到——仪器没接上"
-    unknown = {name: where for name, where in used.items() if name not in BY_ACTION}
-    assert not unknown, f"客户端在调用没登记过的动作：{unknown}"
 
 
 def test_widget_key_lookalikes_are_not_mistaken_for_actions() -> None:
@@ -192,11 +184,447 @@ def test_widget_key_lookalikes_are_not_mistaken_for_actions() -> None:
 
     正对照：拿一行真调用点喂同一个解析器，它必须被扫出来。否则"排键"其实是
     "整个不扫"，前一支就永远绿着（记忆里 `guard-tests-assert-absence` 那一族）。
+
+    第二行 `source.batch_enable` 是 G2-E 加的第二种形状：段里带下划线的那批动作
+    曾经对扫描器完全隐形，只喂 `bookshelf.list` 这种"干净"的名字照不出这个洞。
     """
     sample = ("  final a = client.call('bookshelf.list');\n"
               "  key: const Key('bookshelf.refresh'),\n"
+              "  await client.call('source.batch_enable', payload: x);\n"
               "import 'router.dart';\n")
-    assert _action_literals(sample) == ["bookshelf.list"], _action_literals(sample)
+    assert _action_literals(sample) == ["bookshelf.list", "source.batch_enable"], \
+        _action_literals(sample)
+
+
+#: 反向通道那一发不是客户端能调的（是引擎求客户端渲染 `<useweb>`，§8 R1，G3 才接）。
+_REVERSE_CHANNEL = {"engine.webContentReady"}
+
+
+def _dart_action_calls() -> dict[str, list[str]]:
+    used: dict[str, list[str]] = {}
+    for path in _dart_files():
+        for name in _action_literals(path.read_text(encoding="utf-8")):
+            used.setdefault(name, []).append(
+                str(path.relative_to(DART_LIB)).replace("\\", "/"))
+    return used
+
+
+def test_action_table_and_dart_callers_cover_each_other() -> None:
+    """两个方向都查：客户端**只调登记过的**，登记过的**每一发都有客户端在调**。
+
+    前半个方向：表外动作在服务端回 `bad_request`，用户看到的是"点了没反应"。
+    后半个方向是 G2-E 才补上的，查"服务端建好了、Dart 一行都没调"——
+    那种动作不会报错，只会让某一屏永远缺一块（`refactor-regression-orphan-methods`
+    的同一条：接线断了，测试全绿）。今天允许的例外只有反向通道那一条，
+    而且例外必须是**具名**的：加动作时忘了接界面，这里当场红。
+    """
+    used = _dart_action_calls()
+    assert used, "Dart 里一个 action 都没扫到——仪器没接上"
+    unknown = {name: where for name, where in used.items() if name not in BY_ACTION}
+    assert not unknown, f"客户端在调用没登记过的动作：{unknown}"
+
+    never_called = sorted(set(BY_ACTION) - set(used))
+    assert never_called == sorted(_REVERSE_CHANNEL), (
+        f"这些动作登记在服务端却没有任何 Dart 调用点：{never_called}\n"
+        f"（唯一该在的是 {sorted(_REVERSE_CHANNEL)}；新接上界面就把它从例外表里删掉）")
+
+
+#: Dart 那条默认水池（`RpcClient.timeout` 的默认值）。表外的动作都走它。
+_DART_DEFAULT_POOL_SECONDS = 30
+
+
+def _dart_default_pool_seconds() -> int:
+    body = _read("core/rpc/rpc_client.dart")
+    found = re.search(r"this\.timeout = const Duration\(seconds: (\d+)\)", body)
+    if found is None:
+        pytest.fail("Dart 侧读不到 RpcClient 的默认预算——构造签名变了，"
+                    "守卫与 `action_budgets.dart` 的那句“表外走默认水池”一起失效")
+    return int(found.group(1))
+
+
+def test_client_budget_covers_exactly_the_long_actions() -> None:
+    """客户端预算表必须**正好**覆盖服务端预算比默认水池长的那些动作，秒数逐条相等。
+
+    漏一条长的：客户端先到点，用户看到"超时"而引擎还在后面把活干完并落库——
+    于是"导入失败"的屏底下其实导入了（`action_budgets.dart` 文件头那条）。
+    多一条短的：只是白等，不红；所以这里比的是**键集相等**，不是子集。
+    """
+    pool = _dart_default_pool_seconds()
+    assert pool == _DART_DEFAULT_POOL_SECONDS, (
+        f"Dart 默认水池是 {pool}s 而守卫按 {pool} 反推服务端表，"
+        "改了水池请连这条一起改（它是判据的前提，不是判据本身）")
+
+    expected = {action: int(method.timeout)
+                for action, method in BY_ACTION.items()
+                if method.timeout > pool}
+    assert expected, "服务端一条比默认水池长的动作都没有——这条守卫成了空仪器"
+
+    body = _read("core/rpc/action_budgets.dart")
+    got = dict((re.findall(r"'([a-z][a-zA-Z_]*\.[a-zA-Z_]+)':\s*(\d+)", body)))
+    got = {action: int(seconds) for action, seconds in got.items()}
+    assert got == expected, (f"客户端预算表与服务端 timeout 列对不上：\n"
+                             f"  少：{sorted(set(expected) - set(got))}\n"
+                             f"  多：{sorted(set(got) - set(expected))}\n"
+                             f"  秒数不同：{sorted((a, got[a], expected[a]) for a in set(got) & set(expected) if got[a] != expected[a])}")
+
+
+# -------------------------------------------------------------------- #
+# 外观那一屏的五张表：皮肤 / 模式 / 哨兵 / 检测九态 / 事件名
+# -------------------------------------------------------------------- #
+
+_SKIN_ENTRY = re.compile(
+    r"AppSkin\(\s*id:\s*'([^']+)',\s*"
+    r"name:\s*'([^']+)',\s*"
+    r"description:\s*'([^']+)',\s*"
+    r"primary:\s*0x[0-9A-Fa-f]{2}([0-9A-Fa-f]{6})\)")
+
+
+def test_skin_table_is_one_list_two_places() -> None:
+    """五格皮肤：id、显示名、说明、主色**和顺序**都只许有一份。
+
+    顺序也算内容：flet 那个下拉按 `BUILTIN_SKINS` 的声明序建
+    （`appearance_view.py:116-117`），换序等于换用户第一眼看到的皮肤。
+    主色两边不是同一种写法（`#3F51B5` 对 `0xFF3F51B5`），所以比的是去掉 alpha 的六位。
+    """
+    dart = _read("features/settings/data/theme_preferences.dart")
+    got = _SKIN_ENTRY.findall(dart)
+    assert got, "Dart 侧一条皮肤都没抽到——`kAppSkins` 的写法变了，仪器没接上"
+
+    want = [(skin.id, skin.name, skin.description,
+             skin.light.primary.lstrip("#").upper())
+            for skin in BUILTIN_SKINS.values()]
+    assert [(i, n, d, p.upper()) for i, n, d, p in got] == want, (
+        f"Dart kAppSkins 与 Python BUILTIN_SKINS 不一致：\n"
+        f"  Dart={got}\n  Python={want}")
+
+
+def test_theme_mode_wiring_and_labels_match_appearance_view() -> None:
+    """三个模式：线上值与中文标签都照 `appearance_view.py` 的那三行 Radio。
+
+    这一屏最坏的漂移不是标签错，是**线上值**错——`mode` 存进设置的是那三个串，
+    Dart 发 `dark-mode` 之类过去，服务端表外归一成 system，用户看到的是"切深色没反应"。
+    """
+    view = _py_source("app/views/settings/appearance_view.py")
+    pairs = re.findall(r'ft\.Radio\(value="([^"]+)", label="([^"]+)"\)', view)
+    assert len(pairs) == 3, f"appearance_view 的模式 Radio 不是三条，读到 {pairs}"
+
+    enum_body = _read("features/settings/data/theme_preferences.dart")
+    region = enum_body[enum_body.index("enum ThemeModeKind"):]
+    region = region[:region.index(";")]
+    names = [n for n in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", region)
+             if n not in {"enum", "ThemeModeKind"}]
+    assert sorted(names) == sorted(value for value, _ in pairs), (
+        f"Dart 的 ThemeModeKind 常量与 flet 的 Radio value 不同一套：{names} vs {pairs}")
+
+    for value, label in pairs:
+        assert f"ThemeModeKind.{value} => '{label}'," in enum_body, (
+            f"flet 那一格写的是 {value!r}→{label!r}，Dart 的 label 分支不是这一句")
+
+
+def _py_source(rel: str) -> str:
+    path = ROOT / rel
+    if not path.is_file():
+        pytest.fail(f"flet 侧源文件不见了：{rel}（守卫读的是它的字面量，挪了请一起改）")
+    return path.read_text(encoding="utf-8")
+
+
+def _cjk_literals_in_function(py_rel: str, func: str) -> list[str]:
+    """某个 Python 函数里所有**含汉字**的字符串常量（出现序、去重）。
+
+    从 AST 抽而不是在这里手写：手抄就是把同一句话抄第三遍，
+    flet 改了字样两份抄本一起跟着改，比对永远绿（记忆里 `guard-tests-assert-absence`）。
+    """
+    tree = ast.parse(_py_source(py_rel))
+    node = next((n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and n.name == func), None)
+    if node is None:
+        pytest.fail(f"{py_rel} 里没有函数 {func}——守卫要读的位置挪了")
+    # **裸表达式**位置的字符串常量一律不收：那是 docstring（函数自己的、以及里面
+    # 嵌套函数/类的），不是要上屏的话。只按"含不含换行"过滤是不够的——
+    # `"""把 pending 持久化到 SettingsService。"""` 就是单行的，第一次跑就撞上去了。
+    docstring_ids = {id(child.value) for child in ast.walk(node)
+                     if isinstance(child, ast.Expr)
+                     and isinstance(child.value, ast.Constant)
+                     and isinstance(child.value.value, str)}
+    out: list[str] = []
+    for const in (n for n in ast.walk(node)
+                  if isinstance(n, ast.Constant) and isinstance(n.value, str)):
+        value = const.value
+        if id(const) in docstring_ids:
+            continue
+        if re.search(r"[\u4e00-\u9fff]", value) and value not in out:
+            out.append(value)
+    return out
+
+
+def _dart_literals(rel: str) -> str:
+    """Dart 文件里**字符串字面量的内容**（注释一律剥掉），每条一行。
+
+    为什么不能拿整份文件当文本比 substring：注释里会复述上屏的话
+    （`/// 还欠着没补验正文的源条数。`），于是界面那句真串被改错了，注释还留着原话，
+    守卫照样绿。第一发变异就是这么打不红它的——仪器读错了对象，不是读到了 0 条。
+    """
+    src = _read(rel)
+    out: list[str] = []
+    i, n = 0, len(src)
+    while i < n:
+        ch = src[i]
+        if ch == "/" and src[i + 1:i + 2] == "/":
+            newline = src.find("\n", i)
+            i = n if newline == -1 else newline
+            continue
+        if ch == "/" and src[i + 1:i + 2] == "*":
+            end = src.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            continue
+        if ch in ("'", '"'):
+            quote = ch * 3 if src[i:i + 3] in ("'''", '"""') else ch
+            body, j = [], i + len(quote)
+            while j < n:
+                if src[j] == "\\":
+                    body.append(src[j:j + 2])
+                    j += 2
+                    continue
+                if src.startswith(quote, j):
+                    break
+                body.append(src[j])
+                j += 1
+            out.append("".join(body))
+            i = j + len(quote)
+            continue
+        i += 1
+    assert out, f"{rel} 里一个字符串字面量都没抽到——扫描器坏了，别信这条守卫的绿"
+    return "\n".join(out)
+
+
+def _cjk_runs(literals: list[str]) -> list[str]:
+    """把片段切成**连续汉字串**（≥2 字），按出现序去重。
+
+    为什么切：相邻的 f-string 会被解析器并成一个常量（`f"…{total}，"` 与
+    `f"阻断 {…}"` 并出 `，阻断 `），而 Dart 那边同一句话写在两个字面量里，
+    整片段逐字比会在"缝"上假红。切成语词再比，查的是**用词**漂移
+    （"补验正文"改成"深检"就红）；整句逐字那关在投影表那一臂里做
+    （同一份载荷、两边各渲染一次，见 `tests/gateway/projection/`）。
+    """
+    runs: list[str] = []
+    for piece in literals:
+        for run in re.findall(r"[\u4e00-\u9fff]{2,}", piece):
+            if run not in runs:
+                runs.append(run)
+    return runs
+
+
+def test_check_summary_line_uses_the_same_words_in_both_languages() -> None:
+    """检测收尾那一句的**每个语词**都得在 Dart 的那一句里出现（用词表由 Python 的 AST 给）。
+
+    flet 那句是 `检测完成：可用 U/T，阻断 B（快检 S 源、补验正文 D 源，待深检 P 源）`，
+    四个数各来自不同的表（summary / tiering / deep_queue），所以整串比不了；
+    这里比语词：`_summary_line` 改一个字，Dart 那一屏当场红。
+    **整句逐字**的比对在投影表那一臂（同一份载荷两边各渲染一次）。
+
+    比的是 Dart 的**字面量**而不是整份文件：变异核验第一发就撞见这句——
+    `check_models.dart:137` 的注释里也写着"补验正文"，拿整文件 substring 比，
+    把界面那句改错了注释还替它顶着，守卫不响。
+    """
+    fragments = _cjk_literals_in_function(
+        "app/controllers/source/check_controller.py", "_summary_line")
+    words = _cjk_runs(fragments)
+    assert len(words) >= 4, (f"从 `_summary_line` 只抽到 {fragments} → {words}——"
+                             "抽得太少就是仪器没接上，这条守卫不许靠“少抽”变绿")
+
+    dart = _dart_literals("features/check/data/check_models.dart")
+    missing = [word for word in words if word not in dart]
+    assert not missing, (f"flet 的 `_summary_line` 用这些词，Dart 那一句里没有：{missing}\n"
+                         "改文案要两边各改一次，漏一边就是同一轮检测在两个界面说两种话")
+
+
+def test_scope_sentinels_and_labels_are_one_table_two_places() -> None:
+    """两个哨兵的线上值 + 它们的中文标签：服务端定值，客户端只定显示。
+
+    哨兵拼错的后果不是报错：分组名里确实没有 `__ungrouped`（少两个下划线）那种组，
+    于是"未分组"要么变成"一个都不搜"，要么变成"全部都搜"。
+    """
+    reading = _py_source("app/services/reading/reading_service.py")
+    # 名字 → 线上值。`_SCOPE_LABELS` 的键是**常量名**，不是那两条串，所以先按定义表换算。
+    consts = dict(re.findall(r'^(_SCOPE_[A-Z_]+) = "([^"]+)"', reading, flags=re.M))
+    assert {'_SCOPE_ALL', '_SCOPE_UNGROUPED'} <= set(consts), (
+        f"reading_service 里的哨兵常量抽不全，读到 {sorted(consts)}")
+    sentinels = (consts['_SCOPE_ALL'], consts['_SCOPE_UNGROUPED'])
+
+    dart = _read("features/find_books/data/search_scope.dart")
+    assert f"const String kScopeAll = '{sentinels[0]}';" in dart, (
+        f"服务端的“全部”哨兵是 {sentinels[0]!r}，Dart 的 kScopeAll 不是这一串")
+    assert f"const String kScopeUngrouped = '{sentinels[1]}';" in dart, (
+        f"服务端的“未分组”哨兵是 {sentinels[1]!r}，Dart 的 kScopeUngrouped 不是这一串")
+
+    labels = _scope_label_table()
+    assert sorted(labels) == ['_SCOPE_ALL', '_SCOPE_UNGROUPED'], (
+        f"find_books_controller 的 _SCOPE_LABELS 键不是那两条哨兵名：{sorted(labels)}")
+    resolved = {consts[name]: text for name, text in labels.items()}
+    assert sorted(resolved) == sorted(sentinels)
+    for value, text in resolved.items():
+        assert f"=> '{text}'" in dart, (
+            f"哨兵 {value!r} 的中文标签 {text!r} 在 Dart 的 `label` 分支里找不到")
+
+    # 范围那一行的**排版**：flet 拼的是 `f"{label}（{count} 源）"`
+    # （`find_books_controller.py:293`）。全角括号、括号里那个空格、以及"源"字前
+    # 不带"条"，都是抄的人会顺手改掉的地方，而上面三条查的是哨兵值与标签名，
+    # 一句排版都不查。方向照旧：先从 Python 抽，再把 f-string 的插值名换成 Dart 的，
+    # 要求 Dart 的 `rowLabel` 里含同一串。
+    controller_src = _py_source("app/controllers/find_books_controller.py")
+    row_format = _literal(controller_src, r'f"(\{label\}（\{count\}[^"]*)"',
+                          "范围那一行的拼法")
+    as_dart = (row_format.replace('{label}', '$label')
+               .replace('{count}', '$sourceCount'))
+    literals = _dart_literals("features/find_books/data/search_scope.dart")
+    assert as_dart in literals, (
+        f"flet 那一行拼的是 {row_format!r}（{as_dart!r}），"
+        f"Dart 的 `rowLabel` 不是这一句；Dart 里带“源”的字面量是 "
+        f"{[line for line in literals.splitlines() if '源' in line]}")
+
+
+def _scope_label_table() -> dict[str, str]:
+    """从 `find_books_controller` 的源码里把 `_SCOPE_LABELS` 那张字典抽出来。
+
+    键是 `_SCOPE_ALL` / `_SCOPE_UNGROUPED` 两个**名字**（不是字符串），所以不能
+    `literal_eval`；这里按 ast.Dict 逐格取"键名 + 值字面量"。
+    """
+    tree = ast.parse(_py_source("app/controllers/find_books_controller.py"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "_SCOPE_LABELS"
+                   for t in node.targets):
+            continue
+        table: dict[str, str] = {}
+        for key, value in zip(node.value.keys, node.value.values):
+            assert isinstance(key, ast.Name) and isinstance(value, ast.Constant), \
+                "_SCOPE_LABELS 的形状变了（键应为哨兵名、值应为字符串）"
+            table[key.id] = value.value
+        return table
+    pytest.fail("find_books_controller 里没有 _SCOPE_LABELS——范围标签表挪走了")
+
+
+def _module_dict(py_rel: str, name: str) -> dict[str, str]:
+    """模块级 `NAME = {...}` 的字符串字典（用 literal_eval，键值都得是字面量）。"""
+    tree = ast.parse(_py_source(py_rel))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return ast.literal_eval(node.value)
+    pytest.fail(f"{py_rel} 里没有模块级 {name}——守卫要读的表挪走了")
+
+
+def _returned_strings(py_rel: str, func: str) -> list[str]:
+    """函数**返回位置**上的字符串常量。
+
+    `IfExp` 只看两个分支、不看条件，集合字面量整个不看：`_classify_result` 里
+    `return "content_unavailable" if reading not in {"skip", None} else (…)`
+    那句，条件里的 `skip` 是**输入状态**不是结论，把它当结论抽出来，
+    下一支就会要求标签表给 `skip` 配一句中文——那是假红。
+    """
+    tree = ast.parse(_py_source(py_rel))
+    node = next((n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and n.name == func), None)
+    if node is None:
+        pytest.fail(f"{py_rel} 里没有函数 {func}——守卫要读的位置挪了")
+
+    out: list[str] = []
+
+    def walk(value: ast.expr) -> None:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            out.append(value.value)
+        elif isinstance(value, ast.IfExp):
+            walk(value.body)
+            walk(value.orelse)
+        elif isinstance(value, ast.BoolOp):
+            for item in value.values:
+                walk(item)
+
+    for statement in ast.walk(node):
+        if isinstance(statement, ast.Return) and statement.value is not None:
+            walk(statement.value)
+    return [s for s in out if re.fullmatch(r"[a-z][a-z_]*", s)]
+
+
+def test_check_state_vocabulary_is_one_set_three_places() -> None:
+    """检测结论那一套词汇：**分类器返回的集合 = flet 的标签表 = Dart 的标签表**。
+
+    三份今天都存在，而最坏的那种漂移是**第四种**：分类器新加一档而两边标签表没有它，
+    于是那一档在界面上直接显示英文 `state_class`（flet 与 Dart 都是 `表外回原值`，
+    故意如此）。所以这里查的是"表里有的档，分类器还在返回吗"（多余=死条目）
+    与"分类器返回的档，表里都有吗"（缺=界面漏一档），两个方向都查。
+    """
+    emitted = set(_returned_strings("app/services/check_service.py", "_classify_result"))
+    assert len(emitted) >= 6, (f"从 `_classify_result` 只抽到 {sorted(emitted)}——"
+                               "抽得太少就是仪器没接上")
+
+    labels = _module_dict("app/views/source/check_view.py", "CHECK_STATE_LABELS")
+    assert set(labels) == emitted, (
+        f"flet 的标签表与分类器返回的集合不同：\n"
+        f"  表里有而分类器不返回（死条目）：{sorted(set(labels) - emitted)}\n"
+        f"  分类器返回而表里没有（界面显示英文）：{sorted(emitted - set(labels))}")
+
+    dart = _read("features/check/data/check_models.dart")
+    region = dart[dart.index("kCheckStateLabels"):]
+    region = region[:region.index("};")]
+    got = dict(re.findall(r"'([a-z_]+)':\s*'([^']+)'", region))
+    assert got == labels, (
+        f"Dart 的 kCheckStateLabels 与 flet 的 CHECK_STATE_LABELS 不一致：\n"
+        f"  Dart 多：{sorted(set(got) - set(labels))}  Dart 缺：{sorted(set(labels) - set(got))}\n"
+        f"  同一档两种说法：{sorted((k, got[k], labels[k]) for k in set(got) & set(labels) if got[k] != labels[k])}")
+
+
+def test_dart_event_names_are_classes_the_engine_publishes() -> None:
+    """事件名 = `app/core/events.py` 那些 dataclass 的类名，一个字母都不许多。
+
+    名字打错的后果不是红屏，是**那一屏永远不出结果**：监听器在等
+    `SearchFinshedEvent`，流里来的是 `SearchFinishedEvent`，两边都不报错。
+    """
+    dart = _read("core/events/event_names.dart")
+    names = re.findall(r"static const String \w+ = '([^']+)'", dart)
+    assert names, "Dart 侧一条事件名都没抽到——仪器没接上"
+
+    published = set(re.findall(r"^class (\w+Event)\b",
+                               _py_source("app/core/events.py"), flags=re.M))
+    assert len(published) >= 10, f"从 events.py 只抽到 {len(published)} 个事件类，抽得太少"
+    typo = sorted(set(names) - published)
+    assert not typo, (f"Dart 在听引擎从来不发的事件：{typo}\n"
+                      f"（引擎那边现有的：{sorted(published)}）")
+
+
+def test_appearance_status_lines_are_one_sentence_two_places() -> None:
+    """保存/恢复默认那两句状态行 + 三个模式标签 + 墨水屏标签，都以 flet 源码为准。
+
+    范围是**点名**的：只比 `AppearanceController.save` 与 `.reset` 这两个函数里的句子。
+    背景图那三条（"背景图已换上…""已去掉背景图…""已取消（没选图片）"）故意不在内——
+    协议面上没有"换背景图"那一发（`theme.preferences` 只有 `{skin_id, mode, eink}` 三格），
+    Dart 那一屏在文件头写明了"没接"，比它等于要求两边都有同一件不存在的功能。
+
+    "已恢复默认外观（保存后生效；背景图不受影响）"这一句里同时讲了**两件事**
+    （要按保存才落库、背景图不参与），少了括号那一段用户就会以为背景也被清了。
+    """
+    runs: list[str] = []
+    for func in ("save", "reset"):
+        pieces = [p for p in
+                  _cjk_literals_in_function(
+                      "app/controllers/settings/appearance_controller.py", func)
+                  # "XXService 未就绪"讲的是服务可用性，Dart 那边由信封错误码承担。
+                  if "未就绪" not in p]
+        runs += [word for word in _cjk_runs(pieces) if word not in runs]
+    assert len(runs) >= 4, f"从 save/reset 两个函数只抽到 {runs}——仪器没接上"
+
+    dart = _dart_literals("features/settings/domain/appearance_notifier.dart")
+    missing = sorted(word for word in runs if word not in dart)
+    assert not missing, f"外观那两句在 Dart 里对不上：{missing}\n（抽到的语词：{runs}）"
+
+    view = _py_source("app/views/settings/appearance_view.py")
+    switch_label = _literal(view, r'ft\.Switch\(\s*label="([^"]+)"', "墨水屏开关的标签")
+    assert f"'{switch_label}'" in _read(
+        "features/settings/presentation/appearance_screen.dart"), \
+        f"flet 的开关写着 {switch_label!r}，Dart 那一格不是这一句"
 
 
 # 黄金样本那一族的守卫（覆盖表、时效摘要、请求合法性、账目自洽、job 的事件交付）

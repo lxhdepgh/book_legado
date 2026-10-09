@@ -1,0 +1,99 @@
+{
+  "renderer": "app/views/source/book_source_list_view.py::BookSourceListView._row（无参构造，读回控件树里的 ft.Text.value）",
+  "payload_from": "tests/gateway/golden/source.list.json 的 response.data",
+  "rows": [
+    {
+      "case": "row_0",
+      "row": {
+        "bookSourceUrl": "https://m.lvsexs.com",
+        "bookSourceName": "📂绿色小说",
+        "bookSourceGroup": "通常书源 📂",
+        "bookSourceComment": "书籍页美化 by 二月无雪",
+        "enabled": true
+      },
+      "title": "📂绿色小说",
+      "subtitle": "通常书源 📂 · https://m.lvsexs.com"
+    },
+    {
+      "case": "row_1",
+      "row": {
+        "bookSourceUrl": "http://127.0.0.1:8797",
+        "bookSourceName": "R4健康源",
+        "bookSourceGroup": "R4离线",
+        "enabled": true
+      },
+      "title": "R4健康源",
+      "subtitle": "R4离线 · http://127.0.0.1:8797"
+    },
+    {
+      "case": "row_2",
+      "row": {
+        "bookSourceUrl": "http://127.0.0.1:8797/nosuch",
+        "bookSourceName": "R4搜不到书",
+        "bookSourceGroup": "R4离线",
+        "enabled": true
+      },
+      "title": "R4搜不到书",
+      "subtitle": "R4离线 · http://127.0.0.1:8797/nosuch"
+    },
+    {
+      "case": "row_3",
+      "row": {
+        "bookSourceUrl": "http://127.0.0.1:8799",
+        "bookSourceName": "R4连不上",
+        "bookSourceGroup": "R4离线",
+        "enabled": true
+      },
+      "title": "R4连不上",
+      "subtitle": "R4离线 · http://127.0.0.1:8799"
+    },
+    {
+      "case": "row_4",
+      "row": {
+        "bookSourceUrl": "https://api-bc.wtzw.com",
+        "bookSourceName": "🏷七猫小说·API",
+        "bookSourceGroup": "正版书源 🏷",
+        "bookSourceComment": "七猫小说 · 妍希（原作者）\n// 2026/09/16 By sjshb57 二改内容如下：\n· 正文：弃用失效的第三方接口，改为七猫官方接口 + AES 解密\n· 短篇：自动带 reader_agent=1，修复部分书籍报错\n· 出版物：自动解压 EPUB 章节，支持文字与图片\n· 重构：签名/请求头/接口统一收进 jsLib，规则精简\n· 修正：@put 规范写法、简介标签去重\n· 发现页：按官方分类目录重写（男频/女频/出版）\n  - 分组可折叠，支持状态/字数/排序筛选\n  - 等宽格子排版，短标签 4 列、长标签 3 列，空位补齐",
+        "enabled": true
+      },
+      "title": "🏷七猫小说·API",
+      "subtitle": "正版书源 🏷 · https://api-bc.wtzw.com"
+    },
+    {
+      "case": "nameless",
+      "row": {
+        "bookSourceUrl": "https://m.lvsexs.com",
+        "bookSourceName": "",
+        "bookSourceGroup": "通常书源 📂",
+        "bookSourceComment": "书籍页美化 by 二月无雪",
+        "enabled": true
+      },
+      "title": "https://m.lvsexs.com",
+      "subtitle": "通常书源 📂 · https://m.lvsexs.com"
+    },
+    {
+      "case": "groupless",
+      "row": {
+        "bookSourceUrl": "https://m.lvsexs.com",
+        "bookSourceName": "📂绿色小说",
+        "bookSourceGroup": "",
+        "bookSourceComment": "书籍页美化 by 二月无雪",
+        "enabled": true
+      },
+      "title": "📂绿色小说",
+      "subtitle": "https://m.lvsexs.com"
+    },
+    {
+      "case": "long_url",
+      "row": {
+        "bookSourceUrl": "https://example.com/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "bookSourceName": "📂绿色小说",
+        "bookSourceGroup": "通常书源 📂",
+        "bookSourceComment": "书籍页美化 by 二月无雪",
+        "enabled": true
+      },
+      "title": "📂绿色小说",
+      "subtitle": "通常书源 📂 · https://example.com/xxxxxxxxxxxxxxxxxxxxxxxxxxx…"
+    }
+  ]
+}

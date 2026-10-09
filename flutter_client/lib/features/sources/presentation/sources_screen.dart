@@ -275,17 +275,26 @@ class _SourcesScreenState extends ConsumerState<SourcesScreen> {
 
   /// 前三个名字（没有名字的源退回 url），超出三条补 ` 等 N 条`
   /// （`book_source_list_controller.py:389-401`：连接符是 `、`，不是 `，`）。
-  static String _namesOf(List<String> urls, List<SourceRecord> records) {
-    final byUrl = <String, SourceRecord>{
-      for (final record in records) record.url: record,
-    };
-    final names = urls.take(3).map((url) {
-      final record = byUrl[url];
-      return record == null ? url : (record.name.isNotEmpty ? record.name : url);
-    }).toList();
-    final text = names.join('、');
-    return urls.length > 3 ? '$text 等 ${urls.length} 条' : text;
-  }
+  static String _namesOf(List<String> urls, List<SourceRecord> records) =>
+      namesForBatchDeletion(urls, records);
+}
+
+/// 批量删除确认里那串名字：前三条（没名字的源退回 url），超出三条补 ` 等 N 条`。
+///
+/// 放在顶层而不是 State 的私有静态里，是为了让
+/// `tests/gateway/projection/source.batch_delete.names.json` 能直接喂给它——
+/// 那张表是 flet 的 `_names_of` 跑同一批 url 得到的，比对不许隔一层 UI。
+/// （`book_source_list_controller.py:389-401`：连接符是 `、`，不是 `，`。）
+String namesForBatchDeletion(List<String> urls, List<SourceRecord> records) {
+  final byUrl = <String, SourceRecord>{
+    for (final record in records) record.url: record,
+  };
+  final names = urls.take(3).map((url) {
+    final record = byUrl[url];
+    return record == null ? url : (record.name.isNotEmpty ? record.name : url);
+  }).toList();
+  final text = names.join('、');
+  return urls.length > 3 ? '$text 等 ${urls.length} 条' : text;
 }
 
 extension on SourceFilters {
