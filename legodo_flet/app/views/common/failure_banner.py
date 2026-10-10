@@ -11,20 +11,33 @@ import flet as ft
 class FailureBanner(ft.Row):
     """统一错误横幅（对齐 Dart 的 failure_banner.dart）。
 
-    用法：
+    支持两种模式：
+    1. **命令式**（当前）：Controller 直接调用 banner.show(msg)
+    2. **订阅式**（新增）：传入 on_error 回调，自动监听失败事件
+
+    用法（命令式）：
         banner = FailureBanner()
         # Controller 中
         def on_error(msg: str):
             banner.show(msg)
 
-        def on_dismiss():
-            banner.hide()
+    用法（订阅式）：
+        banner = FailureBanner(
+            on_error=lambda: controller.get_last_error(),
+        )
+        # Controller 触发时调用 banner.check_and_show()
     """
 
-    def __init__(self, visible: bool = False) -> None:
+    def __init__(
+        self,
+        visible: bool = False,
+        on_error: Callable[[], str | None] | None = None,
+    ) -> None:
         super().__init__()
         self._text = ft.Text("", color=ft.Colors.RED_700, expand=True)
         self.visible = visible
+        #: 错误源回调（返回错误消息或 None）
+        self._on_error = on_error
         self.controls = [
             ft.Icon(ft.Icons.ERROR_OUTLINE, color=ft.Colors.RED_700),
             self._text,
@@ -48,6 +61,20 @@ class FailureBanner(ft.Row):
         self._text.value = ""
         if hasattr(self, "update"):
             self.update()
+
+    def check_and_show(self) -> None:
+        """检查错误源并自动显示（订阅式模式）。
+        
+        用法：在 Controller 的事件处理器中调用
+        ```python
+        def on_failure(event):
+            banner.check_and_show()
+        ```
+        """
+        if self._on_error is not None:
+            message = self._on_error()
+            if message:
+                self.show(message)
 
 
 class LoadingSpinner(ft.Container):

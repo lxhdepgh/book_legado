@@ -3,5 +3,6 @@
 本包提供跨屏幕复用的展示组件，禁止 import app.services.*（红线 §7.5）。
 """
 from .failure_banner import EmptyState, FailureBanner, LoadingSpinner, StatusChip
+from .state_bar import StateBar
 
-__all__ = ["FailureBanner", "LoadingSpinner", "EmptyState", "StatusChip"]
+__all__ = ["FailureBanner", "LoadingSpinner", "EmptyState", "StatusChip", "StateBar"]
