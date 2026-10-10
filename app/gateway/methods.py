@@ -78,6 +78,7 @@ _SETTINGS = "app.core.settings.SettingsService"
 _THEME = "app.services.tools.theme_service.ThemeService"
 _RSS = "app.services.content.rss_service.RssService"
 _READALOUD = "app.services.content.read_aloud.ReadAloudService"
+_UPDATE = "app.services.tools.update_service.UpdateService"
 
 METHODS: tuple[Method, ...] = (
     _m("engine.hello", _SELF, "hello", (), 2.0,
@@ -248,6 +249,11 @@ METHODS: tuple[Method, ...] = (
        summary="登记一条新的 TTS 语音档"),
     _m("readaloud.remove_profile", _READALOUD, "remove_profile", ("profile_id",), 5.0,
        summary="删除一条 TTS 语音档"),
+    # update.* - 更新检查域（M5，契约 §1.17）
+    _m("update.check", _UPDATE, "check_update", (), 10.0,
+       summary="检查更新：返回最新版本信息或 None（已是最新/网络失败）"),
+    _m("update.ignore", _UPDATE, "ignore_version", ("version",), 5.0, mode="sync",
+       summary="忽略某版本：该版本不再弹窗"),
 )
 
 #: 按 action 名索引（重名当场炸：两条同名的动作到了客户端就是随机路由）。

@@ -19,6 +19,7 @@ import '../features/reader/domain/reader_controller.dart';
 import '../features/reader/presentation/reader_screen.dart';
 import '../features/rss/presentation/rss_screen.dart';
 import '../features/settings/presentation/appearance_screen.dart';
+import '../features/settings/presentation/update_screen.dart';
 import '../features/sources/presentation/sources_screen.dart';
 import 'shell.dart';
 
@@ -82,12 +83,17 @@ List<GroupTab> sourceTabs() => const <GroupTab>[
       ),
     ];
 
-/// 「配置」组：G2 只有外观一签（快捷键/仪表盘在 G4）。
+/// 「配置」组：G2 只有外观一签，现在加上更新检查。
 List<GroupTab> settingsTabs() => const <GroupTab>[
       GroupTab(
         label: '外观',
         icon: Icons.palette_outlined,
         builder: _appearance,
+      ),
+      GroupTab(
+        label: '更新',
+        icon: Icons.system_update_outlined,
+        builder: _update,
       ),
     ];
 
@@ -102,6 +108,8 @@ Widget _sources(BuildContext _) => const SourcesScreen();
 Widget _check(BuildContext _) => const CheckScreen();
 
 Widget _appearance(BuildContext _) => const AppearanceScreen();
+
+Widget _update(BuildContext _) => const UpdateScreen();
 
 /// 目的地 → 所属分组（与 flet `NavigationHost._dest_group` 同一张反查表）。
 String? groupOfDestination(String destination) => switch (destination) {

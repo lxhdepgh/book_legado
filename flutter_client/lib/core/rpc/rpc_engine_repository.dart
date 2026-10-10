@@ -24,6 +24,7 @@ import '../../features/reader/data/reader_session.dart';
 import '../../features/reader/data/staged_record.dart';
 import '../../features/rss/data/rss_models.dart';
 import '../../features/settings/data/theme_preferences.dart';
+import '../../features/settings/data/update_models.dart';
 import '../../features/sources/data/import_outcome.dart';
 import '../../features/sources/data/source_audit.dart';
 import '../../features/sources/data/source_record.dart';
@@ -55,6 +56,22 @@ class RpcEngineRepository implements EngineRepository {
   Future<void> shutdown({String reason = 'flutter client'}) async {
     await client.call('engine.shutdown',
         payload: <String, Object?>{'reason': reason}, singleFlight: false);
+  }
+
+  // ------------------------------------------------------------------ #
+  // update.* - 更新检查域（M5，契约 §1.17）
+  // ------------------------------------------------------------------ #
+  @override
+  Future<UpdateInfo?> updateCheck() async {
+    final data = await client.call('update.check');
+    if (data == null) return null;
+    return UpdateInfo.fromJson(_asMap(data, 'update.check'));
+  }
+
+  @override
+  Future<void> updateIgnore(String version) async {
+    await client.call('update.ignore',
+        payload: <String, Object?>{'version': version});
   }
 
   /// 反向渲染的答复（§8 R1）。两处与全表不同，都不是风格：

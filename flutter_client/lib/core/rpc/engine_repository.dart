@@ -28,6 +28,7 @@ import '../../features/reader/data/reader_session.dart';
 import '../../features/reader/data/staged_record.dart';
 import '../../features/rss/data/rss_models.dart';
 import '../../features/settings/data/theme_preferences.dart';
+import '../../features/settings/data/update_models.dart';
 import '../../features/sources/data/import_outcome.dart';
 import '../../features/sources/data/source_audit.dart';
 import '../../features/sources/data/source_record.dart';
@@ -126,6 +127,16 @@ abstract class EngineRepository {
   /// 客户端主动收摊（§4.6）：置服务端退出标志，父进程随即走 `hub.shutdown()`。
   Future<void> shutdown({String reason = 'flutter client'}) async =>
       throw _missing('engine.shutdown');
+
+  // ------------------------------------------------------------------ #
+  // update.* - 更新检查域（M5，契约 §1.17）
+  // ------------------------------------------------------------------ #
+  /// 检查更新：返回最新版本信息或 null（已是最新/网络失败）。
+  Future<UpdateInfo?> updateCheck() async => throw _missing('update.check');
+
+  /// 忽略某版本：该版本不再弹窗。
+  Future<void> updateIgnore(String version) async =>
+      throw _missing('update.ignore');
 
   /// 把一次反向渲染的结果交回去（§8 R1，设计里 `<useweb>` 那一族源的唯一出路）。
   ///
