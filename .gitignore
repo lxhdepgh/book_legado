@@ -16,7 +16,10 @@ env/
 build/
 dist/
 wheelhouse/
-*.spec
+
+# PyInstaller build artifacts (but keep the spec file)
+build/LegadoReader/
+!LegadoReader.spec
 
 # IDE and OS metadata
 .idea/
