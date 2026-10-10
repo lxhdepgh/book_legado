@@ -1,37 +1,24 @@
-# 一键打包 Flutter Windows Release（含 Python 后端）
-# 输出到 flutter_client/build/windows/x64/runner/Release/
+# 一键打包 Flutter Windows Release（纯 Dart 实现，无 Python 依赖）
+# WebView + TTS 使用跨平台插件，无需后端服务
+# 输出到 legodo_dart/build/windows/x64/runner/Release/
 
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $DartClient = Join-Path $ProjectRoot "legodo_dart"
-$BackendDir = Join-Path $DartClient "backend"
 $OutputDir = Join-Path $DartClient "build\windows\x64\runner\Release"
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  Legado BookSource Check - Full Build" -ForegroundColor Cyan
+Write-Host "  Legodo BookSource Check - Full Build" -ForegroundColor Cyan
+Write-Host "  Pure Dart (WebView + TTS)" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
-# Step 1: Pack Python backend
-Write-Host "[1/3] Packing Python backend..." -ForegroundColor Yellow
-& (Join-Path $ProjectRoot "build_backend.ps1")
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "[ERROR] Backend packing failed" -ForegroundColor Red
-    exit 1
-}
-Write-Host ""
-
-# Step 2: Flutter build windows --release
-Write-Host "[2/3] Building Flutter Windows Release..." -ForegroundColor Yellow
+# Step 1: Flutter build windows --release
+Write-Host "[1/2] Building Flutter Windows Release..." -ForegroundColor Yellow
 Set-Location $DartClient
 
-$LegodoPython = Join-Path $BackendDir "LegadoReader.exe"
-$LegodoMain = Join-Path $BackendDir "main.py"
-
-& flutter build windows --release `
-    --dart-define="LEGODO_PYTHON=$LegodoPython" `
-    --dart-define="LEGODO_MAIN=$LegodoMain"
+& flutter build windows --release
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] Flutter build failed" -ForegroundColor Red
@@ -47,16 +34,19 @@ if (-not (Test-Path $FlutterExe)) {
 Write-Host "[OK] Flutter exe: $FlutterExe" -ForegroundColor Green
 Write-Host ""
 
-# Step 3: Copy backend to output directory
-Write-Host "[3/3] Copying Python backend to output directory..." -ForegroundColor Yellow
-$OutputBackendDir = Join-Path $OutputDir "backend"
-if (Test-Path $OutputBackendDir) {
-    Remove-Item -Recurse -Force $OutputBackendDir
+# Step 2: Generate release package
+Write-Host "[2/2] Generating release package..." -ForegroundColor Yellow
+$ReleaseZip = Join-Path $ProjectRoot "legodo_client_windows.zip"
+if (Test-Path $ReleaseZip) {
+    Remove-Item -Force $ReleaseZip
 }
-Copy-Item -Recurse -Force $BackendDir $OutputBackendDir
+
+# Create zip with all files from Release directory
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[System.IO.Compression.ZipFile]::CreateFromDirectory($OutputDir, $ReleaseZip)
 
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[ERROR] Failed to copy backend" -ForegroundColor Red
+    Write-Host "[ERROR] Failed to create zip package" -ForegroundColor Red
     exit 1
 }
 
@@ -67,10 +57,13 @@ Write-Host "  Build Complete!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "Executable:   $FlutterExe" -ForegroundColor White
-Write-Host "Built-in backend: $OutputBackendDir\LegadoReader.exe" -ForegroundColor White
+Write-Host "Package:      $ReleaseZip" -ForegroundColor White
 Write-Host ""
-Write-Host "Launch: Double-click legodo_client.exe (auto-starts Python backend)" -ForegroundColor White
+Write-Host "Features:" -ForegroundColor White
+Write-Host "  - WebView browser (WebView2 Runtime required on Win10/11)" -ForegroundColor Gray
+Write-Host "  - TTS text-to-speech (Windows SAPI)" -ForegroundColor Gray
+Write-Host "  - No Python backend required" -ForegroundColor Gray
 Write-Host ""
 
 Get-ChildItem $FlutterExe | Select-Object Name, Length, LastWriteTime
-Get-ChildItem (Join-Path $OutputBackendDir "LegadoReader.exe") | Select-Object Name, Length, LastWriteTime
+Get-ChildItem $ReleaseZip | Select-Object Name, Length, LastWriteTime
