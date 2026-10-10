@@ -139,31 +139,56 @@ Package file_picker:windows references file_picker:windows as the default plugin
 
 ## 八、启动方式说明
 
-### 8.1 双进程架构（当前）
-Flutter 前端与 Python 后端为独立进程，通过 HTTP/RPC 通信。
+### 8.1 单进程架构（Release 版本）
+Flutter 前端自动拉起内置 Python 后端，用户只需双击一个 exe。
 
-**方式 A：手动启动（推荐用于 Release 版本）**
+**一键打包命令**：
+```powershell
+.\build_release.bat
+```
+
+**输出目录**：
+```
+flutter_client\build\windows\x64\runner\Release\
+├── legodo_client.exe          # Flutter 前端（89KB）
+└── backend\
+    └── LegadoReader.exe       # PyInstaller 打包的 Python 后端
+```
+
+**启动方式**：
+```powershell
+# 直接双击或命令行启动（自动拉起 Python 后端）
+.\flutter_client\build\windows\x64\runner\Release\legodo_client.exe
+```
+
+**工作原理**：
+1. Flutter exe 启动时从 `Platform.resolvedExecutable` 同级目录查找 `backend\LegadoReader.exe`
+2. 自动执行 `LegadoReader.exe --serve --port 0 --idle-seconds 15`
+3. 读取 stdout 中的 `LEGODO_GATEWAY {...}` 握手行获取端口和令牌
+4. 建立 RPC 连接并显示书架界面
+5. 退出时自动终止 Python 子进程
+
+### 8.2 开发模式（双进程手动启动）
+调试时使用 conda 环境的 Python 解释器：
+
 ```powershell
 # 终端 1：启动 Python 后端
-python main.py --serve
+python main.py --serve --port 8000
 
-# 终端 2：启动 Flutter 应用
+# 终端 2：启动 Flutter 应用（会自动连接外部服务）
 .\flutter_client\build\windows\x64\runner\Release\legodo_client.exe
 ```
 
-**方式 B：自动启动（开发模式）**
+或使用开发脚本：
 ```powershell
-# 设置环境变量后直接运行 Flutter（会自动拉起 Python 子进程）
-$env:LEGODO_PYTHON = "D:\env_manger\minicaoda\envs\legodo_booksource_check\python.exe"
-$env:LEGODO_MAIN = "D:\WorkSpace\PycharmProjects\legodo_booksource_check\main.py"
-.\flutter_client\build\windows\x64\runner\Release\legodo_client.exe
+.\run_flutter.bat
 ```
 
-### 8.2 注意事项
-- Release 构建不包含 Python 运行时，必须连接外部 `--serve` 服务
-- Python 后端默认监听 `localhost:8000`（端口由 `--port 0` 动态分配）
-- Flutter 回退连接地址为 `http://127.0.0.1:8000`（空令牌）
-- 如 Python 服务未启动，Flutter 会显示"连不上引擎"错误页
+### 8.3 注意事项
+- **Release 版本**：Flutter exe 内置 Python 后端，无需手动启动 `--serve`
+- **开发模式**：需设置 `LEGODO_PYTHON`/`LEGODO_MAIN` 环境变量指向 conda 环境
+- **令牌安全**：一次性令牌通过握手行传递，不落库、不进配置文件
+- **错误提示**：如找不到 `backend\LegadoReader.exe`，会显示"未找到内置 Python 后端"
 
 ## 九、结论
 
@@ -172,25 +197,23 @@ $env:LEGODO_MAIN = "D:\WorkSpace\PycharmProjects\legodo_booksource_check\main.py
 flutter_client\build\windows\x64\runner\Release\legodo_client.exe
 ```
 
-**启动方式**（双进程架构）：
-1. **先启动 Python 后端**：
-   ```bash
-   python main.py --serve --port 8000
-   ```
-2. **再启动 Flutter 前端**（双击 exe 或命令行）：
-   ```bash
-   flutter_client\build\windows\x64\runner\Release\legodo_client.exe
-   ```
+**启动方式**（单进程架构）：
+```bash
+# 直接双击或命令行启动（自动拉起 Python 后端）
+flutter_client\build\windows\x64\runner\Release\legodo_client.exe
+```
 
 **验证要点**：
 - ✅ Python 后端 Hub 初始化成功（31 个服务）
 - ✅ pytest 核心测试通过（1886/1977）
 - ✅ Flutter Windows 构建成功（89KB exe）
-- ✅ 后端握手行输出正常（LEGODO_GATEWAY JSON）
+- ✅ PyInstaller 后端打包完成（LegadoReader.exe）
+- ✅ Flutter 自动启动内置后端并传递握手令牌
 - ⚠️ 浏览器/TTS 功能为占位页面，需后续完善
 - ⚠️ 部分 pytest 失败为已知问题（PermissionError），不影响主流程
 
 **建议下一步**：
-1. 在 Windows 桌面环境手动启动应用，验证各工具域功能
-2. 重点测试：二维码生成/识别、字体管理、书籍导出、替换规则 CRUD
-3. 确认前端能连接后端并显示书架界面
+1. 运行 `build_release.bat` 生成完整 Release 版本
+2. 在 Windows 桌面环境手动启动应用，验证各工具域功能
+3. 重点测试：二维码生成/识别、字体管理、书籍导出、替换规则 CRUD
+4. 确认前端能连接后端并显示书架界面
