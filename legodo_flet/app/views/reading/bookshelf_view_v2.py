@@ -55,7 +55,8 @@ class BookshelfRow(ft.ListTile):
         is_local = record.get("origin", "").startswith("localsource://")
         if not is_local:
             self.trailing = ft.IconButton(
-                ft.Icons.SWAP_HORIZ,
+                key="bookshelf.switch_source",
+                icon=ft.Icons.SWAP_HORIZ,
                 tooltip="换源",
                 on_click=lambda e: self.on_switch(self._record) if self.on_switch else None,
             )
@@ -88,7 +89,7 @@ class BookshelfViewV2(ft.Column):
         self._appbar = ft.AppBar(
             title=ft.Text("书架"),
             actions=[
-                ft.IconButton(ft.Icons.UPLOAD_FILE, tooltip="导入本地书籍", on_click=lambda e: self._fire(self.on_import_local)),
+                ft.IconButton(key="bookshelf.import", icon=ft.Icons.UPLOAD_FILE, tooltip="导入本地书籍", on_click=lambda e: self._fire(self.on_import_local)),
                 ft.IconButton(
                     key="bookshelf.layout_toggle",
                     icon=self._layout_icon,
