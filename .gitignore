@@ -21,6 +21,12 @@ wheelhouse/
 build/LegadoReader/
 !LegadoReader.spec
 
+# Runtime caches and probes (reproducible test artifacts)
+.cache/
+.probe/
+.tmp/
+.tmp_pt/
+
 # IDE and OS metadata
 .idea/
 .vscode/
