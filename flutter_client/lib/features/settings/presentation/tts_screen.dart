@@ -1,99 +1,53 @@
-/// TTS 朗读管理页：语音档列表 + 新建/删除。
+/// TTS 朗读管理页（占位）：语音配置功能待完善。
+///
+/// 当前为说明页面，完整功能需要：
+/// 1. Python 后端 TTS 服务接口（pyttsx3/SAPI5）
+/// 2. 语音列表加载 API
+/// 3. 语速/音调调节 UI
+/// 4. 试听功能
 library;
 
 import 'package:flutter/material.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../../core/di/providers.dart';
-
-class TtsScreen extends ConsumerStatefulWidget {
+class TtsScreen extends StatelessWidget {
   const TtsScreen({super.key});
-
-  @override
-  ConsumerState<TtsScreen> createState() => _TtsScreenState();
-}
-
-class _TtsScreenState extends ConsumerState<TtsScreen> {
-  List<Map<String, Object?>> _profiles = [];
-  bool _loading = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _loadProfiles();
-  }
-
-  Future<void> _loadProfiles() async {
-    setState(() => _loading = true);
-    try {
-      final repo = ref.read(engineRepositoryProvider);
-      // TODO: 添加 listProfiles 接口
-      setState(() {
-        _profiles = [];
-        _loading = false;
-      });
-    } catch (e) {
-      setState(() => _loading = false);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('加载失败：$e')),
-        );
-      }
-    }
-  }
-
-  Future<void> _addProfile() async {
-    // TODO: 需要表单对话框
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('新建语音档功能待实现')),
-      );
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('朗读'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.add),
-            tooltip: '新建语音档',
-            onPressed: _addProfile,
-          ),
-        ],
-      ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _profiles.isEmpty
-              ? Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(Icons.settings_voice, size: 64, color: Colors.grey),
-                      const SizedBox(height: 16),
-                      Text('暂无语音档', style: theme.textTheme.bodyLarge),
-                      const SizedBox(height: 8),
-                      Text('语音档管理功能待完善',
-                          style: theme.textTheme.bodySmall?.copyWith(
-                            color: Colors.grey,
-                          )),
-                    ],
-                  ),
-                )
-              : ListView.builder(
-                  itemCount: _profiles.length,
-                  itemBuilder: (ctx, i) {
-                    final profile = _profiles[i];
-                    final name = profile['name']?.toString() ?? '';
-                    return ListTile(
-                      title: Text(name),
-                      subtitle: Text(profile.toString()),
-                    );
-                  },
+      appBar: AppBar(title: const Text('朗读')),
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.settings_voice, size: 64, color: Colors.grey),
+            const SizedBox(height: 16),
+            Text('TTS 朗读配置',
+                style: theme.textTheme.headlineSmall?.copyWith(
+                  fontWeight: FontWeight.bold,
+                )),
+            const SizedBox(height: 8),
+            Text('语音配置功能待完善', style: theme.textTheme.bodyMedium),
+            const SizedBox(height: 16),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 32),
+              child: Text(
+                '此功能需要完整的 TTS 服务实现：\n'
+                '- Python 侧 pyttsx3/SAPI5 集成\n'
+                '- 语音列表加载\n'
+                '- 语速/音调调节\n'
+                '- 试听功能\n\n'
+                '当前为占位页面，后续完善。',
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: Colors.grey,
                 ),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

@@ -80,7 +80,6 @@ _RSS = "app.services.content.rss_service.RssService"
 _READALOUD = "app.services.content.read_aloud.ReadAloudService"
 _UPDATE = "app.services.tools.update_service.UpdateService"
 _BROWSER = "app.services.tools.browser_service.BrowserService"
-_DICT = "app.services.tools.dict_service.DictService"
 _REPLACE = "app.services.tools.replace_rule_service.ReplaceRuleService"
 _FONT = "app.services.tools.font_service.FontService"
 _QR = "app.services.tools.qr_code_service.QrCodeService"
@@ -271,16 +270,6 @@ METHODS: tuple[Method, ...] = (
        summary="在指定会话中导航到 URL"),
     _m("browser.close", _BROWSER, "close_page", ("session_id",), 5.0,
        summary="关闭浏览器会话"),
-    # dict.* - 词典查询
-    _m("dict.lookup", _DICT, "lookup", ("word",), 10.0,
-       summary="查词：返回释义和音标"),
-    _m("dict.rules", _DICT, "list_rules", (), 5.0,
-       summary="列出所有词典规则"),
-    _m("dict.add_rule", _DICT, "add_rule",
-       ("name", "url", "selector"), 5.0,
-       summary="新增词典规则"),
-    _m("dict.delete_rule", _DICT, "delete_rule", ("rule_id",), 5.0,
-       summary="删除词典规则"),
     # replace.* - 替换规则 CRUD
     _m("replace.list", _REPLACE, "list_rules", (), 5.0,
        summary="列出所有替换规则"),

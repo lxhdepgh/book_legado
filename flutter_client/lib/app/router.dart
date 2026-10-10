@@ -20,7 +20,6 @@ import '../features/reader/presentation/reader_screen.dart';
 import '../features/rss/presentation/rss_screen.dart';
 import '../features/settings/presentation/appearance_screen.dart';
 import '../features/settings/presentation/browser_screen.dart';
-import '../features/settings/presentation/dictionary_screen.dart';
 import '../features/settings/presentation/export_screen.dart';
 import '../features/settings/presentation/font_screen.dart';
 import '../features/settings/presentation/qr_code_screen.dart';
@@ -45,7 +44,6 @@ const String readerRoute = '/reader';
 
 /// 工具域各页：与阅读器同级的整页目的地。
 const String browserToolRoute = '/tools/browser';
-const String dictionaryToolRoute = '/tools/dictionary';
 const String replaceRulesToolRoute = '/tools/replace-rules';
 const String fontToolRoute = '/tools/font';
 const String qrCodeToolRoute = '/tools/qr-code';
@@ -67,7 +65,6 @@ Future<void> openReaderBook(BuildContext context, ReaderArgs args) =>
 void openToolPage(BuildContext context, String label) {
   final route = switch (label) {
     '浏览器' => browserToolRoute,
-    '词典' => dictionaryToolRoute,
     '替换规则' => replaceRulesToolRoute,
     '字体' => fontToolRoute,
     '二维码' => qrCodeToolRoute,
@@ -292,13 +289,6 @@ GoRouter buildRouter() => GoRouter(
           name: 'browserTool',
           pageBuilder: (context, state) => const MaterialPage<void>(
             child: BrowserScreen(),
-          ),
-        ),
-        GoRoute(
-          path: dictionaryToolRoute,
-          name: 'dictionaryTool',
-          pageBuilder: (context, state) => const MaterialPage<void>(
-            child: DictionaryScreen(),
           ),
         ),
         GoRoute(
