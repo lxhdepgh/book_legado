@@ -81,9 +81,10 @@ def register_destinations(registry: ViewRegistry, hub: ServiceHub) -> ViewRegist
     registry.register(
         DEST_TOOLS_BROWSER, lambda: _build(hub, BrowserView, BrowserController),
         required_services=("BrowserService",), hidden=True)
-    registry.register(
-        DEST_TOOLS_DICT, lambda: _build(hub, DictPopup, DictPopupController),
-        required_services=("DictService",), hidden=True)
+    # [已移除] 词典功能在任务 #45 中被删除
+    # registry.register(
+    #     DEST_TOOLS_DICT, lambda: _build(hub, DictPopup, DictPopupController),
+    #     required_services=("DictService",), hidden=True)
     registry.register(
         DEST_TOOLS_REPLACE,
         lambda: _build(hub, ReplaceRuleView, ReplaceRuleController),

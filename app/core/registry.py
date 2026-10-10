@@ -105,7 +105,7 @@ DEST_TOOLS_TTS = "tools.tts"                # 朗读语音档（引擎类型 / H
 #: 按精确长度回查。工具入口页 tools.overview 另列 :data:`DEST_TOOLS_OVERVIEW`，
 #: 不并入本元组，避免破坏既有断言；新增目的地另列常量，不动冻结元组。
 TOOLS_DESTINATIONS: tuple[str, ...] = (
-    DEST_TOOLS_BROWSER, DEST_TOOLS_DICT, DEST_TOOLS_REPLACE, DEST_TOOLS_FONT,
+    DEST_TOOLS_BROWSER, DEST_TOOLS_REPLACE, DEST_TOOLS_FONT,
     DEST_TOOLS_QR, DEST_TOOLS_EXPORT, DEST_TOOLS_WEBDAV, DEST_TOOLS_UPDATE,
 )
 
@@ -174,7 +174,8 @@ NAV_META: dict[str, tuple] = {
     DEST_SETTINGS_SHORTCUTS: (GROUP_CONFIG, "快捷键", False),
     DEST_SETTINGS_DASHBOARD:  (GROUP_CONFIG, "服务", False),
     DEST_TOOLS_BROWSER:  (GROUP_CONFIG, "浏览器",   True),
-    DEST_TOOLS_DICT:     (GROUP_CONFIG, "词典",     True),
+    # [已移除] DEST_TOOLS_DICT 词典功能在任务 #45 中被删除
+    # DEST_TOOLS_DICT:     (GROUP_CONFIG, "词典",     True),
     DEST_TOOLS_REPLACE:  (GROUP_CONFIG, "替换规则", True),
     DEST_TOOLS_FONT:     (GROUP_CONFIG, "字体",     True),
     DEST_TOOLS_QR:       (GROUP_CONFIG, "二维码",   True),

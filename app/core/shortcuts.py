@@ -212,3 +212,21 @@ def conflicts(bindings: dict[str, str]) -> dict[str, list[str]]:
     return {action_id: [other for other in peers if other != action_id]
             for binding, peers in used.items()
             for action_id in peers if len(peers) > 1}
+
+
+# ========== 老板键常量（G4-E 后保留，供 BossKeyService 使用）==========
+#: 老板键启用开关偏好键名
+BOSS_KEY_ENABLED = "bosskey.enabled"
+
+#: 老板键快捷键偏好键名
+BOSS_KEY_SHORTCUT = "bosskey.shortcut"
+
+#: 默认老板键组合
+DEFAULT_BOSS_KEY = "ctrl+alt+h"
+
+#: 老板键动作定义
+BOSS_ACTION = ShortcutAction(
+    "boss_key",
+    "老板键",
+    "立刻藏起整个窗口，点托盘图标回来"
+)
