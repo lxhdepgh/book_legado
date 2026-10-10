@@ -16,7 +16,8 @@ class BrowserScreen extends StatefulWidget {
 
 class _BrowserScreenState extends State<BrowserScreen> {
   late WebViewController _controller;
-  String _url = '';
+  final TextEditingController _urlController = TextEditingController(text: 'https://www.baidu.com');
+  String _currentUrl = '';
   bool _isLoading = false;
 
   @override
@@ -29,13 +30,13 @@ class _BrowserScreenState extends State<BrowserScreen> {
           onPageStarted: (url) {
             setState(() {
               _isLoading = true;
-              _url = url;
             });
           },
           onPageFinished: (url) {
             setState(() {
               _isLoading = false;
-              _url = url;
+              _currentUrl = url;
+              _urlController.text = url;
             });
           },
         ),
@@ -44,10 +45,18 @@ class _BrowserScreenState extends State<BrowserScreen> {
   }
 
   void _navigate(String url) {
+    if (url.isEmpty) return;
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
       url = 'https://$url';
     }
+    _urlController.text = url;
     _controller.loadRequest(Uri.parse(url));
+  }
+
+  @override
+  void dispose() {
+    _urlController.dispose();
+    super.dispose();
   }
 
   @override
@@ -55,23 +64,12 @@ class _BrowserScreenState extends State<BrowserScreen> {
     return Scaffold(
       appBar: AppBar(
         title: TextField(
+          controller: _urlController,
           onSubmitted: _navigate,
-          decoration: InputDecoration(
+          decoration: const InputDecoration(
             hintText: '输入网址',
             border: InputBorder.none,
-            suffixIcon: IconButton(
-              icon: const Icon(Icons.search),
-              onPressed: () {
-                final text = (context.findRenderObject() as RenderBox?)
-                    ?.parent
-                    ?.debugGetNearestAncestorOfType<TextField>()
-                    ?.value
-                    .text;
-                if (text != null && text.isNotEmpty) {
-                  _navigate(text);
-                }
-              },
-            ),
+            suffixIcon: Icon(Icons.search),
           ),
         ),
         actions: [
