@@ -1,4 +1,4 @@
-/// [EngineRepository] 的 RPC 实现：把契约面上那 49 发落到 §4.1 那一个动词上。
+/// [EngineRepository] 的 RPC 实现：把契约面上那 58 发落到 §4.1 那一个动词上。
 ///
 /// 每一发都做**形状检查**（数组就该是数组、对象就该是对象），检查不过抛
 /// `EngineFailureKind.transport`。这不是防御癖：服务端回 `null` 与回 `[]`
@@ -22,6 +22,7 @@ import '../../features/reader/data/content_search_result.dart';
 import '../../features/reader/data/reading_position.dart';
 import '../../features/reader/data/reader_session.dart';
 import '../../features/reader/data/staged_record.dart';
+import '../../features/rss/data/rss_models.dart';
 import '../../features/settings/data/theme_preferences.dart';
 import '../../features/sources/data/import_outcome.dart';
 import '../../features/sources/data/source_audit.dart';
@@ -392,6 +393,97 @@ class RpcEngineRepository implements EngineRepository {
     }
     return SwitchApplyResult.fromJson(data);
   }
+
+  // ------------------------------------------------------------------ #
+  // rss.*
+  // ------------------------------------------------------------------ #
+  // 这一族三条形状规矩，两条与全表不同：
+  // 1. **`rss.article` 的 `null` 是合法回话**（`article_detail` 没这篇文章就回 None），
+  //    所以它不走 `_asMap`——与 `source.get`、`reader.position_get` 同一族。
+  // 2. **`rss.refresh` 的新增篇数走 `_asInt`，而失败根本到不了这里**：抓取失败服务端
+  //    回的是错误信封（`ok:false`），客户端在 `client.call` 那一层就抛。于是 `0`
+  //    说的真是"抓开了、没有新文章"，不许把失败折成 0（那是 `zero-counts` 那一族）。
+  // 3. `rss.add_source` 回的是**字符串**（源 id = feed 地址），不是对象也不是布尔。
+  @override
+  Future<List<RssSourceRow>> listRssSources() async =>
+      _rows(await client.call('rss.sources'), 'rss.sources')
+          .map(RssSourceRow.fromJson)
+          .toList(growable: false);
+
+  @override
+  Future<List<RssArticleRow>> listRssArticles({
+    required String sourceId,
+    bool unreadOnly = false,
+  }) async =>
+      _rows(await client.call('rss.articles', payload: <String, Object?>{
+        'source_id': sourceId,
+        'unread_only': unreadOnly,
+      }), 'rss.articles')
+          .map(RssArticleRow.fromJson)
+          .toList(growable: false);
+
+  @override
+  Future<RssArticleDetail?> openRssArticle(int articleId) async {
+    final data = await client.call('rss.article',
+        payload: <String, Object?>{'article_id': articleId});
+    if (data == null) return null;
+    return RssArticleDetail.fromJson(_asMap(data, 'rss.article'));
+  }
+
+  @override
+  Future<String> addRssSource({
+    required String name,
+    required String url,
+    String sourceGroup = '',
+  }) async {
+    final data = await client.call('rss.add_source', payload: <String, Object?>{
+      'name': name,
+      'url': url,
+      'source_group': sourceGroup,
+    });
+    if (data is! String) {
+      throw EngineFailure(EngineFailureKind.transport,
+          'rss.add_source 的回话不是字符串（收到 ${data.runtimeType}）：'
+              '那一格回的是源 id（就是规范化后的 feed 地址），删除与刷新都吃它，'
+              '读不到就只能自己按 url 猜一遍',
+          action: 'rss.add_source');
+    }
+    return data;
+  }
+
+  @override
+  Future<bool> removeRssSource(String sourceId) async => _asBool(
+      await client.call('rss.remove_source',
+          payload: <String, Object?>{'source_id': sourceId}),
+      'rss.remove_source');
+
+  @override
+  Future<int> refreshRssSource(String sourceId) async => _asInt(
+      await client.call('rss.refresh',
+          payload: <String, Object?>{'source_id': sourceId}),
+      'rss.refresh');
+
+  @override
+  Future<JobAccepted> refreshAllRssSources({required int refreshId}) async =>
+      JobAccepted.fromJson(_asMap(await client.call('rss.refresh_all',
+          payload: <String, Object?>{'refresh_id': refreshId}),
+          'rss.refresh_all'));
+
+  @override
+  Future<bool> markRssArticleRead(int articleId) async => _asBool(
+      await client.call('rss.mark_read',
+          payload: <String, Object?>{'article_id': articleId}),
+      'rss.mark_read');
+
+  @override
+  Future<bool> starRssArticle({
+    required int articleId,
+    required bool starred,
+  }) async =>
+      _asBool(await client.call('rss.star', payload: <String, Object?>{
+        'article_id': articleId,
+        'starred': starred,
+      }), 'rss.star');
 
   // ------------------------------------------------------------------ #
   // reader.*

@@ -1,0 +1,333 @@
+{
+  "renderer": "app/views/reading/rss_view.py::RssView.render_articles",
+  "payload_from": "tests/gateway/golden/rss.articles{,--no-author,--unread-only}.json",
+  "rows": [
+    {
+      "case": "feed_row_0",
+      "why": "RSS 那一本的第一条（作者齐全、未读）",
+      "row": {
+        "id": 2,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "纯文本的第二条",
+        "url": "http://127.0.0.1:8797/rss/post/2",
+        "author": "作者乙",
+        "pub_date": "Tue, 06 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "selected_id": 2,
+      "expected": {
+        "title": "纯文本的第二条",
+        "subtitle": "Tue, 06 Oct 2026 09:00:00 GMT · 作者乙",
+        "selected": true,
+        "weight": "W_500",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏",
+        "read_in_golden": false,
+        "starred_in_golden": false
+      }
+    },
+    {
+      "case": "feed_row_1",
+      "why": "RSS 那一本的第二条",
+      "row": {
+        "id": 1,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "带标签的第一条",
+        "url": "http://127.0.0.1:8797/rss/post/1",
+        "author": "作者甲",
+        "pub_date": "Mon, 05 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "selected_id": 1,
+      "expected": {
+        "title": "带标签的第一条",
+        "subtitle": "Mon, 05 Oct 2026 09:00:00 GMT · 作者甲",
+        "selected": true,
+        "weight": "W_500",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏",
+        "read_in_golden": false,
+        "starred_in_golden": false
+      }
+    },
+    {
+      "case": "atom_row_0",
+      "why": "Atom 那一本：author 整列是空串",
+      "row": {
+        "id": 4,
+        "source_id": "http://127.0.0.1:8797/rss/atom.xml",
+        "title": "Atom 第二条",
+        "url": "http://127.0.0.1:8797/rss/atom/2",
+        "author": "",
+        "pub_date": "2026-10-05T10:00:00Z",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "selected_id": 4,
+      "expected": {
+        "title": "Atom 第二条",
+        "subtitle": "2026-10-05T10:00:00Z",
+        "selected": true,
+        "weight": "W_500",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏",
+        "read_in_golden": false,
+        "starred_in_golden": false
+      }
+    },
+    {
+      "case": "atom_row_1",
+      "why": "Atom 那一本的第二条",
+      "row": {
+        "id": 3,
+        "source_id": "http://127.0.0.1:8797/rss/atom.xml",
+        "title": "Atom 第一条",
+        "url": "http://127.0.0.1:8797/rss/atom/1",
+        "author": "",
+        "pub_date": "2026-10-04T10:00:00Z",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "selected_id": 3,
+      "expected": {
+        "title": "Atom 第一条",
+        "subtitle": "2026-10-04T10:00:00Z",
+        "selected": true,
+        "weight": "W_500",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏",
+        "read_in_golden": false,
+        "starred_in_golden": false
+      }
+    },
+    {
+      "case": "unread_only",
+      "why": "只看未读那一发的行（同一套 9 键）",
+      "row": {
+        "id": 2,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "纯文本的第二条",
+        "url": "http://127.0.0.1:8797/rss/post/2",
+        "author": "作者乙",
+        "pub_date": "Tue, 06 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "selected_id": 2,
+      "expected": {
+        "title": "纯文本的第二条",
+        "subtitle": "Tue, 06 Oct 2026 09:00:00 GMT · 作者乙",
+        "selected": true,
+        "weight": "W_500",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏",
+        "read_in_golden": false,
+        "starred_in_golden": false
+      }
+    },
+    {
+      "case": "pub_date_numeric_epoch",
+      "why": "pub_date 是能读成数字的串且 >1e9 → 按 epoch 秒格式化",
+      "row": {
+        "id": 2,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "纯文本的第二条",
+        "url": "http://127.0.0.1:8797/rss/post/2",
+        "author": "作者乙",
+        "pub_date": "1759000000",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "selected_id": 2,
+      "expected": {
+        "title": "纯文本的第二条",
+        "subtitle": "09-28 03:06 · 作者乙",
+        "selected": true,
+        "weight": "W_500",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏",
+        "read_in_golden": false,
+        "starred_in_golden": false
+      }
+    },
+    {
+      "case": "pub_date_numeric_small",
+      "why": "pub_date 是数字串但 <=1e9 → 原样吐**那一个串**（不是 1700.0）",
+      "row": {
+        "id": 2,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "纯文本的第二条",
+        "url": "http://127.0.0.1:8797/rss/post/2",
+        "author": "作者乙",
+        "pub_date": "1700",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "selected_id": 2,
+      "expected": {
+        "title": "纯文本的第二条",
+        "subtitle": "1700 · 作者乙",
+        "selected": true,
+        "weight": "W_500",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏",
+        "read_in_golden": false,
+        "starred_in_golden": false
+      }
+    },
+    {
+      "case": "pub_date_blank",
+      "why": "日期空 → 那一段整段不出现",
+      "row": {
+        "id": 2,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "纯文本的第二条",
+        "url": "http://127.0.0.1:8797/rss/post/2",
+        "author": "作者乙",
+        "pub_date": "",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "selected_id": 2,
+      "expected": {
+        "title": "纯文本的第二条",
+        "subtitle": "作者乙",
+        "selected": true,
+        "weight": "W_500",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏",
+        "read_in_golden": false,
+        "starred_in_golden": false
+      }
+    },
+    {
+      "case": "author_blank",
+      "why": "作者空 → 只剩日期那一段",
+      "row": {
+        "id": 2,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "纯文本的第二条",
+        "url": "http://127.0.0.1:8797/rss/post/2",
+        "author": "",
+        "pub_date": "Tue, 06 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "selected_id": 2,
+      "expected": {
+        "title": "纯文本的第二条",
+        "subtitle": "Tue, 06 Oct 2026 09:00:00 GMT",
+        "selected": true,
+        "weight": "W_500",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏",
+        "read_in_golden": false,
+        "starred_in_golden": false
+      }
+    },
+    {
+      "case": "title_blank",
+      "why": "标题空 → 「(无标题)」",
+      "row": {
+        "id": 2,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "",
+        "url": "http://127.0.0.1:8797/rss/post/2",
+        "author": "作者乙",
+        "pub_date": "Tue, 06 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "selected_id": 2,
+      "expected": {
+        "title": "(无标题)",
+        "subtitle": "Tue, 06 Oct 2026 09:00:00 GMT · 作者乙",
+        "selected": true,
+        "weight": "W_500",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏",
+        "read_in_golden": false,
+        "starred_in_golden": false
+      }
+    },
+    {
+      "case": "read_row",
+      "why": "已读 → 字重回落 None（不加粗）",
+      "row": {
+        "id": 2,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "纯文本的第二条",
+        "url": "http://127.0.0.1:8797/rss/post/2",
+        "author": "作者乙",
+        "pub_date": "Tue, 06 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": true,
+        "starred": false
+      },
+      "selected_id": 2,
+      "expected": {
+        "title": "纯文本的第二条",
+        "subtitle": "Tue, 06 Oct 2026 09:00:00 GMT · 作者乙",
+        "selected": true,
+        "weight": null,
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏",
+        "read_in_golden": false,
+        "starred_in_golden": false
+      }
+    },
+    {
+      "case": "starred_row",
+      "why": "收藏 → 图标 STAR、tooltip「取消收藏」",
+      "row": {
+        "id": 2,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "纯文本的第二条",
+        "url": "http://127.0.0.1:8797/rss/post/2",
+        "author": "作者乙",
+        "pub_date": "Tue, 06 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": true
+      },
+      "selected_id": 2,
+      "expected": {
+        "title": "纯文本的第二条",
+        "subtitle": "Tue, 06 Oct 2026 09:00:00 GMT · 作者乙",
+        "selected": true,
+        "weight": "W_500",
+        "star_icon": "STAR",
+        "star_tooltip": "取消收藏",
+        "read_in_golden": false,
+        "starred_in_golden": false
+      }
+    },
+    {
+      "case": "empty_list",
+      "why": "没有文章：那一栏只有一句说明，没有行",
+      "row": null,
+      "selected_id": null,
+      "expected": {
+        "title": "这里还没有文章：先选一个订阅源，点「⋮」→「刷新本源」抓一次。",
+        "row_count": 1
+      }
+    }
+  ],
+  "generated": {
+    "local_utc_offset_minutes": 480,
+    "probe": ".probe/g4_rss_projection.py",
+    "reason": "epoch 秒那几格按本地时区折成 MM-DD HH:MM（`rss_view._when`），换时区的机器上比对前先重跑 .probe/g4_rss_projection.py"
+  }
+}

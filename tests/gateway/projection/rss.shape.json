@@ -1,0 +1,306 @@
+{
+  "renderer": "app/views/reading/rss_view.py::RssView.on_band_change / _apply_shape / _render_switch / _clamp_level / _go",
+  "payload_from": "tests/gateway/golden/rss.sources.json、rss.articles.json",
+  "rows": [
+    {
+      "case": "wide_default",
+      "why": "宽窗：三栏都亮、切换条不出现",
+      "expected": {
+        "switch_visible": false,
+        "level": "sources",
+        "panes_visible": [
+          true,
+          true,
+          true
+        ],
+        "dividers_visible": [
+          true,
+          true
+        ],
+        "switch": [
+          {
+            "text": "订阅源",
+            "disabled": false,
+            "tooltip": "当前：订阅源",
+            "kind": "FilledTonalButton"
+          },
+          {
+            "text": "›",
+            "disabled": false,
+            "tooltip": null,
+            "kind": "Text"
+          },
+          {
+            "text": "文章",
+            "disabled": false,
+            "tooltip": "跳到文章",
+            "kind": "TextButton"
+          },
+          {
+            "text": "›",
+            "disabled": false,
+            "tooltip": null,
+            "kind": "Text"
+          },
+          {
+            "text": "正文",
+            "disabled": true,
+            "tooltip": "跳到正文",
+            "kind": "TextButton"
+          }
+        ]
+      }
+    },
+    {
+      "case": "narrow_no_source",
+      "why": "窄窗无源：文章/正文两级不可达",
+      "expected": {
+        "switch_visible": true,
+        "level": "sources",
+        "panes_visible": [
+          true,
+          false,
+          false
+        ],
+        "dividers_visible": [
+          false,
+          false
+        ],
+        "switch": [
+          {
+            "text": "订阅源",
+            "disabled": false,
+            "tooltip": "当前：订阅源",
+            "kind": "FilledTonalButton"
+          },
+          {
+            "text": "›",
+            "disabled": false,
+            "tooltip": null,
+            "kind": "Text"
+          },
+          {
+            "text": "文章",
+            "disabled": true,
+            "tooltip": "跳到文章",
+            "kind": "TextButton"
+          },
+          {
+            "text": "›",
+            "disabled": false,
+            "tooltip": null,
+            "kind": "Text"
+          },
+          {
+            "text": "正文",
+            "disabled": true,
+            "tooltip": "跳到正文",
+            "kind": "TextButton"
+          }
+        ]
+      }
+    },
+    {
+      "case": "narrow_with_source",
+      "why": "窄窗有选中源：正文那一级还不够得着",
+      "expected": {
+        "switch_visible": true,
+        "level": "sources",
+        "panes_visible": [
+          true,
+          false,
+          false
+        ],
+        "dividers_visible": [
+          false,
+          false
+        ],
+        "switch": [
+          {
+            "text": "订阅源",
+            "disabled": false,
+            "tooltip": "当前：订阅源",
+            "kind": "FilledTonalButton"
+          },
+          {
+            "text": "›",
+            "disabled": false,
+            "tooltip": null,
+            "kind": "Text"
+          },
+          {
+            "text": "文章",
+            "disabled": false,
+            "tooltip": "跳到文章",
+            "kind": "TextButton"
+          },
+          {
+            "text": "›",
+            "disabled": false,
+            "tooltip": null,
+            "kind": "Text"
+          },
+          {
+            "text": "正文",
+            "disabled": true,
+            "tooltip": "跳到正文",
+            "kind": "TextButton"
+          }
+        ]
+      }
+    },
+    {
+      "case": "narrow_after_article",
+      "why": "点一篇文章：跳到正文级",
+      "expected": {
+        "switch_visible": true,
+        "level": "detail",
+        "panes_visible": [
+          false,
+          false,
+          true
+        ],
+        "dividers_visible": [
+          false,
+          false
+        ],
+        "switch": [
+          {
+            "text": "订阅源",
+            "disabled": false,
+            "tooltip": "跳到订阅源",
+            "kind": "TextButton"
+          },
+          {
+            "text": "›",
+            "disabled": false,
+            "tooltip": null,
+            "kind": "Text"
+          },
+          {
+            "text": "文章",
+            "disabled": false,
+            "tooltip": "跳到文章",
+            "kind": "TextButton"
+          },
+          {
+            "text": "›",
+            "disabled": false,
+            "tooltip": null,
+            "kind": "Text"
+          },
+          {
+            "text": "正文",
+            "disabled": false,
+            "tooltip": "当前：正文",
+            "kind": "FilledTonalButton"
+          }
+        ]
+      }
+    },
+    {
+      "case": "clamp_after_sources_gone",
+      "why": "停在自己已经够不着的那一级 → 自动退回可达的那一级",
+      "before_level": "articles",
+      "expected": {
+        "switch_visible": true,
+        "level": "sources",
+        "panes_visible": [
+          true,
+          false,
+          false
+        ],
+        "dividers_visible": [
+          false,
+          false
+        ],
+        "switch": [
+          {
+            "text": "订阅源",
+            "disabled": false,
+            "tooltip": "当前：订阅源",
+            "kind": "FilledTonalButton"
+          },
+          {
+            "text": "›",
+            "disabled": false,
+            "tooltip": null,
+            "kind": "Text"
+          },
+          {
+            "text": "文章",
+            "disabled": true,
+            "tooltip": "跳到文章",
+            "kind": "TextButton"
+          },
+          {
+            "text": "›",
+            "disabled": false,
+            "tooltip": null,
+            "kind": "Text"
+          },
+          {
+            "text": "正文",
+            "disabled": true,
+            "tooltip": "跳到正文",
+            "kind": "TextButton"
+          }
+        ]
+      }
+    },
+    {
+      "case": "jump_to_unreachable",
+      "why": "没选文章时点「正文」：原地不动",
+      "expected": {
+        "switch_visible": true,
+        "level": "sources",
+        "panes_visible": [
+          true,
+          false,
+          false
+        ],
+        "dividers_visible": [
+          false,
+          false
+        ],
+        "switch": [
+          {
+            "text": "订阅源",
+            "disabled": false,
+            "tooltip": "当前：订阅源",
+            "kind": "FilledTonalButton"
+          },
+          {
+            "text": "›",
+            "disabled": false,
+            "tooltip": null,
+            "kind": "Text"
+          },
+          {
+            "text": "文章",
+            "disabled": true,
+            "tooltip": "跳到文章",
+            "kind": "TextButton"
+          },
+          {
+            "text": "›",
+            "disabled": false,
+            "tooltip": null,
+            "kind": "Text"
+          },
+          {
+            "text": "正文",
+            "disabled": true,
+            "tooltip": "跳到正文",
+            "kind": "TextButton"
+          }
+        ]
+      }
+    }
+  ],
+  "generated": {
+    "local_utc_offset_minutes": 480,
+    "probe": ".probe/g4_rss_projection.py",
+    "reason": "epoch 秒那几格按本地时区折成 MM-DD HH:MM（`rss_view._when`），换时区的机器上比对前先重跑 .probe/g4_rss_projection.py"
+  }
+}

@@ -1,0 +1,320 @@
+{
+  "renderer": "app/views/reading/rss_view.py::RssView.render_sources（无参构造，读回控件树里 ListTile 的 title/subtitle）",
+  "payload_from": "tests/gateway/golden/rss.sources.json 的 response.data",
+  "corpus_evidence": {
+    "epoch_rows": 2,
+    "never_rows": 1,
+    "unread_rows": 2,
+    "disabled_rows": 0,
+    "nameless_rows": 0
+  },
+  "rows": [
+    {
+      "case": "row_0",
+      "why": "黄金样本原样（第一行就是 last_update_time=0 的那一本）",
+      "row": {
+        "id": "http://127.0.0.1:8799/rss/dead.xml",
+        "name": "G4 取不到的源",
+        "url": "http://127.0.0.1:8799/rss/dead.xml",
+        "enabled": true,
+        "group": "G4订阅",
+        "custom_order": 0,
+        "type": 0,
+        "last_update_time": 0.0,
+        "total": 0,
+        "unread": 0
+      },
+      "counts": {
+        "http://127.0.0.1:8799/rss/dead.xml": {
+          "total": 0,
+          "unread": 0
+        }
+      },
+      "selected_id": "http://127.0.0.1:8799/rss/dead.xml",
+      "expected": {
+        "title": "G4 取不到的源",
+        "subtitle": "0 篇 · 刷新于 从未",
+        "selected": true,
+        "count_label": "1 个"
+      }
+    },
+    {
+      "case": "row_1",
+      "why": "黄金样本原样（第一行就是 last_update_time=0 的那一本）",
+      "row": {
+        "id": "http://127.0.0.1:8797/rss/feed.xml",
+        "name": "G4 订阅语料",
+        "url": "http://127.0.0.1:8797/rss/feed.xml",
+        "enabled": true,
+        "group": "G4订阅",
+        "custom_order": 0,
+        "type": 0,
+        "last_update_time": 1791615036.0404475,
+        "total": 2,
+        "unread": 2
+      },
+      "counts": {
+        "http://127.0.0.1:8797/rss/feed.xml": {
+          "total": 2,
+          "unread": 2
+        }
+      },
+      "selected_id": "http://127.0.0.1:8797/rss/feed.xml",
+      "expected": {
+        "title": "G4 订阅语料",
+        "subtitle": "2 篇 · 2 未读 · 刷新于 10-10 14:50",
+        "selected": true,
+        "count_label": "1 个"
+      }
+    },
+    {
+      "case": "row_2",
+      "why": "黄金样本原样（第一行就是 last_update_time=0 的那一本）",
+      "row": {
+        "id": "http://127.0.0.1:8797/rss/atom.xml",
+        "name": "G4 订阅语料 Atom",
+        "url": "http://127.0.0.1:8797/rss/atom.xml",
+        "enabled": true,
+        "group": "G4订阅",
+        "custom_order": 0,
+        "type": 0,
+        "last_update_time": 1791615036.0525236,
+        "total": 2,
+        "unread": 2
+      },
+      "counts": {
+        "http://127.0.0.1:8797/rss/atom.xml": {
+          "total": 2,
+          "unread": 2
+        }
+      },
+      "selected_id": "http://127.0.0.1:8797/rss/atom.xml",
+      "expected": {
+        "title": "G4 订阅语料 Atom",
+        "subtitle": "2 篇 · 2 未读 · 刷新于 10-10 14:50",
+        "selected": true,
+        "count_label": "1 个"
+      }
+    },
+    {
+      "case": "unread_one",
+      "why": "unread=1 → 「1 未读」那一段出现",
+      "row": {
+        "id": "http://127.0.0.1:8799/rss/dead.xml",
+        "name": "G4 取不到的源",
+        "url": "http://127.0.0.1:8799/rss/dead.xml",
+        "enabled": true,
+        "group": "G4订阅",
+        "custom_order": 0,
+        "type": 0,
+        "last_update_time": 0.0,
+        "total": 0,
+        "unread": 1
+      },
+      "counts": {
+        "http://127.0.0.1:8799/rss/dead.xml": {
+          "total": 0,
+          "unread": 1
+        }
+      },
+      "selected_id": "http://127.0.0.1:8799/rss/dead.xml",
+      "expected": {
+        "title": "G4 取不到的源",
+        "subtitle": "0 篇 · 1 未读 · 刷新于 从未",
+        "selected": true,
+        "count_label": "1 个"
+      }
+    },
+    {
+      "case": "unread_zero",
+      "why": "unread=0 → 那一段**整段不出现**（不是「0 未读」）",
+      "row": {
+        "id": "http://127.0.0.1:8799/rss/dead.xml",
+        "name": "G4 取不到的源",
+        "url": "http://127.0.0.1:8799/rss/dead.xml",
+        "enabled": true,
+        "group": "G4订阅",
+        "custom_order": 0,
+        "type": 0,
+        "last_update_time": 0.0,
+        "total": 0,
+        "unread": 0
+      },
+      "counts": {
+        "http://127.0.0.1:8799/rss/dead.xml": {
+          "total": 0,
+          "unread": 0
+        }
+      },
+      "selected_id": "http://127.0.0.1:8799/rss/dead.xml",
+      "expected": {
+        "title": "G4 取不到的源",
+        "subtitle": "0 篇 · 刷新于 从未",
+        "selected": true,
+        "count_label": "1 个"
+      }
+    },
+    {
+      "case": "nameless",
+      "why": "name 空 → 「(未命名)」",
+      "row": {
+        "id": "http://127.0.0.1:8799/rss/dead.xml",
+        "name": "",
+        "url": "http://127.0.0.1:8799/rss/dead.xml",
+        "enabled": true,
+        "group": "G4订阅",
+        "custom_order": 0,
+        "type": 0,
+        "last_update_time": 0.0,
+        "total": 0,
+        "unread": 0
+      },
+      "counts": {
+        "http://127.0.0.1:8799/rss/dead.xml": {
+          "total": 0,
+          "unread": 0
+        }
+      },
+      "selected_id": "http://127.0.0.1:8799/rss/dead.xml",
+      "expected": {
+        "title": "(未命名)",
+        "subtitle": "0 篇 · 刷新于 从未",
+        "selected": true,
+        "count_label": "1 个"
+      }
+    },
+    {
+      "case": "disabled",
+      "why": "停用 → 标题尾缀「（已停用）」",
+      "row": {
+        "id": "http://127.0.0.1:8799/rss/dead.xml",
+        "name": "G4 取不到的源",
+        "url": "http://127.0.0.1:8799/rss/dead.xml",
+        "enabled": false,
+        "group": "G4订阅",
+        "custom_order": 0,
+        "type": 0,
+        "last_update_time": 0.0,
+        "total": 0,
+        "unread": 0
+      },
+      "counts": {
+        "http://127.0.0.1:8799/rss/dead.xml": {
+          "total": 0,
+          "unread": 0
+        }
+      },
+      "selected_id": "http://127.0.0.1:8799/rss/dead.xml",
+      "expected": {
+        "title": "G4 取不到的源（已停用）",
+        "subtitle": "0 篇 · 刷新于 从未",
+        "selected": true,
+        "count_label": "1 个"
+      }
+    },
+    {
+      "case": "never_refreshed",
+      "why": "刷新时间是 0 → 「刷新于 从未」",
+      "row": {
+        "id": "http://127.0.0.1:8799/rss/dead.xml",
+        "name": "G4 取不到的源",
+        "url": "http://127.0.0.1:8799/rss/dead.xml",
+        "enabled": true,
+        "group": "G4订阅",
+        "custom_order": 0,
+        "type": 0,
+        "last_update_time": 0.0,
+        "total": 0,
+        "unread": 0
+      },
+      "counts": {
+        "http://127.0.0.1:8799/rss/dead.xml": {
+          "total": 0,
+          "unread": 0
+        }
+      },
+      "selected_id": "http://127.0.0.1:8799/rss/dead.xml",
+      "expected": {
+        "title": "G4 取不到的源",
+        "subtitle": "0 篇 · 刷新于 从未",
+        "selected": true,
+        "count_label": "1 个"
+      }
+    },
+    {
+      "case": "epoch_seconds",
+      "why": "epoch 秒（>1e9）→ 格式化成 MM-DD HH:MM（本地时区）",
+      "row": {
+        "id": "http://127.0.0.1:8799/rss/dead.xml",
+        "name": "G4 取不到的源",
+        "url": "http://127.0.0.1:8799/rss/dead.xml",
+        "enabled": true,
+        "group": "G4订阅",
+        "custom_order": 0,
+        "type": 0,
+        "last_update_time": 1759000000.0,
+        "total": 0,
+        "unread": 0
+      },
+      "counts": {
+        "http://127.0.0.1:8799/rss/dead.xml": {
+          "total": 0,
+          "unread": 0
+        }
+      },
+      "selected_id": "http://127.0.0.1:8799/rss/dead.xml",
+      "expected": {
+        "title": "G4 取不到的源",
+        "subtitle": "0 篇 · 刷新于 09-28 03:06",
+        "selected": true,
+        "count_label": "1 个"
+      }
+    },
+    {
+      "case": "small_number",
+      "why": "1e9 以下 → 原样吐那个数（REAL 列，所以带 .0；1970 年那一带多半是别的单位）",
+      "row": {
+        "id": "http://127.0.0.1:8799/rss/dead.xml",
+        "name": "G4 取不到的源",
+        "url": "http://127.0.0.1:8799/rss/dead.xml",
+        "enabled": true,
+        "group": "G4订阅",
+        "custom_order": 0,
+        "type": 0,
+        "last_update_time": 1700.0,
+        "total": 0,
+        "unread": 0
+      },
+      "counts": {
+        "http://127.0.0.1:8799/rss/dead.xml": {
+          "total": 0,
+          "unread": 0
+        }
+      },
+      "selected_id": "http://127.0.0.1:8799/rss/dead.xml",
+      "expected": {
+        "title": "G4 取不到的源",
+        "subtitle": "0 篇 · 刷新于 1700.0",
+        "selected": true,
+        "count_label": "1 个"
+      }
+    },
+    {
+      "case": "empty_list",
+      "why": "一本源都没有：那一栏只有一句说明，没有行",
+      "row": null,
+      "counts": {},
+      "selected_id": "",
+      "expected": {
+        "title": "还没有订阅源：点上方「+」填名称与 feed 地址。",
+        "row_count": 1,
+        "count_label": "0 个"
+      }
+    }
+  ],
+  "generated": {
+    "local_utc_offset_minutes": 480,
+    "probe": ".probe/g4_rss_projection.py",
+    "reason": "epoch 秒那几格按本地时区折成 MM-DD HH:MM（`rss_view._when`），换时区的机器上比对前先重跑 .probe/g4_rss_projection.py"
+  }
+}

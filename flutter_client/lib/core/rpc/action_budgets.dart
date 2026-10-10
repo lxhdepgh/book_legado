@@ -27,6 +27,10 @@ const Map<String, int> kServerBudgetSeconds = <String, int>{
   'reader.toc': 60,
   'reader.content': 60,
   'reader.search_content': 120,
+  // 订阅面只这一发超池：单源抓取要真去取那个 feed（服务端预算 60s）。
+  // 同族的 `rss.refresh_all` 是 30s 且走 job（受理包秒回，慢的那段在事件流里，不占这条 RPC），
+  // 其余各发都在 10~15s——它们不进这张表。
+  'rss.refresh': 60,
 };
 
 /// 线上往返余量。

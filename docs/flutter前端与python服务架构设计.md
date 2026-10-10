@@ -692,6 +692,20 @@ Range——封面名（`^[0-9a-f]{16}\.jpg$`，出自 `SourceService._normalize_
 > **后半 = Dart 那一屏**（模型 + 仓库面 + notifier + 宽窄两形 + 跨语言文案守卫），
 > 划掉的判据仍是 `core/rpc/` 里出现这九个字面量。本轮按授权不跑套件：内存臂
 > （3 支静态 + 4 发臂 + 全部正对照，退出码 0）与 14 发样本/进度守卫只算"仪器接上了"。
+>
+> **G4-B 后半 交（订阅面的 Dart 屏 + 投影表守卫 + 双向文案守卫，2026-10-10，第九十七轮，
+> `docs/dev-logs/2026-10-10.md` §「第九十七轮 收」）**：五块落地（模型 448 行、通知器 527 行、
+> 屏 658 行、两张测试面 747+369 行）；四张 flet 投影表各有自己的 builder 重跑函数
+>（`tests/test_rss_projection_tables.py` 230 行新建，底价行数 11/13/9/6、渲染器点名 1/1/2/5、
+> 恒真变异三发全红、语料证人三支）；时区前置条件 `_when` 的 `>1e9` 分支把表绑在生成机
+>（`generated.local_utc_offset_minutes=480`、`probe` 点名脚本、Dart `_requireSameTimeZone`
+> 硬 `StateError`）；REAL 列那格 `1700.0` 保真（不是 `1700`）；`jump_to_unreachable`
+> 两侧输入不同形（flet 空选中→置灰 vs Dart 自动落首行→可跳），所以比的是「原地不动」；
+> 界面面四条参照 key 补位（`rss.level.<名>.tip` / `rss.shape.flex.<名>`，因为这一版 Flutter
+> 的 `find.ancestor` 没有 `skipOffstage`，而宽窗切换条是 Offstage 且 pane 外还套一条 Expanded）；
+> 详情屏收藏按钮 tooltip 照搬 flet 不改（单独挂号）；跨语言文案守卫两个方向分开钉
+>（正向 73 语词排除 6 → 67 保留，反向 dart_runs=69 dart_only=2 钉住）；欠据表 9→0，
+> `action_table=58 call_sites=58 pending=[]`；自测 9 支 PASS + 6 发变异全红（行为级）。
 
 ---
 
@@ -787,7 +801,17 @@ Range——封面名（`^[0-9a-f]{16}\.jpg$`，出自 `SourceService._normalize_
   Atom 整列空 author）与"取不到"为什么用连接被拒而不是 500、73 份样本一条链共用
   `39b699f1d66d`、进度面那张推导表多点名一条（发布点必须在被派发方法体内），
   以及三处仪器坑（对源码 substring 判回包键、直接调 `TestCase` 实例把失败吞进 `TestResult`、
-  合流窗口里把中间帧当末帧））
+  合流窗口里把中间帧当末帧））；
+  第九十七轮：**G4-B 后半（订阅面 Dart 屏 + 投影表守卫 + 双向文案守卫）**——五块落地
+  （模型 448 / 通知器 527 / 屏 658 / 两张测试 747+369），四张 flet 投影表各有自己的 builder
+  重跑函数（底价行数 11/13/9/6、渲染器点名 1/1/2/5、恒真变异三发全红、语料证人三支），
+  时区前置条件 `_when` 的 `>1e9` 分支把表绑在生成机（`generated.local_utc_offset_minutes=480`、
+  `probe` 点名脚本、Dart `_requireSameTimeZone` 硬 `StateError`），REAL 列那格 `1700.0` 保真，
+  `jump_to_unreachable` 两侧输入不同形所以比的是「原地不动」，界面面四条参照 key 补位
+  （`rss.level.<名>.tip` / `rss.shape.flex.<名>`，因为这一版 Flutter 的 `find.ancestor` 没有
+  `skipOffstage`），详情屏收藏按钮 tooltip 照搬 flet 不改（单独挂号），跨语言文案守卫两个方向
+  分开钉（正向 73 语词排除 6 → 67 保留，反向 dart_runs=69 dart_only=2 钉住），欠据表 9→0，
+  `action_table=58 call_sites=58 pending=[]`，自测 9 支 PASS + 6 发变异全红（行为级））
 - `docs/M7打包说明.md`（PyInstaller 命令与 flet* hidden-import 清单位置）
 - 参照仓库：`github.com/jerunshi/guoapp1`（浅克隆 `D:/tmp/guoapp1`，不在本项目版本控制内）
 - 记忆：`tts-pyttsx3-com-same-thread`、`quickjs-native-crash-risk`、`engine-hub-loop-split`、

@@ -3,7 +3,8 @@
 ///
 /// 只有**分组**是目的地（三条路由）；组内的页签是分组页自己的状态，不进路由表——
 /// 这一条跟 flet 是一致的：侧栏只认分组，`_dest_group` 反查也只到分组那一层。
-/// 「进阅读先落书架」那条落地规矩在 G3（它要的是开读动作，不是页签顺序）。
+/// 「进阅读先落书架」那条落地规矩还没接（见下面 `initialTabOf` 那段）：它要的是
+/// 组内页签的落点，不是路由表——真正的缺口在"谁来持有那两档"，在删 flet 之前补。
 library;
 
 import 'package:flutter/material.dart';
@@ -16,6 +17,7 @@ import '../features/check/presentation/check_screen.dart';
 import '../features/find_books/presentation/find_books_screen.dart';
 import '../features/reader/domain/reader_controller.dart';
 import '../features/reader/presentation/reader_screen.dart';
+import '../features/rss/presentation/rss_screen.dart';
 import '../features/settings/presentation/appearance_screen.dart';
 import '../features/sources/presentation/sources_screen.dart';
 import 'shell.dart';
@@ -41,7 +43,8 @@ Future<void> openReaderBook(BuildContext context, ReaderArgs args) =>
 
 /// 「阅读」组的页签表（`NAV_META` 里 GROUP_READING 的非整页成员）。
 ///
-/// 顺序照 flet：找书在书架之前（`DEST_FIND_BOOKS` 是那一组的第一个）。
+/// 顺序照 flet：找书 → 书架 → 订阅（`DEST_FIND_BOOKS` / `DEST_BOOKSHELF` / `DEST_RSS`
+/// 在 `NAV_META` 里的声明顺序就是导航顺序，`registry.py:165-167`）。
 /// 阅读器是**整页目的地**（`hidden=True`：不在页签里，开读时独占内容区），
 /// 走 `readerRoute` 那条与壳同级的路由；漫画阅读器还在 G4。
 List<GroupTab> readingTabs() => const <GroupTab>[
@@ -54,6 +57,11 @@ List<GroupTab> readingTabs() => const <GroupTab>[
         label: '书架',
         icon: Icons.auto_stories,
         builder: _bookshelf,
+      ),
+      GroupTab(
+        label: '订阅',
+        icon: Icons.rss_feed,
+        builder: _rss,
       ),
     ];
 
@@ -87,6 +95,8 @@ Widget _findBooks(BuildContext _) => const FindBooksScreen();
 
 Widget _bookshelf(BuildContext _) => const BookshelfScreen();
 
+Widget _rss(BuildContext _) => const RssScreen();
+
 Widget _sources(BuildContext _) => const SourcesScreen();
 
 Widget _check(BuildContext _) => const CheckScreen();
@@ -101,8 +111,12 @@ String? groupOfDestination(String destination) => switch (destination) {
       _ => null,
     };
 
-/// 分组的落地页签（flet `_anchor` 里"组内第一个"那一档；
-/// 「架上有书先落书架」那条规则属于 G3，不在这里发明）。
+/// 分组的落地页签：这里只实现 flet `_anchor` 三级里的**第三档**（组内第一个）。
+///
+/// 前两档（记住的页签 > 书架探测）在 Dart 侧还**没有人持有**：`TabbedGroup` 的当前页签
+/// 不跨分组进出留存，书架探测要的是"架上非空"这一个布尔（flet 由装配根注入
+/// `shelf_probe` 可调用，视图层不 import 服务那条红线不变）。这一条是 G4-E0 的活，
+/// **必须在删 flet 之前接上**，否则参照实现一没，这条行为就永久丢了。
 String? initialTabOf(String groupRoute) => switch (groupRoute) {
       readingGroupRoute => '找书',
       sourcesGroupRoute => '管理',

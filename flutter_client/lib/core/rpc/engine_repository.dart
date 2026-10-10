@@ -8,7 +8,7 @@
 /// 实体在 feature，是 §6.1 那个 feature-first 目录换来的一条代价——
 /// 反过来让 core 只认 `Map` 就是今天 RPC 出口那个形状，两侧都得自己解释一遍字段。
 ///
-/// 方法表 = `app/gateway/methods.py` 那张表，**一条不漏**（49 发，含
+/// 方法表 = `app/gateway/methods.py` 那张表，**一条不漏**（58 发，含
 /// `engine.webContentReady`——那一条方向是反的：引擎在 `<useweb>` 那一族源上求客户端
 /// 渲染一次，客户端把结果从 /rpc 交回去；接它的是 `core/webview/webview_host.dart`，
 /// 不是某一屏的按钮）。
@@ -26,6 +26,7 @@ import '../../features/reader/data/content_search_result.dart';
 import '../../features/reader/data/reading_position.dart';
 import '../../features/reader/data/reader_session.dart';
 import '../../features/reader/data/staged_record.dart';
+import '../../features/rss/data/rss_models.dart';
 import '../../features/settings/data/theme_preferences.dart';
 import '../../features/sources/data/import_outcome.dart';
 import '../../features/sources/data/source_audit.dart';
@@ -65,12 +66,13 @@ class GatewayInfo {
       );
 }
 
-/// `mode="job"` 那三发（`check.start` / `search.start` / `switch.scan`）的受理凭据
-/// （`{"started":true,"action":…}`）。
+/// `mode="job"` 那四发（`check.start` / `search.start` / `switch.scan` /
+/// `rss.refresh_all`）的受理凭据（`{"started":true,"action":…}`）。
 ///
 /// **它不是结果**。`mode="job"` 的动作回这个就收摊，真结果一根不落在 RPC 上，
 /// 只走 `/ws` 的事件流（`search.start` → `SearchFinishedEvent`，
-/// `check.start` → `CheckFinishedEvent`，`switch.scan` → 那两条 `SourceSwitch*`）。
+/// `check.start` → `CheckFinishedEvent`，`switch.scan` → 那两条 `SourceSwitch*`，
+/// `rss.refresh_all` → `RssRefreshProgressEvent` + `RssRefreshedEvent`）。
 /// 拿它当"任务成功了"是这一发最容易读错的地方：
 /// `started` 只说服务端肯起，起了之后一条源都检测不出来也照样回 `started:true`。
 class JobAccepted {
@@ -330,6 +332,79 @@ abstract class EngineRepository {
     required Map<String, Object?> book,
   }) async =>
       throw _missing('switch.apply');
+
+  // ------------------------------------------------------------------ #
+  // rss.*（订阅面：源 → 文章 → 正文，加两发写回与一发 job）
+  // ------------------------------------------------------------------ #
+  // 这一族有两条别处没有的形状：
+  // 1. **文章列表不带正文**。`rss.articles` 那 9 格里既没有 `content` 也没有 `text`——
+  //    feed 的 `description` 可以就是整篇文章，而中栏一根都不显示它。正文只在打开那一条时
+  //    由 `rss.article` 单取，回的还是**已去标签**的 `text`（那把尺在服务侧）。
+  //    Dart 这边任何时候都不该再剥一次 HTML。
+  // 2. **源 id 就是 feed 地址**（`add_source` 回它、删除/刷新都吃它），而文章 id 是自增
+  //    整数——同一族里两种主键，混了就删不掉东西。
+
+  /// 订阅列表那一屏：源字段 + 篇数/未读两格角标（服务端 join 好的，客户端不自己数）。
+  Future<List<RssSourceRow>> listRssSources() async =>
+      throw _missing('rss.sources');
+
+  /// 某源的文章行。[unreadOnly] 折的是服务侧那个 `read_flag`，与左栏角标同源。
+  Future<List<RssArticleRow>> listRssArticles({
+    required String sourceId,
+    bool unreadOnly = false,
+  }) async =>
+      throw _missing('rss.articles');
+
+  /// 打开一篇文章：**只有这一发给正文**，回的是去掉标签的 `text`。
+  ///
+  /// 文章没了回 `null`——那是"没有"，不是"正文是空串"，所以返回可空
+  /// （与 `source.get`、`reader.position_get` 同一族；把它折成空对象就是让界面
+  /// 在一条已删的文章下面画一个空白框）。
+  Future<RssArticleDetail?> openRssArticle(int articleId) async =>
+      throw _missing('rss.article');
+
+  /// 新增订阅源，回它的 id（= 规范化后的 feed 地址）。同一地址重复添加是**更新**，
+  /// 不是多出一行。
+  Future<String> addRssSource({
+    required String name,
+    required String url,
+    String sourceGroup = '',
+  }) async =>
+      throw _missing('rss.add_source');
+
+  /// 删除订阅源**连同它的文章**（含已读与收藏标记），回是否真删到行。
+  ///
+  /// 界面必须先二次确认：这一发不可撤销，而 flet 那一屏把这句话写在确认框里。
+  Future<bool> removeRssSource(String sourceId) async =>
+      throw _missing('rss.remove_source');
+
+  /// 抓一个源，回本次**新增**的篇数（不是库里总篇数）。
+  ///
+  /// 这一发**会真的发网络请求**，而且失败是**错误信封**不是静默 0：抓取失败回
+  /// `ok:false`，回 `0` 说的真是"抓开了、没有新文章"。把两者折成一格，
+  /// 用户就在"这个 feed 是空的"与"这台机器取不到它"之间分不清。
+  Future<int> refreshRssSource(String sourceId) async =>
+      throw _missing('rss.refresh');
+
+  /// 起一轮全源刷新（`mode="job"`）：受理回包只有 `{started, action}`。
+  ///
+  /// [refreshId] 由客户端生成、每帧原样回带（与 `switch_id`/`search_id` 同一套办法）。
+  /// 逐源进度走 `RssRefreshProgressEvent`、每源结果走 `RssRefreshedEvent`；
+  /// 单源失败不拖垮其余，**收尾那一帧**带 `failures`。
+  Future<JobAccepted> refreshAllRssSources({required int refreshId}) async =>
+      throw _missing('rss.refresh_all');
+
+  /// 标记已读（点开正文才算读过的那一发），回是否真改到行。
+  Future<bool> markRssArticleRead(int articleId) async =>
+      throw _missing('rss.mark_read');
+
+  /// 收藏/取消收藏，回是否真改到行（文章可能已被另一侧删了 → `false`，
+  /// 那是"这条不在了"，不是"收藏失败"）。
+  Future<bool> starRssArticle({
+    required int articleId,
+    required bool starred,
+  }) async =>
+      throw _missing('rss.star');
 
   // ------------------------------------------------------------------ #
   // reader.*（阅读会话）

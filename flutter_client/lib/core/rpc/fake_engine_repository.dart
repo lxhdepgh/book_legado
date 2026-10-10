@@ -25,6 +25,7 @@ import '../../features/reader/data/content_search_result.dart';
 import '../../features/reader/data/reading_position.dart';
 import '../../features/reader/data/reader_session.dart';
 import '../../features/reader/data/staged_record.dart';
+import '../../features/rss/data/rss_models.dart';
 import '../../features/settings/data/theme_preferences.dart';
 import '../../features/sources/data/import_outcome.dart';
 import '../../features/sources/data/source_audit.dart';
@@ -502,6 +503,152 @@ class FakeEngineRepository implements EngineRepository {
       });
 
   // ------------------------------------------------------------------ #
+  // rss.*（订阅面那九发）
+  // ------------------------------------------------------------------ #
+  // 这一族的替身**改自己的表**，不是回一个写死的布尔：服务端那三发写回
+  // （remove/mark_read/star）回的都是"有没有真改到行"，而 `false` 那一支
+  // （那条源/那篇文章已经不在了）只有让替身真的把它们删掉才演得出来。
+  // 写死 `true` 的替身会让界面永远只走过成功那一路。
+
+  /// `rss.sources` 的替身行。默认空表 = "还没有订阅源"那一支（左栏那句说明）。
+  List<RssSourceRow> rssSources = const <RssSourceRow>[];
+
+  /// `rss.articles` 的替身行（不带正文，与协议面同一格形状）。
+  List<RssArticleRow> rssArticles = const <RssArticleRow>[];
+
+  /// `rss.article` 的回话。**null 是合法值**（"没这篇文章"），与空正文是两件事。
+  RssArticleDetail? rssArticle;
+
+  /// `rss.refresh` 本次新增的篇数。抓取失败那一支走 [failure]，不靠这一格演
+  /// ——服务端把失败回成**错误信封**，`0` 说的真是"抓开了、没有新文章"。
+  int rssNewArticles = 0;
+
+  /// `rss.add_source` 的替身：把行落进 [rssSources]（同一 id 是**更新**不是重复行），
+  /// 回它的 id——服务端那一条的主键就是规范化后的 feed 地址，这里照办，
+  /// 这样"添加完立刻能在左栏点到那一本"这一路不用测试自己补一行。
+  @override
+  Future<String> addRssSource({
+    required String name,
+    required String url,
+    String sourceGroup = '',
+  }) =>
+      _guard(() {
+        final row = RssSourceRow(
+            id: url,
+            // flet 那边传空名称时服务端 `add_source` 拿 url 顶名，这条不许在替身里变空串。
+            name: name.isEmpty ? url : name,
+            url: url,
+            enabled: true,
+            group: sourceGroup,
+            customOrder: 0,
+            type: 0,
+            lastUpdateTime: 0,
+            total: 0,
+            unread: 0);
+        rssSources = [
+          ...rssSources.where((s) => s.id != url),
+          row,
+        ];
+        return url;
+      }, 'rss.add_source', <String, Object?>{
+        'name': name,
+        'url': url,
+        'source_group': sourceGroup,
+      });
+
+  @override
+  Future<bool> removeRssSource(String sourceId) => _guard(() {
+        final kept =
+            rssSources.where((s) => s.id != sourceId).toList(growable: false);
+        final removed = kept.length != rssSources.length;
+        if (removed) {
+          rssSources = kept;
+          // 服务端那一发是**级联**删除（`DELETE FROM rss_articles WHERE source_id=?`
+          // 在前），替身跟着清，否则"删完左栏少一行、中栏还留着上一本的文章"
+          // 这一条就在测试里演不出来。
+          rssArticles = rssArticles
+              .where((a) => a.sourceId != sourceId)
+              .toList(growable: false);
+        }
+        return removed;
+      }, 'rss.remove_source', <String, Object?>{'source_id': sourceId});
+
+  @override
+  Future<int> refreshRssSource(String sourceId) =>
+      _guard(() => rssNewArticles, 'rss.refresh',
+          <String, Object?>{'source_id': sourceId});
+
+  @override
+  Future<JobAccepted> refreshAllRssSources({required int refreshId}) => _guard(
+      () => const JobAccepted(started: true, action: 'rss.refresh_all'),
+      'rss.refresh_all',
+      <String, Object?>{'refresh_id': refreshId});
+
+  @override
+  Future<List<RssSourceRow>> listRssSources() =>
+      _guard(() => rssSources, 'rss.sources');
+
+  @override
+  Future<List<RssArticleRow>> listRssArticles({
+    required String sourceId,
+    bool unreadOnly = false,
+  }) =>
+      _guard(
+          () => rssArticles
+              .where((a) => a.sourceId == sourceId)
+              .where((a) => !unreadOnly || !a.read)
+              .toList(growable: false),
+          'rss.articles',
+          <String, Object?>{'source_id': sourceId, 'unread_only': unreadOnly});
+
+  @override
+  Future<RssArticleDetail?> openRssArticle(int articleId) => _guard(
+          // 没给替身时按 [rssArticles] 里那一行现凑一份空正文的详情：
+          // "打开了但没有正文"（`kRssNoBody` 那一支）与"没这篇文章"（null）
+          // 仍是两条分支，各自可测。
+          () {
+            final detail = rssArticle;
+            if (detail != null) {
+              return detail.row.id == articleId ? detail : null;
+            }
+            final row =
+                rssArticles.where((a) => a.id == articleId).toList(growable: false);
+            if (row.isEmpty) return null;
+            return RssArticleDetail(row: row.first, text: '');
+          },
+          'rss.article',
+          <String, Object?>{'article_id': articleId});
+
+  @override
+  Future<bool> markRssArticleRead(int articleId) => _guard(() {
+        final changed = rssArticles.any((a) => a.id == articleId);
+        if (changed) {
+          rssArticles = [
+            for (final row in rssArticles)
+              row.id == articleId ? _withFlags(row, read: true) : row,
+          ];
+        }
+        return changed;
+      }, 'rss.mark_read', <String, Object?>{'article_id': articleId});
+
+  @override
+  Future<bool> starRssArticle({
+    required int articleId,
+    required bool starred,
+  }) =>
+      _guard(() {
+        final changed = rssArticles.any((a) => a.id == articleId);
+        if (changed) {
+          rssArticles = [
+            for (final row in rssArticles)
+              row.id == articleId ? _withFlags(row, starred: starred) : row,
+          ];
+        }
+        return changed;
+      }, 'rss.star',
+          <String, Object?>{'article_id': articleId, 'starred': starred});
+
+  // ------------------------------------------------------------------ #
   // reader.*
   // ------------------------------------------------------------------ #
   @override
@@ -758,3 +905,17 @@ const AuditReport _cleanAudit = AuditReport(
   suggestions: <String>[],
   notAudited: '',
 );
+
+/// 改一篇替身文章的已读/收藏旗标（`RssArticleRow` 是不可变的，这里按服务端那两发
+/// `UPDATE` 的口径造新一行：只动点名的那一格）。
+RssArticleRow _withFlags(RssArticleRow row, {bool? read, bool? starred}) =>
+    RssArticleRow(
+        id: row.id,
+        sourceId: row.sourceId,
+        title: row.title,
+        url: row.url,
+        author: row.author,
+        pubDate: row.pubDate,
+        image: row.image,
+        read: read ?? row.read,
+        starred: starred ?? row.starred);

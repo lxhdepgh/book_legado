@@ -228,30 +228,20 @@ def test_widget_key_lookalikes_are_not_mistaken_for_actions() -> None:
 #: 第八十八轮（G3-C2）把那 13 条 reader 欠据划完了；第九十轮（G3-D1）把
 #: `engine.webContentReady` 从"反向通道例外"那一张表里挪了出来——它的 Dart 调用点在
 #: `core/webview/webview_host.dart` 那条链上（宿主答回去用的就是这一发），
-#: 所以它现在与其余 43 发一样**必须有调用点**，那张例外表删掉了。
-#: 表现在是空的，而**判据照跑**——它的作用是下一门（G4 的那几族：rss/漫画/朗读/工具）
-#: 落地时的同一张嘴，不是历史装饰。
+#: 所以它现在与其余各发一样**必须有调用点**，那张例外表删掉了。
 #: 口径提醒：这里数的"Dart 侧有人落"是**协议面在 Dart 有实现**（`core/rpc/` 那三个文件
 #: 里的字面量），不是"界面调了它"；后者由 widget/golden 测试那一面负责（G3-C3）。
 #:
 #: 第九十三轮（G3-D3）把换源那一族五发登记上表，第九十四轮在同一门的第二发提交里划掉：
-#: 五个字面量都落在 `core/rpc/rpc_engine_repository.dart`（当场数过：49 发全部有调用点，
+#: 五个字面量都落在 `core/rpc/rpc_engine_repository.dart`（当场数过：58 发全部有调用点，
 #: `never_called` 为空），换源屏那一面另有 `test/source_switch_screen_test.dart` 接住。
 #: 划掉的判据是 `core/rpc/` 里出现这五个字面量，不是"屏幕看着像"。
-#: 第九十六轮（G4-B 前半）把订阅面那九发登记上表，Dart 那一屏在同一门的**后半**发里接：
-#: 这一族是"协议面先行"的具名欠据，不是忘了接界面。后半交清时这张表必须回到空，
-#: 判据照跑（它的靶子是下一门：漫画媒体 / 朗读 / 工具域）。
-_UNWIRED_PENDING_GATE: dict[str, str] = {
-    "rss.sources": "G4-B 后半：订阅屏左栏（源 + 篇数/未读角标）",
-    "rss.articles": "G4-B 后半：订阅屏中栏（文章行，不带正文）",
-    "rss.article": "G4-B 后半：订阅屏右栏（打开一条取去标签正文）",
-    "rss.add_source": "G4-B 后半：添加框提交那一条",
-    "rss.remove_source": "G4-B 后半：「⋮」→删除（必须二次确认）",
-    "rss.refresh": "G4-B 后半：「⋮」→刷新本源",
-    "rss.refresh_all": "G4-B 后半：顶栏全部刷新（mode=job，进度走事件流）",
-    "rss.mark_read": "G4-B 后半：打开正文时那一发",
-    "rss.star": "G4-B 后半：收藏图标那一条",
-}
+#: 第九十六轮（G4-B 前半）把订阅面那九发登记上表，第九十七轮在同一门的后半发里划掉：
+#: 同样是九个字面量都落在 `core/rpc/rpc_engine_repository.dart` 的九个方法里（当场数过：
+#: 58 发全部有调用点），界面那一面另有 `test/rss_screen_test.dart` + `rss_projection_test.dart`。
+#: 表现在是空的，而**判据照跑**——它的作用是下一门（漫画媒体 / 朗读 / 工具域）
+#: 落地时的同一张嘴，不是历史装饰。
+_UNWIRED_PENDING_GATE: dict[str, str] = {}
 
 
 def _dart_action_calls() -> dict[str, list[str]]:
@@ -979,6 +969,83 @@ def test_rss_projections_carry_the_screen_and_not_the_body() -> None:
     rows = _py_function_source("app/services/content/rss_service.py", "source_rows")
     for call in ("self.list_sources()", "self.article_counts()"):
         assert call in rows, f"source_rows 不再经 {call}：那份 join 有了第二个写法"
+
+
+#: 订阅屏 flet 有、Dart **不该**复刻的六格。分两族，理由各不相同：
+#:
+#: - 前五格说的是**进程内装配态**：`self._rss is None`（服务没挂上）与
+#:   `self._page() is None`（视图还没挂载，所以没有弹层可挂）。跨进程之后客户端手里
+#:   没有这两个状态——服务装配失败是服务端的事，走到协议面就是**错误信封**，
+#:   Dart 说的是「订阅源列表加载失败：<原因>」那一族（`rss_notifier.dart`）。
+#:   把「未就绪」要求进 Dart，等于要求客户端预知服务端的接线。
+#: - 最后一格只进 `logger.debug`，从来不上屏（与 `_SWITCH_LOGGER_ONLY_SENTENCES` 同族）。
+_RSS_FLET_ONLY_RUNS = {
+    "未就绪": "RssService 没挂上时的状态句（三处）：跨进程后这一格在服务端",
+    "订阅页无法读写": "同上一句的后半",
+    "页面未就绪": "flet 的 page 还没挂载——Flutter 侧对话框走的是 widget context，没这一格",
+    "暂时弹不出添加框": "同上一格：添加框弹不出的原因在 flet 的挂层机制上",
+    "暂时弹不出确认框": "同上一格：删除确认框",
+    "刷新后重绘失败": "只进 logger.debug（`_after_refresh_done`），不上屏",
+}
+
+#: 反方向：Dart 有、flet 那一屏**没有**的话。跨进程才多出来的两个状态，各写明凭什么
+#: （记忆 `feedback-protocol-missing-predicate-pin-server`：界面自造读数要么上钉常量、
+#: 要么加服务端字段，并且必须具名）。第九十七轮当场扫出来的就是这两格。
+_RSS_DART_ONLY_RUNS = {
+    "个源取失败了": "kRssRefreshDoneWithFailures：收尾那一帧带 failures，而 flet 吃的是"
+                   "`refresh_all()` 的返回值，单源失败被服务吞进 `status.last_error`，"
+                   "那一屏读不到条数。只报「新增 0 篇」会把「三个源都没连上」演成"
+                   "「三个源都没新文章」（`zero-counts-need-a-positive-control`）",
+    "事件流断开": "rss_screen 的 onStreamError：flet 是同进程回调，没有可断的流；"
+                "跨进程之后这条故障必须出声，写法与 find_books 屏同一句",
+}
+
+
+def test_rss_wording_is_read_from_flet_into_dart() -> None:
+    """订阅屏每句上屏的话，用词表由 flet 的 AST 给，Dart 那三份文件必须都接住。
+
+    扫两处：flet 把这一屏的话拆在两个文件里——控件形状与标签在
+    `app/views/reading/rss_view.py`，所有状态句在 `app/controllers/rss_controller.py`
+    （它把句子写在 `_status(...)` 的调用位上，不在函数自己的 docstring 里，
+    所以整模块扫是安全的：docstring 那一族由 `_cjk_literals_from` 排除）。
+
+    **两个方向都查**。正向是"改文案要两边各改一次，漏一边当场红"；反向查的是
+    "界面自己造了一句 flet 从没说过的话"——正向守卫对这一族完全瞎（它只拿着 flet 的词表），
+    而跨进程这一侧恰恰会新增状态（失败源数、事件流断）。两侧各自的排除表都必须是
+    **活配置**：条目在对应那一侧抽不到了，就是那句已经改名或删掉，这张表要跟着改，
+    不许留着当装饰（`comparison-closure-must-reread-live`）。
+    """
+    runs = _cjk_runs(
+        _cjk_literals_in_module("app/views/reading/rss_view.py")
+        + _cjk_literals_in_module("app/controllers/rss_controller.py"))
+
+    vanished = sorted(set(_RSS_FLET_ONLY_RUNS) - set(runs))
+    assert not vanished, (f"排除表里的 {vanished} 在 flet 侧已经抽不到了——"
+                          "那句要么改名了要么删了，这张表要跟着改")
+
+    kept = [word for word in runs if word not in _RSS_FLET_ONLY_RUNS]
+    # 第九十七轮当场数过：整批 73 个语词，视图那一份 45、控制器那一份 29，
+    # 去掉排除表那六格是 67。底价 60 的牙齿：整份文件的扫描面掉任何一个都跌破
+    # （掉控制器只剩 45，掉视图只剩 29）。
+    assert len(kept) >= 60, (f"只抽到 {len(kept)} 个语词（当场测得的是 67）——"
+                             "扫描面缩了就是仪器没接上，这条守卫不许靠“少抽”变绿")
+
+    dart_files = ("features/rss/data/rss_models.dart",
+                  "features/rss/domain/rss_notifier.dart",
+                  "features/rss/presentation/rss_screen.dart")
+    dart = "\n".join(_dart_literals(rel) for rel in dart_files)
+    missing = sorted(word for word in kept if word not in dart)
+    assert not missing, (f"flet 的订阅屏用这些词，Dart 那三份文件里没有：{missing}\n"
+                         "改文案要两边各改一次，漏一边就是同一轮刷新在两个界面说两种话")
+
+    # 反方向：Dart 抽到的语词里，flet 没有的那些必须具名。
+    dart_runs = _cjk_runs(dart.split("\n"))
+    stale = sorted(set(_RSS_DART_ONLY_RUNS) - set(dart_runs))
+    assert not stale, f"反向排除表里的 {stale} 在 Dart 侧已经没有了——那句改名或删了"
+    extra = sorted(word for word in dart_runs if word not in runs
+                   and word not in _RSS_DART_ONLY_RUNS)
+    assert not extra, (f"Dart 的订阅屏在说 flet 从没说过的话：{extra}\n"
+                       "要么补进服务端让它有出处，要么写明凭什么（进排除表要带理由）")
 
 
 # 黄金样本那一族的守卫（覆盖表、时效摘要、请求合法性、账目自洽、job 的事件交付）

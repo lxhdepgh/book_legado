@@ -11,6 +11,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:legodo_client/core/rpc/engine_repository.dart' show JobAccepted;
 import 'package:legodo_client/core/rpc/engine_status.dart';
 import 'package:legodo_client/core/rpc/envelope.dart';
 import 'package:legodo_client/features/bookshelf/data/bookshelf_item.dart';
@@ -26,6 +27,7 @@ import 'package:legodo_client/features/reader/data/content_search_result.dart';
 import 'package:legodo_client/features/reader/data/reading_position.dart';
 import 'package:legodo_client/features/reader/data/reader_session.dart';
 import 'package:legodo_client/features/reader/data/staged_record.dart';
+import 'package:legodo_client/features/rss/data/rss_models.dart';
 import 'package:legodo_client/features/settings/data/theme_preferences.dart';
 import 'package:legodo_client/features/sources/data/import_outcome.dart';
 import 'package:legodo_client/features/sources/data/source_audit.dart';
@@ -152,7 +154,8 @@ List<String> _bracketStringKeys(String src) {
 
 /// 一条绑定：Dart 的哪个类，吃哪一发黄金样本的哪个节点。
 class _Feed {
-  const _Feed(this.library, this.className, this.sample, [this.path = const <String>[]]);
+  const _Feed(this.library, this.className, this.sample,
+      [this.path = const <String>[], this.root = 'data']);
 
   final String library;
   final String className;
@@ -160,11 +163,19 @@ class _Feed {
   /// 黄金样本名（不含 `.json`）。
   final String sample;
 
-  /// 从 `data` 往下走的几步；空 = 载荷本身。
+  /// 从起手节点往下走的几步；空 = 起手节点本身。
   final List<String> path;
 
+  /// 起手节点：默认是**信封的 `data`**。
+  ///
+  /// `progress_sample` / `event_sample` 那一族不在 `data` 里——job 那一发的 `data`
+  /// 只有受理回包 `{started, action}`，进度帧与事件载荷各挂在样本自己那一格。
+  /// 把它们钉进绑定表而不是"另写一条测试"，是因为这一格问的是同一个问题：
+  /// **模型读的键名，服务端到底吐不吐**。
+  final String root;
+
   String get label => '$className ← $sample'
-      '${path.isEmpty ? '' : '/${path.join('/')}'}';
+      '${root == 'data' ? '' : '/$root'}${path.isEmpty ? '' : '/${path.join('/')}'}';
 
   /// 扫这个类读的键。类找不到必须炸——静默返回空集就是"这条没在查"。
   List<String> consumedKeys() {
@@ -200,12 +211,17 @@ class _Feed {
   /// 但只有键名这一半能由这张表判；层级那一半由下面"每一行都解得开"那组的具体取值兜。
   Set<String> allowedKeys() {
     final sample = _load(sampleName);
-    final node = _nodeAt(_envelopeOf(sample)['data'], path);
+    final Object? head =
+        root == 'data' ? _envelopeOf(sample)['data'] : sample[root];
+    if (head == null) {
+      throw StateError('$sampleName 的样本里没有 $root 这一节——绑定表过期了');
+    }
+    final node = _nodeAt(head, path);
     if (node == null) {
       throw StateError('$sampleName 的载荷里没有 ${path.join('/')} 这一节——绑定表过期了');
     }
     final allowed = <String>{};
-    if (path.isEmpty) allowed.addAll(_fieldNamesOf(sample));
+    if (path.isEmpty && root == 'data') allowed.addAll(_fieldNamesOf(sample));
     _keysAnywhere(node, allowed);
     return allowed;
   }
@@ -235,7 +251,7 @@ Object? _nodeAt(Object? data, List<String> path) {
   return node;
 }
 
-/// 绑定表：30 个模型类 ↔ 23 发样本。少一格就是有一批键没人核（正对照在下面的计数里）。
+/// 绑定表：35 条绑定 ↔ 34 个模型类 ↔ 27 发样本。少一格就是有一批键没人核（正对照在下面的计数里）。
 const List<_Feed> _feeds = <_Feed>[
   _Feed('features/bookshelf/data/bookshelf_item.dart', 'BookshelfItem', 'bookshelf.list'),
   _Feed('features/find_books/data/book_row.dart', 'BookRow', 'browse.books'),
@@ -273,6 +289,15 @@ const List<_Feed> _feeds = <_Feed>[
   _Feed('features/bookshelf/data/source_switch_models.dart', 'SwitchApplyResult', 'switch.apply'),
   // 种子那一发回的是**裸书行**，与 `browse.books` 同一套 35 键（服务端都走 `_book_item_dict`）。
   _Feed('features/find_books/data/book_row.dart', 'BookRow', 'switch.seeds'),
+  // 订阅那一族（G4-B）：三个行模型各钉在自己那一发的真载荷上，
+  // 两个事件模型钉在样本自己的 `progress_sample` / `event_sample` 那一格。
+  _Feed('features/rss/data/rss_models.dart', 'RssSourceRow', 'rss.sources'),
+  _Feed('features/rss/data/rss_models.dart', 'RssArticleRow', 'rss.articles'),
+  _Feed('features/rss/data/rss_models.dart', 'RssArticleDetail', 'rss.article'),
+  _Feed('features/rss/data/rss_models.dart', 'RssRefreshProgress', 'rss.refresh_all',
+      <String>[], 'progress_sample'),
+  _Feed('features/rss/data/rss_models.dart', 'RssRefreshed', 'rss.refresh_all',
+      <String>[], 'event_sample'),
 ];
 
 void main() {
@@ -383,9 +408,15 @@ void main() {
 
     // 语料里有一族**故意失败**的信封：协议面必须有一发让客户端看清"错误信封长什么样"
     // （会话不是这本书 → 拒答而不是回空目录，回空目录看起来像书坏了）。
+    // `rss.refresh--dead-feed` 是同一族的第二发，而且它是**这一族必须的**：
+    // 抓取失败在服务端是错误信封，不是静默 0（`rss_service.refresh_source` 让异常出栈）。
+    // 客户端若按"回 0 篇"处理，用户读到的是"这个源没有新文章"，而真相是"连不上"。
     // 这一族必须**具名**：表外的样本一律按成功信封要求，所以"整批都成了失败"
     // 这条路是走不通的；反过来，具名的那一发如果哪天真的成功了，这里也红。
-    const errorSamples = <String>{'reader.toc--no-session'};
+    const errorSamples = <String>{
+      'reader.toc--no-session',
+      'rss.refresh--dead-feed',
+    };
     for (final name in errorSamples) {
       expect(names, contains(name), reason: '欠着的错误样本 $name 不在语料里');
     }
@@ -417,9 +448,9 @@ void main() {
         reason: '这些样本与 engine.hello 的 schema_digest 不一致——重抓样本');
   });
 
-  group('模型吃的每一个键都在真载荷里（30 个类 ↔ 23 发样本）', () {
+  group('模型吃的每一个键都在真载荷里（35 条绑定 ↔ 27 发样本）', () {
     test('绑定表与扫描器都接上了（正对照）', () {
-      expect(_feeds.length, greaterThanOrEqualTo(30),
+      expect(_feeds.length, greaterThanOrEqualTo(35),
           reason: '绑定表只剩 ${_feeds.length} 格——删一格就是有一批键没人核');
       final total = _feeds.fold<int>(
           0, (sum, feed) => sum + feed.consumedKeys().length);
@@ -999,6 +1030,158 @@ void main() {
       expect(sample['cancelled'], isFalse,
           reason: '抓样那一拍没有轮次在跑（空闲支）。在跑那一支由 pytest 的 SWITCH_CONCURRENCY=1 臂出证据，'
               '界面那两句话的分叉在 source_switch_screen_test.dart 里按替身走');
+    });
+  });
+
+  group('rss.* 那一族解得开：角标在行里、正文只在详情、本轮身份每帧回带（G4-B）', () {
+    Map<String, Object?> data(String name) =>
+        Map<String, Object?>.from(_envelopeOf(_load(name))['data']! as Map);
+
+    List<Map<String, Object?>> listRows(String name) {
+      final node = _envelopeOf(_load(name))['data'];
+      if (node is! List) {
+        throw StateError('$name 的载荷不是数组——这一格测的东西变了');
+      }
+      final decoded = node.cast<Map<String, Object?>>().toList();
+      expect(decoded, isNotEmpty, reason: '$name 一行都没有');
+      return decoded;
+    }
+
+    test('rss.sources：行 id 逐行唯一，两格角标真在行里（客户端不自己数文章）', () {
+      final raw = listRows('rss.sources');
+      final sources = raw.map(RssSourceRow.fromJson).toList();
+      expect(sources.map((s) => s.id).toSet(), hasLength(raw.length),
+          reason: '源 id 就是规范化后的 feed 地址：撞行等于两个源渲染成一个，'
+              '而选中/刷新/删除全都按它找回');
+      // 角标是服务端 join 好的（`source_rows` = `list_sources` + `article_counts`）。
+      // 少这一格证人，Dart 侧"自己逐源数一遍"那条错法就没有对照物。
+      expect(_fieldNamesOf(_load('rss.sources')), containsAll(<String>['total', 'unread']));
+      expect(sources.where((s) => s.unread > 0), isNotEmpty,
+          reason: '正对照：全 0 未读的话「N 未读」那一段就没被真载荷走过');
+      expect(sources.where((s) => s.total > 0), isNotEmpty);
+      // 「刷新于」那一段永远在，`last_update_time=0` 说「从未」，>1e9 说日期。
+      final never = sources.firstWhere((s) => s.lastUpdateTime <= 0);
+      expect(never.subtitle, contains('刷新于 从未'),
+          reason: '副标题那一句由 flet 的 `render_sources` 逐字给过（投影表同一句）');
+      expect(sources.where((s) => s.lastUpdateTime > 1000000000), isNotEmpty,
+          reason: '语料里没有 epoch 秒的行 → 那一条分支的靶子变了');
+      // 停用与未命名两支语料里都没有证人（实测各 0 条）→ 合成行走，别把"没走到"读成"走过"。
+      final disabled = RssSourceRow.fromJson(
+          Map<String, Object?>.from(raw.first)..['enabled'] = false);
+      expect(disabled.title, endsWith('（已停用）'));
+      expect(RssSourceRow.fromJson(Map<String, Object?>.from(raw.first)..['name'] = '')
+          .title, '(未命名)');
+      expect(RssSourceRow.fromJson({'id': 'x'}).enabled, isTrue,
+          reason: '缺键 = 启用（服务端那一列的默认是 1）：读成 false 会把好源演成停用');
+    });
+
+    test('rss.articles 那一族**没有正文**：9 键，text 只在 rss.article 出现', () {
+      for (final name in <String>[
+        'rss.articles', 'rss.articles--no-author', 'rss.articles--unread-only'
+      ]) {
+        expect(_fieldNamesOf(_load(name)), isNot(contains('text')),
+            reason: '$name：列表开始带正文了——那"逐条 HTML 剥离 + 几十倍载荷"的取舍要重看');
+      }
+      final articles = listRows('rss.articles').map(RssArticleRow.fromJson).toList();
+      expect(articles.map((a) => a.id).toSet(), hasLength(articles.length),
+          reason: '文章 id 是自增整数（与源 id=url 那一族不同），`rss.mark_read`/`rss.star` 吃它');
+      expect(articles.every((a) => a.url.isNotEmpty), isTrue,
+          reason: '右栏那一格链接与"打开原文"都取它，空行点了没反应');
+      expect(articles.every((a) => a.bold), isTrue,
+          reason: '语料那三发全是未读（实测）→ 已读不加粗那一支由合成行走，这里明写它没被走过');
+      // Atom 那一发：author 整列是空串 → 副标题只剩日期，不许留一个孤零零的分隔符。
+      final atom = listRows('rss.articles--no-author').map(RssArticleRow.fromJson).toList();
+      expect(atom.every((a) => a.author.isEmpty), isTrue);
+      for (final row in atom) {
+        expect(row.subtitle, isNot(endsWith(' · ')),
+            reason: '空段要整段不出现：${row.subtitle}');
+        expect(row.subtitle, isNot(contains(' · ')),
+            reason: '只剩一段时不该有分隔符：${row.subtitle}');
+      }
+    });
+
+    test('rss.article：10 键 = 那 9 格 + text，且 text 是服务端去掉标签的那一份', () {
+      final json = data('rss.article');
+      expect(json.keys.toSet(),
+          containsAll(_fieldNamesOf(_load('rss.articles')).toSet().union({'text'})));
+      final detail = RssArticleDetail.fromJson(json);
+      expect(detail.text, isNotEmpty, reason: '正对照：空正文走的是下面那条合成支');
+      // 「带标签的第一条」在库里存的是 HTML（`<strong>` 那一族），上屏必须是去掉标签的。
+      // 这一格钉的是"尺在服务侧"：Dart 再剥一次就有两把尺（设计 §4.2）。
+      expect(detail.text, isNot(contains('<')),
+          reason: '正文里还留着标签 = 服务端那一发没剥，界面在显示 HTML 源码');
+      expect(detail.body, detail.text);
+      expect(detail.meta, contains(' · '),
+          reason: '元信息是「作者 · 日期」两段（顺序与列表那行**相反**，照 flet `show_article`）');
+      final empty = RssArticleDetail.fromJson(Map<String, Object?>.from(json)..['text'] = '');
+      expect(empty.body, '(这条没有正文，只有标题和链接)');
+    });
+
+    test('rss.refresh 的失败回的是错误信封，不是静默 0', () {
+      final ok = _load('rss.refresh');
+      expect((ok['response']! as Map)['ok'], isTrue);
+      expect((ok['response'] as Map)['data'], isA<int>(),
+          reason: '成功那一发回的是**新增篇数**（标量），不是 {added: …} 那种包装');
+      final dead = RpcEnvelope.decode(
+          Map<String, Object?>.from(_load('rss.refresh--dead-feed')['response']! as Map),
+          action: 'rss.refresh');
+      expect(dead.ok, isFalse);
+      expect(dead.error, isNotNull);
+      expect(() => dead.dataOrThrow(action: 'rss.refresh'), throwsA(isA<EngineFailure>()),
+          reason: '连不上源的抓取失败必须能被界面当失败处理：读成 0 就是"这个源没有新文章"');
+    });
+
+    test('rss.refresh_all：进度帧六格里本轮身份每帧回带，failures 只在收尾那一帧', () {
+      final sample = _load('rss.refresh_all');
+      final receipt = Map<String, Object?>.from(
+          _envelopeOf(sample)['data']! as Map);
+      expect(receipt.keys, <String>{'started', 'action'},
+          reason: 'job 那一发的受理回包**没有**新增篇数——收尾那句只能从事件里累加'
+              '（`rss_notifier.dart` 的第 7 条规矩）');
+      expect(JobAccepted.fromJson(receipt).started, isTrue);
+
+      final requested =
+          Map<String, Object?>.from((sample['request']! as Map)['payload']! as Map);
+      final frames = ((sample['progress_sample']! as Map)['frames']! as List)
+          .cast<Map<String, Object?>>();
+      expect(frames.length, greaterThanOrEqualTo(3), reason: '正对照：帧太少撑不起下面那三条比对');
+      final progress = frames
+          .map((frame) => RssRefreshProgress.fromJson(
+              Map<String, Object?>.from(frame['payload']! as Map)))
+          .toList();
+      for (final frame in progress) {
+        expect(frame.refreshId, requested['refresh_id'],
+            reason: 'refresh_id 由客户端生成、每帧原样回带；认不出本轮的帧会把上一轮的计数叠进这一轮');
+      }
+      // `total` 开头定下、中途不变（计划源数），`done` 单调不降（已经动手的源数）。
+      expect(progress.map((f) => f.total).toSet(), hasLength(1),
+          reason: '进度条的分母中途变了，界面就是一条会缩回去的条');
+      final dones = progress.map((f) => f.done).toList();
+      expect(dones, equals(dones.toList()..sort()), reason: 'done 退步 = 进度条往回走');
+      expect(progress.last.done, progress.last.total,
+          reason: '收尾那一帧必须跑完，否则进度条永远不收');
+      // failures 只在收尾那一帧有意义：中途每一帧的失败数都只是"截至此刻"。
+      final failing = progress.asMap().entries.where((e) => e.value.failures > 0).toList();
+      expect(failing, hasLength(1), reason: '有多于一帧带失败数 = 那条口径改了，锯齿会回来');
+      expect(failing.first.key, progress.length - 1,
+          reason: '失败数出现在中途那一帧：进度条上是一条锯齿状失败数');
+      // 第一帧 `current` 是空串（还没排到源名）→「未知源」那一支在**真语料**里有证人。
+      expect(progress.first.current, isEmpty,
+          reason: '语料里第一帧开始就带名字了：界面那句「未知源」的分支要重新找靶子');
+      expect(progress.first.status, contains('未知源'));
+      // `done + 1` 而不是 `done`：进度条读分数、状态行读"正在刷第几条"，两者不同值是**有意的**。
+      expect(progress[1].status, '正在刷新 2/${progress[1].total}：'
+          '${progress[1].current}', reason: '状态行与进度条同一格数字才是真的对齐');
+
+      final event = Map<String, Object?>.from(
+          (sample['event_sample']! as Map)['payload']! as Map);
+      final refreshed = RssRefreshed.fromJson(event);
+      expect(refreshed.sourceId, isNotEmpty);
+      expect(refreshed.newCount, greaterThan(0),
+          reason: '事件那发回的是**本次新增**篇数：0 会让"整轮一篇没取到"与"这一源本来就新"分不开');
+      expect(event.containsKey('refresh_id'), isFalse,
+          reason: '`RssRefreshedEvent` **不带**本轮身份（`app/core/events.py` 那一族只有两格）：'
+              '客户端只能在自己拥有本轮的那段窗口里累加（`rss_notifier.dart` 第 7 条那条让步）');
     });
   });
 }

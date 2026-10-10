@@ -5,9 +5,9 @@
 /// `tests/test_gateway_contract_single_source.py` 拿 Python 侧 `event_types()`
 /// 的类名逐个比对本文件的字面量，多一格、少一格、拼错都是红。
 ///
-/// 这里只列**G2 那四个屏真正在听的**那几条。其余事件（`ImportProgressEvent`、
-/// `ReadAloudStateEvent` 那一族）等到有屏听它们的那一天再登记——
-/// 提前列全表会得到一份没人用的名单，而它的漂移比它的价值高。
+/// 这里只列**有屏在听的那几条**（找书 / 检测 / 换源 / 订阅 / 书源库变更 / 服务状态）。
+/// 其余事件（`ImportProgressEvent`、`ReadAloudStateEvent` 那一族）等到有屏听它们的那一天
+/// 再登记——提前列全表会得到一份没人用的名单，而它的漂移比它的价值高。
 library;
 
 abstract final class EngineEventNames {
@@ -31,4 +31,14 @@ abstract final class EngineEventNames {
   /// 换源扫描收尾（`switch_id` + `candidates` + `cancelled` + `error`）。
   /// 候选名单**只在这条里**，进度帧里没有——所以那五格里只有这一条带数据。
   static const String sourceSwitchFinished = 'SourceSwitchFinishedEvent';
+
+  /// 全源刷新的进度（`refresh_id` + `done`/`total` + `current` + `failures`）。
+  /// `failures` 只在收尾那一帧读（服务端中途每帧也带，但那是"截至此刻"，
+  /// 画在界面上会是一条锯齿状失败数）。
+  static const String rssRefreshProgress = 'RssRefreshProgressEvent';
+
+  /// 一条订阅源刷完了（`source_id` + `new_count`）。
+  /// 一条一轮里会来 N 条（N=本轮源数），不收尾——认本轮靠 [rssRefreshProgress] 那一发
+  /// 的进度帧收尾，这一条只用来数"新增了几篇"。
+  static const String rssRefreshed = 'RssRefreshedEvent';
 }

@@ -1,0 +1,207 @@
+{
+  "renderer": "app/views/reading/rss_view.py::RssView.show_article / clear_detail",
+  "payload_from": "tests/gateway/golden/rss.article.json 的 response.data",
+  "rows": [
+    {
+      "case": "as_captured",
+      "why": "黄金样本原样：标题/元信息/正文/链接四格",
+      "article": {
+        "id": 1,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "带标签的第一条",
+        "url": "http://127.0.0.1:8797/rss/post/1",
+        "author": "作者甲",
+        "pub_date": "Mon, 05 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "body": "第一段\n加粗\n第二段",
+      "expected": {
+        "title": "带标签的第一条",
+        "meta": "作者甲 · Mon, 05 Oct 2026 09:00:00 GMT",
+        "body": "第一段\n加粗\n第二段",
+        "link": "http://127.0.0.1:8797/rss/post/1",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏"
+      }
+    },
+    {
+      "case": "empty_body",
+      "why": "正文空 → 「(这条没有正文，只有标题和链接)」",
+      "article": {
+        "id": 1,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "带标签的第一条",
+        "url": "http://127.0.0.1:8797/rss/post/1",
+        "author": "作者甲",
+        "pub_date": "Mon, 05 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "body": "",
+      "expected": {
+        "title": "带标签的第一条",
+        "meta": "作者甲 · Mon, 05 Oct 2026 09:00:00 GMT",
+        "body": "(这条没有正文，只有标题和链接)",
+        "link": "http://127.0.0.1:8797/rss/post/1",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏"
+      }
+    },
+    {
+      "case": "no_author",
+      "why": "作者空 → 元信息只剩日期",
+      "article": {
+        "id": 1,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "带标签的第一条",
+        "url": "http://127.0.0.1:8797/rss/post/1",
+        "author": "",
+        "pub_date": "Mon, 05 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "body": "第一段\n加粗\n第二段",
+      "expected": {
+        "title": "带标签的第一条",
+        "meta": "Mon, 05 Oct 2026 09:00:00 GMT",
+        "body": "第一段\n加粗\n第二段",
+        "link": "http://127.0.0.1:8797/rss/post/1",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏"
+      }
+    },
+    {
+      "case": "numeric_pub_date",
+      "why": "日期是能读成数字的串 → 与左栏同一把尺格式化",
+      "article": {
+        "id": 1,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "带标签的第一条",
+        "url": "http://127.0.0.1:8797/rss/post/1",
+        "author": "作者甲",
+        "pub_date": "1759000000",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "body": "第一段\n加粗\n第二段",
+      "expected": {
+        "title": "带标签的第一条",
+        "meta": "作者甲 · 09-28 03:06",
+        "body": "第一段\n加粗\n第二段",
+        "link": "http://127.0.0.1:8797/rss/post/1",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏"
+      }
+    },
+    {
+      "case": "starred",
+      "why": "已收藏 → 图标 STAR、tooltip「取消收藏」",
+      "article": {
+        "id": 1,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "带标签的第一条",
+        "url": "http://127.0.0.1:8797/rss/post/1",
+        "author": "作者甲",
+        "pub_date": "Mon, 05 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": true
+      },
+      "body": "第一段\n加粗\n第二段",
+      "expected": {
+        "title": "带标签的第一条",
+        "meta": "作者甲 · Mon, 05 Oct 2026 09:00:00 GMT",
+        "body": "第一段\n加粗\n第二段",
+        "link": "http://127.0.0.1:8797/rss/post/1",
+        "star_icon": "STAR",
+        "star_tooltip": "收藏"
+      }
+    },
+    {
+      "case": "titleless",
+      "why": "标题空 → 「(无标题)」",
+      "article": {
+        "id": 1,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "",
+        "url": "http://127.0.0.1:8797/rss/post/1",
+        "author": "作者甲",
+        "pub_date": "Mon, 05 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "body": "第一段\n加粗\n第二段",
+      "expected": {
+        "title": "(无标题)",
+        "meta": "作者甲 · Mon, 05 Oct 2026 09:00:00 GMT",
+        "body": "第一段\n加粗\n第二段",
+        "link": "http://127.0.0.1:8797/rss/post/1",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏"
+      }
+    },
+    {
+      "case": "urlless",
+      "why": "链接空 → 那一格是空串（不是「无」之类的自造占位）",
+      "article": {
+        "id": 1,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "带标签的第一条",
+        "url": "",
+        "author": "作者甲",
+        "pub_date": "Mon, 05 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      "body": "第一段\n加粗\n第二段",
+      "expected": {
+        "title": "带标签的第一条",
+        "meta": "作者甲 · Mon, 05 Oct 2026 09:00:00 GMT",
+        "body": "第一段\n加粗\n第二段",
+        "link": "",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏"
+      }
+    },
+    {
+      "case": "cleared_default",
+      "why": "clear_detail() 的默认那一句",
+      "article": null,
+      "body": null,
+      "expected": {
+        "title": "选一个订阅源",
+        "meta": "",
+        "body": "",
+        "link": "",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏"
+      }
+    },
+    {
+      "case": "cleared_hint",
+      "why": "控制器传的占位句原样上屏",
+      "article": null,
+      "body": null,
+      "expected": {
+        "title": "选一篇文章看正文",
+        "meta": "",
+        "body": "",
+        "link": "",
+        "star_icon": "STAR_BORDER",
+        "star_tooltip": "收藏"
+      }
+    }
+  ],
+  "generated": {
+    "local_utc_offset_minutes": 480,
+    "probe": ".probe/g4_rss_projection.py",
+    "reason": "epoch 秒那几格按本地时区折成 MM-DD HH:MM（`rss_view._when`），换时区的机器上比对前先重跑 .probe/g4_rss_projection.py"
+  }
+}
