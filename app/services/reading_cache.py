@@ -74,7 +74,11 @@ class ReadingCache:
 
     def load_catalog(self, source_url: str, book_url: str) -> list[ChapterItem] | None:
         data = self._read(self._book_dir(source_url, book_url) / "catalog.json")
-        if not isinstance(data, dict) or data.get("version") != self.VERSION:
+        if not isinstance(data, dict):
+            return None
+        # 目录文件不涉及媒体块形状，VERSION 1 和 2 都能读（G4-C 只改了内容缓存的字节存储）。
+        version = data.get("version")
+        if version not in (1, 2):
             return None
         try:
             return [ChapterItem(**item) for item in data.get("chapters", [])]
@@ -105,7 +109,11 @@ class ReadingCache:
     def load_content(self, source_url: str, book_url: str,
                      chapter_url: str) -> ChapterContent | None:
         data = self._read(self._content_path(source_url, book_url, chapter_url))
-        if not isinstance(data, dict) or data.get("version") != self.VERSION:
+        if not isinstance(data, dict):
+            return None
+        # 兼容旧缓存：VERSION 1（字节在 JSON 里）和 VERSION 2（字节在 .bin）都能读。
+        version = data.get("version")
+        if version not in (1, 2):
             return None
         content_dir = self._book_dir(source_url, book_url) / "content"
         chapter_digest = self._digest(chapter_url)
