@@ -19,7 +19,17 @@ import '../features/reader/domain/reader_controller.dart';
 import '../features/reader/presentation/reader_screen.dart';
 import '../features/rss/presentation/rss_screen.dart';
 import '../features/settings/presentation/appearance_screen.dart';
+import '../features/settings/presentation/browser_screen.dart';
+import '../features/settings/presentation/dictionary_screen.dart';
+import '../features/settings/presentation/export_screen.dart';
+import '../features/settings/presentation/font_screen.dart';
+import '../features/settings/presentation/qr_code_screen.dart';
+import '../features/settings/presentation/replace_rules_screen.dart';
+import '../features/settings/presentation/tts_screen.dart';
+import '../features/settings/presentation/tools_overview_screen.dart';
 import '../features/settings/presentation/update_screen.dart';
+import '../features/settings/presentation/web_bridge_screen.dart';
+import '../features/settings/presentation/webdav_screen.dart';
 import '../features/sources/presentation/sources_screen.dart';
 import 'shell.dart';
 
@@ -33,6 +43,17 @@ const String settingsGroupRoute = '/settings';
 /// 用根导航器压在壳之上（`context.push`，返回就落回原来那一屏）。
 const String readerRoute = '/reader';
 
+/// 工具域各页：与阅读器同级的整页目的地。
+const String browserToolRoute = '/tools/browser';
+const String dictionaryToolRoute = '/tools/dictionary';
+const String replaceRulesToolRoute = '/tools/replace-rules';
+const String fontToolRoute = '/tools/font';
+const String qrCodeToolRoute = '/tools/qr-code';
+const String exportToolRoute = '/tools/export';
+const String webdavToolRoute = '/tools/webdav';
+const String webBridgeToolRoute = '/tools/web-bridge';
+const String ttsToolRoute = '/tools/tts';
+
 /// 开一本书：把 [ReaderArgs] 作为 `extra` 递进路由。
 ///
 /// 为什么不走 `go_named` 的 query 参数：`reader.open` 吃的是一份**字典快照**
@@ -41,6 +62,25 @@ const String readerRoute = '/reader';
 /// "编码口径不一致"的错法。
 Future<void> openReaderBook(BuildContext context, ReaderArgs args) =>
     context.push(readerRoute, extra: args);
+
+/// 打开工具页：按标签名推对应的整页路由。
+void openToolPage(BuildContext context, String label) {
+  final route = switch (label) {
+    '浏览器' => browserToolRoute,
+    '词典' => dictionaryToolRoute,
+    '替换规则' => replaceRulesToolRoute,
+    '字体' => fontToolRoute,
+    '二维码' => qrCodeToolRoute,
+    '导出' => exportToolRoute,
+    '备份' => webdavToolRoute,
+    '网络桥' => webBridgeToolRoute,
+    '朗读' => ttsToolRoute,
+    _ => null,
+  };
+  if (route != null) {
+    context.push(route);
+  }
+}
 
 /// 「阅读」组的页签表（`NAV_META` 里 GROUP_READING 的非整页成员）。
 ///
@@ -83,7 +123,7 @@ List<GroupTab> sourceTabs() => const <GroupTab>[
       ),
     ];
 
-/// 「配置」组：G2 只有外观一签，现在加上更新检查。
+/// 「配置」组：外观 / 更新 / 工具入口。
 List<GroupTab> settingsTabs() => const <GroupTab>[
       GroupTab(
         label: '外观',
@@ -94,6 +134,11 @@ List<GroupTab> settingsTabs() => const <GroupTab>[
         label: '更新',
         icon: Icons.system_update_outlined,
         builder: _update,
+      ),
+      GroupTab(
+        label: '工具',
+        icon: Icons.build_outlined,
+        builder: _toolsOverview,
       ),
     ];
 
@@ -110,6 +155,8 @@ Widget _check(BuildContext _) => const CheckScreen();
 Widget _appearance(BuildContext _) => const AppearanceScreen();
 
 Widget _update(BuildContext _) => const UpdateScreen();
+
+Widget _toolsOverview(BuildContext _) => const ToolsOverviewScreen();
 
 /// 目的地 → 所属分组（与 flet `NavigationHost._dest_group` 同一张反查表）。
 String? groupOfDestination(String destination) => switch (destination) {
@@ -237,6 +284,70 @@ GoRouter buildRouter() => GoRouter(
               ],
               child: const ReaderScreen(),
             ),
+          ),
+        ),
+        // 工具域各页：整页目的地，返回落回工具概览。
+        GoRoute(
+          path: browserToolRoute,
+          name: 'browserTool',
+          pageBuilder: (context, state) => const MaterialPage<void>(
+            child: BrowserScreen(),
+          ),
+        ),
+        GoRoute(
+          path: dictionaryToolRoute,
+          name: 'dictionaryTool',
+          pageBuilder: (context, state) => const MaterialPage<void>(
+            child: DictionaryScreen(),
+          ),
+        ),
+        GoRoute(
+          path: replaceRulesToolRoute,
+          name: 'replaceRulesTool',
+          pageBuilder: (context, state) => const MaterialPage<void>(
+            child: ReplaceRulesScreen(),
+          ),
+        ),
+        GoRoute(
+          path: fontToolRoute,
+          name: 'fontTool',
+          pageBuilder: (context, state) => const MaterialPage<void>(
+            child: FontScreen(),
+          ),
+        ),
+        GoRoute(
+          path: qrCodeToolRoute,
+          name: 'qrCodeTool',
+          pageBuilder: (context, state) => const MaterialPage<void>(
+            child: QrCodeScreen(),
+          ),
+        ),
+        GoRoute(
+          path: exportToolRoute,
+          name: 'exportTool',
+          pageBuilder: (context, state) => const MaterialPage<void>(
+            child: ExportScreen(),
+          ),
+        ),
+        GoRoute(
+          path: webdavToolRoute,
+          name: 'webdavTool',
+          pageBuilder: (context, state) => const MaterialPage<void>(
+            child: WebDavScreen(),
+          ),
+        ),
+        GoRoute(
+          path: webBridgeToolRoute,
+          name: 'webBridgeTool',
+          pageBuilder: (context, state) => const MaterialPage<void>(
+            child: WebBridgeScreen(),
+          ),
+        ),
+        GoRoute(
+          path: ttsToolRoute,
+          name: 'ttsTool',
+          pageBuilder: (context, state) => const MaterialPage<void>(
+            child: TtsScreen(),
           ),
         ),
       ],

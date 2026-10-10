@@ -1,11 +1,11 @@
 /// 更多工具入口页（M7 后导航精简：工具组折叠为单一入口）。
 ///
-/// 工具域十个页面不在侧栏直接展示，统一收进本页卡片；点击经 GroupTabs 切换到同组的对应页签。
+/// 工具域十个页面不在侧栏直接展示，统一收进本页卡片；点击经路由推到对应整页。
 library;
 
 import 'package:flutter/material.dart';
 
-import '../../../core/widgets/tabbed_group.dart';
+import '../../../app/router.dart';
 
 /// 工具卡片清单：(标签, 图标, 说明)。
 const _tools = <({String label, IconData icon, String desc})>[
@@ -27,7 +27,6 @@ class ToolsOverviewScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final tabs = GroupTabsScope.maybeOf(context);
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
@@ -45,7 +44,7 @@ class ToolsOverviewScreen extends StatelessWidget {
           Wrap(
             spacing: 12,
             runSpacing: 12,
-            children: _tools.map((tool) => _buildCard(context, tabs, tool)).toList(),
+            children: _tools.map((tool) => _buildCard(context, tool)).toList(),
           ),
         ],
       ),
@@ -54,12 +53,11 @@ class ToolsOverviewScreen extends StatelessWidget {
 
   Widget _buildCard(
     BuildContext context,
-    GroupTabs? tabs,
     ({String label, IconData icon, String desc}) tool,
   ) {
     final theme = Theme.of(context);
     return InkWell(
-      onTap: () => tabs?.select(tool.label),
+      onTap: () => openToolPage(context, tool.label),
       borderRadius: BorderRadius.circular(12),
       child: Container(
         width: 280,
