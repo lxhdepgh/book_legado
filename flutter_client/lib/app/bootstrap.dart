@@ -15,6 +15,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../core/di/providers.dart';
+import '../core/rpc/engine_endpoint.dart';
 import '../core/rpc/engine_process.dart';
 import '../core/rpc/engine_repository.dart';
 import '../core/rpc/envelope.dart';
@@ -83,7 +84,39 @@ Future<BootstrapResult> bootstrapEngine() async {
   if (_useFakeEngine) {
     return BootstrapResult(repository: FakeEngineRepository());
   }
-  final started = await EngineProcess.start();
+
+  // 尝试自动启动 Python 子进程（开发模式）
+  StartedEngine? started;
+  try {
+    started = await EngineProcess.start();
+  } on EngineFailure catch (e) {
+    // 如果无法启动子进程（release 模式无 LEGODO_PYTHON/LEGODO_MAIN），
+    // 回退到连接外部已运行的 --serve 服务
+    if (e.kind == EngineFailureKind.unavailable) {
+      // 使用默认地址连接外部服务（localhost:8000，空令牌）
+      final client = RpcClient(const EngineEndpoint(
+        host: '127.0.0.1',
+        port: 8000,
+        token: '',
+        protocolVersion: 1,
+        build: 'external',
+        pid: 0,
+      ));
+      final repository = RpcEngineRepository(client);
+
+      // 尝试握手验证连接
+      try {
+        await repository.hello();
+      } catch (_) {
+        // 连不上外部服务，返回错误让界面显示
+        rethrow;
+      }
+
+      return BootstrapResult(repository: repository, handle: null);
+    }
+    rethrow;
+  }
+
   final client = RpcClient(started.endpoint);
   // 句柄与界面共用这一个仓库实例：各 new 一个的话 `engine.shutdown` 发两遍，
   // 第二遍打在已经退场的进程上，表现是退出时多一条没来由的 transport 错。
