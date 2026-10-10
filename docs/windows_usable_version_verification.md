@@ -134,8 +134,38 @@ Package file_picker:windows references file_picker:windows as the default plugin
 2. **a292f31**: feat: 删除词典服务并完善 Windows 可用版本
 3. **f78fc82**: fix: 彻底移除词典功能残留引用
 4. **08647a1**: fix: 从 main.py 移除 DictService 注册
+5. **16ffcd0**: docs: 添加 Windows 可用版本实机验证报告
+6. **877e083**: fix: 修复 release 模式下 Python DLL 加载失败问题
 
-## 七、结论
+## 八、启动方式说明
+
+### 8.1 双进程架构（当前）
+Flutter 前端与 Python 后端为独立进程，通过 HTTP/RPC 通信。
+
+**方式 A：手动启动（推荐用于 Release 版本）**
+```powershell
+# 终端 1：启动 Python 后端
+python main.py --serve
+
+# 终端 2：启动 Flutter 应用
+.\build\windows\x64\runner\Release\legodo_client.exe
+```
+
+**方式 B：自动启动（开发模式）**
+```powershell
+# 设置环境变量后直接运行 Flutter（会自动拉起 Python 子进程）
+$env:LEGODO_PYTHON = "D:\env_manger\minicaoda\envs\legodo_booksource_check\python.exe"
+$env:LEGODO_MAIN = "D:\WorkSpace\PycharmProjects\legodo_booksource_check\main.py"
+.\build\windows\x64\runner\Release\legodo_client.exe
+```
+
+### 8.2 注意事项
+- Release 构建不包含 Python 运行时，必须连接外部 `--serve` 服务
+- Python 后端默认监听 `localhost:8000`（端口由 `--port 0` 动态分配）
+- Flutter 回退连接地址为 `http://127.0.0.1:8000`（空令牌）
+- 如 Python 服务未启动，Flutter 会显示"连不上引擎"错误页
+
+## 九、结论
 
 **Windows 可用版本已就绪**，可执行文件位于：
 ```
