@@ -20,10 +20,15 @@ DART_CLIENT = PROJECT_ROOT / "legodo_dart"
 def run(cmd: list[str], cwd: Path | None = None) -> None:
     """执行命令并在失败时退出。"""
     print(f"$ {' '.join(cmd)}", flush=True)
-    result = subprocess.run(cmd, cwd=cwd or PROJECT_ROOT)
-    if result.returncode != 0:
-        print(f"[ERROR] Command failed with exit code {result.returncode}", file=sys.stderr)
+    try:
+        result = subprocess.run(cmd, cwd=cwd or PROJECT_ROOT, check=True)
+    except FileNotFoundError as e:
+        print(f"[ERROR] Command not found: {cmd[0]}", file=sys.stderr)
+        print(f"[INFO] Please ensure '{cmd[0]}' is in your PATH", file=sys.stderr)
         sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Command failed with exit code {e.returncode}", file=sys.stderr)
+        sys.exit(e.returncode)
 
 
 def build_backend(target: str = "windows") -> None:
