@@ -541,6 +541,13 @@ abstract class EngineRepository {
   }) async =>
       throw _missing('theme.save');
 
+  // -- G4-E: 工具域 --
+  // qr.* - 二维码生成/识别
+  Future<String?> qrGenerate(String text) async => throw _missing('qr.generate');
+
+  Future<String?> qrDecode(String imageData) async =>
+      throw _missing('qr.decode');
+
   EngineFailure _missing(String action) => EngineFailure(
         EngineFailureKind.unavailable,
         '当前环境不支持 $action',

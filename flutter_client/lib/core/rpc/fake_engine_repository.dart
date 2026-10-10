@@ -891,6 +891,13 @@ class FakeEngineRepository implements EngineRepository {
   @override
   Future<void> updateIgnore(String version) async {}
 
+  // -- G4-E: 工具域 --
+  @override
+  Future<String?> qrGenerate(String text) async => null;
+
+  @override
+  Future<String?> qrDecode(String imageData) async => null;
+
   Future<void> dispose() async {
     _calls.clear();
     _payloads.clear();

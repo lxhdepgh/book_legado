@@ -74,6 +74,21 @@ class RpcEngineRepository implements EngineRepository {
         payload: <String, Object?>{'version': version});
   }
 
+  // -- G4-E: 工具域 --
+  @override
+  Future<String?> qrGenerate(String text) async {
+    final data = await client.call('qr.generate',
+        payload: <String, Object?>{'text': text});
+    return data is String ? data : null;
+  }
+
+  @override
+  Future<String?> qrDecode(String imageData) async {
+    final data = await client.call('qr.decode',
+        payload: <String, Object?>{'image_data': imageData});
+    return data is String ? data : null;
+  }
+
   /// 反向渲染的答复（§8 R1）。两处与全表不同，都不是风格：
   ///
   /// 1. **`singleFlight: false`**。同 action 只许在飞一发"这条是**答两条不同的渲染**
