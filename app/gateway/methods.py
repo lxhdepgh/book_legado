@@ -79,6 +79,15 @@ _THEME = "app.services.tools.theme_service.ThemeService"
 _RSS = "app.services.content.rss_service.RssService"
 _READALOUD = "app.services.content.read_aloud.ReadAloudService"
 _UPDATE = "app.services.tools.update_service.UpdateService"
+_BROWSER = "app.services.tools.browser_service.BrowserService"
+_DICT = "app.services.tools.dict_service.DictService"
+_REPLACE = "app.services.tools.replace_rule_service.ReplaceRuleService"
+_FONT = "app.services.tools.font_service.FontService"
+_QR = "app.services.tools.qr_code_service.QrCodeService"
+_EXPORT = "app.services.tools.book_export_service.BookExportService"
+_WEBDAV = "app.services.tools.web_dav_service.WebDavService"
+_WEB_BRIDGE = "app.services.tools.web_bridge_service.WebBridgeService"
+_TTS = "app.services.content.read_aloud.ReadAloudService"  # TTS 控制复用朗读域
 
 METHODS: tuple[Method, ...] = (
     _m("engine.hello", _SELF, "hello", (), 2.0,
@@ -254,6 +263,70 @@ METHODS: tuple[Method, ...] = (
        summary="检查更新：返回最新版本信息或 None（已是最新/网络失败）"),
     _m("update.ignore", _UPDATE, "ignore_version", ("version",), 5.0, mode="sync",
        summary="忽略某版本：该版本不再弹窗"),
+    # -- G4-E: 工具域 --
+    # browser.* - 浏览器会话管理
+    _m("browser.open_page", _BROWSER, "open_page", ("url",), 10.0,
+       summary="打开内置浏览器页面，返回会话号"),
+    _m("browser.navigate", _BROWSER, "navigate_page", ("session_id", "url"), 10.0,
+       summary="在指定会话中导航到 URL"),
+    _m("browser.close", _BROWSER, "close_page", ("session_id",), 5.0,
+       summary="关闭浏览器会话"),
+    # dict.* - 词典查询
+    _m("dict.lookup", _DICT, "lookup", ("word",), 10.0,
+       summary="查词：返回释义和音标"),
+    _m("dict.rules", _DICT, "list_rules", (), 5.0,
+       summary="列出所有词典规则"),
+    _m("dict.add_rule", _DICT, "add_rule",
+       ("name", "url", "selector"), 5.0,
+       summary="新增词典规则"),
+    _m("dict.delete_rule", _DICT, "delete_rule", ("rule_id",), 5.0,
+       summary="删除词典规则"),
+    # replace.* - 替换规则 CRUD
+    _m("replace.list", _REPLACE, "list_rules", (), 5.0,
+       summary="列出所有替换规则"),
+    _m("replace.add", _REPLACE, "add_rule",
+       ("name", "pattern", "replacement", "enabled"), 5.0,
+       summary="新增替换规则"),
+    _m("replace.update", _REPLACE, "update_rule",
+       ("rule_id", "name", "pattern", "replacement", "enabled"), 5.0,
+       summary="更新替换规则"),
+    _m("replace.delete", _REPLACE, "delete_rule", ("rule_id",), 5.0,
+       summary="删除替换规则"),
+    _m("replace.toggle_global", _REPLACE, "set_global_enabled", ("enabled",), 5.0,
+       mode="sync", summary="切换全局替换开关"),
+    # font.* - 字体管理
+    _m("font.scan_system", _FONT, "scan_system_fonts", (), 10.0,
+       summary="扫描系统字体"),
+    _m("font.add_user", _FONT, "add_font_file", ("file_path",), 10.0,
+       summary="添加用户字体文件"),
+    _m("font.remove", _FONT, "remove_font", ("font_id",), 5.0,
+       summary="移除用户字体"),
+    _m("font.select", _FONT, "select_font", ("family",), 5.0, mode="sync",
+       summary="选中当前字体"),
+    # qr.* - 二维码生成/识别
+    _m("qr.generate", _QR, "generate", ("text",), 10.0,
+       summary="生成二维码 PNG（返回 base64）"),
+    _m("qr.decode", _QR, "decode_image", ("image_data",), 10.0,
+       summary="识别图片中的二维码"),
+    # export.* - 书籍导出
+    _m("export.epub", _EXPORT, "export_epub", ("book_key", "output_path"), 60.0,
+       summary="导出书籍为 epub"),
+    _m("export.txt", _EXPORT, "export_txt", ("book_key", "output_path"), 60.0,
+       summary="导出书籍为 txt"),
+    # webdav.* - WebDAV 备份
+    _m("webdav.backup", _WEBDAV, "backup", (), 120.0,
+       summary="WebDAV 备份数据"),
+    _m("webdav.restore", _WEBDAV, "restore", ("backup_id",), 120.0,
+       summary="从备份恢复"),
+    _m("webdav.list_backups", _WEBDAV, "list_backups", (), 10.0,
+       summary="列出所有备份"),
+    # webbridge.* - 网络桥
+    _m("webbridge.start", _WEB_BRIDGE, "start_server", ("port",), 5.0,
+       summary="启动 HTTP/WebSocket 书源管理服务"),
+    _m("webbridge.stop", _WEB_BRIDGE, "stop_server", (), 5.0,
+       summary="停止网络桥服务"),
+    _m("webbridge.status", _WEB_BRIDGE, "get_status", (), 5.0,
+       summary="获取网络桥状态"),
 )
 
 #: 按 action 名索引（重名当场炸：两条同名的动作到了客户端就是随机路由）。
