@@ -176,7 +176,6 @@ def _build_hub():
     from app.services.tools.background_service import BackgroundService
     from app.services.tools.book_export_service import BookExportService
     from app.services.tools.boss_key_service import BossKeyService
-    from app.services.tools.dict_service import DictService
     from app.services.tools.font_service import FontService
     from app.services.tools.qr_code_service import QrCodeService
     from app.services.tools.replace_rule_service import ReplaceRuleService
@@ -188,7 +187,6 @@ def _build_hub():
     hub.register(WebDavService())
     hub.register(BookExportService())
     hub.register(ReplaceRuleService())
-    hub.register(DictService())
     hub.register(FontService())
     hub.register(QrCodeService())
     # 本机版本只有 app.APP_VERSION 一处：不传就用默认空串，更新页既显示"未知"、
