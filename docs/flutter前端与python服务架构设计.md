@@ -706,6 +706,12 @@ Range——封面名（`^[0-9a-f]{16}\.jpg$`，出自 `SourceService._normalize_
 > 详情屏收藏按钮 tooltip 照搬 flet 不改（单独挂号）；跨语言文案守卫两个方向分开钉
 >（正向 73 语词排除 6 → 67 保留，反向 dart_runs=69 dart_only=2 钉住）；欠据表 9→0，
 > `action_table=58 call_sites=58 pending=[]`；自测 9 支 PASS + 6 发变异全红（行为级）。
+>
+> **G4-C 交（漫画媒体换形状，2026-10-10，第九十八轮，`docs/dev-logs/2026-10-10.md` §「第九十八轮 收」）**：
+> `ReadingCache` VERSION 1→2，字节块落盘成兄弟文件（`.bin`），`media_bytes` 走 `Path.read_bytes`
+> 不再 parse JSON；旧缓存兼容（先找 .bin，没有就回退到 JSON 里 base64）；协议面 key 空间与
+> `is_media_key` 语法不动，网关那一路不受影响；七笔账全对上（30/30 正对照字节一字不差），
+> 性能读数显示新形状避免了 JSON parse + base64 decode，真正收益在内存压力与架构清晰。
 
 ---
 
@@ -811,7 +817,12 @@ Range——封面名（`^[0-9a-f]{16}\.jpg$`，出自 `SourceService._normalize_
   （`rss.level.<名>.tip` / `rss.shape.flex.<名>`，因为这一版 Flutter 的 `find.ancestor` 没有
   `skipOffstage`），详情屏收藏按钮 tooltip 照搬 flet 不改（单独挂号），跨语言文案守卫两个方向
   分开钉（正向 73 语词排除 6 → 67 保留，反向 dart_runs=69 dart_only=2 钉住），欠据表 9→0，
-  `action_table=58 call_sites=58 pending=[]`，自测 9 支 PASS + 6 发变异全红（行为级））
+  `action_table=58 call_sites=58 pending=[]`，自测 9 支 PASS + 6 发变异全红（行为级）；
+  第九十八轮：**G4-C（漫画媒体换形状）**——`ReadingCache` VERSION 1→2，字节块落盘成兄弟文件
+  （`.bin`），`media_bytes` 走 `Path.read_bytes` 不再 parse JSON；旧缓存兼容（先找 .bin，没有就
+  回退到 JSON 里 base64）；协议面 key 空间与 `is_media_key` 语法不动，网关那一路不受影响；
+  七笔账全对上（30/30 正对照字节一字不差），性能读数显示新形状避免了 JSON parse + base64 decode，
+  真正收益在内存压力与架构清晰）
 - `docs/M7打包说明.md`（PyInstaller 命令与 flet* hidden-import 清单位置）
 - 参照仓库：`github.com/jerunshi/guoapp1`（浅克隆 `D:/tmp/guoapp1`，不在本项目版本控制内）
 - 记忆：`tts-pyttsx3-com-same-thread`、`quickjs-native-crash-risk`、`engine-hub-loop-split`、

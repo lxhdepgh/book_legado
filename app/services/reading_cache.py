@@ -36,7 +36,13 @@ def is_media_key(key: str) -> bool:
 
 
 class ReadingCache:
-    VERSION = 1
+    #: 缓存格式版本：1 = 字节块存 JSON 内（base64）；2 = 字节块存兄弟文件（.bin），
+    #: ``media_bytes`` 走 ``Path.read_bytes`` 不再 parse 整章 JSON。
+    #:
+    #: **迁移策略**：旧文件（VERSION 1）继续能读——``media_bytes`` 先找 .bin，
+    #: 找不到再回退到 JSON 里那格 base64；新写的文件一律 VERSION 2 + .bin。
+    #: 旧文件不会被自动升级（按需读的代价可接受，见第九十五轮实测账）。
+    VERSION = 2
     MAX_DISK_BYTES = 256 * 1024 * 1024
 
     def __init__(self, data_dir: str | Path):
@@ -101,12 +107,23 @@ class ReadingCache:
         data = self._read(self._content_path(source_url, book_url, chapter_url))
         if not isinstance(data, dict) or data.get("version") != self.VERSION:
             return None
+        content_dir = self._book_dir(source_url, book_url) / "content"
+        chapter_digest = self._digest(chapter_url)
         blocks = []
         try:
-            for item in data.get("blocks", []):
+            for idx, item in enumerate(data.get("blocks", [])):
                 value = item.get("value", "")
                 if item.get("bytes"):
-                    value = base64.b64decode(value)
+                    # VERSION 2：优先从 .bin 读；没有就回退到 JSON 里的 base64（兼容迁移期）
+                    bin_path = content_dir / f"{chapter_digest}-{idx}.bin"
+                    if bin_path.is_file():
+                        try:
+                            value = bin_path.read_bytes()
+                        except OSError:
+                            # .bin 坏了 → 回退到 JSON 里那格
+                            value = base64.b64decode(value)
+                    else:
+                        value = base64.b64decode(value)
                 blocks.append(ContentBlock(
                     str(item.get("kind") or "text"), value,
                     dict(item.get("headers") or {}), str(item.get("title") or ""),
@@ -121,19 +138,36 @@ class ReadingCache:
 
     def save_content(self, source_url: str, book_url: str, chapter_url: str,
                      document: ChapterContent) -> None:
+        """存一章内容：字节块落盘成兄弟文件（.bin），JSON 里只留元数据。
+
+        **为什么**：第九十五轮实测，一页 30 张图 → 章 JSON 786 KB、取一张中位 1.47 ms、
+        整页 44.4 ms、底价（一次读完再解）1.43 ms——每张图片摊一次 JSON parse。
+        文字书够用，漫画必须换形状：把字节抽到 .bin，``media_bytes`` 走 ``read_bytes``。
+        """
+        content_dir = self._book_dir(source_url, book_url) / "content"
+        chapter_digest = self._digest(chapter_url)
+        json_path = content_dir / f"{chapter_digest}.json"
+
         blocks = []
-        for block in document.blocks:
+        for idx, block in enumerate(document.blocks):
             is_bytes = isinstance(block.value, bytes)
             value = (base64.b64encode(block.value).decode("ascii")
                      if is_bytes else str(block.value))
-            blocks.append({
+            entry = {
                 "kind": block.kind, "value": value, "bytes": is_bytes,
                 "headers": block.headers, "title": block.title,
-                # 字节块的地址只剩这一格认得（value 已被 _load_protected_images 换掉），
-                # 不落盘等于让跨进程那侧渲染不出图。
                 "url": str(getattr(block, "url", "") or ""),
-            })
-        self._write(self._content_path(source_url, book_url, chapter_url), {
+            }
+            # 字节块额外写一份 .bin 兄弟文件：media_bytes 直接 read_bytes，不碰 JSON。
+            if is_bytes:
+                bin_path = content_dir / f"{chapter_digest}-{idx}.bin"
+                bin_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = bin_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+                temporary.write_bytes(block.value)
+                temporary.replace(bin_path)
+            blocks.append(entry)
+
+        self._write(json_path, {
             "version": self.VERSION,
             "saved_at": int(time.time()),
             "title": document.title,
@@ -162,6 +196,8 @@ class ReadingCache:
     def media_bytes(self, key: str) -> bytes | None:
         """按 ``/media`` 的 key 取回那块字节；取不到就是 None（不猜、不回空串）。
 
+        **优先走 .bin 兄弟文件**（VERSION 2）：``Path.read_bytes``，不 parse JSON。
+        旧缓存（VERSION 1）没有 .bin → 回退到 JSON 里那格 base64（兼容迁移期）。
         只认 ``bytes`` 为真的那一格：文本块本来就该过协议面，给它一条二进制路等于
         多一个能读正文的口子。缓存文件不在/版本不对/下标越界/base64 坏了，一律 None——
         网关那边据此回 404，而不是回一份"看着像"的载荷。
@@ -171,12 +207,24 @@ class ReadingCache:
             return None
         book_digest, chapter_digest, index = match.groups()
         # 三段都已被正则钉死成十六进制/十进制：拼不出 ``..``，也拼不出分隔符。
-        path = self.root / book_digest / "content" / f"{chapter_digest}.json"
-        data = self._read(path)
-        if not isinstance(data, dict) or data.get("version") != self.VERSION:
-            return None
-        blocks = data.get("blocks")
+        content_dir = self.root / book_digest / "content"
+        json_path = content_dir / f"{chapter_digest}.json"
         position = int(index)
+
+        # ① VERSION 2：先找 .bin 兄弟文件（快，不碰 JSON）
+        bin_path = content_dir / f"{chapter_digest}-{position}.bin"
+        if bin_path.is_file():
+            try:
+                return bin_path.read_bytes()
+            except OSError:
+                return None
+
+        # ② 回退：旧缓存（VERSION 1）或 .bin 被删了 → 从 JSON 里解 base64
+        data = self._read(json_path)
+        if not isinstance(data, dict):
+            return None
+        # 兼容 VERSION 1 和 2：只要 blocks 在就试
+        blocks = data.get("blocks")
         if not isinstance(blocks, list) or position >= len(blocks):
             return None
         item = blocks[position]
@@ -201,12 +249,17 @@ class ReadingCache:
         marker.touch(exist_ok=True)
 
     def _prune(self) -> None:
-        """Keep the persistent reader cache bounded, evicting oldest content."""
+        """Keep the persistent reader cache bounded, evicting oldest content.
+
+        同时扫 .json 与 .bin：.bin 是字节块的兄弟文件，只随对应的章 JSON 一起删。
+        """
         try:
-            files = [path for path in self.root.glob("*/content/*.json")
-                     if path.is_file() and not (path.parent.parent / ".offline").exists()]
+            json_files = [path for path in self.root.glob("*/content/*.json")
+                          if path.is_file() and not (path.parent.parent / ".offline").exists()]
+            bin_files = [path for path in self.root.glob("*/content/*.bin")
+                         if path.is_file() and not (path.parent.parent / ".offline").exists()]
             sized = [(path.stat().st_mtime, path.stat().st_size, path)
-                     for path in files]
+                     for path in json_files + bin_files]
         except OSError:
             return
         total = sum(size for _, size, _ in sized)
