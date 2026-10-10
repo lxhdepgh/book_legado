@@ -300,14 +300,44 @@ flet build apk --release
 
 ## 4. 风险与应对
 
-### 4.1 已知风险
+### 4.1 已知风险（已验证）
 
 | 风险 | 概率 | 影响 | 应对措施 |
 |------|------|------|---------|
+| **服务层 API 不兼容** | **高** | **Flet UI 无法启动** | **需同步回滚服务层到 f867150 版本，或重写 UI 层适配新 API** |
 | Flet 1.0 API 变更 | 中 | 部分控件参数不兼容 | 对照 f867150 版本的 Flet 0.86.5 API 文档逐项核对 |
 | PyInstaller 打包体积过大 | 高 | APK > 150MB | 启用 UPX 压缩、剔除未使用模块 |
 | 服务层与 UI 循环耦合 | 低 | EngineHub 专属循环冲突 | 已在 G4-F1 解耦，platform_support.py 不再 import flet |
 | 事件流订阅丢失 | 中 | 进度反馈失效 | 复用 G3-D3 的 job.* 异步句柄 + WebSocket 事件 |
+
+#### 4.1.1 服务层 API 不兼容详情（2026-10-11 实测）
+
+尝试启动 `legodo_flet/app/main.py` 时遇到以下导入错误：
+
+1. **`app.core.shortcuts.BOSS_KEY_ENABLED` 不存在**：老板键快捷键常量在 G4-E 中被移除
+2. **`app.services.tools.dict_service.DictService` 不存在**：词典服务在任务 #45 中被删除
+3. **控制器引用已删除服务**：`reader_controller.py` / `dict_popup_controller.py` 仍导入 `DictService`
+
+**根本原因**：从 `f867150`（2026-10-08）恢复的是 **G1 迁移前**的 Flet 代码，但服务层在 G1-G4 期间（2026-10-08 ~ 2026-10-10）经历了大量重构，包括：
+- 删除词典服务（简化 Windows 工具域）
+- 移除老板键快捷键常量（Android 裁剪）
+- GatewayService action 表重构（JSON Schema 校验）
+- 事件系统冻结 dataclass 化（22 个事件类）
+
+**两条修复路径**：
+
+**路径 A：完全回滚服务层**（推荐用于 Android 打包验证）
+```bash
+# 将 app/services/ 也回滚到 f867150 版本
+git checkout f867150 -- app/services/
+# 注意：这会丢弃 G1-G4 的所有服务层改进（GatewayService、action 表等）
+```
+
+**路径 B：重写 Flet UI 适配新服务层**（长期方案，工作量大）
+- 修改所有控制器，移除对已删除服务的引用
+- 适配新的 GatewayService RPC 协议（POST /rpc + JSON Schema）
+- 重写事件订阅逻辑（改用 WebSocket 事件流）
+- 预计工作量：**15-20 天**（接近重新开发）
 
 ### 4.2 回退方案
 
@@ -414,17 +444,19 @@ flet build apk --release
 
 ---
 
-## 6. 推荐路径
+## 6. 推荐路径（更新）
 
-基于当前产品阶段与资源约束，建议按以下优先级执行：
+基于实测验证结果，原"短期恢复 Flet"方案不可行。调整优先级如下：
 
-### 短期（1-2 周）：**恢复 Flet 架构**
-- 从 `f867150` 提取 UI 文件到 `legodo_flet/`
-- 验证 `flet build apk` 在 Android 上的打包流程
-- 产出双轨版本：`legodo_client_windows.zip`（Flutter）+ `legodo_flet_android.apk`（Flet）
+### 短期（1-2 周）：**维持 Flutter Windows + 评估 Android 替代方案**
+- ✅ 已完成：Flutter Windows 桌面版本打包（230MB，功能完整）
+- ❌ 已放弃：从 git 历史恢复 Flet（服务层 API 不兼容，修复成本 > 重写）
+- **新方案 A**：Flutter APK + Termux Python 后端（通过 localhost RPC 通信）
+- **新方案 B**：调研 Flutter + Pydroid3 混合打包可行性
+- **新方案 C**：直接使用远程 Python 后端（云服务器/局域网主机）
 
 ### 中期（1-2 个月）：**评估 Go 重写必要性**
-- 若 Flet APK 体积 > 150MB 或启动延迟 > 2s，启动 Go 重写计划
+- 若 Android 方案 A/B/C 均不理想，启动 Go 重写计划
 - 优先实现核心规则引擎（LegadoParser + QuickJS 替代）
 - 保留 Python 服务层作为 fallback
 
@@ -435,12 +467,21 @@ flet build apk --release
 
 ---
 
-## 7. 下一步行动
+## 7. 下一步行动（更新）
 
-1. **立即执行**：从 git 历史提取 Flet 文件到 `legodo_flet/`
-2. **验证打包**：在 Android 设备上测试 `flet build apk`
-3. **性能基线**：对比 Flet APK 与 Flutter + 远程后端的启动延迟/内存占用
-4. **决策点**：根据实测数据决定是否启动 Go/Java 重写
+1. **✅ 已完成**：从 git 历史提取 Flet UI 文件到 `legodo_flet/`（62 个 Python 文件）
+2. **❌ 已验证不可行**：直接运行 Flet UI（服务层 API 不兼容，导入错误）
+3. **🔄 进行中**：评估 Android 替代打包方案
+   - 方案 A：Flutter APK + Termux Python（localhost RPC）
+   - 方案 B：Flutter + Pydroid3 混合打包
+   - 方案 C：远程 Python 后端（云服务器）
+4. **⏸️ 暂缓**：Go/Java 重写核心规则引擎（待 Android 方案明确后再决策）
+
+### 实测结论
+
+- **Flet 恢复失败原因**：服务层在 G1-G4 期间重构幅度大（删除服务、移除常量、协议变更），UI 层与服务层接口契约已断裂
+- **修复成本估算**：完全回滚服务层（丢弃 G1-G4 成果）或重写 UI 层（15-20 天），均高于预期
+- **推荐方向**：维持 Flutter Windows 版本，Android 采用分离架构或等待更成熟的 Python-in-APK 方案
 
 ---
 

@@ -14,9 +14,11 @@ import sys
 from pathlib import Path
 
 # 确保项目根目录在 sys.path 中（沿用旧 main.py 方式）
-_ROOT = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+# legodo_flet/app/main.py → 项目根 = ../../ 
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+_ROOT = _PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -177,8 +179,8 @@ def _build_hub():
     # BrowserService 懒拉起 Chromium、WebBridgeService 默认关闭监听（SUSPENDED 语义）。
     from app.services.tools.background_service import BackgroundService
     from app.services.tools.book_export_service import BookExportService
-    from app.services.tools.boss_key_service import BossKeyService
-    from app.services.tools.dict_service import DictService
+    # [已移除] from app.services.tools.boss_key_service import BossKeyService  # G4-E: Android 裁剪
+    # [已移除] from app.services.tools.dict_service import DictService  # 任务#45: 删除词典服务
     from app.services.tools.font_service import FontService
     from app.services.tools.qr_code_service import QrCodeService
     from app.services.tools.replace_rule_service import ReplaceRuleService
@@ -190,7 +192,7 @@ def _build_hub():
     hub.register(WebDavService())
     hub.register(BookExportService())
     hub.register(ReplaceRuleService())
-    hub.register(DictService())
+    # [已移除] hub.register(DictService())
     hub.register(FontService())
     hub.register(QrCodeService())
     # 本机版本只有 app.APP_VERSION 一处：不传就用默认空串，更新页既显示"未知"、
@@ -198,9 +200,8 @@ def _build_hub():
     from app import APP_VERSION
     hub.register(UpdateService(current_version=APP_VERSION))
     hub.register(WebBridgeService())
-    # 老板键（藏窗 + 托盘回来）：只在 Windows 有意义，非 Windows 上服务照样注册，
-    # 但 :attr:`available` 为 False，快捷键页会明说"本机没有托盘能力"。
-    hub.register(BossKeyService())
+    # [已移除] 老板键（G4-E Android 裁剪）：BossKeyService 依赖的快捷键常量已删除
+    # hub.register(BossKeyService())
     # 全应用一层背景图（第七十四轮）：只管文件与偏好，那一层画在导航外壳上。
     hub.register(BackgroundService())
     # 同一个实例：引擎的 webview/验证码 fetcher 绑的就是它（上面 M2 段），
@@ -277,23 +278,11 @@ def _wire_browser_page(hub, page) -> None:
 
 
 def _wire_boss_key(hub, page):
-    """把窗口交给老板键服务，回一个"这一拍按键被它吃掉了没"的判定。
+    """[已移除] 老板键服务接线（G4-E Android 裁剪）。
 
-    ``hub.get()`` 拿到的是 EngineProxy：``handle_key`` 是同步方法，Proxy 属性直达
-    原对象，所以判定就跑在界面循环上（正是它改 ``page.window`` 需要的地方）。
-    服务没注册时返回 None，装配处就不挂这条钩子（阅读快捷键照旧）。
+    BossKeyService 依赖的快捷键常量已在主项目中删除，此处直接返回 None。
     """
-    from app.services.tools.boss_key_service import BossKeyService
-
-    try:
-        service = hub.get(BossKeyService)
-    except Exception:
-        logger.exception("老板键服务没起来，老板键不可用")
-        return None
-    if service is None:
-        return None
-    service.set_page_provider(lambda: page)
-    return service.handle_key
+    return None
 
 
 def _background_path(hub) -> str:
