@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import sys
 import tempfile
 import threading
 import time
@@ -30,7 +31,8 @@ from app.core.bus import EventBus
 from app.core.engine_worker import (
     EngineHub, call_on_ui, reset_ui_dispatch_counts, set_ui_loop, ui_dispatch_counts)
 from app.core.events import (
-    CheckFinishedEvent, DownloadProgressEvent, ReadAloudStateEvent)
+    CheckFinishedEvent, DownloadProgressEvent, ReadAloudStateEvent,
+    RssRefreshProgressEvent, RssRefreshedEvent)
 from app.core.hub import ServiceHub
 from app.core.settings import SettingsService
 from app.core.storage import StorageService
@@ -38,6 +40,7 @@ from app.gateway import jsonschema_min as schema
 from app.gateway.methods import BY_ACTION
 from app.gateway.serialize import find_leak
 from app.services.app_paths import AppPaths
+from app.services.content.rss_service import RssService, plain_text
 from app.services.engine.reading_engine import ChapterContent, ContentBlock
 from app.services.engine.rule_engine_service import RuleEngineService
 from app.services.gateway.service import (
@@ -47,6 +50,11 @@ from app.services.reading_cache import ReadingCache
 from app.services.sources.source_check_service import SourceCheckService
 from app.services.sources.source_service import SourceService
 from app.services.tools.browser_service import BrowserService
+
+# 订阅面语料住在 tests/gateway/（与黄金样本探针共用一份，理由见那个文件的头）：
+# 那个目录不是包，按目录插路径再 import，与 test_reader_* 那两条臂同一办法。
+sys.path.insert(0, str(Path(__file__).resolve().parent / "gateway"))
+import fake_rss_feed as fx  # noqa: E402
 
 ENVELOPE_KEYS = ["code", "data", "error", "id", "ok", "v"]
 BASE = "http://127.0.0.1"
@@ -1300,6 +1308,216 @@ class ServeImportTests(unittest.TestCase):
         self.assertEqual(marker, "NOFLET", "网关导入面上出现了 flet")
         self.assertGreater(int(count), 100,
                            f"只导了 {count} 个模块，仪器没接上（这条 NOFLET 不算证据）")
+
+
+class RssSurfaceTests(unittest.TestCase):
+    """``rss.*`` 那九发的运行期形状：正文不过列表、去标签只有一把尺、全源刷新走 job。
+
+    语料是 ``tests/gateway/fake_rss_feed.py`` 那三份 feed（RSS 2.0 / Atom / 取不到的那条），
+    取页走的是服务的**注入面**（``fetcher=fx.fetcher``，不联网）——这一族钉的是协议面上
+    那些格子的形状，"feed 抓取走引擎网络栈"那一条由黄金样本那一趟（真 RuleEngine 取回环
+    ``/rss/*``）钉。
+    """
+
+    def setUp(self) -> None:
+        self.rss = RssService(fetcher=fx.fetcher)
+        self.harness = Harness(extra=(self.rss,))
+        self.harness.start()
+        self.addCleanup(self.harness.stop)
+
+    def _call(self, action, payload=None):
+        """打一发动作，回 ``(status, 信封)``——判据只看信封，HTTP 层不该参与。"""
+        async def _drive(session, base, token):
+            return await _rpc(session, base, token, _envelope(action, payload))
+        return self.harness.drive(_drive)
+
+    def _add(self, url: str, name: str = "G4 订阅语料") -> str:
+        _, env = self._call("rss.add_source", {"name": name, "url": url})
+        self.assertTrue(env["ok"], env["error"])
+        # 源 id 就是 feed 地址本身（对标 Legado sourceUrl 主键），不是服务端另发的号
+        self.assertEqual(env["data"], url)
+        return url
+
+    def test_the_article_list_never_carries_the_body_but_the_detail_does(self) -> None:
+        """列表那一发**没有正文**，正文只在打开那一条时给，而且给的是去掉标签的那份。
+
+        两头都要钉：只钉"列表里没有正文"可能是服务压根没读表；只钉"正文能取到"可能是
+        列表也带着它过去（920 行书源那一笔账的同一个形状）。所以第三条读回**服务面**：
+        库里存的必须还是 HTML 原文——刷新要能覆盖回原文，这是服务的既有契约。
+        """
+        self._add(fx.RSS_PATH)
+        _, env = self._call("rss.refresh", {"source_id": fx.RSS_PATH})
+        self.assertTrue(env["ok"], env["error"])
+        self.assertEqual(env["data"], fx.ARTICLE_COUNTS[fx.RSS_PATH],
+                         "正对照：这一发必须真落进行，0 行时下面每一条都在空转")
+
+        _, env = self._call("rss.articles", {"source_id": fx.RSS_PATH})
+        rows = env["data"]
+        declared = set(BY_ACTION["rss.articles"].fields or ())
+        self.assertTrue(declared, "rss.articles 没声明投影，这一条在空转")
+        for row in rows:
+            self.assertEqual(set(row), declared,
+                             f"列表行的键与表里声明的不是一回事：{sorted(set(row))}")
+        self.assertNotIn("content", declared, "正文过了协议面的列表那一发")
+        self.assertNotIn("text", declared, "列表连『去标签正文』都不该带：那是一屏一条的活")
+        html_row = next(row for row in rows if row["url"] == fx.HTML_ITEM_URL)
+        self.assertNotIn("<", json.dumps(html_row, ensure_ascii=False),
+                         "列表行里还留着标签形状的东西")
+
+        _, env = self._call("rss.article", {"article_id": html_row["id"]})
+        detail = env["data"]
+        self.assertTrue(env["ok"], env["error"])
+        self.assertEqual(detail["text"], fx.PLAIN_HTML_TEXT,
+                         "去标签那把尺的答案与语料里那份对不上")
+        self.assertEqual(set(detail), declared | {"text"},
+                         "详情那一发的键不再是列表那一发 + text：正文口径又分家了")
+        self.assertNotIn("content", detail, "详情把 HTML 原文也带出去了")
+        self.assertEqual(detail["title"], "带标签的第一条")
+        self.assertEqual(detail["author"], "作者甲")
+        # 脚本那一格必须由这一直喂的输入钉住：RSS 2.0 这一路 feedparser 在**解析时**
+        # 就把 <script> 吞了（下面 stored 的读数是现场事实，不是断言对象），
+        # 于是 RPC 那一发上根本见不到脚本；而规则源那一路（``_parse_rule_feed``）
+        # 会把原文连脚本一起带到显示口径——那才是这把尺的脚本分支要吃的输入。
+        self.assertNotIn("evil", plain_text(f"<p>x</p><script>{fx.SCRIPT_MARK}</script>"),
+                         "那把尺不再去脚本：规则源那一路会把脚本送上屏")
+
+        stored = next(row for row in
+                      self.harness.on_loop(lambda: self.rss.list_articles(fx.RSS_PATH))
+                      if row["url"] == fx.HTML_ITEM_URL)["content"]
+        self.assertIn("<b>", stored, "库里存的已经不是原文了：刷新会把原文盖没")
+        self.assertNotEqual(stored, fx.PLAIN_HTML_TEXT,
+                            "库里存的是去标签那一份：显示口径写回了原文的格子")
+        self.assertEqual(plain_text(stored), fx.PLAIN_HTML_TEXT,
+                         "库里那份过这把尺算不出屏上那一串：两侧各有尺了")
+
+    def test_badges_the_unread_filter_and_the_read_flag_answer_on_one_count(self) -> None:
+        """角标、只看未读、已读那一发落在**同一个数**上，缺一格就是两套口径。
+
+        为什么钉在一起：``unread_only`` 在服务侧滤，未读角标也在服务侧数，客户端自己
+        再滤一遍的话，勾上"只看未读"与角标上的数就会分家（记忆
+        ``aggregated-counters-hide-which-call`` 那一族：先按调用拆开再报数）。
+        """
+        self._add(fx.RSS_PATH)
+        _, env = self._call("rss.sources")
+        row = env["data"][0]
+        self.assertEqual(set(row), set(BY_ACTION["rss.sources"].fields or ()),
+                         "订阅列表行的键与表里声明的投影不同")
+        self.assertEqual((row["total"], row["unread"]), (0, 0), "还没刷就该是 0/0")
+        self.assertEqual(row["last_update_time"], 0.0, "从没刷过不是「刷过且为空」")
+
+        self._call("rss.refresh", {"source_id": fx.RSS_PATH})
+        _, env = self._call("rss.sources")
+        row = env["data"][0]
+        self.assertEqual((row["total"], row["unread"]), (2, 2), "刷完两篇都该是未读")
+        self.assertGreater(row["last_update_time"], 0.0)
+
+        _, env = self._call("rss.articles", {"source_id": fx.RSS_PATH})
+        article_rows = env["data"]
+        self.assertEqual(len(article_rows), 2)
+        target = article_rows[0]["id"]
+
+        _, env = self._call("rss.mark_read", {"article_id": target})
+        self.assertIs(env["data"], True, "已读那一发没改到行")
+        _, env = self._call("rss.sources")
+        self.assertEqual((env["data"][0]["total"], env["data"][0]["unread"]), (2, 1),
+                         "角标没跟着已读那一发走")
+        _, env = self._call("rss.articles", {"source_id": fx.RSS_PATH,
+                                             "unread_only": True})
+        left = env["data"]
+        self.assertEqual([row["id"] for row in left], [article_rows[1]["id"]],
+                         "「只看未读」滤掉的不是刚读过的那一条")
+
+        _, env = self._call("rss.star", {"article_id": article_rows[1]["id"],
+                                         "starred": True})
+        self.assertIs(env["data"], True)
+        _, env = self._call("rss.articles", {"source_id": fx.RSS_PATH})
+        flags = {row["id"]: (row["read"], row["starred"]) for row in env["data"]}
+        self.assertEqual(flags[target], (True, False), "已读把收藏盖掉了")
+        self.assertEqual(flags[article_rows[1]["id"]], (False, True))
+
+        # 没了的文章：正文回 null（「这条没了」），改状态回 false（"没改成"）——两件事
+        _, env = self._call("rss.article", {"article_id": 9_999_999})
+        self.assertTrue(env["ok"], env["error"])
+        self.assertIsNone(env["data"], "查无此文要回 null，不能回一个空正文的壳")
+        _, env = self._call("rss.mark_read", {"article_id": 9_999_999})
+        self.assertIs(env["data"], False)
+
+    def test_a_dead_feed_comes_back_as_an_error_envelope_not_a_quiet_zero(self) -> None:
+        """抓不到 feed 要**出声**，而"源不存在"那一条不许出声。
+
+        两种 0 必须分开：抓取失败回错误信封（code=engine，error 里带异常名），界面念得出来；
+        源不在了回 0（列表刚被另一侧删掉时不该把界面炸掉）。合成一个 0 就是
+        记忆里 ``zero-counts-need-a-positive-control`` 那一族：读数朝期望的方向自圆其说。
+        """
+        self._add(fx.DEAD_PATH, name="取不到的那条")
+        status, env = self._call("rss.refresh", {"source_id": fx.DEAD_PATH})
+        self.assertEqual((status, env["ok"], env["code"]), (200, False, "engine"), env)
+        self.assertIn("RuntimeError", str(env["error"]),
+                      f"错误信封里没有异常名：{env['error']}")
+        self.assertIsNone(env["data"])
+
+        _, env = self._call("rss.refresh", {"source_id": f"{fx.BASE}/never-added.xml"})
+        self.assertTrue(env["ok"], env["error"])
+        self.assertEqual(env["data"], 0)
+
+    def test_refresh_all_is_a_job_whose_frames_name_the_round(self) -> None:
+        """全源刷新是 ``mode="job"``：受理回包不含结果，进度与逐源结果都在 /ws 上。
+
+        两条源各管一格：一条抓得到（2 篇新增）、一条抓不到（收尾帧的 failures=1）。
+        ``refresh_id`` 每一帧都得带着，且与发出去的那个同号——那是本轮唯一的身份证；
+        ``total`` 是本轮**计划**源数，中途不许变。
+        """
+        round_id = 77001
+        self._add(fx.RSS_PATH)
+        self._add(fx.DEAD_PATH, name="取不到的那条")
+
+        async def _drive(session, base, token):
+            async with session.ws_connect(f"{base}/ws?token={token}") as ws:
+                await ws.receive()                    # ready
+                _, receipt = await _rpc(session, base, token, _envelope(
+                    "rss.refresh_all", {"refresh_id": round_id}))
+                got: list[dict] = []
+                for _ in range(60):
+                    try:
+                        msg = await ws.receive(timeout=15)
+                    except Exception:
+                        break
+                    if msg.type is not WSMsgType.TEXT:
+                        break
+                    frame = json.loads(msg.data)
+                    got.extend([frame] if frame.get("type") == "event"
+                               else frame.get("events") or [])
+                    done = [item for item in got
+                            if item.get("name") == "RssRefreshProgressEvent"
+                            and item["payload"].get("refresh_id") == round_id
+                            and item["payload"].get("done") == item["payload"].get("total")]
+                    if done and any(item.get("name") == "RssRefreshedEvent"
+                                    for item in got):
+                        break
+                return receipt, got
+
+        receipt, frames = self.harness.drive(_drive)
+        self.assertEqual(receipt["data"], {"started": True, "action": "rss.refresh_all"},
+                         "job 的受理回包只该是受理凭据")
+        progress = [item["payload"] for item in frames
+                    if item.get("name") == "RssRefreshProgressEvent"]
+        self.assertTrue(progress, "进度一帧都没到：这一轮的进度条没有靶子")
+        self.assertEqual({row["refresh_id"] for row in progress}, {round_id},
+                         "进度帧里有不是本轮的")
+        self.assertEqual({row["total"] for row in progress}, {2},
+                         "分母中途变了：那是混了轮")
+        dones = [row["done"] for row in progress]
+        self.assertEqual(dones, sorted(dones), f"done 倒退了：{dones}")
+        self.assertEqual(dones[-1], 2)
+        self.assertEqual(progress[-1]["failures"], 1,
+                         "取不到的那条没进 failures：这一格可以是永远 0 的常量")
+        self.assertIn("G4 订阅语料", [row.get("current") for row in progress],
+                      "进度里没有「正在刷哪一条」，状态行就只能空转")
+        refreshed = [item["payload"] for item in frames
+                     if item.get("name") == "RssRefreshedEvent"]
+        self.assertEqual(len(refreshed), 1, f"逐源结果该只有一条（另一条抓不到）：{refreshed}")
+        self.assertEqual((refreshed[0]["source_id"], refreshed[0]["new_count"]),
+                         (fx.RSS_PATH, fx.ARTICLE_COUNTS[fx.RSS_PATH]))
 
 
 if __name__ == "__main__":

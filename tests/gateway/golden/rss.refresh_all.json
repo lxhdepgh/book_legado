@@ -1,0 +1,126 @@
+{
+  "action": "rss.refresh_all",
+  "protocol_version": 1,
+  "schema_digest": "39b699f1d66d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "mode=job 的受理凭据：{started, action}。真结果与进度都从 /ws 走（refresh_id 由客户端生成，用来把迟到帧认成上一轮的）",
+  "data_shape": "object",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-rss.refresh_all-1395917156000000",
+    "action": "rss.refresh_all",
+    "seq": 10,
+    "payload": {
+      "refresh_id": 15043844
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-rss.refresh_all-1395917156000000",
+    "ok": true,
+    "data": {
+      "started": true,
+      "action": "rss.refresh_all"
+    },
+    "error": null,
+    "code": null
+  },
+  "row_count": 1,
+  "inline_row_count": null,
+  "bytes": 43,
+  "sha256": "f6e3d2e9bb01b210e56ece34866d4c39581f069e31c0cca187c5a96d627b4d00",
+  "client_wall_ms": 0.4,
+  "wire_bytes": 150,
+  "field_names": [
+    "action",
+    "started"
+  ],
+  "progress_sample": {
+    "name": "RssRefreshProgressEvent",
+    "frame_count": 5,
+    "frames": [
+      {
+        "name": "RssRefreshProgressEvent",
+        "payload": {
+          "done": 0,
+          "total": 3,
+          "current": "",
+          "failures": 0,
+          "refresh_id": 15043844,
+          "timestamp": 1791615043.8452923
+        }
+      },
+      {
+        "name": "RssRefreshProgressEvent",
+        "payload": {
+          "done": 0,
+          "total": 3,
+          "current": "G4 取不到的源",
+          "failures": 0,
+          "refresh_id": 15043844,
+          "timestamp": 1791615043.8452923
+        }
+      },
+      {
+        "name": "RssRefreshProgressEvent",
+        "payload": {
+          "done": 1,
+          "total": 3,
+          "current": "G4 重立的源 atom.xml",
+          "failures": 0,
+          "refresh_id": 15043844,
+          "timestamp": 1791615051.5181599
+        }
+      },
+      {
+        "name": "RssRefreshProgressEvent",
+        "payload": {
+          "done": 2,
+          "total": 3,
+          "current": "G4 重立的源 feed.xml",
+          "failures": 0,
+          "refresh_id": 15043844,
+          "timestamp": 1791615051.5301907
+        }
+      },
+      {
+        "name": "RssRefreshProgressEvent",
+        "payload": {
+          "done": 3,
+          "total": 3,
+          "current": "",
+          "failures": 1,
+          "refresh_id": 15043844,
+          "timestamp": 1791615051.5412066
+        }
+      }
+    ],
+    "payload_field_names": [
+      "current",
+      "done",
+      "failures",
+      "refresh_id",
+      "timestamp",
+      "total"
+    ]
+  },
+  "event_sample": {
+    "name": "RssRefreshedEvent",
+    "payload": {
+      "source_id": "http://127.0.0.1:8797/rss/atom.xml",
+      "new_count": 2,
+      "timestamp": 1791615051.5301907
+    },
+    "payload_bytes": 95,
+    "payload_list_key": null,
+    "row_count": 0,
+    "inline_row_count": 0,
+    "event_field_names": [],
+    "payload_field_names": [
+      "new_count",
+      "source_id",
+      "timestamp"
+    ]
+  }
+}

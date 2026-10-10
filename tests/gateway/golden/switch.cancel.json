@@ -1,21 +1,21 @@
 {
   "action": "switch.cancel",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "本轮已经收尾，再点停止：cancelled=false（没叫停下任何东西）",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-switch.cancel-1392021343000000",
+    "id": "r4-switch.cancel-1395908656000000",
     "action": "switch.cancel",
     "seq": 4,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-switch.cancel-1392021343000000",
+    "id": "r4-switch.cancel-1395908656000000",
     "ok": true,
     "data": {
       "cancelled": false

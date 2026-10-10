@@ -1,0 +1,66 @@
+{
+  "action": "rss.articles",
+  "protocol_version": 1,
+  "schema_digest": "39b699f1d66d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "一篇文章一行，列表**不带正文**（正文按行算，一屏几十行就是几十次 HTML 剥离 + 几十倍载荷）",
+  "data_shape": "list",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-rss.articles-1395917078000000",
+    "action": "rss.articles",
+    "seq": 4,
+    "payload": {
+      "source_id": "http://127.0.0.1:8797/rss/feed.xml"
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-rss.articles-1395917078000000",
+    "ok": true,
+    "data": [
+      {
+        "id": 2,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "纯文本的第二条",
+        "url": "http://127.0.0.1:8797/rss/post/2",
+        "author": "作者乙",
+        "pub_date": "Tue, 06 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      {
+        "id": 1,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "带标签的第一条",
+        "url": "http://127.0.0.1:8797/rss/post/1",
+        "author": "作者甲",
+        "pub_date": "Mon, 05 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": false
+      }
+    ],
+    "error": null,
+    "code": null
+  },
+  "row_count": 2,
+  "inline_row_count": 2,
+  "bytes": 471,
+  "sha256": "31f340302b34b5eb7b7975f78aa4c98f213f2a6d3f93040baf6503cd8d9b4001",
+  "client_wall_ms": 1.0,
+  "wire_bytes": 607,
+  "field_names": [
+    "author",
+    "id",
+    "image",
+    "pub_date",
+    "read",
+    "source_id",
+    "starred",
+    "title",
+    "url"
+  ]
+}

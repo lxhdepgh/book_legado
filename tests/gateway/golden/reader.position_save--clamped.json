@@ -1,14 +1,14 @@
 {
   "action": "reader.position_save",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "越界的一发：偏移夹到本章字符流总长、段号夹到最后一段、比例夹到 1",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-reader.position_save-1392019921000000",
+    "id": "r4-reader.position_save-1395907375000000",
     "action": "reader.position_save",
     "seq": 14,
     "payload": {
@@ -23,13 +23,13 @@
         "chapter_pos": 15801,
         "chapter_paragraph": 48,
         "font_size": 18,
-        "last_read_at": 1791611146
+        "last_read_at": 1791615034
       }
     }
   },
   "response": {
     "v": 1,
-    "id": "r4-reader.position_save-1392019921000000",
+    "id": "r4-reader.position_save-1395907375000000",
     "ok": true,
     "data": {
       "chapter_url": "http://127.0.0.1:8797/g3/ch/2.html",
@@ -40,7 +40,7 @@
       "chapter_pos": 5802,
       "chapter_paragraph": 7,
       "font_size": 18,
-      "last_read_at": 1791611146
+      "last_read_at": 1791615034
     },
     "error": null,
     "code": null
@@ -48,8 +48,8 @@
   "row_count": 1,
   "inline_row_count": null,
   "bytes": 228,
-  "sha256": "33d480186fe471c185f8c9cb57883d0e1ddf71913026b7742006707f0b55115c",
-  "client_wall_ms": 3.8,
+  "sha256": "1432ff8b1b9eafd0e9b9687303c9fcbf401bdaaddd8df8e87b2c3b7c321fd25b",
+  "client_wall_ms": 4.3,
   "wire_bytes": 354,
   "field_names": [
     "chapter_index",

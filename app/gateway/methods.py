@@ -76,6 +76,7 @@ _IMPORT = "app.services.sources.online_import_service.OnlineImportService"
 _AUDIT = "app.services.sources.compat_audit_service.CompatAuditService"
 _SETTINGS = "app.core.settings.SettingsService"
 _THEME = "app.services.tools.theme_service.ThemeService"
+_RSS = "app.services.content.rss_service.RssService"
 
 METHODS: tuple[Method, ...] = (
     _m("engine.hello", _SELF, "hello", (), 2.0,
@@ -179,6 +180,36 @@ METHODS: tuple[Method, ...] = (
     _m("switch.apply", _READING, "apply_switch",
        ("record", "source_url", "book"), 20.0,
        summary="换源写回：按 url 取回候选那条源，清旧源缓存并续上阅读位置"),
+    # ---- 订阅面（§9 门 G4 第一族；服务早就在，缺的是这张表与 Dart 那一屏） ----
+    # 三条口径与阅读面一致：列表那一屏只带那一屏读的键，正文与规则原文各走单取；
+    # 批量刷新这种"一跑几十秒"的走 job，进度与逐源结果走事件流。
+    _m("rss.sources", _RSS, "source_rows", (), 10.0,
+       summary="订阅源列表行：源字段 + 篇数/未读两格角标（左栏那一屏），正文不过协议面",
+       fields=("id", "name", "url", "enabled", "group", "custom_order", "type",
+               "last_update_time", "total", "unread")),
+    _m("rss.articles", _RSS, "article_rows", ("source_id", "unread_only"), 10.0,
+       summary="某源的文章行：标题/作者/日期/已读/收藏；**不带正文**——feed 的"
+               "description 可以是整篇文章，中栏一根都不显示（与 source.list 同一笔账）",
+       fields=("id", "source_id", "title", "url", "author", "pub_date", "image",
+               "read", "starred")),
+    _m("rss.article", _RSS, "article_detail", ("article_id",), 10.0,
+       summary="打开一篇文章：回**已去标签**的正文 ``text``（去标签那把尺在服务侧，"
+               "库里存的仍是 HTML 原文）；文章没了回 null"),
+    _m("rss.add_source", _RSS, "add_source", ("name", "url", "source_group"), 15.0,
+       summary="新增订阅源（id 即 feed 地址）；同一地址重复添加是更新而不是重复行"),
+    _m("rss.remove_source", _RSS, "remove_source", ("source_id",), 15.0,
+       summary="删除订阅源连同它的文章（含已读与收藏标记）；界面必须先二次确认"),
+    _m("rss.refresh", _RSS, "refresh_source", ("source_id",), 60.0,
+       summary="抓取并刷新单个源，回本次**新增**的文章数；会真的发网络请求，"
+               "抓取失败回 engine 错误而不是静默 0"),
+    _m("rss.refresh_all", _RSS, "refresh_all", ("refresh_id",), 30.0, mode="job",
+       summary="起一轮全源刷新：受理回包只有 {started, action}，逐源进度走"
+               " RssRefreshProgressEvent（refresh_id 认本轮）、每源结果走"
+               " RssRefreshedEvent；单源失败不拖垮其余，收尾那帧带 failures"),
+    _m("rss.mark_read", _RSS, "mark_read", ("article_id",), 10.0,
+       summary="标记文章已读（点开正文才算读过的就是这一发）；回是否真改到行"),
+    _m("rss.star", _RSS, "star", ("article_id", "starred"), 10.0,
+       summary="收藏/取消收藏一篇文章；回是否真改到行（文章可能已被删）"),
     _m("check.start", _CHECK, "check_all", ("groups",), 30.0, mode="job",
        summary="起一轮批量检测；进度与结论走事件流，不占这条 RPC"),
     _m("check.snapshot", _CHECK, "run_snapshot", (), 5.0,

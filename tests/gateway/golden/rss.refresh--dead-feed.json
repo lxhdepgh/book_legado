@@ -1,0 +1,33 @@
+{
+  "action": "rss.refresh",
+  "protocol_version": 1,
+  "schema_digest": "39b699f1d66d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "feed 取不到（连接被拒）：这一发必须是错误信封 + data=null，回 0 篇看起来像这篇 feed 是空的",
+  "data_shape": "null",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "g3-rss.refresh-1395909375000000",
+    "action": "rss.refresh",
+    "seq": 0,
+    "payload": {
+      "source_id": "http://127.0.0.1:8799/rss/dead.xml"
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "g3-rss.refresh-1395909375000000",
+    "ok": false,
+    "data": null,
+    "error": "RequestConnectionError: 连接失败：Cannot connect to host 127.0.0.1:8799 ssl:False [远程计算机拒绝网络连接。]｜拨到 127.0.0.1",
+    "code": "engine"
+  },
+  "row_count": 0,
+  "inline_row_count": null,
+  "bytes": 4,
+  "sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+  "client_wall_ms": 7669.6,
+  "wire_bytes": 251,
+  "field_names": []
+}

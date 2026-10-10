@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "description": "rss.refresh_all 入参（mode=job：这条只负责起一轮全源刷新，受理回包只有 {started, action}，真交付全在事件流上）。串行逐源抓 feed，所以一轮的长短取决于源数与网络，不取决于这一发的预算。",
+  "properties": {
+    "refresh_id": {
+      "type": "integer",
+      "description": "本轮的身份证，由**客户端**生成（与 switch_id / search_id 同一套办法：job 的回包里没有任务号，晚到的进度与结果只能靠这一格认本轮）。每帧 RssRefreshProgressEvent 都原样回带它；不带上它，上一轮迟到的进度会被当成这一轮渲染。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "refresh_id"
+  ]
+}

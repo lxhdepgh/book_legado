@@ -1,14 +1,14 @@
 {
   "action": "bookshelf.add",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "scalar",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-bookshelf.add-1392018218000000",
+    "id": "r4-bookshelf.add-1395905671000000",
     "action": "bookshelf.add",
     "seq": 14,
     "payload": {
@@ -56,7 +56,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-bookshelf.add-1392018218000000",
+    "id": "r4-bookshelf.add-1395905671000000",
     "ok": true,
     "data": true,
     "error": null,
@@ -66,7 +66,7 @@
   "inline_row_count": null,
   "bytes": 4,
   "sha256": "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b",
-  "client_wall_ms": 5.6,
+  "client_wall_ms": 5.7,
   "wire_bytes": 106,
   "field_names": []
 }

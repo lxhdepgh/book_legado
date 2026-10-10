@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "description": "rss.remove_source 入参：删除一个订阅源。回 data 是 true/false——false 表示「这条本来就不在列表里」，不是失败。这一发不可撤销：源的文章（含已读与收藏标记）一起删。",
+  "properties": {
+    "source_id": {
+      "type": "string",
+      "description": "订阅源 id（feed 地址原样）。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "source_id"
+  ]
+}

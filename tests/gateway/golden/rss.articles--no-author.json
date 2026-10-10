@@ -1,0 +1,66 @@
+{
+  "action": "rss.articles",
+  "protocol_version": 1,
+  "schema_digest": "39b699f1d66d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "**第二种形状**：Atom 条目没有 author/summary，整列都是空 author——只给一份「author 都有值」的样本，客户端就学不出「这一格可以缺」",
+  "data_shape": "list",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-rss.articles-1395917125000000",
+    "action": "rss.articles",
+    "seq": 5,
+    "payload": {
+      "source_id": "http://127.0.0.1:8797/rss/atom.xml"
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-rss.articles-1395917125000000",
+    "ok": true,
+    "data": [
+      {
+        "id": 4,
+        "source_id": "http://127.0.0.1:8797/rss/atom.xml",
+        "title": "Atom 第二条",
+        "url": "http://127.0.0.1:8797/rss/atom/2",
+        "author": "",
+        "pub_date": "2026-10-05T10:00:00Z",
+        "image": "",
+        "read": false,
+        "starred": false
+      },
+      {
+        "id": 3,
+        "source_id": "http://127.0.0.1:8797/rss/atom.xml",
+        "title": "Atom 第一条",
+        "url": "http://127.0.0.1:8797/rss/atom/1",
+        "author": "",
+        "pub_date": "2026-10-04T10:00:00Z",
+        "image": "",
+        "read": false,
+        "starred": false
+      }
+    ],
+    "error": null,
+    "code": null
+  },
+  "row_count": 2,
+  "inline_row_count": 2,
+  "bytes": 421,
+  "sha256": "ef25a994f20d0edc74f6e28725ad5dd8dcffaa556ecf51d145a683ed74d7ff1a",
+  "client_wall_ms": 1.0,
+  "wire_bytes": 557,
+  "field_names": [
+    "author",
+    "id",
+    "image",
+    "pub_date",
+    "read",
+    "source_id",
+    "starred",
+    "title",
+    "url"
+  ]
+}

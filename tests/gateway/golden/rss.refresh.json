@@ -1,0 +1,33 @@
+{
+  "action": "rss.refresh",
+  "protocol_version": 1,
+  "schema_digest": "39b699f1d66d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "抓取并入库：回的是本次**新增**篇数（非 0 才证明真取到了）",
+  "data_shape": "scalar",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-rss.refresh-1395909328000000",
+    "action": "rss.refresh",
+    "seq": 2,
+    "payload": {
+      "source_id": "http://127.0.0.1:8797/rss/feed.xml"
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-rss.refresh-1395909328000000",
+    "ok": true,
+    "data": 2,
+    "error": null,
+    "code": null
+  },
+  "row_count": 0,
+  "inline_row_count": null,
+  "bytes": 1,
+  "sha256": "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35",
+  "client_wall_ms": 26.4,
+  "wire_bytes": 101,
+  "field_names": []
+}

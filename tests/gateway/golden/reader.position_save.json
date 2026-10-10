@@ -1,14 +1,14 @@
 {
   "action": "reader.position_save",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "客户端报的坐标原样落库（都在范围内）",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-reader.position_save-1392019921000000",
+    "id": "r4-reader.position_save-1395907375000000",
     "action": "reader.position_save",
     "seq": 13,
     "payload": {
@@ -23,13 +23,13 @@
         "chapter_pos": 137,
         "chapter_paragraph": 2,
         "font_size": 18,
-        "last_read_at": 1791611146
+        "last_read_at": 1791615034
       }
     }
   },
   "response": {
     "v": 1,
-    "id": "r4-reader.position_save-1392019921000000",
+    "id": "r4-reader.position_save-1395907375000000",
     "ok": true,
     "data": {
       "chapter_url": "http://127.0.0.1:8797/g3/ch/2.html",
@@ -40,7 +40,7 @@
       "chapter_pos": 137,
       "chapter_paragraph": 2,
       "font_size": 18,
-      "last_read_at": 1791611146
+      "last_read_at": 1791615034
     },
     "error": null,
     "code": null
@@ -48,8 +48,8 @@
   "row_count": 1,
   "inline_row_count": null,
   "bytes": 227,
-  "sha256": "55268044aa5f144ae25a7e9a26b9c30abbe43358b877a5738a2e903b48fca481",
-  "client_wall_ms": 5.4,
+  "sha256": "9c9247dc0ea0a1b1ddadc38be3b1bee975adee2a556c70fd14a90a5324182fac",
+  "client_wall_ms": 5.1,
   "wire_bytes": 353,
   "field_names": [
     "chapter_index",

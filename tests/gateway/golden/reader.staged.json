@@ -1,21 +1,21 @@
 {
   "action": "reader.staged",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-reader.staged-1392019953000000",
+    "id": "r4-reader.staged-1395907421000000",
     "action": "reader.staged",
     "seq": 21,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-reader.staged-1392019953000000",
+    "id": "r4-reader.staged-1395907421000000",
     "ok": true,
     "data": {
       "in_bookshelf": false,
@@ -38,7 +38,7 @@
       "originName": "G3阅读源",
       "latestChapterTitle": "第 6 章",
       "totalChapterNum": 0,
-      "lastCheckTime": 1791611146629,
+      "lastCheckTime": 1791615034090,
       "lastCheckCount": 0,
       "durChapterTitle": null,
       "durChapterIndex": 0,
@@ -59,8 +59,8 @@
   "row_count": 1,
   "inline_row_count": null,
   "bytes": 899,
-  "sha256": "2fcafecde1eb88a3263a60ba8401e509716ec4be0acbb5f66e88df302e9ceb7d",
-  "client_wall_ms": 0.4,
+  "sha256": "1c9d134860a420cb9cc40c87f67c9d5cca73bc063c2fcb11fd7be2e8d56e048a",
+  "client_wall_ms": 0.6,
   "wire_bytes": 1068,
   "field_names": [
     "author",

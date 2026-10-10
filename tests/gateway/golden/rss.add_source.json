@@ -1,0 +1,35 @@
+{
+  "action": "rss.add_source",
+  "protocol_version": 1,
+  "schema_digest": "39b699f1d66d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "新增订阅源：回的就是源 id（feed 地址本身，不是服务端另发的号）",
+  "data_shape": "string",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-rss.add_source-1395909328000000",
+    "action": "rss.add_source",
+    "seq": 1,
+    "payload": {
+      "name": "G4 订阅语料",
+      "url": "http://127.0.0.1:8797/rss/feed.xml",
+      "source_group": "G4订阅"
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-rss.add_source-1395909328000000",
+    "ok": true,
+    "data": "http://127.0.0.1:8797/rss/feed.xml",
+    "error": null,
+    "code": null
+  },
+  "row_count": 0,
+  "inline_row_count": null,
+  "bytes": 36,
+  "sha256": "d9abea66dac3a80b2996ec570e2ed394d498da70e812e46027d89fb6e3de9aed",
+  "client_wall_ms": 5.1,
+  "wire_bytes": 139,
+  "field_names": []
+}

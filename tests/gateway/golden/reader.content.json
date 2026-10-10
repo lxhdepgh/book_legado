@@ -1,14 +1,14 @@
 {
   "action": "reader.content",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-reader.content-1392019671000000",
+    "id": "r4-reader.content-1395907140000000",
     "action": "reader.content",
     "seq": 5,
     "payload": {
@@ -19,7 +19,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-reader.content-1392019671000000",
+    "id": "r4-reader.content-1395907140000000",
     "ok": true,
     "data": {
       "chapterUrl": "http://127.0.0.1:8797/g3/ch/2.html",
@@ -66,7 +66,7 @@
   "inline_row_count": null,
   "bytes": 18007,
   "sha256": "bc4508e68d5801b79940ed759521b83849549c053d67c6f5f1ab2171d96525a1",
-  "client_wall_ms": 181.5,
+  "client_wall_ms": 188.5,
   "wire_bytes": 18166,
   "field_names": [
     "blocks",

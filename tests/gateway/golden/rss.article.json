@@ -1,0 +1,55 @@
+{
+  "action": "rss.article",
+  "protocol_version": 1,
+  "schema_digest": "39b699f1d66d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "打开那一条才给正文，而且给的是**已去标签**的那一份（去标签那把尺在服务侧，库里存的仍是 HTML 原文）",
+  "data_shape": "object",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-rss.article-1395917125000000",
+    "action": "rss.article",
+    "seq": 6,
+    "payload": {
+      "article_id": 1
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-rss.article-1395917125000000",
+    "ok": true,
+    "data": {
+      "id": 1,
+      "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+      "title": "带标签的第一条",
+      "url": "http://127.0.0.1:8797/rss/post/1",
+      "author": "作者甲",
+      "pub_date": "Mon, 05 Oct 2026 09:00:00 GMT",
+      "text": "第一段\n加粗\n第二段",
+      "image": "",
+      "read": false,
+      "starred": false
+    },
+    "error": null,
+    "code": null
+  },
+  "row_count": 1,
+  "inline_row_count": null,
+  "bytes": 272,
+  "sha256": "2ce1391d7bb78b375ef56970ba078d1bbee2ec7aae6aa0e764b7fc09a46efdab",
+  "client_wall_ms": 1.0,
+  "wire_bytes": 391,
+  "field_names": [
+    "author",
+    "id",
+    "image",
+    "pub_date",
+    "read",
+    "source_id",
+    "starred",
+    "text",
+    "title",
+    "url"
+  ]
+}

@@ -1,14 +1,14 @@
 {
   "action": "reader.position_get",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-reader.position_get-1392019937000000",
+    "id": "r4-reader.position_get-1395907390000000",
     "action": "reader.position_get",
     "seq": 17,
     "payload": {
@@ -18,7 +18,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-reader.position_get-1392019937000000",
+    "id": "r4-reader.position_get-1395907390000000",
     "ok": true,
     "data": {
       "chapter_url": "",
@@ -29,7 +29,7 @@
       "chapter_pos": 5802,
       "chapter_paragraph": 7,
       "font_size": 18,
-      "last_read_at": 1791611146
+      "last_read_at": 1791615034
     },
     "error": null,
     "code": null
@@ -37,8 +37,8 @@
   "row_count": 1,
   "inline_row_count": null,
   "bytes": 177,
-  "sha256": "20e3db241c06447bf604bec01aa19b53f9c5f1dbb9fb7903615627b3ddbc0ba2",
-  "client_wall_ms": 0.6,
+  "sha256": "e37ab1229f352c123a800b56d05cf3532bba07ccec74b16e359e36cb26c5b77a",
+  "client_wall_ms": 0.7,
   "wire_bytes": 302,
   "field_names": [
     "chapter_index",

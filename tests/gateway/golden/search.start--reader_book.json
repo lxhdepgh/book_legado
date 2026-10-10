@@ -1,25 +1,25 @@
 {
   "action": "search.start",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "G3 阅读面取书那一发：reader.open 的 book 快照来自这里（单独一个名字，别把 G2 那份带事件交付的样本顶掉）",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-search.start-1392019437000000",
+    "id": "r4-search.start-1395906921000000",
     "action": "search.start",
     "seq": 2,
     "payload": {
       "keyword": "阅读基线书",
       "scope": "G3离线",
-      "search_id": 11146
+      "search_id": 15033
     }
   },
   "response": {
     "v": 1,
-    "id": "r4-search.start-1392019437000000",
+    "id": "r4-search.start-1395906921000000",
     "ok": true,
     "data": {
       "started": true,
@@ -41,7 +41,7 @@
   "event_sample": {
     "name": "SearchFinishedEvent",
     "payload": {
-      "search_id": "11146",
+      "search_id": "15033",
       "items": [
         {
           "name": "阅读基线书",
@@ -83,7 +83,7 @@
           ]
         }
       ],
-      "timestamp": 1791611146.1268942,
+      "timestamp": 1791615033.6152694,
       "finished": true
     },
     "payload_bytes": 777,

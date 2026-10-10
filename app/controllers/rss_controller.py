@@ -7,7 +7,9 @@
 三条不那么显然的约束：
 
 - **正文是 HTML**：库里存原文（刷新会覆盖回原文，见服务 `_upsert_articles`），
-  显示前在这里去掉标签。视图不认 HTML，也不 import 服务。
+  显示前要去掉标签。去标签那把尺 :func:`plain_text` **在服务侧**（第九十六轮 G4-B
+  从本文件搬进 ``rss_service``）：跨进程的 Dart 客户端读的是同一个函数，
+  两边各剥一次迟早给出两种字数。视图不认 HTML，也不 import 服务。
 - **已读要点开才算**：``mark_read`` 只在用户打开文章时调用，且随后同步本地那一份
   dict，否则中栏的"未读"字重要到下一次刷新才变。
 - **失败要出声**：抓取失败只在服务 status 里，用户看不到；每条动作都以状态行回报，
@@ -19,25 +21,9 @@ import logging
 
 from app.controllers.base import BaseController
 from app.core.events import RssRefreshedEvent, RssRefreshProgressEvent
-from app.services.content.rss_service import RssService
+from app.services.content.rss_service import RssService, plain_text
 
 logger = logging.getLogger(__name__)
-
-
-def plain_text(html: str) -> str:
-    """feed 正文（HTML）→ 可读纯文本：去掉脚本/样式，按块换行。"""
-    text = str(html or "")
-    if "<" not in text:
-        return text.strip()
-    try:
-        from bs4 import BeautifulSoup
-    except Exception:  # pragma: no cover - 依赖声明里有，缺失只是降级
-        return text.strip()
-    soup = BeautifulSoup(text, "html.parser")
-    for tag in soup(["script", "style"]):
-        tag.decompose()
-    lines = [line.strip() for line in soup.get_text("\n").splitlines()]
-    return "\n".join([line for line in lines if line])
 
 
 class RssController(BaseController):

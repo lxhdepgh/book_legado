@@ -1,14 +1,14 @@
 {
   "action": "browse.books",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "list",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-browse.books-1392017968000000",
+    "id": "r4-browse.books-1395905437000000",
     "action": "browse.books",
     "seq": 10,
     "payload": {
@@ -22,7 +22,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-browse.books-1392017968000000",
+    "id": "r4-browse.books-1395905437000000",
     "ok": true,
     "data": [
       {
@@ -107,7 +107,7 @@
   "inline_row_count": 2,
   "bytes": 1323,
   "sha256": "0ddf22156c36f6f5943ed6e71789d6b2c804d3d2f72b375d63426df08fabda0f",
-  "client_wall_ms": 6.6,
+  "client_wall_ms": 7.0,
   "wire_bytes": 1563,
   "field_names": [
     "author",

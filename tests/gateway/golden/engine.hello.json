@@ -1,21 +1,21 @@
 {
   "action": "engine.hello",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-engine.hello-1392017437000000",
+    "id": "r4-engine.hello-1395904875000000",
     "action": "engine.hello",
     "seq": 1,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-engine.hello-1392017437000000",
+    "id": "r4-engine.hello-1395904875000000",
     "ok": true,
     "data": {
       "protocol_version": 1,
@@ -28,7 +28,7 @@
         "job.actions",
         "webview.reverse"
       ],
-      "schema_digest": "879d1fbcfdf0",
+      "schema_digest": "39b699f1d66d",
       "actions": [
         "bookshelf.add",
         "bookshelf.list",
@@ -57,6 +57,15 @@
         "reader.staged_discard",
         "reader.staged_promote",
         "reader.toc",
+        "rss.add_source",
+        "rss.article",
+        "rss.articles",
+        "rss.mark_read",
+        "rss.refresh",
+        "rss.refresh_all",
+        "rss.remove_source",
+        "rss.sources",
+        "rss.star",
         "search.scopes",
         "search.start",
         "search.stop",
@@ -80,17 +89,17 @@
         "theme.preferences",
         "theme.save"
       ],
-      "pid": 117196
+      "pid": 125028
     },
     "error": null,
     "code": null
   },
   "row_count": 1,
   "inline_row_count": null,
-  "bytes": 1030,
-  "sha256": "cd56d857a3e78de16b9926e54409d04ff54c7f2426976ff4241869de622cc3ed",
-  "client_wall_ms": 6.1,
-  "wire_bytes": 1195,
+  "bytes": 1169,
+  "sha256": "69bba9c873cea2afae5266f58b683737efb0a8450175c29056aaf2986ae8bf57",
+  "client_wall_ms": 7.6,
+  "wire_bytes": 1343,
   "field_names": [
     "actions",
     "build",

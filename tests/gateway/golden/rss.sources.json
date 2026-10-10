@@ -1,0 +1,79 @@
+{
+  "action": "rss.sources",
+  "protocol_version": 1,
+  "schema_digest": "39b699f1d66d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "订阅列表那一屏：源字段 + total/unread 两格角标（不逐源数文章）",
+  "data_shape": "list",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-rss.sources-1395917062000000",
+    "action": "rss.sources",
+    "seq": 3,
+    "payload": {}
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-rss.sources-1395917062000000",
+    "ok": true,
+    "data": [
+      {
+        "id": "http://127.0.0.1:8799/rss/dead.xml",
+        "name": "G4 取不到的源",
+        "url": "http://127.0.0.1:8799/rss/dead.xml",
+        "enabled": true,
+        "group": "G4订阅",
+        "custom_order": 0,
+        "type": 0,
+        "last_update_time": 0.0,
+        "total": 0,
+        "unread": 0
+      },
+      {
+        "id": "http://127.0.0.1:8797/rss/feed.xml",
+        "name": "G4 订阅语料",
+        "url": "http://127.0.0.1:8797/rss/feed.xml",
+        "enabled": true,
+        "group": "G4订阅",
+        "custom_order": 0,
+        "type": 0,
+        "last_update_time": 1791615036.0404475,
+        "total": 2,
+        "unread": 2
+      },
+      {
+        "id": "http://127.0.0.1:8797/rss/atom.xml",
+        "name": "G4 订阅语料 Atom",
+        "url": "http://127.0.0.1:8797/rss/atom.xml",
+        "enabled": true,
+        "group": "G4订阅",
+        "custom_order": 0,
+        "type": 0,
+        "last_update_time": 1791615036.0525236,
+        "total": 2,
+        "unread": 2
+      }
+    ],
+    "error": null,
+    "code": null
+  },
+  "row_count": 3,
+  "inline_row_count": 3,
+  "bytes": 687,
+  "sha256": "714e188468346af893ea96fca4fdbf948151b5f1f28700ab03c709aa85d48b50",
+  "client_wall_ms": 1.1,
+  "wire_bytes": 846,
+  "field_names": [
+    "custom_order",
+    "enabled",
+    "group",
+    "id",
+    "last_update_time",
+    "name",
+    "total",
+    "type",
+    "unread",
+    "url"
+  ]
+}

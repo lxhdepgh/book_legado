@@ -1,14 +1,14 @@
 {
   "action": "browse.categories",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "list",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-browse.categories-1392017968000000",
+    "id": "r4-browse.categories-1395905421000000",
     "action": "browse.categories",
     "seq": 9,
     "payload": {
@@ -17,7 +17,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-browse.categories-1392017968000000",
+    "id": "r4-browse.categories-1395905421000000",
     "ok": true,
     "data": [
       {
@@ -32,7 +32,7 @@
   "inline_row_count": 1,
   "bytes": 57,
   "sha256": "8da25f30f08b57e93e1d74510512be36c36b1955ff55e93268972d1f0f654755",
-  "client_wall_ms": 10.2,
+  "client_wall_ms": 10.7,
   "wire_bytes": 166,
   "field_names": [
     "title",

@@ -1,0 +1,33 @@
+{
+  "action": "rss.mark_read",
+  "protocol_version": 1,
+  "schema_digest": "39b699f1d66d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "标已读：回 True 表示真改了那一行（False 是这条记录没了）",
+  "data_shape": "scalar",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-rss.mark_read-1395917125000000",
+    "action": "rss.mark_read",
+    "seq": 7,
+    "payload": {
+      "article_id": 1
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-rss.mark_read-1395917125000000",
+    "ok": true,
+    "data": true,
+    "error": null,
+    "code": null
+  },
+  "row_count": 0,
+  "inline_row_count": null,
+  "bytes": 4,
+  "sha256": "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b",
+  "client_wall_ms": 3.9,
+  "wire_bytes": 106,
+  "field_names": []
+}

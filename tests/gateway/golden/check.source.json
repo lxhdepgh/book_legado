@@ -1,14 +1,14 @@
 {
   "action": "check.source",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-check.source-1392018218000000",
+    "id": "r4-check.source-1395905687000000",
     "action": "check.source",
     "seq": 15,
     "payload": {
@@ -50,7 +50,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-check.source-1392018218000000",
+    "id": "r4-check.source-1395905687000000",
     "ok": true,
     "data": {
       "idx": 1,
@@ -58,7 +58,7 @@
       "raw_url": "http://127.0.0.1:8797",
       "status": "ok",
       "status_code": 200,
-      "response_time_ms": 0.7378000300377607,
+      "response_time_ms": 0.8229999803006649,
       "error": null,
       "search_status": "ok",
       "book_count": 1,
@@ -91,8 +91,8 @@
   "row_count": 1,
   "inline_row_count": null,
   "bytes": 676,
-  "sha256": "e13b7930fe00d67e64b44d6c918583f4e5df7f6b205a198b769fa04358c0d722",
-  "client_wall_ms": 17.8,
+  "sha256": "22a6182a9893440e6fb5287d2b58d99cf79d491a9696685801e2a978b7049c8e",
+  "client_wall_ms": 19.7,
   "wire_bytes": 838,
   "field_names": [
     "auto_disabled",

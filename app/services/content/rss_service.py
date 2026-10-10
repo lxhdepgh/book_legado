@@ -20,6 +20,12 @@ rssStars），按集成契约 §3 授权**简化**为两张表：
 事件与状态：每源刷新完成发 :class:`RssRefreshedEvent`（source_id, new_count）；
 刷新进度写 ``status.progress``（0-1），供仪表盘 / RSS 视图进度条消费。
 
+**显示口径也在这里**（设计 §9 门 G4 / §4.2「不许界面自己发明判据」）：feed 正文是
+HTML，库里存原文（刷新会覆盖回原文，见 :meth:`_upsert_articles`），去标签的那把尺
+是 :func:`plain_text`——它住在服务侧，所以 flet 那一面与跨进程的 ``rss.article`` 拿到的是
+同一份文本，而不是各剥一次。``article_rows`` 那一发**不带正文**：列表那一屏一根都不读它
+（920 行书源那一笔账的同一个理由，见 ``methods.Method.fields``）。
+
 硬约束：零 flet import；服务间只经 EventBus / 显式接口 / hub.require；
 跨平台纯 Python（无平台分支）。
 """
@@ -31,7 +37,8 @@ import threading
 import time
 from typing import Any, Awaitable, Callable
 
-from app.core.events import (RssRefreshedEvent, RssRefreshProgressEvent)
+from app.core.events import (AppEvent, RssRefreshedEvent,
+                             RssRefreshProgressEvent)
 from app.core.lifecycle import Service
 from app.core.storage import LockedConnection, StorageService
 
@@ -40,6 +47,33 @@ logger = logging.getLogger(__name__)
 # fetcher 注入面：async callable(url) -> str（返回 feed 原文）。
 # 默认走 RuleEngineService 网络栈；测试注入本地文件读取以离线跑（不联网）。
 Fetcher = Callable[[str], Awaitable[str]]
+
+#: ``article_rows`` 那一屏的键（列表不带正文，正文由 ``article_detail`` 单取）。
+#: 这份名单与 action 表上 ``rss.articles`` 的 ``fields`` 必须一字不差，
+#: 护栏见 ``tests/test_gateway_contract_single_source.py``。
+ARTICLE_ROW_FIELDS = ("id", "source_id", "title", "url", "author", "pub_date",
+                      "image", "read", "starred")
+
+
+def plain_text(html: str) -> str:
+    """feed 正文（HTML）→ 可读纯文本：去掉脚本/样式，按块换行。
+
+    这是**全库唯一**一处把 feed 正文变可读文本的地方：界面不认 HTML，跨进程的
+    Dart 客户端也不该有第二把尺（两边各剥一次迟早给出两种字数）。库里存的仍是原文。
+    """
+    text = str(html or "")
+    if "<" not in text:
+        return text.strip()
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:  # pragma: no cover - 依赖声明里有，缺失只是降级
+        return text.strip()
+    soup = BeautifulSoup(text, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    lines = [line.strip() for line in soup.get_text("\n").splitlines()]
+    return "\n".join([line for line in lines if line])
+
 
 
 class RssService(Service):
@@ -121,6 +155,21 @@ class RssService(Service):
                 " FROM rss_articles GROUP BY source_id").fetchall()
         return {str(r[0]): {"total": int(r[1] or 0), "unread": int(r[2] or 0)}
                 for r in rows}
+
+    async def source_rows(self) -> list[dict]:
+        """订阅列表那一屏的行：源字段 + 篇数 / 未读两格角标。
+
+        为什么合成一发：左栏每一行都要"几篇 · 几未读 · 刷新于"，客户端拿两份
+        结果再自己配对，就是让它发明一次 join——按 ``id`` 对错了没人报错。
+        这里只做组合，取数仍是 ``list_sources`` + ``article_counts`` 那两条。
+        """
+        counts = await self.article_counts()
+        rows: list[dict] = []
+        for source in await self.list_sources():
+            stat = counts.get(str(source["id"])) or {}
+            rows.append({**source, "total": int(stat.get("total") or 0),
+                         "unread": int(stat.get("unread") or 0)})
+        return rows
 
     async def add_source(self, name: str, url: str,
                          source_group: str = "") -> str:
@@ -244,23 +293,40 @@ class RssService(Service):
         self._publish(RssRefreshedEvent(source_id=source_id, new_count=new_count))
         return new_count
 
-    async def refresh_all(self) -> int:
-        """刷新全部启用源，返回新增文章总数；逐源发 RssRefreshedEvent。"""
+    async def refresh_all(self, refresh_id: int = 0) -> int:
+        """刷新全部启用源，返回新增文章总数；逐源发 RssRefreshedEvent。
+
+        ``refresh_id`` 是本轮的身份证（跨进程用，由客户端生成，见设计 §4.5）：
+        ``rss.refresh_all`` 是 ``mode="job"``，受理回包只有 ``{started, action}``，
+        晚到的进度与结果只能靠这一格认本轮。flet 那一面单进程、只有一轮，传 0 就行。
+        """
         sources = await self.list_sources()
         enabled = [s for s in sources if s["enabled"]]
+        total = len(enabled)
         total_new = 0
+        failures = 0
         # 逐源发进度：多个源串行抓 feed，没有事件的话界面在整批期间一动不动。
-        self._publish_progress(0, len(enabled), "")
+        # 分母在**开头**就定下（本轮计划源数），中途不许变：进度条的"几分之一"
+        # 只有对一个固定分母取数才有意义（语料面见 G4-B 的进度帧判据）。
+        self._publish(RssRefreshProgressEvent(
+            done=0, total=total, refresh_id=refresh_id))
         for index, src in enumerate(enabled):
             # 进度按源数推进：0.1 起步，每源占一段
-            self._publish_progress(index, len(enabled), src["name"] or src["id"])
-            self._set_progress(0.1 + 0.8 * (index / max(1, len(enabled))))
+            self._publish(RssRefreshProgressEvent(
+                done=index, total=total, current=src["name"] or src["id"],
+                refresh_id=refresh_id))
+            self._set_progress(0.1 + 0.8 * (index / max(1, total)))
             try:
                 total_new += await self.refresh_source(src["id"])
             except Exception:
-                # 单源失败不拖垮其余源（§4.4 异常策略哲学）
+                # 单源失败不拖垮其余源（§4.4 异常策略哲学），但**要有读数**：
+                # 只写日志的话，进度条走到头而文章没多，用户分不清"刷过了"与"没接上"。
+                failures += 1
                 logger.warning("refresh_all：源 %s 刷新失败，继续其余", src["id"])
-        self._publish_progress(len(enabled), len(enabled), "")
+        # 收尾那一帧是**唯一**带 failures 的：进度条读的是 done/total 这根长度尺，
+        # 中途每一帧的 failures 都只是"截至此刻"，画出来就是一条锯齿状失败数。
+        self._publish(RssRefreshProgressEvent(
+            done=total, total=total, failures=failures, refresh_id=refresh_id))
         self._set_progress(1.0)
         return total_new
 
@@ -293,6 +359,39 @@ class RssService(Service):
             }
             for r in rows
         ]
+
+    async def article_rows(self, source_id: str,
+                           unread_only: bool = False) -> list[dict]:
+        """文章列表那一屏的行：标题 / 作者 / 日期 / 已读 / 收藏，**不带正文**。
+
+        正文是这一族里最重的一格（一条 feed 的 description 可以就是整篇文章），
+        而中栏只显示标题与副标题；它由 :meth:`article_detail` 单取。
+        """
+        return [{name: row[name] for name in ARTICLE_ROW_FIELDS}
+                for row in await self.list_articles(source_id, unread_only)]
+
+    async def article_detail(self, article_id: int) -> dict | None:
+        """打开一篇文章：行 + **已去掉标签**的正文（``text``）；没这篇文章回 None。
+
+        库里存的仍是 HTML 原文（刷新要能覆盖回原文），``text`` 是显示口径，
+        由 :func:`plain_text` 现剥——flet 那一面与跨进程的 Dart 客户端读到的同一份。
+        """
+        conn = self._conn()
+        if conn is None:
+            return None
+        with self._lock:
+            row = conn.execute(
+                "SELECT id, source_id, title, url, author, pub_date, content,"
+                "       image, read_flag, star_flag"
+                " FROM rss_articles WHERE id=?",
+                (int(article_id),)).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": int(row[0]), "source_id": row[1], "title": row[2], "url": row[3],
+            "author": row[4], "pub_date": row[5], "text": plain_text(row[6]),
+            "image": row[7], "read": bool(row[8]), "starred": bool(row[9]),
+        }
 
     async def mark_read(self, article_id: int) -> bool:
         """标记文章已读（read_flag=1，折叠 Legado rssReadRecords）。"""
@@ -437,12 +536,6 @@ class RssService(Service):
         self.status.progress = float(value)
         self.status.updated_at = time.time()
 
-    def _publish(self, event: RssRefreshedEvent) -> None:
+    def _publish(self, event: AppEvent) -> None:
         if self.bus is not None:
             self.bus.publish(event)
-
-    def _publish_progress(self, done: int, total: int, current: str) -> None:
-        if self.bus is not None:
-            self.bus.publish(
-                RssRefreshProgressEvent(done=int(done), total=int(total),
-                                        current=str(current or "")))

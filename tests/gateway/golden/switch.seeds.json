@@ -1,14 +1,14 @@
 {
   "action": "switch.seeds",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "换源对话框第一屏：本地种子，不联网（a 与当前源各一行）",
   "data_shape": "list",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-switch.seeds-1392021109000000",
+    "id": "r4-switch.seeds-1395908437000000",
     "action": "switch.seeds",
     "seq": 1,
     "payload": {
@@ -56,7 +56,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-switch.seeds-1392021109000000",
+    "id": "r4-switch.seeds-1395908437000000",
     "ok": true,
     "data": [
       {
@@ -143,7 +143,7 @@
   "inline_row_count": 2,
   "bytes": 1389,
   "sha256": "72d6cc34063d2a88f359e59e1b16fb43304f6a311383c14ae4d20a1540c39be1",
-  "client_wall_ms": 1.4,
+  "client_wall_ms": 1.3,
   "wire_bytes": 1629,
   "field_names": [
     "author",

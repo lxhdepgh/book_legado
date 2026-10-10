@@ -1,0 +1,33 @@
+{
+  "action": "rss.remove_source",
+  "protocol_version": 1,
+  "schema_digest": "39b699f1d66d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "删一条源：回 True 表示真删了那一行，文章跟着没（级联），界面必须先二次确认",
+  "data_shape": "scalar",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-rss.remove_source-1395926265000000",
+    "action": "rss.remove_source",
+    "seq": 11,
+    "payload": {
+      "source_id": "http://127.0.0.1:8797/rss/feed.xml"
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-rss.remove_source-1395926265000000",
+    "ok": true,
+    "data": true,
+    "error": null,
+    "code": null
+  },
+  "row_count": 0,
+  "inline_row_count": null,
+  "bytes": 4,
+  "sha256": "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b",
+  "client_wall_ms": 8.0,
+  "wire_bytes": 110,
+  "field_names": []
+}

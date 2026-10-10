@@ -11,7 +11,8 @@
 服务方法**函数体里**发布了一条 ``*ProgressEvent``。手抄表会漂——把发布点搬进另一个方法、
 或给某条 job 新加一条进度事件，表都照样绿。推出来是零条也算仪器没接上，所以
 :func:`test_progress_faces_are_derived_from_the_live_method_bodies` 里
-**点名**要求 ``switch.scan`` 那一支必须在推导结果里（它管的就是 G3-D3 这一门）。
+**点名**要求 ``switch.scan`` 与 ``rss.refresh_all`` 两支都在推导结果里
+（它们管的就是 G3-D3 与 G4-B 这两门）。
 
 四笔账：
 
@@ -21,7 +22,7 @@
    帧形状、帧数与"帧里出现过的键并集"必须一次过得了同一个口
    （:func:`_check_progress_sample`）；字段清单那个口读的是**今天的** dataclass，
    改字段不重抓就红。
-3. **同一轮、走得最远**：各帧的关联格（``switch_id``/``search_id``）与 ``total`` 必须各自
+3. **同一轮、走得最远**：各帧的关联格（现场那张 ``CORRELATION_KEYS``）与 ``total`` 必须各自
    唯一，且与同一条样本 ``event_sample`` 里那一轮同号；``done`` 不许倒退，末帧就是最大那一发，
    且不超过分母——收尾那帧丢了，进度条停在半路。
 4. **变异对照**：把样本逐处改坏喂回**同一个口**，每一处都必须被拒（少这一支，
@@ -44,15 +45,20 @@ from app.services.gateway.service import COALESCED_EVENTS
 ROOT = Path(__file__).resolve().parents[1]
 GOLDEN = ROOT / "tests" / "gateway" / "golden"
 
-#: 关联那一格在本库里的两个名字：换源用 ``switch_id``（G3-D3），搜索用 ``search_id``。
+#: 关联那一格在本库里的三个名字：换源用 ``switch_id``（G3-D3）、搜索用 ``search_id``、
+#: 全源刷新用 ``refresh_id``（G4-B）。
 #: 为什么由客户端生成：``_start_job`` 的受理回包只有 ``{started, action}``，没有任务号
 #: ——事件是异步到达的，晚到的那一份只能靠这个号认本轮。
-CORRELATION_KEYS = ("switch_id", "search_id")
+CORRELATION_KEYS = ("switch_id", "search_id", "refresh_id")
 
-#: 这一门（§9 G3-D3）交付的那一条：**点名**要求它有自己的进度面与进度样本。
-#: 少了这一行，上面的推导会因为"函数体里那条发布被搬走了"而退化成空表，
-#: 于是四笔账全部绿着比空气（记忆 ``guard-tests-assert-absence``）。
-NAMED_FACE = ("switch.scan", "SourceSwitchProgressEvent")
+#: **点名**要求它们有自己的进度面与进度样本的那几条：少了这一列，上面的推导会因为
+#: "函数体里那条发布被搬走了"而退化成空表，于是四笔账全部绿着比空气
+#: （记忆 ``guard-tests-assert-absence``）。第九十四轮 G3-D3 交换源那一支，
+#: 第九十六轮 G4-B 交全源刷新那一支。
+NAMED_FACES: tuple[tuple[str, str], ...] = (
+    ("switch.scan", "SourceSwitchProgressEvent"),
+    ("rss.refresh_all", "RssRefreshProgressEvent"),
+)
 
 
 def _progress_event_names() -> set[str]:
@@ -128,15 +134,16 @@ def _derived_faces() -> dict[str, str]:
 
 
 def test_progress_faces_are_derived_from_the_live_method_bodies() -> None:
-    """推导本身必须是**接上的**：这一门那一条点名在里面，且推出来的都是计数类事件。"""
+    """推导本身必须是**接上的**：点名的那两条在里面，且推出来的都是计数类事件。"""
     faces = _derived_faces()
-    assert NAMED_FACE[0] in faces, (
-        f"{NAMED_FACE[0]} 不再发布进度事件（推导为空）：要么它的函数体把发布搬走了，"
-        f"要么换源扫描退回界面回调那一版——两种都让 G3-D3 的判据落空。现场推出来的是 "
-        f"{faces}")
-    assert faces[NAMED_FACE[0]] == NAMED_FACE[1], (
-        f"{NAMED_FACE[0]} 的进度事件不再是 {NAMED_FACE[1]}：换了名字，"
-        "Dart 的订阅与黄金样本都还对着旧名字")
+    for action, event_name in NAMED_FACES:
+        assert action in faces, (
+            f"{action} 不再发布进度事件（推导为空）：要么它的函数体把发布搬走了，"
+            f"要么那一轮退回界面回调那一版——两种都让本门的判据落空。"
+            f"现场推出来的是 {faces}")
+        assert faces[action] == event_name, (
+            f"{action} 的进度事件不再是 {event_name}：换了名字，"
+            "Dart 的订阅与黄金样本都还对着旧名字")
     for action, name in faces.items():
         cls = getattr(event_module, name, None)
         assert isinstance(cls, type) and dataclasses.is_dataclass(cls), (
@@ -219,14 +226,8 @@ def test_only_a_job_with_a_progress_face_may_carry_a_progress_sample() -> None:
         "与样本记的交付方式必须同出一处")
 
 
-def test_mutation_controls_show_the_progress_guards_are_not_deaf() -> None:
-    """把这一族的样本逐处改坏一处，每一处都必须被 :func:`_check_progress_sample` 拒掉。
-
-    没有这一支，上面那些判据可能只是在比一个恒等式（记忆 ``guard-tests-assert-absence``）。
-    不写盘、不动真样本：改的是内存里的一份副本，喂回**同一个口**。
-    """
-    action, name = NAMED_FACE
-    progress = _samples()[action]["progress_sample"]
+def _mutation_face(progress: dict, *, name: str) -> None:
+    """把**一支**进度样本逐处改坏，每一处都必须被 :func:`_check_progress_sample` 拒掉。"""
     live = sorted(f.name for f in dataclasses.fields(getattr(event_module, name)))
     assert not _check_progress_sample(progress, name=name, live=live), (
         "现成的样本过不了自己的判据：判据写错了，后面每一发变异都测不出东西")
@@ -256,7 +257,7 @@ def test_mutation_controls_show_the_progress_guards_are_not_deaf() -> None:
         sample["frames"][0]["seq"] = 1
 
     def frame_named_otherwise(sample: dict) -> None:
-        sample["frames"][0]["name"] = "SourceSwitchFinishedEvent"
+        sample["frames"][0]["name"] = f"{name}X"
 
     for mutate, label in ((add_key, "帧里多一个键"),
                           (rename_event, "整段换了事件名"),
@@ -272,3 +273,16 @@ def test_mutation_controls_show_the_progress_guards_are_not_deaf() -> None:
     assert _check_progress_sample(empty, name=name, live=live), "一帧都没有却没被查出来"
     # 这一支管的是进度，**不许**顺手把结果类事件当成进度面。
     assert name.endswith("ProgressEvent") and name in COALESCED_EVENTS, name
+
+
+def test_mutation_controls_show_the_progress_guards_are_not_deaf() -> None:
+    """点名的**每一支**样本都要过一遍变异对照，不是只跑最先有的那一条。
+
+    没有这一支，上面那些判据可能只是在比一个恒等式（记忆 ``guard-tests-assert-absence``）。
+    不写盘、不动真样本：改的是内存里的一份副本，喂回**同一个口**。
+    逐支都跑而不是只跑换源那一支，是因为新加的那一支（``rss.refresh_all``）的样本形状
+    与旧的**不同**（帧数、有没有 current、failures 落在哪一帧）——只测旧样本等于新样本没人测。
+    """
+    samples = _samples()
+    for action, name in NAMED_FACES:
+        _mutation_face(samples[action]["progress_sample"], name=name)

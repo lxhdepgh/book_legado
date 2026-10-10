@@ -1,24 +1,24 @@
 {
   "action": "switch.snapshot",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "扫描结束后的回放：done/total/candidates 与事件那一发同数",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-switch.snapshot-1392021328000000",
+    "id": "r4-switch.snapshot-1395908656000000",
     "action": "switch.snapshot",
     "seq": 3,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-switch.snapshot-1392021328000000",
+    "id": "r4-switch.snapshot-1395908656000000",
     "ok": true,
     "data": {
-      "switch_id": "11147806",
+      "switch_id": "15035127",
       "running": false,
       "cancelled": false,
       "done": 3,
@@ -158,8 +158,8 @@
   "row_count": 1,
   "inline_row_count": null,
   "bytes": 2409,
-  "sha256": "69b328b45216816d607292c0c7e260077c14e7b5286263773f381f8d85bd6be8",
-  "client_wall_ms": 1.1,
+  "sha256": "df32d3f7f6b5723ebfe855fd3be516fab22fff6f003ab7d9b30e95ed33494d10",
+  "client_wall_ms": 0.7,
   "wire_bytes": 2754,
   "field_names": [
     "cancelled",

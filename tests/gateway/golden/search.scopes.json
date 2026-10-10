@@ -1,21 +1,21 @@
 {
   "action": "search.scopes",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "list",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-search.scopes-1392017984000000",
+    "id": "r4-search.scopes-1395905437000000",
     "action": "search.scopes",
     "seq": 11,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-search.scopes-1392017984000000",
+    "id": "r4-search.scopes-1395905437000000",
     "ok": true,
     "data": [
       {

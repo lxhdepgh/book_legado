@@ -670,6 +670,28 @@ Range——封面名（`^[0-9a-f]{16}\.jpg$`，出自 `SourceService._normalize_
 > 按需读的代价当场量得——一页 30 张图 → 章 JSON **786 KB**、取一张中位 **1.47 ms**、
 > 整页 **44.4 ms**、底价（一次读完再解）**1.43 ms**，即每张图片摊一次 JSON parse；
 > 文字书够用，**G4 漫画必须换形状**。G3 的 R1 那一半到此交完。
+>
+> **G4-B 前半 交（订阅面的服务面 + 协议面 + 语料 + 样本，2026-10-10，第九十六轮，
+> `docs/dev-logs/2026-10-10.md` §「第九十六轮 开」）**：§4 那张域表里 `rss.*` 那一行从此有表
+> ——动作 **49→58**，九发各有入参 schema（八发 RPC + `rss.refresh_all` 走 `mode="job"`，
+> `rss.refresh` 给 60s 因为本轮实测"取不到的那一条"那一发是 7669.6 ms）。三条判断记下来：
+> ① **去标签那把尺搬进服务侧**（`rss_service.plain_text`，控制器改成 import 它）——
+> §4.2「不许界面自己发明判据」在显示口径上的版本：库里存 HTML 原文，`rss.article` 回的
+> `text` 是现剥的那一份，flet 与 Dart 读同一个函数；`rss.articles` 那 9 格投影连 `content`
+> 带 `text` 都不许有，正文按行算是几十倍载荷。② **进度帧的 `failures` 只在收尾那一帧**、
+> `total` 开头定下中途不变、`refresh_id` 由客户端生成（job 的受理回包只有 `{started, action}`，
+> 迟到帧只能靠它认本轮）；发布点必须写在**被派发方法自己的函数体**里，否则进度面那张
+> 从函数体推导的表（`NAMED_FACES` 从一条涨到两条：`switch.scan` / `rss.refresh_all`）
+> 看不见它。③ **语料里"取不到"用的是回环上没人监听的 8799，不是 HTTP 500**——
+> `_request_transport` 对非 2xx 照样回 body、`block_reason` 只认已知标记词，
+> 于是 5xx 在协议面上和"这篇 feed 是空的"同形（`ok:true, data:0`），而这正是这一族要防的
+> ambiguity；连接层失败才真的抛 `RequestConnectionError`。黄金样本 **73 份**（61 重盖章 +
+> 12 新）共用 digest `39b699f1d66d`——新增九发把旧章全冲掉，所以**必须一条链跑完**。
+> 语料 `tests/gateway/fake_rss_feed.py`（133 行，入库）给三种形状：RSS 带标签 / RSS 纯文本 /
+> Atom **整列空 author**。九发各挂一张具名欠据（`_UNWIRED_PENDING_GATE` 0→9），
+> **后半 = Dart 那一屏**（模型 + 仓库面 + notifier + 宽窄两形 + 跨语言文案守卫），
+> 划掉的判据仍是 `core/rpc/` 里出现这九个字面量。本轮按授权不跑套件：内存臂
+> （3 支静态 + 4 发臂 + 全部正对照，退出码 0）与 14 发样本/进度守卫只算"仪器接上了"。
 
 ---
 
@@ -758,7 +780,14 @@ Range——封面名（`^[0-9a-f]{16}\.jpg$`，出自 `SourceService._normalize_
   第九十五轮：**G3-D4（`/media` 键空间对齐）**——正文插图的第二种 key（`书摘要-章摘要-块下标`，
   语法住在 `reading_cache.py`）、协议面新增恒在的 `mediaKey` 一格、网关两种形状一套 Range、
   Dart 的 `mediaUri`（令牌走 query，代价写明）、语料锚从六笔涨到七笔（因为 `schema_digest`
-  不含出参内容）、下标 1:1 那条隐式前提升成守卫，以及按需读那笔点名的债（786 KB/1.47 ms/44.4 ms））
+  不含出参内容）、下标 1:1 那条隐式前提升成守卫，以及按需读那笔点名的债（786 KB/1.47 ms/44.4 ms）；
+  第九十六轮：**G4-B 前半（订阅面上协议面）**——`rss.*` 九发上表（**58** 条动作）与九份 schema、
+  去标签那把尺从控制器搬进服务侧（`rss.article` 回 `text`、列表九格连 `content` 都不带）、
+  进度帧的 `failures` 只在末帧 + `refresh_id` 客户端生成、语料三形状（RSS 带标签 / 纯文本 /
+  Atom 整列空 author）与"取不到"为什么用连接被拒而不是 500、73 份样本一条链共用
+  `39b699f1d66d`、进度面那张推导表多点名一条（发布点必须在被派发方法体内），
+  以及三处仪器坑（对源码 substring 判回包键、直接调 `TestCase` 实例把失败吞进 `TestResult`、
+  合流窗口里把中间帧当末帧））
 - `docs/M7打包说明.md`（PyInstaller 命令与 flet* hidden-import 清单位置）
 - 参照仓库：`github.com/jerunshi/guoapp1`（浅克隆 `D:/tmp/guoapp1`，不在本项目版本控制内）
 - 记忆：`tts-pyttsx3-com-same-thread`、`quickjs-native-crash-risk`、`engine-hub-loop-split`、

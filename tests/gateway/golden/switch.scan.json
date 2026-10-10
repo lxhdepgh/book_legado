@@ -1,14 +1,14 @@
 {
   "action": "switch.scan",
   "protocol_version": 1,
-  "schema_digest": "879d1fbcfdf0",
+  "schema_digest": "39b699f1d66d",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "mode=job 的受理凭据：{started, action}，本轮真结果在事件那一段",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-switch.scan-1392021125000000",
+    "id": "r4-switch.scan-1395908453000000",
     "action": "switch.scan",
     "seq": 2,
     "payload": {
@@ -33,7 +33,7 @@
         "originName": "G3换源x",
         "latestChapterTitle": "第 4 章",
         "totalChapterNum": 0,
-        "lastCheckTime": 1791611147799,
+        "lastCheckTime": 1791615035119,
         "lastCheckCount": 0,
         "durChapterTitle": null,
         "durChapterIndex": 0,
@@ -48,14 +48,14 @@
         "cacheTotalChapterCount": 0,
         "cacheErrorCount": 0
       },
-      "switch_id": 11147806,
+      "switch_id": 15035127,
       "keyword": "换源目标书",
       "group": "G3换源"
     }
   },
   "response": {
     "v": 1,
-    "id": "r4-switch.scan-1392021125000000",
+    "id": "r4-switch.scan-1395908453000000",
     "ok": true,
     "data": {
       "started": true,
@@ -68,7 +68,7 @@
   "inline_row_count": null,
   "bytes": 39,
   "sha256": "2e4ba700d874e20bfa84091563623f0c599c4960da48a83a27e43252314e3b52",
-  "client_wall_ms": 0.4,
+  "client_wall_ms": 0.6,
   "wire_bytes": 142,
   "field_names": [
     "action",
@@ -77,7 +77,7 @@
   "event_sample": {
     "name": "SourceSwitchFinishedEvent",
     "payload": {
-      "switch_id": "11147806",
+      "switch_id": "15035127",
       "candidates": [
         {
           "source_url": "http://127.0.0.1:8797/g3sw/a",
@@ -205,7 +205,7 @@
       ],
       "cancelled": false,
       "error": "",
-      "timestamp": 1791611147.822714
+      "timestamp": 1791615035.144008
     },
     "payload_bytes": 2379,
     "payload_list_key": "candidates",
@@ -231,12 +231,12 @@
       {
         "name": "SourceSwitchProgressEvent",
         "payload": {
-          "switch_id": "11147806",
+          "switch_id": "15035127",
           "done": 3,
           "total": 3,
           "failures": 0,
           "starved": 0,
-          "timestamp": 1791611147.822714
+          "timestamp": 1791615035.144008
         }
       }
     ],

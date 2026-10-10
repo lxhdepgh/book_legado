@@ -1,0 +1,56 @@
+{
+  "action": "rss.articles",
+  "protocol_version": 1,
+  "schema_digest": "39b699f1d66d",
+  "captured_from": "main.py --serve（真子进程，回环）",
+  "corpus": "只看未读：刚读过的那一条必须不在里面（滤的是服务侧那个 read_flag，与角标 unread 同一个来源）",
+  "data_shape": "list",
+  "data_truncated": false,
+  "request": {
+    "v": 1,
+    "id": "r4-rss.articles-1395917140000000",
+    "action": "rss.articles",
+    "seq": 8,
+    "payload": {
+      "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+      "unread_only": true
+    }
+  },
+  "response": {
+    "v": 1,
+    "id": "r4-rss.articles-1395917140000000",
+    "ok": true,
+    "data": [
+      {
+        "id": 2,
+        "source_id": "http://127.0.0.1:8797/rss/feed.xml",
+        "title": "纯文本的第二条",
+        "url": "http://127.0.0.1:8797/rss/post/2",
+        "author": "作者乙",
+        "pub_date": "Tue, 06 Oct 2026 09:00:00 GMT",
+        "image": "",
+        "read": false,
+        "starred": false
+      }
+    ],
+    "error": null,
+    "code": null
+  },
+  "row_count": 1,
+  "inline_row_count": 1,
+  "bytes": 236,
+  "sha256": "dc734e6e63e2fe92a6802c9f2895320e7f799c898e79d9e2a04dbf93c0d2964e",
+  "client_wall_ms": 0.8,
+  "wire_bytes": 354,
+  "field_names": [
+    "author",
+    "id",
+    "image",
+    "pub_date",
+    "read",
+    "source_id",
+    "starred",
+    "title",
+    "url"
+  ]
+}

@@ -238,7 +238,20 @@ def test_widget_key_lookalikes_are_not_mistaken_for_actions() -> None:
 #: 五个字面量都落在 `core/rpc/rpc_engine_repository.dart`（当场数过：49 发全部有调用点，
 #: `never_called` 为空），换源屏那一面另有 `test/source_switch_screen_test.dart` 接住。
 #: 划掉的判据是 `core/rpc/` 里出现这五个字面量，不是"屏幕看着像"。
-_UNWIRED_PENDING_GATE: dict[str, str] = {}
+#: 第九十六轮（G4-B 前半）把订阅面那九发登记上表，Dart 那一屏在同一门的**后半**发里接：
+#: 这一族是"协议面先行"的具名欠据，不是忘了接界面。后半交清时这张表必须回到空，
+#: 判据照跑（它的靶子是下一门：漫画媒体 / 朗读 / 工具域）。
+_UNWIRED_PENDING_GATE: dict[str, str] = {
+    "rss.sources": "G4-B 后半：订阅屏左栏（源 + 篇数/未读角标）",
+    "rss.articles": "G4-B 后半：订阅屏中栏（文章行，不带正文）",
+    "rss.article": "G4-B 后半：订阅屏右栏（打开一条取去标签正文）",
+    "rss.add_source": "G4-B 后半：添加框提交那一条",
+    "rss.remove_source": "G4-B 后半：「⋮」→删除（必须二次确认）",
+    "rss.refresh": "G4-B 后半：「⋮」→刷新本源",
+    "rss.refresh_all": "G4-B 后半：顶栏全部刷新（mode=job，进度走事件流）",
+    "rss.mark_read": "G4-B 后半：打开正文时那一发",
+    "rss.star": "G4-B 后半：收藏图标那一条",
+}
 
 
 def _dart_action_calls() -> dict[str, list[str]]:
@@ -893,6 +906,79 @@ def test_media_key_is_handed_out_from_the_content_key_only() -> None:
                           py.relative_to(ROOT).as_posix()))})
     assert callers == ["app/services/reading/reading_service.py"], \
         f"block_rows 出现了第二处调用点（第二个发地址的口）：{callers}"
+
+
+def test_feed_html_to_text_rule_is_only_on_the_service() -> None:
+    """feed 正文去标签那把尺**只有服务侧一把**：控制器与视图都不许再定义或自己剥一次。
+
+    G4-B 之前它住在 ``rss_controller``（"显示前在这里去掉标签"），flet 那一面用着没问题；
+    跨进程之后它就是**两侧共同的口径**——Dart 若自己剥一次，两边给出的字数、空行、
+    脚本处理就会分家，而没有任何一侧会报错（记忆里 ``legado-port-adapt-not-copy`` 与
+    「不许界面自己发明判据」说的都是这一族）。所以钉三处：定义在不在服务上、
+    控制器是不是 import 过来的、视图有没有沾 HTML。
+    """
+    stripper = _py_function_source("app/services/content/rss_service.py", "plain_text")
+    assert "BeautifulSoup" in stripper and "script" in stripper, \
+        "服务侧那把尺不再去脚本/样式：它已经不是原来那把尺了"
+
+    controller = _py_source("app/controllers/rss_controller.py")
+    assert "def plain_text" not in controller, \
+        "控制器里还有第二份 plain_text 定义：两侧各剥一次的入口又开回来了"
+    assert re.search(r"from app\.services\.content\.rss_service import [^\n]*plain_text",
+                     controller), "控制器没从服务侧 import 那把尺"
+
+    view = _py_source("app/views/reading/rss_view.py")
+    for banned in ("plain_text", "BeautifulSoup"):
+        assert banned not in view, \
+            f"订阅页视图出现了 {banned}：视图不认 HTML，这条红线挪位置了"
+
+    # 发正文那一步必须真过这把尺（不是"函数还在，没人调用"那一族）
+    detail = _py_function_source("app/services/content/rss_service.py", "article_detail")
+    assert "plain_text(" in detail, "rss.article 的正文没过那把尺"
+
+    # 两处定义的正对照：controllers/views 里一个 plain_text 定义都不许有
+    second = sorted(py.relative_to(ROOT).as_posix()
+                    for py in list((ROOT / "app" / "controllers").rglob("*.py"))
+                    + list((ROOT / "app" / "views").rglob("*.py"))
+                    if "__pycache__" not in py.parts
+                    and re.search(r"\bdef plain_text\(", _py_source(
+                        py.relative_to(ROOT).as_posix())))
+    assert not second, f"界面面出现了 plain_text 的定义处：{second}"
+
+
+def test_rss_projections_carry_the_screen_and_not_the_body() -> None:
+    """订阅面两发的投影名单：**列表不带正文，角标两格必须在**。
+
+    名单在服务侧有一份常量（``ARTICLE_ROW_FIELDS``）、在 action 表上有一份，两处必须
+    逐字相等——这就是"字段在两侧各写一遍迟早会飘"那一笔账，方向是列表那一发。
+    另一头钉角标：``total``/``unread`` 少了任何一格，客户端就只能自己逐源数文章
+    （``article_counts`` 那条 GROUP BY 的存在理由）。
+    """
+    from app.services.content.rss_service import ARTICLE_ROW_FIELDS
+
+    articles = BY_ACTION["rss.articles"]
+    assert tuple(articles.fields or ()) == ARTICLE_ROW_FIELDS, (
+        f"rss.articles 的投影 {articles.fields} 与服务那份名单 {ARTICLE_ROW_FIELDS} 不同")
+    for name in ("content", "text"):
+        assert name not in (articles.fields or ()), \
+            f"文章列表那一发带着正文（{name}）：一屏几十行每行都剥一次 HTML"
+
+    detail = _py_function_source("app/services/content/rss_service.py", "article_detail")
+    # 钉的是**回包里的键**，不是"这段源码里有没有 content 这几个字母"：SQL 本来就要
+    # SELECT 那一个列（库里存的还是 HTML 原文），拿 substring 判会把合法写法判成事故。
+    assert '"content":' not in detail and "'content':" not in detail, \
+        "rss.article 把 HTML 原文也递出去了：那界面就会自己再剥一次"
+    assert '"text":' in detail, "rss.article 不再给显示口径那一份正文"
+    # 正对照：正文确实是从库里那一列**现剥**出来的，不是凭空造的字段。
+    assert re.search(r'"text":\s*plain_text\(', detail), \
+        "rss.article 的 text 没过那把尺（或那一列压根没读）"
+
+    sources = BY_ACTION["rss.sources"]
+    assert {"total", "unread"} <= set(sources.fields or ()), \
+        f"订阅列表的角标两格不在投影里：{sources.fields}"
+    rows = _py_function_source("app/services/content/rss_service.py", "source_rows")
+    for call in ("self.list_sources()", "self.article_counts()"):
+        assert call in rows, f"source_rows 不再经 {call}：那份 join 有了第二个写法"
 
 
 # 黄金样本那一族的守卫（覆盖表、时效摘要、请求合法性、账目自洽、job 的事件交付）

@@ -337,11 +337,23 @@ class RssRefreshProgressEvent(AppEvent):
     发布方：RssService.refresh_all()；订阅方：订阅页进度条。
     进度必须有事件（服务 status.progress 只有仪表盘在轮询）——不发包，多个源
     串行抓取期间界面就是一潭死水，看起来像没点。
+
+    跨进程那一段（设计 §9 门 G4，``rss.refresh_all`` 是 ``mode="job"``）：
+    - ``refresh_id`` 是本轮的身份证，由**客户端**生成、每帧原样回带——job 的受理
+      回包只有 ``{started, action}``，晚到的进度只能靠它认本轮（与 switch_id /
+      search_id 同一套办法）。单进程那一面只有一轮，传 0。
+    - ``total`` 是本轮**计划**源数，开头定下、中途不变；``done`` 是已经动手的源数，
+      所以每一帧都有它，进度条读的就是一根长度尺。
+    - ``current`` 只在"正在抓这一条"的那些帧里给名字（进度条不读它，状态行读）。
+    - ``failures`` **只在收尾那一帧**：中途每一帧的失败数都是"截至此刻"，
+      画在进度条上就是一条锯齿状失败数。
     """
 
     done: int
     total: int
     current: str = ""
+    failures: int = 0
+    refresh_id: int = 0
     timestamp: float = field(default_factory=time.time)
 
 
