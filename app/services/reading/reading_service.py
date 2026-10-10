@@ -267,6 +267,9 @@ class ReadingSession:
             if viewport.document_start > offset:
                 break
             selected, selected_index = viewport, index
+        by_paragraph = self._by_paragraph(ordered, _paragraph_or_none(paragraph_index))
+        if by_paragraph is not None:
+            selected, selected_index = by_paragraph
         end = (ordered[selected_index + 1].document_start
                if selected_index + 1 < len(ordered)
                else self.document_extent)
@@ -297,6 +300,38 @@ class ReadingSession:
             chapter_paragraph=local_paragraph,
             font_size=int(font_size), updated_at=int(time.time()))
         return self.position, chapter
+
+    @staticmethod
+    def _by_paragraph(ordered, paragraph):
+        """整篇段号在场时按**段区间**选章：返回 ``(视口, 序号)``，选不出就交 None。
+
+        这里有两套尺，而它们在章间接缝上会打架：``document_start`` 记的是触发追加那一次
+        滚动事件里的**旧文档总高**（客户端实测），而视图报上来的段号是它把整篇按当前
+        装尺**等比缩放**之后数出来的（``ReaderView._paragraph_tops``）。两者对各章高度占比
+        的判断不一样，接缝那几格就会出现"像素说还在上一章、段号说已经是下一章的第 0 段"。
+        第九十二轮的参照表把这件事量成了一个不可能的读数：整篇第 12 段被存成"第一章的第
+        12 段"，而第一章只有 12 段（0~11）——那个数重开时被夹到 11，用户从第二章段首被
+        弹回第一章段尾。
+
+        落库能跨装尺活下来的是段号（#88 取证一），所以段号在场时以段号为准；像素只用来
+        算段内那一截的比例。只在表里的区间**每章都算过坐标、且首尾相接不重叠**时才信它：
+        老替身与老记录里两张视口的起点可以都是 0，那种表自相矛盾，退回像素口径。
+        """
+        if paragraph is None or not ordered:
+            return None
+        spans = []
+        for viewport in ordered:
+            if not viewport.paragraph_offsets:
+                return None
+            start = int(viewport.paragraph_start)
+            end = start + len(viewport.paragraph_offsets)
+            if end <= start or (spans and start < spans[-1][1]):
+                return None        # 重叠或倒序：这张表的段区间不可信
+            spans.append((start, end))
+        for index, (start, end) in enumerate(spans):
+            if start <= paragraph < end:
+                return ordered[index], index
+        return None
 
     @staticmethod
     def _character_offset_at(offsets, paragraph: int, ratio: float) -> int:

@@ -195,6 +195,96 @@ def web_source_dict(port: int) -> dict:
 
 
 
+# --------------------------------------------------------------------------- #
+# 连续那一支：三章**形状互不相同**，专给"接上下一章之后落点归谁"当靶子
+# --------------------------------------------------------------------------- #
+#: §9 G3-D2 的语料。为什么不能拿 ``/g3`` 那一族接两章就完事：``chapter_html`` 对每一章
+#: 用的是**同一串** ``lengths``，所以第 1 章与第 2 章的段数（7）与每段长度**全同**——
+#: 那时"忘了把整篇段号减成本章起点"与"减对了"会算出同一个 ``character_offset``，
+#: 只有章号能区分（记忆 ``measurement-corpus-must-not-be-self-proving``）。
+#: 所以这一族三章各是一种形状：12 短段 / 3 长段带一张图（**媒体占行不产段**，
+#: 追加起点要是把行当段算就连第一站都对不上）/ 7 段且首行是标题形状。
+#: 章与章的段数（12 / 3 / 7）与段长都不同，段起点因此是 0 / 12 / 15 三个不同的数。
+#:
+#: 这一族**不带 ``nextContentUrl``**（与 ``/g3web`` 同策）：要验的是**客户端**按目录
+#: 序号接下一章，而引擎那条 Legado 章尾合并会把两章并成一章的正文，那条路一走
+#: "接来的那一章"就不存在了。
+CONT_KEYWORD = "连续阅读书"
+CONT_CHAPTER_COUNT = 3
+CONT_GROUP = "G3连续"
+CONT_STEM = "字句读纸张看灯下山风"
+
+CONT_SEARCH_HTML = ('<ul class="list"><li><a href="/g3cont/book/1.html">连续阅读书</a>'
+                    '<i>作者戊</i><span>连载</span></li></ul>')
+CONT_BOOK_HTML = """<html><body>
+<h1>连续阅读书</h1><p class="author">作者戊</p>
+<p class="intro">这一本要连着读：三章形状各异，接上之后段起点会换。</p>
+<a class="toc" href="/g3cont/toc.html">目录</a><p class="last">第 3 章</p>
+</body></html>
+"""
+CONT_TOC_HTML = ("<html><body><ul>" + "".join(
+    f'<li><a href="/g3cont/ch/{i}.html">第{i}章 连续章</a></li>'
+    for i in range(1, CONT_CHAPTER_COUNT + 1)) + "</ul></body></html>")
+
+#: 每一章的段构造：``(每段重复次数, ...)`` 三章长度互不相同；``usehtml`` 只在第 1 章
+#: 前两行（验"显示形态改了字数"这件事在追加文档里也不算进尺），``picture_after``
+#: 指插图插在**第几段之后**（第 2 章插在 1 之后：那一行上屏、不产段）。
+CONT_SHAPES: dict[int, dict] = {
+    1: {"counts": (1, 2, 1, 3, 2, 1, 4, 2, 3, 1, 2, 1), "usehtml": 2,
+        "picture_after": None, "heading": False},
+    2: {"counts": (24, 31, 18), "usehtml": 0, "picture_after": 1, "heading": False},
+    3: {"counts": (5, 2, 9, 1, 6, 3), "usehtml": 0, "picture_after": None,
+        "heading": True},
+}
+
+
+def cont_chapter_html(index: int) -> str:
+    """连续章：第 1 章 12 短段（带 ``<usehtml>``）、第 2 章 3 长段带插图、第 3 章首行是标题。"""
+    shape = CONT_SHAPES[index]
+    paras = [f"连续第{index}章第{n}段" + CONT_STEM * count
+             for n, count in enumerate(shape["counts"], start=1)]
+    if shape["heading"]:
+        paras.insert(0, f"第{index}章 收梢")     # 认得出标题，也照样占第 0 段
+    pieces: list[str] = []
+    usehtml = shape["usehtml"]
+    if usehtml:
+        inner = ("<p><strong>" + paras[0] + "</strong></p>"
+                 "<p>" + paras[1] + "</p>")
+        pieces.append(f"<usehtml>{inner}</usehtml>")
+        rest = paras[usehtml:]
+    else:
+        rest = paras
+    picture_after = shape["picture_after"]
+    for position, text in enumerate(rest):
+        pieces.append(f"<p>{text}</p>")
+        if picture_after is not None and position == picture_after - 1:
+            pieces.append('<p><img src="/g3cont/pic.jpg"></p>')
+    body = "\n".join(pieces)
+    return f"<html><body><div class='list'>{body}</div></body></html>"
+
+
+def cont_source_dict(port: int) -> dict:
+    """连续那一支的书源：正文规则只有 ``content``（不追章尾，见上面的注释）。"""
+    url = f"http://127.0.0.1:{port}/g3cont"
+    return {
+        "bookSourceName": "G3连续源",
+        "bookSourceUrl": url,
+        "bookSourceGroup": CONT_GROUP,
+        "bookSourceType": 0,
+        "enabled": True,
+        "enabledExplore": False,
+        "searchUrl": f"{url}/search?key={{{{key}}}}",
+        "ruleSearch": {"bookList": "ul.list li", "name": "a@text",
+                       "bookUrl": "a@href", "author": "i@text", "kind": "span@text"},
+        "ruleBookInfo": {"name": "h1@text", "author": "p.author@text",
+                         "intro": ".intro@text", "tocUrl": "a.toc@href",
+                         "lastChapter": "p.last@text"},
+        "ruleToc": {"chapterList": "li", "chapterName": "a@text",
+                    "chapterUrl": "a@href"},
+        "ruleContent": {"content": ".list@html"},
+    }
+
+
 def create_app(port: int) -> web.Application:
     async def handler(request: web.Request) -> web.Response:
         path = request.path
@@ -210,6 +300,21 @@ def create_app(port: int) -> web.Application:
             return web.json_response(source_dict(request.app["source_port"]))
         if path == "/g3web/source.json":
             return web.json_response(web_source_dict(request.app["source_port"]))
+        if path == "/g3cont/source.json":
+            return web.json_response(cont_source_dict(request.app["source_port"]))
+        if path.startswith("/g3cont/ch/"):
+            digits = "".join(char for char in path.rsplit("/", 1)[-1] if char.isdigit())
+            number = int(digits or 1)
+            _hit(path)
+            return web.Response(text=cont_chapter_html(number), content_type="text/html")
+        if path.startswith("/g3cont/pic"):
+            return web.Response(body=PICTURE, content_type="image/jpeg")
+        if path.startswith("/g3cont/toc"):
+            return web.Response(text=CONT_TOC_HTML, content_type="text/html")
+        if path.startswith("/g3cont/book/"):
+            return web.Response(text=CONT_BOOK_HTML, content_type="text/html")
+        if path.startswith("/g3cont/"):
+            return web.Response(text=CONT_SEARCH_HTML, content_type="text/html")
         if path.startswith("/g3/ch/"):
             number = int(path.rsplit("/", 1)[-1].split(".")[0])
             _hit(path)
@@ -247,6 +352,9 @@ def create_app(port: int) -> web.Application:
     app.router.add_get("/g3web", handler)
     app.router.add_get("/g3web/", handler)
     app.router.add_get("/g3web/{tail:.*}", handler)
+    app.router.add_get("/g3cont", handler)
+    app.router.add_get("/g3cont/", handler)
+    app.router.add_get("/g3cont/{tail:.*}", handler)
     return app
 
 

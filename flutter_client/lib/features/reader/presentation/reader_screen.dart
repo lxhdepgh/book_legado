@@ -5,14 +5,19 @@
 /// 与 flet 的三张投影表数出来的是同一串字。为什么要紧：这一屏滚到哪一段，
 /// 就是要落库的那个字符偏移（`offsetOfParagraph`）——行与尺不同源，落点就整体漂。
 ///
+/// 连续阅读（G3-D2）之后"第 n 段"要说是**哪一篇**的第 n 段：读到章尾自动接下一章，
+/// 屏上同时挂着 1~N 章，行表由 [ReaderPage.documentLines] 给（整篇口径的段号），
+/// 每一章前面补分隔线 + 章名（flet 同两行，占行不产段）。滚到哪一段报回
+/// `noteViewport(documentParagraph: …)`，由 `domain/continuous_reading.dart` 折算成章内。
+///
 /// 三处对齐看得见的文案（判据见 `test/reader_screen_test.dart`）：
-/// - 顶栏进度 = `第 n/N · 章名`（flet `set_progress`，N 数**滤掉卷标题**之后的那批）；
+/// - 顶栏进度 = `第 n/N · 章名`（flet `set_progress`，N 数**滤掉卷标题**之后的那批，
+///   n 跟着**视口那一章**走，不是"当初点进来的那一章"）；
 /// - 底部状态 = `《书名》 · 作者 · 共 N 章`（flet `set_status_bar`）；
 /// - 段首缩进 `　　`、标题行不缩进且加粗、媒体块挂在正文之间但**不产段**。
 ///
-/// G3-C3 不含：连续阅读（到底接下一章）、其余八格排版偏好（行距/版心/背景/划词……
-/// 这一屏没有它们的控件，读了也用不上）、音视频的外部播放器（没有 url_launcher 依赖，
-/// 这里只把地址显示出来）。
+/// 这一版仍不含：其余八格排版偏好（行距/版心/背景/划词……这一屏没有它们的控件，
+/// 读了也用不上）、音视频的外部播放器（没有 url_launcher 依赖，这里只把地址显示出来）。
 /// 这里不放点了没反应的按钮——占位会被当成已接上。反过来说，屏上每一颗按钮都发得出一发。
 library;
 
@@ -59,10 +64,16 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   final ScrollController _controller = ScrollController();
 
   /// 段号 → 那一行的 GlobalKey。**只给建出来的那批行**（ListView 一屏十几个），
-  /// 换章时整表丢掉——留着旧章的键会把上一本的段号报进这一本的落点里。
+  /// 换章时整表丢掉——留着旧章的段号会把上一章的落点报进这一章里。
+  ///
+  /// 键是**整篇**段号：连续阅读时三章同时挂在屏上，而"第 0 段"每一章都有一个，
+  /// 拿章内口径当键就是撞名（撞了就把上一章那一段报成这一章那一段，落点整体漂）。
   final Map<int, GlobalKey> _paragraphKeys = <int, GlobalKey>{};
 
-  /// 上一次为其重建过键表的那一章（判据是 url，章名可以重复）。
+  /// 上一次为其重建过键表的那一篇文档（判据是**第一个挂载章**的 url）。
+  ///
+  /// 不能用当前章的 url：视口跟着已追加的下一章走时 url 变了，而键表里的行还挂在
+  /// 屏上——照着 url 清表就是"追加一章，前面所有段的落位能力全丢"。
   String _documentKey = '';
 
   /// 已经为第几次"整篇换章"落过位（与 [ReaderPage.loadSeq] 比）。
@@ -106,10 +117,12 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
       final page = ref.read(readerProvider).value;
       if (page == null) return;
       final paragraph = _paragraphAtViewportTop();
-      if (paragraph != null) {
-        ref.read(readerProvider.notifier).noteViewport(
-            paragraph: paragraph, pixels: _controller.offset);
-      }
+      if (paragraph == null) return;
+      ref.read(readerProvider.notifier).noteViewport(
+            pixels: _controller.offset,
+            documentExtent: _controller.position.maxScrollExtent,
+            documentParagraph: paragraph,
+          );
     });
   }
 
@@ -133,6 +146,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   ///
   /// 为什么不按 `pixels / 行高` 算：正文行高不定（一段可能占 1 行也可能占 9 行），
   /// 等分出来的"第 n 行"与真实那一段最坏差七段——`#88` 取证一量的就是这种错尺。
+  /// 连续阅读之后这一格更省不掉：章名行与分隔线插在中间，行号与段号的差每一章都不一样。
   int? _paragraphAtViewportTop() {
     final top = _listTop();
     if (top == null) return null;
@@ -149,7 +163,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     return best;
   }
 
-  /// 换章：键表整表作废（段号是新那一章自己的）。
+  /// 换整篇文档：键表整表作废（段号是新一篇自己的）。追加不走这一条。
   void _resetKeys(String documentKey) {
     if (_documentKey == documentKey) return;
     _documentKey = documentKey;
@@ -315,7 +329,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   }
 
   Widget _body(ReaderPage page, ReaderNotifier notifier) {
-    _resetKeys(page.document.chapterUrl);
+    _resetKeys(page.baseChapterUrl);
     _scheduleAnchor(page);
     return Column(
       children: <Widget>[
@@ -333,7 +347,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
   }
 
   Widget _content(ReaderPage page, ReaderNotifier notifier) {
-    if (page.lines.isEmpty) {
+    if (page.documentLines.isEmpty) {
       // 空正文有两种来路，必须分开说：这一章真没字（源给的正文空），
       // 和"这本书根本没有目录"（chapterIndex 是 -1）。后者报"这一章是空的"
       // 就是让用户以为书坏了。
@@ -349,9 +363,9 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           key: const Key('reader.body'),
           controller: _controller,
           padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
-          itemCount: page.lines.length,
+          itemCount: page.documentLines.length,
           itemBuilder: (context, index) =>
-              _line(page, page.lines[index], notifier),
+              _row(page.documentLines[index], page),
         ),
         // 翻页按钮浮在正文上（flet 那屏的上下章按钮也在正文区，不在顶栏）：
         // 单手滚动时够得着，顶栏那排图标已经挤满了。
@@ -388,24 +402,42 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
     );
   }
 
-  Widget _line(ReaderPage page, ReaderLine line, ReaderNotifier notifier) {
-    if (line.isText) {
-      final paragraph = line.paragraphIndex ?? 0;
-      return Padding(
-        key: _keyFor(paragraph),
-        padding: EdgeInsets.only(bottom: paragraph == page.paragraphs.length - 1 ? 12 : 6),
-        child: Text(
-          line.display,
-          key: ValueKey('reader.text.$paragraph'),
-          style: TextStyle(
-            fontSize: page.typography.fontSize.toDouble(),
-            height: 1.7,
-            fontWeight: line.heading ? FontWeight.w700 : FontWeight.normal,
-          ),
-        ),
+  /// 整篇行表里的一行 → 屏上那一个控件。
+  ///
+  /// 三种行：正文段（有整篇段号，挂 GlobalKey 供落点量）、媒体块（占行不产段），
+  /// 以及追加章节时补的分隔线与章名（flet `render_plan(append=True)` 那两行）。
+  /// 后两类**都不许进键表**：它们没有段号，进了就把上一段的落点报成它们。
+  Widget _row(DocumentLine row, ReaderPage page) {
+    if (!row.isContent) {
+      return _ChapterDivider(
+        key: ValueKey('reader.title.${row.mountIndex}.${row.name}'),
+        row: row,
       );
     }
-    return _MediaLine(key: ValueKey('reader.media.${line.kind}.${line.block?.url ?? ''}'), block: line.block, style: line.meta);
+    final line = row.line!;
+    if (!line.isText) {
+      return _MediaLine(
+        key: ValueKey('reader.media.${line.kind}.${line.block?.url ?? ''}'),
+        block: line.block,
+        style: line.meta,
+      );
+    }
+    // 键里的段号是**整篇**口径：追加之后每一章都有自己的第 0 段，撞了键就把
+    // 上一章那一行报成本章的落点。
+    final paragraph = row.paragraph!;
+    return Padding(
+      key: _keyFor(paragraph),
+      padding: EdgeInsets.only(bottom: row.lastInChapter ? 12 : 6),
+      child: Text(
+        line.display,
+        key: ValueKey('reader.text.$paragraph'),
+        style: TextStyle(
+          fontSize: page.typography.fontSize.toDouble(),
+          height: 1.7,
+          fontWeight: line.heading ? FontWeight.w700 : FontWeight.normal,
+        ),
+      ),
+    );
   }
 
   /// 退出：先问 `reader.staged`，需要问的那一臂等用户答完再关会话（规矩 6）。
@@ -515,6 +547,39 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
           );
         },
       )),
+    );
+  }
+}
+
+/// 追加一章时补在正文中间的那两行：分隔线 + 章名。
+///
+/// 形状照 flet `render_plan`：`ft.Divider(height=32)` + `ft.Text(name, size=22, BOLD)`。
+/// 章名用**目录里**的那一句而不是正文里的 `<title>`（顶栏同一个来源）：两边不同形时
+/// 用户会在同一屏看到两个章名。这两行占行不产段，所以不进段号键表。
+class _ChapterDivider extends StatelessWidget {
+  const _ChapterDivider({required this.row, super.key});
+
+  final DocumentLine row;
+
+  @override
+  Widget build(BuildContext context) {
+    if (row.name.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 16),
+        child: Divider(height: 1),
+      );
+    }
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 16),
+      child: Column(
+        children: <Widget>[
+          const Divider(height: 1),
+          const SizedBox(height: 8),
+          Text(row.name,
+              style: const TextStyle(
+                  fontSize: 22, fontWeight: FontWeight.w700, height: 1.4)),
+        ],
+      ),
     );
   }
 }

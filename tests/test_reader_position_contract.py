@@ -8,7 +8,7 @@
 各猜一次的尺比出来的"一致"是自证。段号是跨装尺唯一还认得回来的数，所以偏移改由段号
 导出（段首是事实，段内那一截按像素比例估且**不越过段尾**）。
 
-三笔账，每笔钉的是"没发生"而不是"没失败"（记忆 ``guard-tests-assert-absence``）：
+这几笔账，每笔钉的是"没发生"而不是"没失败"（记忆 ``guard-tests-assert-absence``）：
 
 1. **同一把尺**：``chapter_paragraphs`` 切出来的段必须与视图挂出来的段逐字相等。
    这条不能拿"两边都调 paragraph_lines"糊弄——视图那侧还多一步段首缩进（每段 +2 字），
@@ -19,6 +19,15 @@
 3. **口径只有一份**：``<usehtml>`` 的渲染会改字数。它原来在控制器里做，现在收进
    ``reading_engine.display_blocks``，控制器只剩一次转呼。这一条用"控制器源码里
    再也数不出第二次渲染"来钉——两侧各渲染一遍正是本门要防的那件事。
+
+第四笔是接成一篇之后才有的（连续阅读，第九十二轮）：
+
+4. **接缝谁说了算**：``document_start`` 是客户端实测的**追加前**旧文档高，段号是视图
+   把整篇按**当前**高度等比缩放后数出来的——两套尺在章与章之间必然不同判。参照表
+   （``tests/test_reader_continuous_projection.py``）把这件事量成了一个不可能的读数：
+   整篇第 12 段被存成"只有 12 段的第一章的第 12 段"，重开时夹到段尾，用户从第二章
+   段首被弹回第一章段尾。所以段号在场时按**段区间**选章；但表不可信（某章没算过坐标、
+   区间重叠）时必须退回像素，别把兜底一起砸了。
 
 语料用真形状（带 ``<usehtml>`` 标记、夹媒体块、空行、行首行尾空白），不拿三段假文
 凑数：段长均匀时 clamp 与越界那几条能自证（记忆
@@ -297,6 +306,99 @@ def test_appended_chapter_offsets_stay_chapter_local():
     assert position.chapter_paragraph == 2
     assert position.character_offset == second_offsets[2], (
         "追加章的偏移要按本章的坐标算，不是整篇累加")
+
+
+# --------------------------------------------------------------------------- #
+# 四、接缝：整篇段号与像素两套尺各说一章时，以段区间为准（但表不可信就退回像素）
+# --------------------------------------------------------------------------- #
+SEAM = 12          # 第一章的段数：整篇第 12 段已经是第二章的段首
+SECOND = 3
+
+
+def _uneven(count: int, marker: str) -> list[str]:
+    """长短不齐的一章段列表：段长均匀时"按段区间选章"与"按像素选章"可能同判，
+    接缝那几发就成了自证（记忆 ``measurement-corpus-must-not-be-self-proving``）。"""
+    return [f"{marker}第{i}段" + "字" * (5 + (i % 4) * 11) for i in range(count)]
+
+
+def _appended():
+    """两章接成一篇的会话：第 1 章整篇 0~11 段，第 2 章从整篇第 12 段起。
+
+    第二章的 ``document_start`` 是触发追加那次滚动里客户端量到的**旧**文档高，而视图
+    报上来的段号是它把整篇按**当前**高度等比缩放后数出来的——接缝那几格两把尺不同判，
+    这一节的靶子就是那几格。
+    """
+    first = paragraph_offsets(_uneven(SEAM, "甲"))
+    second = paragraph_offsets(_uneven(SECOND, "乙"))
+    session = ReadingSession()
+    session.bind("s", "b", [_Chapter("ch1", 0), _Chapter("ch2", 1)])
+    _mount(session, _Chapter("ch1", 0), 0.0, first, text_length=1000)
+    _mount(session, _Chapter("ch2", 1), 2000.0, second, text_length=1000,
+           paragraph_start=SEAM)
+    return session, first, second
+
+
+def test_the_seam_paragraph_lands_in_the_next_chapter():
+    session, first, second = _appended()
+    # 像素 1500 还在第一章区间内（第二章从 2000 起），段号 12/13/14 却已经是第二章的段。
+    for paragraph, local in ((SEAM, 0), (SEAM + 1, 1), (SEAM + 2, 2)):
+        position, visible = session.track(1500.0, 2600.0, 16, paragraph)
+        assert str(visible.url) == "ch2", (
+            f"整篇第 {paragraph} 段被记成了第一章的第 {position.chapter_paragraph} 段")
+        assert position.chapter_paragraph == local
+        assert position.chapter_paragraph < len(second), (
+            f"落库段号 {position.chapter_paragraph} 越出本章段数 {len(second)}：重开时"
+            "这个数会被夹到段尾，用户从下一章段首被弹回上一章段尾")
+        assert position.character_offset == second[local], (
+            "跨章的段号减错了起点，偏移指到了别人的段首")
+    # 反向同一条规矩：段号说还在第一章，就不能被像素拽进第二章。
+    position, visible = session.track(2000.0, 2600.0, 16, SEAM - 1)
+    assert str(visible.url) == "ch1", "两把尺只在朝一个方向打架时才会被当成像素的错"
+    assert position.chapter_paragraph == SEAM - 1
+    assert position.character_offset == first[-1]
+
+
+def test_the_same_pixels_without_a_paragraph_still_take_the_pixel_ruler():
+    """正对照：同一格像素、不给段号时必须选到**上一章**——不然上面那条在测空气。"""
+    session, _, _ = _appended()
+    position, visible = session.track(1500.0, 2600.0, 16, None)
+    assert str(visible.url) == "ch1", (
+        "两把尺这一轮同判，段区间那条没测到接缝")
+    assert position.character_offset == 750        # int(1000 × 1500/2000)
+    assert position.chapter_paragraph is None
+
+
+def test_a_table_that_cannot_be_trusted_falls_back_to_pixels():
+    """三种"表不可信"的形状都退回像素：修接缝不该顺手把兜底砸了。
+
+    ① 某一章没算过坐标（老替身、只挂控件不读正文）；② 两张视口的段区间**倒挂**
+    （后挂上来的第二章说自己从整篇第 0 段起——这张表自相矛盾，按它选章会选到别人家）；
+    ③ 段号越出所有区间（脏记录、目录改过）。
+    """
+    session, first, second = _appended()
+    headless = ReadingSession()
+    headless.bind("s", "b", [_Chapter("ch1", 0), _Chapter("ch2", 1)])
+    _mount(headless, _Chapter("ch1", 0), 0.0, (), text_length=1000)
+    _mount(headless, _Chapter("ch2", 1), 2000.0, second, text_length=1000,
+           paragraph_start=SEAM)
+    position, visible = headless.track(1500.0, 2600.0, 16, SEAM)
+    assert str(visible.url) == "ch1", "第一章没有坐标，这张表的段区间无从算起"
+    assert position.character_offset == 750, "退回像素口径就要读出像素的那个数"
+
+    inverted = ReadingSession()
+    inverted.bind("s", "b", [_Chapter("ch1", 0), _Chapter("ch2", 1)])
+    _mount(inverted, _Chapter("ch1", 0), 0.0, first, text_length=1000,
+           paragraph_start=SEAM)
+    _mount(inverted, _Chapter("ch2", 1), 2000.0, second, text_length=1000)
+    position, visible = inverted.track(1500.0, 2600.0, 16, 2)
+    assert str(visible.url) == "ch1", (
+        "第二章自称从整篇第 0 段起，比第一章还早——按这种表选章会把人送进第二章，"
+        "而像素说这里还在第一章")
+    assert position.chapter_url == "ch1" and position.chapter_paragraph == 0, (
+        f"倒挂的表还顺带把章内段号算成了 {position.chapter_paragraph}")
+
+    _, visible = session.track(1500.0, 2600.0, 16, 99)
+    assert str(visible.url) == "ch1", "整篇第 99 段不落在任何一章里，按像素算"
 
 
 def test_controller_delegates_the_display_transform_instead_of_doing_it_again():

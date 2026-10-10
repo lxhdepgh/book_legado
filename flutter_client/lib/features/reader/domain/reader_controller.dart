@@ -21,10 +21,21 @@
 ///    而"问不问"由 `reader.staged` 那一发决定：在架的书回 null，
 ///    否则每次退出都被问一遍"要放入书架吗"（flet `exit_reader:1432` 同一发）。
 ///
-/// **G3-C3 不含连续阅读（到底自动接下一章）**：flet 那条是 `append` 文档 +
-/// 章节视口表（`_mount_chapter`），落点要按"本章在整篇文档里的段起点"折算；
-/// 而 Dart 这一版一页一章、翻页走整篇替换，段号天然从 0 起，不需要那张表。
-/// 追加那一臂与换源同批进 G3-D（都要 `mode="job"` 的在途快照）。
+/// 7. **连续阅读：读到章尾接下一章，接上来的那一章不改视口**（flet `_on_reader_scroll`）：
+///    整篇文档同时挂着 1~N 章，屏上报的段号是**整篇**口径，而落库必须是**章内**段号与
+///    **章内**偏移——那一步折算在 `domain/continuous_reading.dart`（与 flet 的 `track`
+///    同源，由 `test/continuous_reading_projection_test.dart` 对着 flet 自己产出的
+///    `tests/gateway/projection/reader.continuous.json` 逐发核）。迟滞阈值也照那边：
+///    离底部 500px 以上重新武装、不足 180px 且已武装才追加（一条阈值线判定会在边界上
+///    反复触发，一章能被接两遍）。
+///
+/// **两处与 flet 有意不同**（都在这轮的量里说过，不是抄漏）：
+/// - 追加过的章**不另立台账**，就看它在不在 `mounts` 里。flet 的 `_continuous_loaded`
+///   只在换书时清（`_set_chapters`），于是"先按下一章翻到第 3 章 → 退回第 2 章 → 读到底"
+///   那一串会把第 3 章永远拒掉，自动续读静默失效。整篇替换既然已经把文档换成一篇，
+///   那张账就该跟着作废。
+/// - `scroll_offset` 存的是**章内**像素（`Landing.chapterPixels`）。文档级像素在下一次
+///   只挂一章的会话里指不到同一处，那一列本来就不是可跨会话比的数（`ReadingPosition` 文件头）。
 library;
 
 import 'dart:async';
@@ -42,6 +53,7 @@ import '../data/content_search_result.dart';
 import '../data/reader_session.dart';
 import '../data/reading_position.dart';
 import '../data/staged_record.dart';
+import 'continuous_reading.dart';
 import 'text_layout.dart';
 
 /// 打开阅读器要带的那几格：源、书快照、要不要入架、要不要续读。
@@ -143,16 +155,192 @@ class ReaderTypography {
       'ReaderTypography($fontSize 号, 缩进 ${indent ? '开' : '关'})';
 }
 
+/// 屏上挂着的一章（连续阅读时同时挂着 1~N 章，每一章一份）。
+///
+/// [paragraphStart] 与 [documentStart] 是折算用的两个原点，一个数段、一个数像素：
+/// - `paragraphStart` = 本章第一段在**整篇**文档里的段序号，就是接上来那一刻已经挂着的
+///   那些段数（flet `reader_controller.py:425` 的 `self._view.paragraph_count()`）。
+///   数错这一格（按屏上**行数**累加）整篇段号就整体漂移：媒体块、章名、分隔线都占行不产段；
+/// - `documentStart` = 触发追加那一刻的文档总高（像素）。它是**旧**文档的高度，而视图
+///   报的段号按**当前**高度缩放，两套尺在章间接缝上会打架——所以选章只认段号，
+///   这一格只用来算段内那一截的比例（`continuous_reading.dart` 文件头）。
+class MountedChapter {
+  const MountedChapter({
+    required this.chapterIndex,
+    required this.chapterName,
+    required this.document,
+    required this.paragraphs,
+    required this.offsets,
+    required this.lines,
+    required this.paragraphStart,
+    required this.documentStart,
+  });
+
+  /// 挂一章并把三把读数算好（段、段首偏移、屏上行）。
+  ///
+  /// [paragraphStart] 与 [documentStart] 只在追加那一臂给：整篇替换时文档只剩它，
+  /// 两个原点天然归零。
+  factory MountedChapter.mount({
+    required int chapterIndex,
+    required String chapterName,
+    required ChapterDocument document,
+    required bool indent,
+    int paragraphStart = 0,
+    double documentStart = 0,
+  }) {
+    final paragraphs = chapterParagraphs(document.blocks);
+    return MountedChapter(
+      chapterIndex: chapterIndex,
+      chapterName: chapterName,
+      document: document,
+      paragraphs: paragraphs,
+      offsets: paragraphOffsets(paragraphs),
+      lines: contentPlan(document, indent: indent),
+      paragraphStart: paragraphStart,
+      documentStart: documentStart,
+    );
+  }
+
+  final int chapterIndex;
+
+  /// 目录里的那一行的名字（flet 的顶栏与追加章名行用的都是它，不是正文里那行 `<title>`）。
+  final String chapterName;
+
+  final ChapterDocument document;
+
+  /// 本章自然段（尺上口径，不缩进）。
+  final List<String> paragraphs;
+
+  /// 本章各段段首的**章内**字符偏移。
+  final List<int> offsets;
+
+  /// 本章的屏上行，段号是**章内**口径（进整篇之前由 [documentLinesOf] 加上起点）。
+  final List<ReaderLine> lines;
+
+  final int paragraphStart;
+  final double documentStart;
+
+  String get chapterUrl => document.chapterUrl;
+
+  int get paragraphCount => paragraphs.length;
+
+  /// 段号夹进本章。
+  ///
+  /// 越界不夹就是把"第 12 段"存进只有 12 段的那一章——服务端会夹回来，
+  /// 于是重开时用户从下一章段首被弹回上一章段尾（第九十二轮量到的那发不可能的读数）。
+  int clampParagraph(int paragraph) {
+    if (paragraphs.isEmpty) return -1;
+    if (paragraph < 0) return 0;
+    return paragraph >= paragraphs.length ? paragraphs.length - 1 : paragraph;
+  }
+
+  /// 改缩进只重画行，尺不动（`paragraphs`/`offsets` 都是没缩进的原文）。
+  MountedChapter withIndent(bool indent) => MountedChapter(
+        chapterIndex: chapterIndex,
+        chapterName: chapterName,
+        document: document,
+        paragraphs: paragraphs,
+        offsets: offsets,
+        lines: contentPlan(document, indent: indent),
+        paragraphStart: paragraphStart,
+        documentStart: documentStart,
+      );
+
+  /// 交给折算层的那一格。`textLength` 用的是**带段间换行**的字符流长度
+  /// （`chapterTextLength`），与 `offsets` 同一把尺；flet 那边是 `sum(len(line))`，
+  /// 少了 n−1 个段间格。那一格只在"段表不可信、退回像素插值"时才乘比例，
+  /// 而这一屏每一章都算得出段表，走不到那一条。
+  ChapterMount toMount() => ChapterMount(
+        chapterUrl: chapterUrl,
+        chapterIndex: chapterIndex,
+        paragraphStart: paragraphStart,
+        paragraphOffsets: offsets,
+        textLength: chapterTextLength(paragraphs),
+        documentStart: documentStart,
+      );
+
+  @override
+  String toString() =>
+      'MountedChapter(#$chapterIndex $chapterName, 段起点 $paragraphStart/'
+      '$paragraphCount 段)';
+}
+
+/// 整篇文档里屏上的那一行：正文段、媒体块，或追加进来时补的分隔线/章名。
+///
+/// [paragraph] 是**整篇**段号（不是章内）：屏上每一行的 GlobalKey 用它当索引，
+/// 三章同时挂着时"第 0 段"这种章内口径会撞名，撞了就把上一章的落点报进下一章。
+class DocumentLine {
+  const DocumentLine.row({
+    required this.mountIndex,
+    required this.line,
+    this.paragraph,
+    this.lastInChapter = false,
+  }) : name = '';
+
+  const DocumentLine.divider({required this.mountIndex})
+      : line = null,
+        paragraph = null,
+        lastInChapter = false,
+        name = '';
+
+  const DocumentLine.title({required this.mountIndex, required this.name})
+      : line = null,
+        paragraph = null,
+        lastInChapter = false;
+
+  final int mountIndex;
+
+  /// 这一行的原行计划；分隔线与章名行是 null。
+  final ReaderLine? line;
+
+  /// **整篇**段号；媒体行与补的两行是 null（它们不产段）。
+  final int? paragraph;
+
+  /// 本章最后一段（正文行之间留的白不一样，追加之后不能只认整篇那最后一段）。
+  final bool lastInChapter;
+
+  /// 章名行那一句（其余行是空串）。
+  final String name;
+
+  bool get isContent => line != null;
+}
+
+/// 挂着的那几章 → 整篇的屏上行表（每一章前头补分隔线 + 章名，第一章不补）。
+///
+/// flet 那侧是 `render_plan(append=True)` 往同一个 `_content_host` 后面 extend
+/// `ft.Divider` 与 `ft.Text(chapter_name)`，第一章由顶栏报名字。补在第一章前面就与
+/// flet 的屏上控件数不同（参照表里 `screen_controls` 27 = 22 段 + 1 图 + 2 章 ×2 行），
+/// 那一格正对照钉的就是这件事。
+List<DocumentLine> documentLinesOf(List<MountedChapter> mounts) {
+  final rows = <DocumentLine>[];
+  for (var i = 0; i < mounts.length; i++) {
+    final mount = mounts[i];
+    if (i > 0) {
+      rows.add(DocumentLine.divider(mountIndex: i));
+      rows.add(DocumentLine.title(mountIndex: i, name: mount.chapterName));
+    }
+    for (final line in mount.lines) {
+      rows.add(line.isText
+          ? DocumentLine.row(
+              mountIndex: i,
+              line: line,
+              paragraph: mount.paragraphStart + (line.paragraphIndex ?? 0),
+              lastInChapter: line.paragraphIndex == mount.paragraphCount - 1,
+            )
+          : DocumentLine.row(mountIndex: i, line: line));
+    }
+  }
+  return rows;
+}
+
 /// 一屏读完所需的全部状态（不可变；改一处就 `copyWith` 一份）。
 class ReaderPage {
   const ReaderPage({
     required this.session,
     required this.chapters,
+    required this.mounts,
+    required this.documentLines,
     required this.chapterIndex,
-    required this.document,
-    required this.paragraphs,
-    required this.offsets,
-    required this.lines,
     required this.typography,
     required this.anchorParagraph,
     this.loadSeq = 0,
@@ -172,11 +360,9 @@ class ReaderPage {
       'position': <String, Object?>{},
     }),
     chapters: const <ChapterRow>[],
+    mounts: const <MountedChapter>[],
+    documentLines: const <DocumentLine>[],
     chapterIndex: -1,
-    document: _emptyDocument,
-    paragraphs: const <String>[],
-    offsets: const <int>[],
-    lines: const <ReaderLine>[],
     typography: ReaderTypography.defaults,
     anchorParagraph: -1,
   );
@@ -186,23 +372,21 @@ class ReaderPage {
   /// `reader.toc` 的原样行表（**不滤卷标题**：序号要与服务端的 `chapters[index]` 对齐）。
   final List<ChapterRow> chapters;
 
-  /// 当前章在 [chapters] 里的下标 = 落库的 `chapter_index`。
+  /// 屏上挂着的那几章（挂载顺序 = 从上到下；整篇替换只剩一章）。
+  final List<MountedChapter> mounts;
+
+  /// 整篇的屏上行表（[documentLinesOf] 的产物；段号是整篇口径）。
+  final List<DocumentLine> documentLines;
+
+  /// **屏幕上在读的那一章**在 [chapters] 里的下标 = 落库的 `chapter_index`。
+  ///
+  /// 连续阅读时它跟着视口走（flet `_follow_visible_chapter`）：挂着三章而眼睛在第
+  /// 二章中段，落库就该落第二章——落"当初点进来的那章"会把进度写成半章之前。
   final int chapterIndex;
-
-  final ChapterDocument document;
-
-  /// 尺上的自然段（`chapterParagraphs(document.blocks)`，不带缩进）。
-  final List<String> paragraphs;
-
-  /// 各段段首的章内字符偏移（`paragraphOffsets(paragraphs)`）。
-  final List<int> offsets;
-
-  /// 屏上那一批行（[contentPlan] 的产物：正文段 + 媒体块，带缩进与标题画法）。
-  final List<ReaderLine> lines;
 
   final ReaderTypography typography;
 
-  /// 这一拍要落到的段号；`-1` = 不落（章首）。
+  /// 这一拍要落到的段号（**[chapterIndex] 那一章的章内**段号）；`-1` = 不落（章首）。
   final int anchorParagraph;
 
   final List<BookmarkRow> bookmarks;
@@ -222,7 +406,41 @@ class ReaderPage {
   /// 还是用户自己滚出来的（不许再滚——否则每跨一段就把视口弹到那一段的段首，
   /// 用户会觉得书在跟他抢方向盘）。只按 `chapterUrl` 分不行：同一章可以重开
   /// （点书签跳回本章、目录里再点一次），那时 url 没变而落点变了。
+  ///
+  /// **追加下一章不减也不加这一格**：追加不动视口，加一次就把刚立好的落位重新跑一遍，
+  /// 用户读到哪儿就被弹回哪儿。
   final int loadSeq;
+
+  MountedChapter? mountFor(int index) {
+    for (final mount in mounts) {
+      if (mount.chapterIndex == index) return mount;
+    }
+    return null;
+  }
+
+  /// 视口那章落在挂载表里时用它，否则用最后一章（跟进在途、表还没换过来的那一拍）。
+  MountedChapter? get activeMount =>
+      mountFor(chapterIndex) ?? (mounts.isEmpty ? null : mounts.last);
+
+  /// 当前章的文档（顶栏、书签摘要、`totalChars` 都读它）。
+  ChapterDocument get document => activeMount?.document ?? _emptyDocument;
+
+  /// 当前章的自然段（章内口径）。
+  List<String> get paragraphs => activeMount?.paragraphs ?? const <String>[];
+
+  /// 当前章各段段首的章内字符偏移。
+  List<int> get offsets => activeMount?.offsets ?? const <int>[];
+
+  /// 整篇段数（各章段数之和，**不是**屏上行数）。
+  int get paragraphTotal =>
+      mounts.fold(0, (sum, mount) => sum + mount.paragraphCount);
+
+  /// 折算层吃的那一张表。
+  ContinuousDocument get continuous =>
+      ContinuousDocument(<ChapterMount>[for (final m in mounts) m.toMount()]);
+
+  /// 整篇替换的判据：键表与落位只认这一格，追加进来的章不许把已挂出的键清掉。
+  String get baseChapterUrl => mounts.isEmpty ? '' : mounts.first.chapterUrl;
 
   ChapterRow? get currentChapter =>
       (chapterIndex >= 0 && chapterIndex < chapters.length)
@@ -235,9 +453,6 @@ class ReaderPage {
   int get totalChars => document.totalChars;
 
   /// 卷标题不产段，所以"第 n/N 章"的 N 与 flet 一样数滤掉卷标题之后的那批。
-  int get readableCount => chapters.where((c) => !c.isVolume).length;
-
-  /// 顶栏那一句：`第 n/N · 章名`（n 与分母同一把尺：都按滤卷之后的序号）。
   String get progressText {
     final total = readableCount;
     if (total == 0 || chapterIndex < 0) return '未选择章节';
@@ -245,6 +460,8 @@ class ReaderPage {
         chapters.take(chapterIndex).where((c) => !c.isVolume).length;
     return '${before + 1}/$total · ${currentChapter?.name ?? ''}';
   }
+
+  int get readableCount => chapters.where((c) => !c.isVolume).length;
 
   /// 底部那一行：`《书名》 · 作者 · 共 N 章`（flet `_update_chapter_navigation`）。
   String get bookLine => <String>[
@@ -269,21 +486,16 @@ class ReaderPage {
     return null;
   }
 
-  /// 段号夹进本章。
-  int clampParagraph(int paragraph) {
-    if (paragraphs.isEmpty) return -1;
-    if (paragraph < 0) return 0;
-    return paragraph >= paragraphs.length ? paragraphs.length - 1 : paragraph;
-  }
+  /// 段号夹进**当前这一章**（跳书签/跳命中吃的都是章内段号）。
+  int clampParagraph(int paragraph) =>
+      activeMount?.clampParagraph(paragraph) ?? -1;
 
   ReaderPage copyWith({
     ReaderSession? session,
     List<ChapterRow>? chapters,
+    List<MountedChapter>? mounts,
+    List<DocumentLine>? documentLines,
     int? chapterIndex,
-    ChapterDocument? document,
-    List<String>? paragraphs,
-    List<int>? offsets,
-    List<ReaderLine>? lines,
     ReaderTypography? typography,
     int? anchorParagraph,
     int? loadSeq,
@@ -295,11 +507,9 @@ class ReaderPage {
       ReaderPage(
         session: session ?? this.session,
         chapters: chapters ?? this.chapters,
+        mounts: mounts ?? this.mounts,
+        documentLines: documentLines ?? this.documentLines,
         chapterIndex: chapterIndex ?? this.chapterIndex,
-        document: document ?? this.document,
-        paragraphs: paragraphs ?? this.paragraphs,
-        offsets: offsets ?? this.offsets,
-        lines: lines ?? this.lines,
         typography: typography ?? this.typography,
         anchorParagraph: anchorParagraph ?? this.anchorParagraph,
         loadSeq: loadSeq ?? this.loadSeq,
@@ -310,9 +520,8 @@ class ReaderPage {
       );
 
   @override
-  String toString() =>
-      'ReaderPage(${document.chapterName}, ${paragraphs.length} 段/'
-      '$totalChars 字, 落点 $anchorParagraph)';
+  String toString() => 'ReaderPage(${document.chapterName}, '
+      '${mounts.length} 章/$paragraphTotal 段, 落点 $anchorParagraph)';
 }
 
 const ChapterDocument _emptyDocument = ChapterDocument(
@@ -353,14 +562,32 @@ class ReaderNotifier extends AsyncNotifier<ReaderPage> {
   /// 落库合流窗口：与 flet 的 `throttle(…, 0.5)` 同值。
   static const Duration _saveWindow = Duration(milliseconds: 500);
 
+  /// 离文档底部不足这一格就接下一章（flet `_APPEND_TRIGGER_DISTANCE`）。
+  static const double _appendTriggerPx = 180;
+
+  /// 退回这一格以上才把"自动续读"重新武装（flet `_APPEND_REARM_DISTANCE`）。
+  ///
+  /// 两个数中间那一段是**迟滞带**，不是冗余：只留一条线的话，贴着线的那几帧
+  /// 会反复触发，一章能被接两遍（屏上出现两份同样的正文）。
+  static const double _appendRearmPx = 500;
+
   Timer? _saveTimer;
 
   /// 换章那一拍的布局噪音不许落库（规矩 4）。
   bool _restoring = false;
 
-  /// 屏幕报来的像素偏移。留着只为了把它一起写进 `scroll_offset`
-  /// （下次在**同一个客户端**续读时落回原样），它从不参与跨端比对。
+  /// 当前这一章内的像素偏移（落 `scroll_offset`；由 [Landing.chapterPixels] 折算而来）。
   double _pixels = 0;
+
+  /// 追加下一章在途。只挡"再要一章"，绝不挡定位与落库：文档在取下一章时仍然可滚。
+  bool _appending = false;
+
+  /// 自动续读是否武装（见 [_appendRearmPx] 那条迟滞）。整篇替换重新置真。
+  bool _autoScrollArmed = true;
+
+  /// 最近一次折算出的**章内字符偏移**（含段内那一截的估算，与 flet `track` 同一份算术）。
+  /// `null` = 换章之后还没滚过（那时存档用段首，见 [_writePosition]）。
+  int? _landedOffset;
 
   final StreamController<EngineFailure> _failures =
       StreamController<EngineFailure>.broadcast();
@@ -446,7 +673,10 @@ class ReaderNotifier extends AsyncNotifier<ReaderPage> {
     return ReaderTypography.fromSettings(settings);
   }
 
-  /// 读一章，并把三把读数一起算好（段、段首偏移、屏上行）。
+  /// 读一章并**整篇替换**屏上那一篇文档（顶栏点进来的、目录、上下章、书签、命中都走这条）。
+  ///
+  /// 三把读数（段、段首偏移、屏上行）在这里一次算好挂进 [MountedChapter]：
+  /// 追加那一臂（[_appendNextChapter]）走的是同一份挂载，只是不清旧文档、起点不归零。
   Future<ReaderPage> _loadChapter({
     required ReaderSession session,
     required List<ChapterRow> chapters,
@@ -461,6 +691,10 @@ class ReaderNotifier extends AsyncNotifier<ReaderPage> {
     // 整篇替换：这一拍的布局通知是噪音，不是"用户读到了章首"（规矩 4）。
     _restoring = true;
     _pixels = 0;
+    _landedOffset = null;
+    // 文档已经换成一篇：接着往下读要重新接一次下一章，武装状态得跟着重来
+    // （flet 那边是 `_auto_scroll_armed = True`，在同一处 `if not append`）。
+    _autoScrollArmed = true;
     final document = await _attempt<ChapterDocument>('reader.content', () {
       if (chapter == null) return Future<ChapterDocument>.value(_emptyDocument);
       return _repository.chapterDocument(
@@ -468,18 +702,22 @@ class ReaderNotifier extends AsyncNotifier<ReaderPage> {
           bookUrl: session.bookUrl,
           chapterUrl: chapter.url);
     }, or: () => _emptyDocument);
-    final paragraphs = chapterParagraphs(document.blocks);
-    final anchor = paragraphs.isEmpty
+    final mount = MountedChapter.mount(
+      chapterIndex: chapterIndex,
+      chapterName: chapter?.name ?? document.chapterName,
+      document: document,
+      indent: typography.indent,
+    );
+    final anchor = mount.paragraphs.isEmpty
         ? -1
-        : pageAnchor(paragraphs, storedParagraph, storedOffset);
+        : pageAnchor(mount.paragraphs, storedParagraph, storedOffset);
+    final mounts = <MountedChapter>[mount];
     return ReaderPage(
       session: session,
       chapters: chapters,
+      mounts: mounts,
+      documentLines: documentLinesOf(mounts),
       chapterIndex: chapterIndex,
-      document: document,
-      paragraphs: paragraphs,
-      offsets: paragraphOffsets(paragraphs),
-      lines: contentPlan(document, indent: typography.indent),
       typography: typography,
       anchorParagraph: anchor,
       loadSeq: current.loadSeq + 1,
@@ -487,6 +725,58 @@ class ReaderNotifier extends AsyncNotifier<ReaderPage> {
       echo: chapter == null ? '这本书没有目录' : '',
     );
   }
+
+  /// 读到章尾：把下一章**接**在当前文档末尾（分隔线 + 章名 + 正文），视口一点都不动。
+  ///
+  /// 三条不许：
+  /// - 不许动 `loadSeq`——动了屏上就会为"新的一拍"重跑落位，用户读到哪儿被弹回哪儿；
+  /// - 不许把 `paragraph_start` 数成都市的行数——媒体块、刚补的分隔线与章名都占行不产段，
+  ///   数错了整篇段号就整体漂移（[MountedChapter.paragraphStart] 那条）；
+  /// - 不许接已经在屏上的那一章（[_maybeAppendNext] 查的是挂载表本身，不是另立的台账）。
+  ///
+  /// [documentStart] 是触发那一发滚动里的**旧**文档总高：它是本章的像素起点，
+  /// 也是两套尺里较不可信的那一套（见 `continuous_reading.dart` 文件头）。
+  Future<void> _appendNextChapter({
+    required int chapterIndex,
+    required double documentStart,
+    required int loadSeq,
+  }) async {
+    _appending = true;
+    try {
+      final page = current;
+      if (page.loadSeq != loadSeq) return; // 在途的路上翻了章：这篇文档已经不是那一篇
+      final chapter = page.chapters[chapterIndex];
+      final document = await _attempt<ChapterDocument>(
+          'reader.content',
+          () => _repository.chapterDocument(
+              sourceUrl: page.session.sourceUrl,
+              bookUrl: page.session.bookUrl,
+              chapterUrl: chapter.url),
+          // 接失败就挂一章空的：屏上有分隔线与章名、正文空着，用户知道是这一章没读出来。
+          // 代价折算层看得见——段表空 = 这张表不可信，落点退回像素口径（那是设计上认的降级）。
+          or: () => _emptyDocument);
+      // 取正文这一等就是几百毫秒到几秒：这期间用户可能翻了章（上面那条判据管的是
+      // **开始之前**），也可能这一章已经被接上了（另一发滚动的判据在途）。
+      final now = current;
+      if (now.loadSeq != loadSeq || now.mountFor(chapterIndex) != null) return;
+      final append = MountedChapter.mount(
+        chapterIndex: chapterIndex,
+        chapterName: chapter.name,
+        document: document,
+        indent: now.typography.indent,
+        paragraphStart:
+            now.paragraphTotal, // 已经挂在屏上的那些**段**，不是行
+        documentStart: documentStart,
+      );
+      _emit(_withMounts(now, <MountedChapter>[...now.mounts, append]));
+    } finally {
+      _appending = false;
+    }
+  }
+
+  /// 挂载表变了就要重算整篇行表（段号是整篇口径，起点跟着挂载顺序走）。
+  static ReaderPage _withMounts(ReaderPage page, List<MountedChapter> mounts) =>
+      page.copyWith(mounts: mounts, documentLines: documentLinesOf(mounts));
 
   /// 恢复落点：段序号优先，没有才按字符偏移算（规矩 3）。越界夹到最后一段。
   static int pageAnchor(List<String> paragraphs, int? storedParagraph, int storedOffset) {
@@ -551,17 +841,83 @@ class ReaderNotifier extends AsyncNotifier<ReaderPage> {
     ));
   }
 
-  /// 屏幕报视口：哪一段在顶部 + 像素（像素只进 `scroll_offset`，不参与比对）。
+  /// 屏幕报视口：整篇那一段在顶上 + 文档像素 + 文档总高。
   ///
-  /// [paragraph] 是**章内**段序号（与 `reader.content` 数段同一个口径）。
-  void noteViewport({required int paragraph, double pixels = 0}) {
-    if (_restoring) return;
-    _pixels = pixels < 0 ? 0 : pixels;
+  /// [documentParagraph] 是**整篇**段号（连续阅读时顶上那一段前面还挂着别的章；
+  /// 量不到就传 null）。折算就在这一步：整篇段号 → (哪一章, 章内段号, 章内字符偏移)，
+  /// 与 flet 的 `session.track` 同一份算术（`domain/continuous_reading.dart`，
+  /// 那张参照表逐发钉着它）。顺带在这一发里判"要不要接下一章"——flet 同一条：
+  /// 定位、落库、续读这三件事都挂在滚动通知上。
+  void noteViewport({
+    required double pixels,
+    required double documentExtent,
+    int? documentParagraph,
+  }) {
     final page = current;
-    final clamped = page.clampParagraph(paragraph);
-    if (clamped < 0 || clamped == page.anchorParagraph) return;
-    _emit(page.copyWith(anchorParagraph: clamped));
+    if (_restoring || page.mounts.isEmpty) return;
+    final landing = page.continuous.land(
+        pixels: pixels,
+        documentExtent: documentExtent,
+        documentParagraph: documentParagraph);
+    if (landing != null) _followViewport(page, landing);
+    _maybeAppendNext(pixels: pixels, documentExtent: documentExtent);
+  }
+
+  /// 视口走到已追加的那一章：章号与段号跟着走、落库跟着改，**正文一行都不动**。
+  ///
+  /// flet 那边叫 `_follow_visible_chapter`（"标题/计数跟着走，但正文一篇都不动"）。
+  /// 要紧的是落库那一头：挂着三章而眼睛在第二章中段时，进度必须记第二章——
+  /// 记"当初点进来的那一章"就是把半章之后的阅读存成了半章之前。
+  void _followViewport(ReaderPage page, Landing landing) {
+    final local = landing.localParagraph;
+    final mount = page.mountFor(landing.chapterIndex);
+    if (local == null || mount == null) {
+      // 这一屏量不到段号（顶上只挂着媒体行）或那一章不在表里：像素可以记，段号不许猜。
+      _pixels = landing.chapterPixels;
+      return;
+    }
+    // 夹进本章：像素口径那一臂（那张表不可信时走的）能把整篇段号减成越界的数，
+    // 越界的段号落库，重开时被服务端夹回来——用户就从这一章的中段被弹到别处。
+    final clamped = mount.clampParagraph(local);
+    if (clamped < 0) return;
+    _pixels = landing.chapterPixels;
+    // 段内那一截是估算，但它是**这一发**折算的估算：存档读的是它，屏上顶着的才是
+    // 同一段（两个数各存一处就是两套落点）。
+    _landedOffset = landing.characterOffset;
+    if (clamped == page.anchorParagraph && landing.chapterIndex == page.chapterIndex) {
+      return;
+    }
+    _emit(page.copyWith(chapterIndex: landing.chapterIndex, anchorParagraph: clamped));
     _scheduleSave();
+  }
+
+  /// 到底了就接下一章（flet `_on_reader_scroll` 最后那一段）。
+  ///
+  /// 三道闸缺一不可：
+  /// - **迟滞**：先退到 [_appendRearmPx] 之外重新武装，才能在 [_appendTriggerPx] 之内
+  ///   触发一次。只留一条阈值线的话，贴线那几帧会反复触发，一章被接两遍；
+  /// - **在途**：`_appending` 只挡"再要一章"，绝不挡定位与落库（文档取下一章时仍然可滚，
+  ///   一起挡住进度就再也不更新了——flet 的 `_reading_loading` 同一分际）；
+  /// - **已在屏上**：查的是挂载表本身。flet 用的是另一本台账 `_continuous_loaded`，
+  ///   而那本只在换书时清，于是"翻到第 3 章 → 退回第 2 章 → 读到底"会把第 3 章永远拒掉。
+  void _maybeAppendNext(
+      {required double pixels, required double documentExtent}) {
+    if (documentExtent <= 0 || _appending) return;
+    final distance = documentExtent - pixels;
+    if (distance > _appendRearmPx) {
+      _autoScrollArmed = true;
+      return;
+    }
+    if (distance >= _appendTriggerPx || !_autoScrollArmed) return;
+    final page = current;
+    final next = page.nextIndexIn(1);
+    if (next == null || page.mountFor(next) != null) return;
+    _autoScrollArmed = false;
+    unawaited(_appendNextChapter(
+      chapterIndex: next,
+      documentStart: documentExtent,
+      loadSeq: page.loadSeq,
+    ));
   }
 
   /// 恢复滚动已经兑现：从这一拍起的视口通知才是用户滚出来的。
@@ -580,7 +936,10 @@ class ReaderNotifier extends AsyncNotifier<ReaderPage> {
     final page = current;
     if (page.chapterIndex < 0) return;
     final paragraph = page.anchorParagraph < 0 ? 0 : page.anchorParagraph;
-    final offset = page.characterOffsetFor(paragraph);
+    // 滚过就用折算出来的那一个数（段首 + 段内那一截的估算，与 flet `track` 同一份算术，
+    // 由 `continuous_reading_projection_test` 对着 flet 的参照表逐发核过）；
+    // 还没滚过就存**段首**——那是事实，不是猜出来的。
+    final offset = _landedOffset ?? page.characterOffsetFor(paragraph);
     final position = ReadingPosition(
       chapterUrl: page.document.chapterUrl,
       chapterName: page.currentChapter?.name ?? page.document.chapterName,
@@ -601,6 +960,8 @@ class ReaderNotifier extends AsyncNotifier<ReaderPage> {
         or: () => null);
     if (stored != null && stored.characterOffset != offset) {
       // 服务端夹过就是夹过：把屏上的段号挪到它认的那一段，别让存档与屏幕各说一套。
+      // 折算那一格跟着作废——它已经是**上一发**存档时那一段的数，留着就是拿旧估算配新段号。
+      _landedOffset = null;
       _emit(page.copyWith(
           anchorParagraph:
               paragraphAtOffset(page.paragraphs, stored.characterOffset).paragraphIndex));
@@ -627,10 +988,16 @@ class ReaderNotifier extends AsyncNotifier<ReaderPage> {
         applied.indent == page.typography.indent) {
       return;
     }
-    // 缩进改的是**画法**，尺不动：重算 lines 而重新拉正文是白跑一发网络。
-    _emit(page.copyWith(
-        typography: applied,
-        lines: contentPlan(page.document, indent: applied.indent)));
+    // 缩进改的是**画法**，尺不动：重排每一章已挂出的那些行，而重新拉正文是白跑一发网络。
+    // 只重排"当前那一章"是连续阅读下最容易犯的错：接上来的两章会顶着旧缩进，
+    // 整篇行表（段号、`lastInChapter`）就得从这份不一致的各行里拼。
+    // 字号那一格不用重排——它由屏上的 `TextStyle` 现读，不落进行表。
+    final mounts = applied.indent == page.typography.indent
+        ? page.mounts
+        : <MountedChapter>[
+            for (final mount in page.mounts) mount.withIndent(applied.indent)
+          ];
+    _emit(_withMounts(page, mounts).copyWith(typography: applied));
     // 一键一发，只写**变了的那一格**（flet `set_preference(key, value)` 同一条）：
     // 把两格都写一遍的话，改缩进会顺带落一发没变过的字号，而那一发在设置表上是
     // 一次真实的写入与一次变更广播。

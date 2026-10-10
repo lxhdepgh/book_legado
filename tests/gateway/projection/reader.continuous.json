@@ -1,0 +1,239 @@
+{
+ "corpus": {
+  "family": "/g3cont",
+  "source_url": "http://127.0.0.1:8797/g3cont",
+  "book_url": "http://127.0.0.1:8797/g3cont/book/1.html",
+  "keyword": "连续阅读书",
+  "chapters": [
+   "http://127.0.0.1:8797/g3cont/ch/1.html",
+   "http://127.0.0.1:8797/g3cont/ch/2.html",
+   "http://127.0.0.1:8797/g3cont/ch/3.html"
+  ],
+  "note": "正文 = tests/gateway/fake_source_reader.py 的 cont_chapter_html(i) 过引擎纯管线（@html→_format_content_page→process_book_content→parse_content_blocks），渲染那一步由真控制器自己做。"
+ },
+ "layout": {
+  "width": 728.0,
+  "font_size": 16,
+  "stage_heights": [
+   9000.0,
+   18000.0,
+   24000.0
+  ],
+  "indent": true,
+  "line_height": 1.7,
+  "paragraph_spacing": 12.0
+ },
+ "append_trail": [
+  {
+   "stage": 1,
+   "rearm_pixels": 8400.0,
+   "scroll_pixels": 8900.0,
+   "max_scroll_extent": 9000.0,
+   "mounted_before": [
+    "http://127.0.0.1:8797/g3cont/ch/1.html"
+   ],
+   "mounted_after": [
+    "http://127.0.0.1:8797/g3cont/ch/1.html",
+    "http://127.0.0.1:8797/g3cont/ch/2.html"
+   ]
+  },
+  {
+   "stage": 2,
+   "rearm_pixels": 17400.0,
+   "scroll_pixels": 17900.0,
+   "max_scroll_extent": 18000.0,
+   "mounted_before": [
+    "http://127.0.0.1:8797/g3cont/ch/1.html",
+    "http://127.0.0.1:8797/g3cont/ch/2.html"
+   ],
+   "mounted_after": [
+    "http://127.0.0.1:8797/g3cont/ch/1.html",
+    "http://127.0.0.1:8797/g3cont/ch/2.html",
+    "http://127.0.0.1:8797/g3cont/ch/3.html"
+   ]
+  },
+  {
+   "stage": 3,
+   "rearm_pixels": 23400.0,
+   "scroll_pixels": 23900.0,
+   "max_scroll_extent": 24000.0,
+   "mounted_before": [
+    "http://127.0.0.1:8797/g3cont/ch/1.html",
+    "http://127.0.0.1:8797/g3cont/ch/2.html",
+    "http://127.0.0.1:8797/g3cont/ch/3.html"
+   ],
+   "mounted_after": [
+    "http://127.0.0.1:8797/g3cont/ch/1.html",
+    "http://127.0.0.1:8797/g3cont/ch/2.html",
+    "http://127.0.0.1:8797/g3cont/ch/3.html"
+   ]
+  }
+ ],
+ "chapters": [
+  {
+   "chapter_url": "http://127.0.0.1:8797/g3cont/ch/1.html",
+   "chapter_index": 0,
+   "chapter_name": "第1章 连续章",
+   "paragraph_start": 0,
+   "paragraph_count": 12,
+   "offsets": [
+    0,
+    19,
+    48,
+    67,
+    106,
+    135,
+    154,
+    203,
+    232,
+    271,
+    291,
+    321
+   ],
+   "text_length": 353,
+   "document_start": 0.0
+  },
+  {
+   "chapter_url": "http://127.0.0.1:8797/g3cont/ch/2.html",
+   "chapter_index": 1,
+   "chapter_name": "第2章 连续章",
+   "paragraph_start": 12,
+   "paragraph_count": 3,
+   "offsets": [
+    0,
+    249,
+    568
+   ],
+   "text_length": 760,
+   "document_start": 9000.0
+  },
+  {
+   "chapter_url": "http://127.0.0.1:8797/g3cont/ch/3.html",
+   "chapter_index": 2,
+   "chapter_name": "第3章 连续章",
+   "paragraph_start": 15,
+   "paragraph_count": 7,
+   "offsets": [
+    0,
+    7,
+    66,
+    95,
+    194,
+    213,
+    282
+   ],
+   "text_length": 326,
+   "document_start": 18000.0
+  }
+ ],
+ "document": {
+  "paragraph_total": 22,
+  "screen_controls": 27
+ },
+ "probes": [
+  {
+   "document_paragraph": 0,
+   "flet_pixel": 0.0,
+   "answer": {
+    "chapter_index": 0,
+    "chapter_url": "http://127.0.0.1:8797/g3cont/ch/1.html",
+    "chapter_paragraph": 0,
+    "character_offset": 0,
+    "chapter_ratio": 0.0
+   }
+  },
+  {
+   "document_paragraph": 5,
+   "flet_pixel": 3283.769633507853,
+   "answer": {
+    "chapter_index": 0,
+    "chapter_url": "http://127.0.0.1:8797/g3cont/ch/1.html",
+    "chapter_paragraph": 5,
+    "character_offset": 141,
+    "chapter_ratio": 0.3648632926119837
+   }
+  },
+  {
+   "document_paragraph": 11,
+   "flet_pixel": 7680.0,
+   "answer": {
+    "chapter_index": 0,
+    "chapter_url": "http://127.0.0.1:8797/g3cont/ch/1.html",
+    "chapter_paragraph": 11,
+    "character_offset": 321,
+    "chapter_ratio": 0.8533333333333334
+   }
+  },
+  {
+   "document_paragraph": 12,
+   "flet_pixel": 8336.75392670157,
+   "answer": {
+    "chapter_index": 1,
+    "chapter_url": "http://127.0.0.1:8797/g3cont/ch/2.html",
+    "chapter_paragraph": 0,
+    "character_offset": 0,
+    "chapter_ratio": 0.0
+   }
+  },
+  {
+   "document_paragraph": 13,
+   "flet_pixel": 11272.041884816752,
+   "answer": {
+    "chapter_index": 1,
+    "chapter_url": "http://127.0.0.1:8797/g3cont/ch/2.html",
+    "chapter_paragraph": 1,
+    "character_offset": 329,
+    "chapter_ratio": 0.2524490983129724
+   }
+  },
+  {
+   "document_paragraph": 14,
+   "flet_pixel": 15118.74345549738,
+   "answer": {
+    "chapter_index": 1,
+    "chapter_url": "http://127.0.0.1:8797/g3cont/ch/2.html",
+    "chapter_paragraph": 2,
+    "character_offset": 568,
+    "chapter_ratio": 0.6798603839441534
+   }
+  },
+  {
+   "document_paragraph": 15,
+   "flet_pixel": 17598.324607329843,
+   "answer": {
+    "chapter_index": 2,
+    "chapter_url": "http://127.0.0.1:8797/g3cont/ch/3.html",
+    "chapter_paragraph": 0,
+    "character_offset": 0,
+    "chapter_ratio": 0.0
+   }
+  },
+  {
+   "document_paragraph": 17,
+   "flet_pixel": 19349.10994764398,
+   "answer": {
+    "chapter_index": 2,
+    "chapter_url": "http://127.0.0.1:8797/g3cont/ch/3.html",
+    "chapter_paragraph": 2,
+    "character_offset": 72,
+    "chapter_ratio": 0.22485165794066356
+   }
+  },
+  {
+   "document_paragraph": 21,
+   "flet_pixel": 23343.246073298433,
+   "answer": {
+    "chapter_index": 2,
+    "chapter_url": "http://127.0.0.1:8797/g3cont/ch/3.html",
+    "chapter_paragraph": 6,
+    "character_offset": 282,
+    "chapter_ratio": 0.8905410122164055
+   }
+  }
+ ],
+ "content_calls": [
+  "http://127.0.0.1:8797/g3cont/ch/1.html",
+  "http://127.0.0.1:8797/g3cont/ch/2.html",
+  "http://127.0.0.1:8797/g3cont/ch/3.html"
+ ]
+}

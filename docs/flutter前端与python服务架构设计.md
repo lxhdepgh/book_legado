@@ -308,7 +308,13 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 锚点是 `tests/gateway/projection/reader.content.webview.json`（语料新加的 `/g3web` 那一族
 **两种形状**各过一遍纯管线），不作答那一臂把报错归回宿主那 20s 而不是 `reader.content` 的 60s。
 **可见 WebView 插件不在本轮**（零新依赖、只留 seam；G4 选型清单在日志 §8）。
-剩下的 R1 那一半在 **G3-D2/D3/D4**（连续阅读 append、换源走 `mode="job"` + 事件、
+**连续阅读那一档也交了（2026-10-10 第九十二轮，G3-D2，离线面）**：flet 的"读到章尾自动接下一章"
+在 Dart 侧落地——追加不动 `loadSeq`、不动视口，段起点按**已挂牌的段数**（不是行数：媒体块与刚补的
+分隔线/章名都占行不产段）累加，落库三格换成**本章**口径；迟滞 180/500 与 flet 同数，
+flet 那本 `_continuous_loaded` 台账**有意不抄**（它在"翻章→退回"之后会永久关掉自动接，Dart 查的是挂载表本身）。
+屏侧的 GlobalKey 键改成**整篇段号**（撞一次键就把上一章那一行报成本章落点）。
+本轮按"过程中不跑测试"的授权执行，**通过数与变异核验欠到批量验证那一趟**，日志里只留静态读数。
+剩下的 R1 那一半在 **G3-D3/D4**（换源走 `mode="job"` + 事件、
 `GET /media/{key}`）与 G4 的插件决定 |
 | **G4** | `rss` / 漫画 / 朗读 / 工具域 / 老板键托盘；删 flet 依赖与 4 个 UI 耦合服务；PyInstaller spec 去 flet* | 2–3 周 | flet 从 `requirements.txt` 消失后全库仍绿；打包冒烟（照真果鉴 `smoke_windows.py` 那条：解压产物跑一次 `--package-smoke`） |
 
@@ -530,6 +536,30 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 > Dart `259 passed / 9 skipped`（带 env `267 passed / 1 skipped`；本轮新增 16 + 3 = 19 条）；
 > `flutter analyze` 10 条 info（6 既有 + 本轮 4 条同族 `use_null_aware_elements`，
 > 与相邻 `saveTheme` 同一写法，故意不改成 `?`）。
+>
+> **G3-D2 交（离线面，2026-10-10，第九十二轮，`docs/dev-logs/2026-10-10.md`）**：连续阅读
+> （append 下一章）与文档级落点折算在 Dart 侧落地。三处形状与 flet 同数、一处有意不同：
+> 迟滞 180/500 抄 `_APPEND_TRIGGER_DISTANCE`/`_APPEND_REARM_DISTANCE`；段起点按
+> **已挂牌的段数**累加而非行数（本语言料三章齐挂是 **22 段 / 27 个控件**，媒体行与刚补的
+> 分隔线/章名都占行不产段）；落库三格换成**本章**口径（`chapter_paragraph` 不许写整篇段号，
+> 那正是"12 段的章报第 12 段、重开被夹到段尾"那个不可能读数的来路）；flet 的
+> `_continuous_loaded` 台账**不抄**——它在"翻章 → 退回上一章"之后会永久关掉自动接，
+> Dart 这里查挂载表本身（`page.mountFor(next) != null`），文档换了账就没了。
+> 屏侧 `GlobalKey` 的键从"本章行号"改成**整篇段号**（两章各有自己的第 0 段，撞键就把
+> 上一章那一行认成视口顶），行表 `documentLines` 成为 `itemCount`/`itemBuilder` 的**唯一**渲染源。
+> 守卫新增 **30 条**（Dart 折算层 10 + Dart 屏 8 + Python 投影臂 9，另有位置契约臂 17→20）；
+> 屏侧第一条钉的是"**两侧吃的是同一串字**"——把 Dart 手搓的 `/g3cont` 三章与 flet 表里每章
+> `offsets` 逐列比，并当场钉住 `text_length` 那**已知口径差**（flet 是 `sum(len(段))`、
+> Dart 的尺每段间多一个 `"\n"`，差 n−1 格），对不上则后面全在测空气。
+> 仪器两条：`_driveToBottom` 必须**一屏一屏跳**（`ListView.builder` 的 `maxScrollExtent`
+> 是按已建行均值估的，一次到位时通知里的 distance 是几百像素，追加根本不触发）；
+> 迟滞那一臂的**前提**（distance < 180）与**结论**（没接第二遍）要当场各读一次，否则那一格是自证。
+> `_triggerBand()` 写死 180 而不 import 那个私有常量。
+> **本轮按"过程中不跑测试、迁移完成后统一验证"的授权执行**：全库通过数、`flutter test` 两档、
+> 这 30 条守卫的变异核验、以及 D2 剩下的实弹臂（`/g3cont` 上真网关真引擎的三头读数）
+> 全部**欠到批量验证那一趟**，这里不抄上一轮的值也不写估计值。静态面当场取到：
+> `dart analyze test lib` → 10 issues found，0 error / 0 warning，且那 10 条全是既有 info、
+> 本轮新文件一条都没有。
 
 ---
 
@@ -606,7 +636,9 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 - `docs/dev-logs/2026-10-10.md`（第九十一轮：**G3-D1 反向 WebView 通道**——`/ws` 的 `request` 帧
   在 Dart 侧有模型与宿主接缝、`engine.webContentReady` 有真调用点、语料 `/g3web` 两形状与取页账、
   两个宿主语言各自答回同一章（4 段 / 1961 字）、报错归回宿主那 20s、18 发变异全红、
-  以及留给 G4 的 WebView 插件选型清单）
+  以及留给 G4 的 WebView 插件选型清单；
+  第九十二轮：**G3-D2 连续阅读（离线面）**——append 下一章的迟滞/段起点折算/本章口径落库、
+  屏侧 GlobalKey 改整篇段号、30 条新守卫，以及"按授权不跑测试、通过数与变异核验欠到批量验证"这一条）
 - `docs/M7打包说明.md`（PyInstaller 命令与 flet* hidden-import 清单位置）
 - 参照仓库：`github.com/jerunshi/guoapp1`（浅克隆 `D:/tmp/guoapp1`，不在本项目版本控制内）
 - 记忆：`tts-pyttsx3-com-same-thread`、`quickjs-native-crash-risk`、`engine-hub-loop-split`、

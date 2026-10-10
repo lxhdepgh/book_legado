@@ -58,6 +58,7 @@ class FakeEngineRepository implements EngineRepository {
     this.session,
     this.toc = const [],
     this.document,
+    this.documentsByChapterUrl = const <String, ChapterDocument>{},
     this.position,
     this.staged,
     this.closeOutcome,
@@ -120,6 +121,13 @@ class FakeEngineRepository implements EngineRepository {
   ReaderSession? session;
   List<ChapterRow> toc;
   ChapterDocument? document;
+
+  /// 按章 url 给不同正文（连续阅读那几发要的是**每章形状互异**的载荷）。
+  ///
+  /// 只用 [document] 时三章回同一串字：接错章、接两遍、段起点数错，屏上全都看不出来
+  /// ——对照样本自己得先能被认出来（记忆 `measurement-corpus-must-not-be-self-proving`）。
+  /// 命中这张表的 url 优先于 [document]，其余章仍走 [document]。
+  Map<String, ChapterDocument> documentsByChapterUrl = const <String, ChapterDocument>{};
 
   /// `reader.position_get` 回它；`reader.position_save` 也回它（服务端那一发回的是
   /// **落库并收口后**的形状，替身照这一条办：给测试一个"回话与请求不同"的入口）。
@@ -481,7 +489,11 @@ class FakeEngineRepository implements EngineRepository {
     required String bookUrl,
     required String chapterUrl,
   }) =>
-      _guard(() => document ?? _emptyDocument(chapterUrl), 'reader.content',
+      _guard(
+          () => documentsByChapterUrl[chapterUrl] ??
+              document ??
+              _emptyDocument(chapterUrl),
+          'reader.content',
           <String, Object?>{
             'source_url': sourceUrl,
             'book_url': bookUrl,
