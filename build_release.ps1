@@ -4,9 +4,9 @@
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$FlutterClient = Join-Path $ProjectRoot "flutter_client"
-$BackendDir = Join-Path $FlutterClient "backend"
-$OutputDir = Join-Path $FlutterClient "build\windows\x64\runner\Release"
+$DartClient = Join-Path $ProjectRoot "legodo_dart"
+$BackendDir = Join-Path $DartClient "backend"
+$OutputDir = Join-Path $DartClient "build\windows\x64\runner\Release"
 
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  Legado BookSource Check - Full Build" -ForegroundColor Cyan
@@ -24,7 +24,7 @@ Write-Host ""
 
 # Step 2: Flutter build windows --release
 Write-Host "[2/3] Building Flutter Windows Release..." -ForegroundColor Yellow
-Set-Location $FlutterClient
+Set-Location $DartClient
 
 $LegodoPython = Join-Path $BackendDir "LegadoReader.exe"
 $LegodoMain = Join-Path $BackendDir "main.py"

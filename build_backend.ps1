@@ -4,8 +4,8 @@
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$FlutterClient = Join-Path $ProjectRoot "flutter_client"
-$BackendDir = Join-Path $FlutterClient "backend"
+$DartClient = Join-Path $ProjectRoot "legodo_dart"
+$BackendDir = Join-Path $DartClient "backend"
 
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  Packing Python Backend" -ForegroundColor Cyan
