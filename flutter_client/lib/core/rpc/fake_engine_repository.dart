@@ -27,6 +27,7 @@ import '../../features/reader/data/reader_session.dart';
 import '../../features/reader/data/staged_record.dart';
 import '../../features/rss/data/rss_models.dart';
 import '../../features/settings/data/theme_preferences.dart';
+import '../../features/settings/data/update_models.dart';
 import '../../features/sources/data/import_outcome.dart';
 import '../../features/sources/data/source_audit.dart';
 import '../../features/sources/data/source_record.dart';
@@ -883,6 +884,12 @@ class FakeEngineRepository implements EngineRepository {
             if (mode != null) 'mode': mode,
             if (eink != null) 'eink': eink,
           });
+
+  @override
+  Future<UpdateInfo?> updateCheck() async => null;
+
+  @override
+  Future<void> updateIgnore(String version) async {}
 
   Future<void> dispose() async {
     _calls.clear();

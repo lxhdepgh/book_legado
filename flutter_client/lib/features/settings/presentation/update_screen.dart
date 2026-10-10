@@ -4,7 +4,7 @@ library;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../../core/rpc/engine_repository.dart';
+import '../../../core/di/providers.dart';
 import '../data/update_models.dart';
 
 class UpdateScreen extends ConsumerStatefulWidget {
