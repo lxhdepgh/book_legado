@@ -57,10 +57,32 @@ class _QrCodeScreenState extends ConsumerState<QrCodeScreen> {
   }
 
   Future<void> _decodeQr() async {
-    // TODO: 需要图片选择器，当前仅展示接口
-    setState(() {
-      _decodeResult = '图片选择功能待实现（需要 image_picker 插件）';
-    });
+    final text = _textController.text.trim();
+    if (text.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('请在上方输入框粘贴要解码的图片 Base64 数据')),
+        );
+      }
+      return;
+    }
+
+    setState(() => _decoding = true);
+    try {
+      final repo = ref.read(engineRepositoryProvider);
+      final result = await repo.qrDecode(text);
+      setState(() {
+        _decoding = false;
+        _decodeResult = result ?? '未识别到二维码';
+      });
+    } catch (e) {
+      setState(() => _decoding = false);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('识别失败：$e')),
+        );
+      }
+    }
   }
 
   @override
@@ -102,7 +124,7 @@ class _QrCodeScreenState extends ConsumerState<QrCodeScreen> {
                 OutlinedButton.icon(
                   onPressed: _decoding ? null : _decodeQr,
                   icon: const Icon(Icons.image_search),
-                  label: const Text('从图片识别'),
+                  label: const Text('识别（Base64）'),
                 ),
               ],
             ),

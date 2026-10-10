@@ -1,6 +1,7 @@
 /// 书籍导出页：导出为 epub / txt。
 library;
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -16,6 +17,7 @@ class ExportScreen extends ConsumerStatefulWidget {
 class _ExportScreenState extends ConsumerState<ExportScreen> {
   final _bookKeyController = TextEditingController();
   final _outputPathController = TextEditingController();
+  String? _selectedFormat;
   String _status = '';
   bool _exporting = false;
 
@@ -26,6 +28,26 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
     super.dispose();
   }
 
+  Future<void> _selectOutputPath(String format) async {
+    final result = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: '选择导出目录',
+    );
+
+    if (result != null) {
+      final bookKey = _bookKeyController.text.trim();
+      if (bookKey.isEmpty) {
+        setState(() => _status = '请先填写书籍标识');
+        return;
+      }
+      // 根据格式自动拼接文件名
+      final fileName = '$bookKey.$format';
+      setState(() {
+        _outputPathController.text = '$result\\$fileName';
+        _selectedFormat = format;
+      });
+    }
+  }
+
   Future<void> _exportEpub() async {
     final bookKey = _bookKeyController.text.trim();
     final outputPath = _outputPathController.text.trim();
@@ -34,24 +56,7 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
       return;
     }
 
-    setState(() {
-      _exporting = true;
-      _status = '正在导出 epub...';
-    });
-
-    try {
-      final repo = ref.read(engineRepositoryProvider);
-      await repo.exportEpub(bookKey, outputPath);
-      setState(() {
-        _exporting = false;
-        _status = '导出成功';
-      });
-    } catch (e) {
-      setState(() {
-        _exporting = false;
-        _status = '导出失败：$e';
-      });
-    }
+    await _doExport('epub', bookKey, outputPath);
   }
 
   Future<void> _exportTxt() async {
@@ -62,17 +67,25 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
       return;
     }
 
+    await _doExport('txt', bookKey, outputPath);
+  }
+
+  Future<void> _doExport(String format, String bookKey, String outputPath) async {
     setState(() {
       _exporting = true;
-      _status = '正在导出 txt...';
+      _status = '正在导出 $format...';
     });
 
     try {
       final repo = ref.read(engineRepositoryProvider);
-      await repo.exportTxt(bookKey, outputPath);
+      if (format == 'epub') {
+        await repo.exportEpub(bookKey, outputPath);
+      } else {
+        await repo.exportTxt(bookKey, outputPath);
+      }
       setState(() {
         _exporting = false;
-        _status = '导出成功';
+        _status = '导出成功：$outputPath';
       });
     } catch (e) {
       setState(() {
@@ -103,13 +116,37 @@ class _ExportScreenState extends ConsumerState<ExportScreen> {
             const SizedBox(height: 12),
             TextField(
               controller: _outputPathController,
-              decoration: const InputDecoration(
+              decoration: InputDecoration(
                 labelText: '输出路径',
-                hintText: '/path/to/output/file',
-                border: OutlineInputBorder(),
+                hintText: '选择目录后自动填充',
+                border: const OutlineInputBorder(),
+                suffixIcon: IconButton(
+                  icon: const Icon(Icons.folder_open),
+                  tooltip: '选择目录',
+                  onPressed: () async {
+                    final format = _selectedFormat ?? 'epub';
+                    await _selectOutputPath(format);
+                  },
+                ),
               ),
             ),
             const SizedBox(height: 16),
+            Row(
+              children: [
+                ElevatedButton.icon(
+                  onPressed: _exporting ? null : () => _selectOutputPath('epub'),
+                  icon: const Icon(Icons.folder_open),
+                  label: const Text('选 epub 目录'),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: _exporting ? null : () => _selectOutputPath('txt'),
+                  icon: const Icon(Icons.folder_open),
+                  label: const Text('选 txt 目录'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
             Row(
               children: [
                 ElevatedButton.icon(

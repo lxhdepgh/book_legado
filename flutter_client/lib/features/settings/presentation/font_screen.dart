@@ -1,6 +1,7 @@
 /// 字体管理页：系统字体扫描 + 用户字体添加/移除 + 当前选中。
 library;
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -45,11 +46,26 @@ class _FontScreenState extends ConsumerState<FontScreen> {
   }
 
   Future<void> _addUserFont() async {
-    // TODO: 需要文件选择器（file_picker 插件）
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('文件选择功能待实现（需要 file_picker 插件）')),
-      );
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['ttf', 'otf', 'ttc', 'woff', 'woff2'],
+    );
+
+    if (result == null || result.files.isEmpty) return;
+
+    final path = result.files.single.path;
+    if (path == null) return;
+
+    try {
+      final repo = ref.read(engineRepositoryProvider);
+      await repo.fontAddUser(path);
+      await _loadFonts();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('添加失败：$e')),
+        );
+      }
     }
   }
 
