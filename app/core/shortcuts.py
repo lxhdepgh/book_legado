@@ -72,13 +72,8 @@ _DISPLAY_REVERSE: dict[str, str] = {
     value: key for key, value in _DISPLAY.items() if not value.isascii()}
 
 #: 快捷键在 ``settings`` 表里的落点：阅读那组是 ``reader.shortcuts``（字典，
-#: 见 :meth:`ReadingService.save_reader_preference`），老板键是两条独立标量。
+#: 阅读器快捷键偏好键（ReadingService.save_reader_preference 用），老板键已移除（Android 不支持）。
 READER_PREF_KEY = "shortcuts"
-BOSS_KEY_ENABLED = "bosskey.enabled"
-BOSS_KEY_SHORTCUT = "bosskey.shortcut"
-
-#: 老板键默认组合：三键同按，不会跟阅读器的单键默认值撞上。
-DEFAULT_BOSS_KEY = "ctrl+alt+h"
 
 
 def normalize_key(value: object) -> str:
@@ -168,10 +163,6 @@ DEFAULT_READER_SHORTCUTS: dict[str, str] = {
     "page_up": "pageup", "page_down": "pagedown",
     "directory": "f", "settings": "comma", "close": "escape",
 }
-
-#: 全局动作（不属于阅读器，设置页单独一段）。
-BOSS_ACTION = ShortcutAction("boss_key", "老板键",
-                             "立刻藏起整个窗口，点托盘图标回来")
 
 
 def default_reader_shortcuts() -> dict[str, str]:

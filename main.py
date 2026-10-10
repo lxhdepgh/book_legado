@@ -175,7 +175,7 @@ def _build_hub():
     # BrowserService 懒拉起 Chromium、WebBridgeService 默认关闭监听（SUSPENDED 语义）。
     from app.services.tools.background_service import BackgroundService
     from app.services.tools.book_export_service import BookExportService
-    from app.services.tools.boss_key_service import BossKeyService
+    # BossKeyService 已移除（Android 不支持系统托盘/老板键）
     from app.services.tools.font_service import FontService
     from app.services.tools.qr_code_service import QrCodeService
     from app.services.tools.replace_rule_service import ReplaceRuleService
@@ -194,9 +194,7 @@ def _build_hub():
     from app import APP_VERSION
     hub.register(UpdateService(current_version=APP_VERSION))
     hub.register(WebBridgeService())
-    # 老板键（藏窗 + 托盘回来）：只在 Windows 有意义，非 Windows 上服务照样注册，
-    # 但 :attr:`available` 为 False，快捷键页会明说"本机没有托盘能力"。
-    hub.register(BossKeyService())
+    # 老板键已移除（Android 不支持系统托盘/老板键功能）
     # 全应用一层背景图（第七十四轮）：只管文件与偏好，那一层画在导航外壳上。
     hub.register(BackgroundService())
     # 同一个实例：引擎的 webview/验证码 fetcher 绑的就是它（上面 M2 段），
@@ -272,24 +270,7 @@ def _wire_browser_page(hub, page) -> None:
         logger.exception("内置浏览器 page 注入失败")
 
 
-def _wire_boss_key(hub, page):
-    """把窗口交给老板键服务，回一个"这一拍按键被它吃掉了没"的判定。
-
-    ``hub.get()`` 拿到的是 EngineProxy：``handle_key`` 是同步方法，Proxy 属性直达
-    原对象，所以判定就跑在界面循环上（正是它改 ``page.window`` 需要的地方）。
-    服务没注册时返回 None，装配处就不挂这条钩子（阅读快捷键照旧）。
-    """
-    from app.services.tools.boss_key_service import BossKeyService
-
-    try:
-        service = hub.get(BossKeyService)
-    except Exception:
-        logger.exception("老板键服务没起来，老板键不可用")
-        return None
-    if service is None:
-        return None
-    service.set_page_provider(lambda: page)
-    return service.handle_key
+# _wire_boss_key 已移除（老板键功能已删除）
 
 
 def _background_path(hub) -> str:
@@ -493,7 +474,7 @@ def main():
             _apply_saved_theme(page, hub)
             _wire_browser_page(hub, page)
             build_app_shell(page, hub, shelf_probe=lambda: _shelf_has_books(hub),
-                            key_filter=_wire_boss_key(hub, page),
+                            # key_filter 已移除（老板键功能已删除）
                             background=_wire_background(hub))
 
         ft.run(_on_page, view=ft.AppView.FLET_APP)
