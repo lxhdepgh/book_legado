@@ -77,6 +77,7 @@ _AUDIT = "app.services.sources.compat_audit_service.CompatAuditService"
 _SETTINGS = "app.core.settings.SettingsService"
 _THEME = "app.services.tools.theme_service.ThemeService"
 _RSS = "app.services.content.rss_service.RssService"
+_READALOUD = "app.services.content.read_aloud.ReadAloudService"
 
 METHODS: tuple[Method, ...] = (
     _m("engine.hello", _SELF, "hello", (), 2.0,
@@ -230,6 +231,23 @@ METHODS: tuple[Method, ...] = (
        ("request_id", "body", "headers", "status", "url", "cookie", "error",
         "js_result"), 5.0,
        summary="WebView 渲染结果交回：解开一次服务端→客户端的 webview.content 反向请求"),
+    # -- G4-D: 朗读域（TTS 控制 + 语音档管理） --
+    _m("readaloud.speak", _READALOUD, "speak",
+       ("book_url", "text", "opts"), 30.0, mode="job",
+       summary="开始朗读：选后端 → 发声；进度与状态走事件流"),
+    _m("readaloud.stop", _READALOUD, "stop_speaking", (), 5.0, mode="sync",
+       summary="停止当前朗读"),
+    _m("readaloud.set_voice", _READALOUD, "set_voice_by_id", ("profile_id",), 5.0,
+       mode="sync", summary="按语音档 id 切换音色（builtin = 内置语音）"),
+    _m("readaloud.set_rate", _READALOUD, "set_rate", ("rate_key",), 5.0, mode="sync",
+       summary="设置语速档位（slow/normal/fast/very_fast，仅系统 TTS 后端生效）"),
+    _m("readaloud.profiles", _READALOUD, "list_profiles", (), 5.0,
+       summary="列出所有已登记的 TTS 语音档"),
+    _m("readaloud.add_profile", _READALOUD, "add_profile",
+       ("name", "url", "headers", "engine_type"), 5.0,
+       summary="登记一条新的 TTS 语音档"),
+    _m("readaloud.remove_profile", _READALOUD, "remove_profile", ("profile_id",), 5.0,
+       summary="删除一条 TTS 语音档"),
 )
 
 #: 按 action 名索引（重名当场炸：两条同名的动作到了客户端就是随机路由）。

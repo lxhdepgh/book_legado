@@ -259,6 +259,19 @@ class SystemTtsBackend(TtsBackend):
             return
         try:
             eng.stop()
+        except Exception:
+            pass
+
+    def set_rate(self, rate: int) -> None:
+        """在专属线程上设置 pyttsx3 语速（词/分钟）。"""
+        if self._closed or not self.available:
+            return
+        try:
+            self._post(lambda: self._engine.setProperty("rate", rate))
+        except Exception as exc:
+            logger.debug("系统 TTS set_rate 异常：%s", exc)
+        try:
+            eng.stop()
         except Exception as exc:  # pragma: no cover
             logger.debug("系统 TTS 关闭前 stop 异常：%s", exc)
         try:
@@ -551,6 +564,40 @@ class ReadAloudService(Service):
             return False
         cur = conn.execute("DELETE FROM tts_profiles WHERE id=?", (int(profile_id),))
         return cur.rowcount > 0
+
+    # ------------------------------------------------------------------ #
+    # 网关动作包装（G4-D）
+    # ------------------------------------------------------------------ #
+    async def set_voice_by_id(self, profile_id: str) -> dict[str, Any] | None:
+        """按语音档 id 切换音色；返回选中的后端信息。
+
+        ``profile_id`` 为字符串：纯数字表示数据库 id，"builtin" 表示内置语音（不设 profile）。
+        """
+        if str(profile_id or "").lower() == "builtin":
+            backend = self.set_voice(None)
+        else:
+            profiles = await self.list_profiles()
+            target = next((p for p in profiles if str(p["id"]) == str(profile_id)), None)
+            if target is None:
+                return None
+            backend = self.set_voice(target)
+        if backend is None:
+            return None
+        return {"name": backend.name, "available": backend.available, "state": backend.state}
+
+    def set_rate(self, rate_key: str) -> None:
+        """设置语速档位（slow/normal/fast/very_fast），仅系统 TTS 后端生效。
+
+        对 edge/http 后端无影响（它们不吃这个参数）。
+        """
+        from app.views.reading.read_aloud_bar import RATE_PRESETS
+        rate_value = RATE_PRESETS.get(str(rate_key))
+        if rate_value is None:
+            return
+        # 只有 system 后端支持语速调节
+        backend = self._backends.get("system")
+        if isinstance(backend, SystemTtsBackend):
+            backend.set_rate(rate_value)
 
     # ------------------------------------------------------------------ #
     # 内部
