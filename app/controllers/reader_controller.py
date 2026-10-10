@@ -38,7 +38,6 @@ from app.services.content.read_aloud import ReadAloudService
 from app.services.content.local_book_service import is_local_source_url
 from app.services.sources.rule_repair_service import RuleRepairService
 from app.services.engine.rule_engine import display_intro, html_to_text
-from app.services.tools.dict_service import DictService
 from app.core.shortcuts import (action_for, chord_of, default_reader_shortcuts,
                                 merge_reader_shortcuts)
 
@@ -99,8 +98,6 @@ class ReaderController(BaseController):
         self._tts = self._safe_service(ReadAloudService)
         # 自愈同样是可选形态：没有 RuleRepairService 时失败条上不给"自动修复"动作。
         self._repair = self._safe_service(RuleRepairService)
-        # 词典同样是可选形态：没有 DictService 时「查词典」给一句明确的话，不静默。
-        self._dict = self._safe_service(DictService)
         # 视频书也是可选形态：没有 MediaPlayService 时面板直接报"服务未就绪"，
         # 而不是悄悄把视频丢给系统默认播放器（凭空开一个外部窗口）。
         self._media = self._safe_service(MediaPlayService)
@@ -754,29 +751,18 @@ class ReaderController(BaseController):
         self._view.set_immersive(not self._view.immersive)
 
     # ------------------------------------------------------------------ #
-    # 划词查词典（选中 → 划词条 → 点「查词典」→ DictService.lookup → 释义弹窗）
+    # 划词查词典（已移除 DictService，功能待重新实现）
     # ------------------------------------------------------------------ #
     def lookup_word(self, word: str, _=None) -> None:
-        """查划词条上那个词：一次点击一次请求，选中过程一条网络都不发。
-
-        弹窗先亮"查询中…"：``lookup`` 要抓释义页（几秒），点了没反应会被当成
-        按钮坏了、连点第二下——所以同一词在途时直接忽略。
-        """
+        """查划词条上那个词：词典服务已移除，提示用户。"""
         word = str(word or "").strip()
         if not word:
             return
-        if self._lookup_word == word and self._definition_dialog is not None:
-            return
-        if self._dict is None:
-            self._open_definition(word, status="词典服务未就绪，查不了词")
-            return
-        self._open_definition(word, status="查询中…")
-        future = self.ui_call(self._dict.lookup(word))
-        future.add_done_callback(self.on_done(lambda f: self._after_lookup(word, f)))
+        self._open_definition(word, status="词典功能已移除")
 
     def _open_definition(self, word: str, *, text: str = "",
                          status: str = "") -> None:
-        """开（或换到）释义弹窗：只有真开了弹窗才认领 ``_lookup_word``。"""
+        """开（或换到）释义弹窗：当前仅显示状态消息。"""
         page = self._page()
         if page is None:
             return
@@ -787,26 +773,8 @@ class ReaderController(BaseController):
         self.flush()
 
     def _after_lookup(self, word: str, future) -> None:
-        if self._view is None:    # 在途时用户已切页
-            return
-        if self._lookup_word != word:
-            # 弹窗已经换成别的词（或已被关掉）：这条迟到结果贴上去就是假释义。
-            return
-        try:
-            raw = future.result()
-        except Exception as exc:
-            logger.warning("划词查询失败 %s: %s", word, exc)
-            self._view.update_definition(status=f"查询失败：{exc}")
-            return
-        text = _definition_text(raw)
-        if text.strip():
-            self._view.update_definition(text=text)
-            return
-        # 服务侧"没有启用规则 / 抓取失败"都只回空串：这里必须说清是哪种不见得，
-        # 但绝不能只显示一个空弹窗。
-        self._view.update_definition(status=(
-            f"没查到「{word}」的释义：词典规则可能未启用或释义页抓取失败\n"
-            "规则在「更多工具 → 词典」里维护"))
+        """词典查询回调（已废弃）。"""
+        pass
 
     def close_definition(self, _=None) -> None:
         self._lookup_word = ""
