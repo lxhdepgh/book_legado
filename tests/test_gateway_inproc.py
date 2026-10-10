@@ -38,9 +38,12 @@ from app.gateway import jsonschema_min as schema
 from app.gateway.methods import BY_ACTION
 from app.gateway.serialize import find_leak
 from app.services.app_paths import AppPaths
+from app.services.engine.reading_engine import ChapterContent, ContentBlock
 from app.services.engine.rule_engine_service import RuleEngineService
 from app.services.gateway.service import (
     WEBVIEW_TIMEOUT, GatewayService, WebviewUnavailable)
+from app.services.reading.reading_service import block_rows
+from app.services.reading_cache import ReadingCache
 from app.services.sources.source_check_service import SourceCheckService
 from app.services.sources.source_service import SourceService
 from app.services.tools.browser_service import BrowserService
@@ -1047,9 +1050,34 @@ class JsBridgeThreadAffinityTests(_FramesByType, unittest.TestCase):
 
 
 class MediaEndpointTests(unittest.TestCase):
-    """``GET /media/{key}``：二进制不走 RPC，key 被正则钉死，Range 是真语义。"""
+    """``GET /media/{key}``：二进制不走 RPC，两种 key 各被钉死，Range 是真语义。
+
+    两把尺分别归两处：封面名归 ``SourceService._normalize_cover`` 落在盘上的文件名，
+    正文插图名归 ``ReadingCache.media_key``——后者就是缓存自己写在盘上的那两个摘要
+    加一个下标（设计 §4.4「不新造一套键空间」）。所以这一族存图**一律走真函数**：
+    手拼一份 JSON 只能证明网关认得它自己抄的形状，证明不了键与盘上的名字同源。
+    """
 
     KEY = "0123456789abcdef.jpg"
+
+    #: 正文插图那一路的坐标：与黄金样本同一条回环假源（``fake_source_reader``）。
+    SOURCE = "http://127.0.0.1:8797/g3"
+    BOOK = "http://127.0.0.1:8797/g3/book/1.html"
+    CHAPTER = "http://127.0.0.1:8797/g3/ch/2.html"
+    OTHER_CHAPTER = "http://127.0.0.1:8797/g3/ch/3.html"
+    PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(64))
+    WEBP = b"RIFF\x00\x00\x00\x00WEBPVP8 " + bytes(32)
+
+    @classmethod
+    def _chapter(cls, picture: bytes) -> ChapterContent:
+        """一"章"：两段正文夹一张图——图的**下标**是键的一部分，形状要真。"""
+        return ChapterContent(
+            blocks=[ContentBlock("text", "第一段\n第二段"),
+                    ContentBlock("image", picture, {"Cookie": "a=1"},
+                                 "", "https://protected.test/pic.jpg"),
+                    ContentBlock("text", "第三段")],
+            title="第2章 测试章", image_style="",
+            raw_content="第一段\n第二段\n第三段")
 
     def setUp(self) -> None:
         self.harness = Harness()
@@ -1058,6 +1086,11 @@ class MediaEndpointTests(unittest.TestCase):
         covers = self.harness.storage.cache_dir("image-cache/covers")
         self.body = bytes(range(256)) * 4
         (covers / self.KEY).write_bytes(self.body)
+        self.reader = ReadingCache(self.harness.storage.paths.cache)
+        self.reader.save_content(self.SOURCE, self.BOOK, self.CHAPTER,
+                                 self._chapter(self.PNG))
+        self.chapter_key = self.reader.media_key(self.SOURCE, self.BOOK,
+                                                 self.CHAPTER, 1)
 
     def _get(self, key: str, headers=None):
         async def _drive(session, base, token):
@@ -1088,6 +1121,91 @@ class MediaEndpointTests(unittest.TestCase):
     def test_missing_file_is_404_not_a_crash(self) -> None:
         status, _, _ = self._get("ffffffffffffffff.jpg")
         self.assertEqual(status, 404)
+
+    # ---------------- 正文插图那一路（第九十五轮 G3-D4） ----------------
+
+    def test_chapter_wire_field_is_the_http_address(self) -> None:
+        """协议面发的 ``mediaKey`` 就是这条地址，取回的字节与存进去的一字不差。
+
+        两头都走真函数：存用 ``save_content``、发地址用 ``block_rows``（正文那一发
+        序列化块表的就是它）。中间那一格若是手抄的，两侧就只是在比同一个常量。
+        """
+        rows = block_rows(self._chapter(self.PNG).blocks, self.reader,
+                          (self.SOURCE, self.BOOK, self.CHAPTER))
+        self.assertEqual([row["mediaKey"] for row in rows],
+                         ["", self.chapter_key, ""],
+                         "只有服务端此刻真存着字节的那一块该拿到地址")
+        self.assertEqual(rows[1]["url"], "https://protected.test/pic.jpg",
+                         "url 那一格退回本来的职责：远端地址，不是取字节的把手")
+        self.assertEqual({len(row) for row in rows}, {7},
+                         "每行键数必须固定——少一格的行会让白名单形状的守卫失明")
+        status, body, headers = self._get(rows[1]["mediaKey"])
+        self.assertEqual((status, body), (200, self.PNG))
+        self.assertEqual(headers["Content-Type"], "image/png")
+
+    def test_media_type_is_sniffed_not_pinned(self) -> None:
+        """类型是嗅出来的：同一种 key 形状、不同文件头 → 不同 Content-Type。
+
+        只测 PNG 的话"钉死 image/jpeg"也能绿，所以这一发必须换格式；再补一发
+        认不出来的头——不许它冒充 jpeg。
+        """
+        for picture, expected in ((self.WEBP, "image/webp"),
+                                  (b"BM" + bytes(30), "application/octet-stream")):
+            self.reader.save_content(self.SOURCE, self.BOOK, self.OTHER_CHAPTER,
+                                     self._chapter(picture))
+            key = self.reader.media_key(self.SOURCE, self.BOOK, self.OTHER_CHAPTER, 1)
+            status, body, headers = self._get(key)
+            self.assertEqual((status, body), (200, picture))
+            self.assertEqual(headers["Content-Type"], expected, key)
+
+    def test_chapter_ranges_share_the_cover_semantics(self) -> None:
+        """两把 key 共用一套 Range：半份、后缀、越界各回各的。
+
+        期望的 ``Content-Range`` 是按 HTTP 语义从**字节长度**推出来的（闭区间、
+        后缀那发是 `末-8 .. 末-1`），不是读 `_ranged` 自己拼的那个串——读它拼的
+        就等于让实现给自己判卷。
+        """
+        length = len(self.PNG)
+        for spec, expected, content_range in (
+            ("bytes=4-11", self.PNG[4:12], f"bytes 4-11/{length}"),
+            ("bytes=-8", self.PNG[-8:], f"bytes {length - 8}-{length - 1}/{length}"),
+        ):
+            status, body, headers = self._get(self.chapter_key, {"Range": spec})
+            self.assertEqual((status, body), (206, expected), spec)
+            self.assertEqual(headers["Content-Range"], content_range, spec)
+        status, _, headers = self._get(self.chapter_key)
+        self.assertEqual(headers["Accept-Ranges"], "bytes")
+        status, body, headers = self._get(self.chapter_key,
+                                          {"Range": "bytes=99999-100000"})
+        self.assertEqual(status, 416)
+        self.assertEqual(headers["Content-Range"], f"bytes */{len(self.PNG)}")
+        self.assertEqual(body, b"")
+
+    def test_chapter_keys_that_point_at_nothing_are_404(self) -> None:
+        """四种"取不到"各有各的形状，一律 404，而不是回一份看着像的东西。
+
+        ``别的书`` 那一发是关键：章摘要完全正确、书摘要是另一本——如果网关只看了
+        后半段就取文件，这一发会回 200，而"两个摘要都在寻址"这件事就没人证过。
+        """
+        book_digest, chapter_digest, _ = self.chapter_key.split("-")
+        for label, key in {
+            "文本块那一位": self.reader.media_key(self.SOURCE, self.BOOK,
+                                                  self.CHAPTER, 0),
+            "越界下标": self.reader.media_key(self.SOURCE, self.BOOK,
+                                              self.CHAPTER, 9),
+            "别的书（章摘要没错）": f"{'9' * 64}-{chapter_digest}-1",
+            "别的章（书摘要没错）": f"{book_digest}-{'9' * 64}-1",
+            "大写形状": self.chapter_key.upper(),
+        }.items():
+            self.assertEqual(self._get(key)[0], 404, f"{label} 不该被答出来")
+        # 零字节那一发排在最后：它覆盖的就是上面那本同一章，写完 chapter_key 就不成立了
+        self.reader.save_content(self.SOURCE, self.BOOK, self.CHAPTER,
+                                 self._chapter(b""))
+        status, body, _ = self._get(self.chapter_key)
+        self.assertEqual(status, 404,
+                         "缓存里躺着 b''（取图失败那一格）时回 200 零字节，客户端的 "
+                         "errorBuilder 永远不触发——图位上是一片空白，不是「取不到」")
+        self.assertEqual(body, b"not found", "404 那一发必须真空：半个 jpeg 会被当成图开始渲染")
 
     def test_media_reads_keep_the_idle_countdown_at_bay(self) -> None:
         """只拉封面不发动作的客户端也是活人：``/media`` 同样要把倒计时掐回去。

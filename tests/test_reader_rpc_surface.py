@@ -331,9 +331,58 @@ def test_protected_image_keeps_its_address_through_the_cache() -> None:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_block_index_survives_the_display_rewrite(tmp_path: Path) -> None:
+    """字节块过完渲染还在**原来那一格**——那个下标就是它在 ``/media`` 上的名字。
+
+    G3-D4 的地址是 ``<书摘要>-<章摘要>-<块下标>``，下标是选择器。今天
+    :func:`display_blocks` 是一份 1:1 的列表推导（只改文本 value，不增删、不换序），
+    所以拿它当下标是安全的；哪天它加一条"空段丢弃"或"多图合并"，客户端收到的地址
+    会指向**另一块**——那不是 404，是张冠李戴地画出另一张图，而两侧都绿。
+    这条守卫钉的就是那层隐式前提，连同"落盘读回一趟之后仍然成立"。
+    """
+    from app.services.engine.reading_engine import display_blocks
+    from app.services.reading.reading_service import block_rows
+
+    picture = b"\xff\xd8\xff\xe0\x00\x01"
+    blocks = [ContentBlock("text", "甲段" + "甲" * 12),
+              ContentBlock("text", "<usehtml><b>乙段重点</b></usehtml>"),
+              ContentBlock("image", picture, {"Cookie": "a=1"}, "插图",
+                           f"{SOURCE_URL}/pic.jpg"),
+              ContentBlock("audio", f"{SOURCE_URL}/voice.mp3", {}, "有声"),
+              ContentBlock("text", "丙段" + "丙" * 30)]
+    shown = display_blocks(ChapterContent(title="第一章", blocks=blocks))
+
+    assert len(shown) == len(blocks), "渲染换了块数：下标不再是那块图的名字"
+    assert [block.kind for block in shown] == [block.kind for block in blocks]
+    # 正对照：改写真发生了——"长度一样"若是没改出来的，这条比对就是空的。
+    assert "<usehtml>" not in shown[1].value and "乙段重点" in shown[1].value, \
+        shown[1].value
+    assert isinstance(shown[2].value, bytes), "字节块被降级成字符串：那一格不再算二进制"
+    assert sum(isinstance(block.value, bytes) for block in shown) == 1, \
+        "不止一格带字节：发地址的那一支会给每一格都发"
+    assert shown[2].url == f"{SOURCE_URL}/pic.jpg", "换成字节之后只剩这一格认得地址"
+    assert shown[3].value == f"{SOURCE_URL}/voice.mp3", "公开媒体地址被清洗改写过"
+
+    # 落盘一趟再读回来：下标、字节、地址三者还指向同一格，地址才取得到东西。
+    cache = ReadingCache(tmp_path)
+    key = (SOURCE_URL, BOOK_URL, CHAPTER_URLS[0])
+    cache.save_content(*key, ChapterContent(title="第一章", blocks=shown))
+    rows = block_rows(display_blocks(cache.load_content(*key)), cache, key)
+    assert [row["mediaKey"] != "" for row in rows] == \
+        [False, False, True, False, False], \
+        f"发地址的那一格不在下标 2：{[row['mediaKey'] for row in rows]}"
+    assert cache.media_bytes(rows[2]["mediaKey"]) == picture, "取回的不是那一块的字节"
+    # 没被换成字节的那一格照旧由 url 那格自取（发了地址反而多一条没人应的路）。
+    assert rows[3]["url"] == f"{SOURCE_URL}/voice.mp3" and rows[3]["binary"] is False
+    # 正对照：相邻那格的地址取不到东西（下标真在寻址，不是"整章回一份"）。
+    assert cache.media_bytes(cache.media_key(*key, 3)) is None, \
+        "音频格也躺着字节：上一发挑错了块"
+
+
 # --------------------------------------------------------------------------- #
 # 三、目录行：键与 ChapterItem 双向对齐，投影裁得掉重的
 # --------------------------------------------------------------------------- #
+
 
 def _camel(snake: str) -> str:
     head, *rest = snake.split("_")

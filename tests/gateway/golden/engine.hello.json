@@ -8,14 +8,14 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-engine.hello-1387247250000000",
+    "id": "r4-engine.hello-1392017437000000",
     "action": "engine.hello",
     "seq": 1,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-engine.hello-1387247250000000",
+    "id": "r4-engine.hello-1392017437000000",
     "ok": true,
     "data": {
       "protocol_version": 1,
@@ -24,6 +24,7 @@
         "rpc",
         "events",
         "media.covers",
+        "media.chapters",
         "job.actions",
         "webview.reverse"
       ],
@@ -79,17 +80,17 @@
         "theme.preferences",
         "theme.save"
       ],
-      "pid": 117848
+      "pid": 117196
     },
     "error": null,
     "code": null
   },
   "row_count": 1,
   "inline_row_count": null,
-  "bytes": 1013,
-  "sha256": "e97c04c97f7c587e414b9483442b0601ff2ab0022822e3915afb2233b8a30db9",
-  "client_wall_ms": 6.0,
-  "wire_bytes": 1177,
+  "bytes": 1030,
+  "sha256": "cd56d857a3e78de16b9926e54409d04ff54c7f2426976ff4241869de622cc3ed",
+  "client_wall_ms": 6.1,
+  "wire_bytes": 1195,
   "field_names": [
     "actions",
     "build",

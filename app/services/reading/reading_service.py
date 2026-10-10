@@ -1449,7 +1449,8 @@ class ReadingService(Service):
             "chapterName": str(getattr(chapter, "name", "") or ""),
             "title": str(getattr(shown, "title", "") or ""),
             "imageStyle": str(getattr(shown, "image_style", "") or ""),
-            "blocks": [_block_row(block) for block in shown.blocks],
+            "blocks": block_rows(shown.blocks, self._cache,
+                                 self._content_key(source, book, chapter)),
             "paragraphCount": len(paragraphs),
             "totalChars": chapter_text_length(paragraphs),
         }
@@ -1615,12 +1616,15 @@ def _chapter_row(chapter) -> dict:
     }
 
 
-def _block_row(block) -> dict:
+def _block_row(block, media_key: str = "") -> dict:
     """正文块上协议面的形状：文本给原文，媒体给地址，二进制只给"我是二进制"。
 
     ``url`` 与 ``value`` 分两格是有原因的：受保护图在引擎里会被换成字节串好让 flet
     显示（见 ``ContentBlock.url`` 那一格），此时 ``value`` 是 None 而地址还在——
-    跨进程那侧（``Image.network``/``media_kit``）用的就是这一格加 ``headers``。
+    跨进程那侧原先只能拿这一格加 ``headers`` 去远端取，而**那份 cookie/UA 恰恰只在
+    服务端有**（``_load_protected_images`` 就是为此才把字节拉回来的）。G3-D4 之后
+    这一格退回它本来的职责：非受保护的公开地址。字节改由 ``mediaKey`` 那一格领，
+    形状是 ``GET /media/{key}``（§4.4），地址由服务端算、由缓存自己那支摘要函数出。
     字节本身按设计 §4.4 不过协议面。
     """
     value = getattr(block, "value", "")
@@ -1632,9 +1636,30 @@ def _block_row(block) -> dict:
         "value": None if is_binary else str(value or ""),
         "url": (raw_url or ("" if is_binary or kind == "text" else str(value or ""))),
         "binary": bool(is_binary),
+        "mediaKey": media_key,
         "title": str(getattr(block, "title", "") or ""),
         "headers": dict(getattr(block, "headers", None) or {}),
     }
+
+
+def block_rows(blocks, cache, key: tuple[str, str, str]) -> list[dict]:
+    """一整章的块表 → 协议面，顺带给"服务端此刻真存着字节"的那几块发地址。
+
+    地址只在这两个条件都成立时才发：这一块的值是字节、而且缓存面在那儿（``cache``
+    是 :class:`ReadingCache`）。没有缓存就没有可取的字节，发一条取不到的地址比发空串
+    更坏——空串让客户端照旧走 ``url`` 那一格，发错地址会让它去敲一扇没人应的门。
+
+    ``key`` 必须是 :meth:`ReadingService._content_key` 那个三元组：字节是照着它落盘的，
+    换成请求参数里的 ``source_url`` 就可能是另一份摘要（书源 url 有过归一化那一次）。
+    """
+    rows = []
+    for index, block in enumerate(blocks):
+        media_key = ""
+        if cache is not None and isinstance(getattr(block, "value", None),
+                                            (bytes, bytearray)):
+            media_key = cache.media_key(*key, index)
+        rows.append(_block_row(block, media_key=media_key))
+    return rows
 
 
 #: 搜索范围特殊值（与找书页面的范围选择器一致）。

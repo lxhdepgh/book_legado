@@ -8,7 +8,7 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "g3-reader.toc-1387251093000000",
+    "id": "g3-reader.toc-1392019984000000",
     "action": "reader.toc",
     "seq": 0,
     "payload": {
@@ -18,7 +18,7 @@
   },
   "response": {
     "v": 1,
-    "id": "g3-reader.toc-1387251093000000",
+    "id": "g3-reader.toc-1392019984000000",
     "ok": false,
     "data": null,
     "error": "ReaderSessionError: 当前会话不是这本书，先调 reader.open：source='http://127.0.0.1:8797/g3' book='http://127.0.0.1:9/没开过的书'（会话=('http://127.0.0.1:8797/g3', 'http://127.0.0.1:8797/g3/book/preview.html')）",
@@ -28,7 +28,7 @@
   "inline_row_count": null,
   "bytes": 4,
   "sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
-  "client_wall_ms": 0.8,
+  "client_wall_ms": 0.5,
   "wire_bytes": 339,
   "field_names": []
 }

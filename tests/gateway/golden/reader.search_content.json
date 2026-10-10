@@ -8,7 +8,7 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-reader.search_content-1387250953000000",
+    "id": "r4-reader.search_content-1392019890000000",
     "action": "reader.search_content",
     "seq": 12,
     "payload": {
@@ -19,7 +19,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-reader.search_content-1387250953000000",
+    "id": "r4-reader.search_content-1392019890000000",
     "ok": true,
     "data": {
       "hits": [
@@ -40,10 +40,16 @@
           "para_index": 2,
           "offset": 1578.0,
           "snippet": "第4章<mark>第3段</mark>字句读纸张看灯下山风月夜…"
+        },
+        {
+          "chapter_index": 4,
+          "para_index": 2,
+          "offset": 1578.0,
+          "snippet": "第5章<mark>第3段</mark>字句读纸张看灯下山风月夜…"
         }
       ],
-      "written": 24,
-      "indexedChapters": 3,
+      "written": 32,
+      "indexedChapters": 4,
       "ftsAvailable": true
     },
     "error": null,
@@ -51,10 +57,10 @@
   },
   "row_count": 1,
   "inline_row_count": null,
-  "bytes": 453,
-  "sha256": "2f86832c44f244679bf49c5c76c7beb8da785b3b4203894a1570f671ffb0d196",
-  "client_wall_ms": 33.4,
-  "wire_bytes": 593,
+  "bytes": 583,
+  "sha256": "120a51ad562d17952d00e7f696a223bdfe262da11450cce787e775b3bcfc3488",
+  "client_wall_ms": 33.8,
+  "wire_bytes": 731,
   "field_names": [
     "ftsAvailable",
     "hits",

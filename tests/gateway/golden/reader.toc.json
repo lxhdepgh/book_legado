@@ -8,7 +8,7 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-reader.toc-1387250156000000",
+    "id": "r4-reader.toc-1392019671000000",
     "action": "reader.toc",
     "seq": 4,
     "payload": {
@@ -18,7 +18,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-reader.toc-1387250156000000",
+    "id": "r4-reader.toc-1392019671000000",
     "ok": true,
     "data": [
       {
@@ -89,7 +89,7 @@
   "inline_row_count": 6,
   "bytes": 907,
   "sha256": "dd7986dc2c7dbd2937ba23a3f2c8977eb58d55961bd4d60d372ae7401609183b",
-  "client_wall_ms": 1.9,
+  "client_wall_ms": 1.1,
   "wire_bytes": 1101,
   "field_names": [
     "index",

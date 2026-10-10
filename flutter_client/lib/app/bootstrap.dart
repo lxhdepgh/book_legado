@@ -63,6 +63,9 @@ class BootstrapResult {
         overrides: [
           engineRepositoryProvider.overrideWithValue(repository),
           engineHandleProvider.overrideWithValue(handle),
+          // 二进制那条路（§4.4 `GET /media/{key}`）要的是地址，不是动作：
+          // 真起过进程才有端口与令牌，替身那一程是 null（图片退回 url 那一格）。
+          engineEndpointProvider.overrideWithValue(handle?.started.endpoint),
         ],
         child: child,
       );

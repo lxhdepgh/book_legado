@@ -8,17 +8,17 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-switch.snapshot-1387252546000000",
+    "id": "r4-switch.snapshot-1392021328000000",
     "action": "switch.snapshot",
     "seq": 3,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-switch.snapshot-1387252546000000",
+    "id": "r4-switch.snapshot-1392021328000000",
     "ok": true,
     "data": {
-      "switch_id": "6379028",
+      "switch_id": "11147806",
       "running": false,
       "cancelled": false,
       "done": 3,
@@ -157,10 +157,10 @@
   },
   "row_count": 1,
   "inline_row_count": null,
-  "bytes": 2408,
-  "sha256": "ad6ec53424b9f900e45e4c15d8351a0bd1d4430e01566ae0fa6dc3f2d730c1c0",
+  "bytes": 2409,
+  "sha256": "69b328b45216816d607292c0c7e260077c14e7b5286263773f381f8d85bd6be8",
   "client_wall_ms": 1.1,
-  "wire_bytes": 2753,
+  "wire_bytes": 2754,
   "field_names": [
     "cancelled",
     "candidates",

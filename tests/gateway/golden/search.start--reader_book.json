@@ -8,18 +8,18 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-search.start-1387249921000000",
+    "id": "r4-search.start-1392019437000000",
     "action": "search.start",
     "seq": 2,
     "payload": {
       "keyword": "阅读基线书",
       "scope": "G3离线",
-      "search_id": 6376
+      "search_id": 11146
     }
   },
   "response": {
     "v": 1,
-    "id": "r4-search.start-1387249921000000",
+    "id": "r4-search.start-1392019437000000",
     "ok": true,
     "data": {
       "started": true,
@@ -41,7 +41,7 @@
   "event_sample": {
     "name": "SearchFinishedEvent",
     "payload": {
-      "search_id": "6376",
+      "search_id": "11146",
       "items": [
         {
           "name": "阅读基线书",
@@ -83,10 +83,10 @@
           ]
         }
       ],
-      "timestamp": 1791606376.60335,
+      "timestamp": 1791611146.1268942,
       "finished": true
     },
-    "payload_bytes": 774,
+    "payload_bytes": 777,
     "payload_list_key": "items",
     "row_count": 1,
     "inline_row_count": 1,

@@ -8,7 +8,7 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-settings.read-1387249781000000",
+    "id": "r4-settings.read-1392019312000000",
     "action": "settings.read",
     "seq": 27,
     "payload": {
@@ -22,7 +22,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-settings.read-1387249781000000",
+    "id": "r4-settings.read-1392019312000000",
     "ok": true,
     "data": {
       "reader.max_width": 700.0,
@@ -40,7 +40,7 @@
   "inline_row_count": null,
   "bytes": 123,
   "sha256": "fd86a6e815f6ddab456a807fd1ae0db8d1adb64cca4f00af2f883b3f03c97893",
-  "client_wall_ms": 0.5,
+  "client_wall_ms": 0.4,
   "wire_bytes": 235,
   "field_names": [
     "appearance.snapshot",

@@ -76,14 +76,18 @@ SNAPSHOT_EVENTS: frozenset[str] = frozenset({
     "MediaPlayStateEvent",
 })
 
-#: ``/media`` 的 key 形状：封面落点就是 ``md5(book_url)[:16].jpg``
+#: ``/media`` 的第一种 key 形状：封面落点就是 ``md5(book_url)[:16].jpg``
 #: （见 ``source_service.py::_normalize_cover``）。**不新造 key 空间**，
 #: 也不让路径进来——正则不匹配直接 404，``..`` 这种形状到不了文件名。
+#: 第二种形状（正文插图）的语法在 ``reading_cache.MEDIA_KEY_RE``，那里是它的定义处。
 _MEDIA_KEY_RE = re.compile(r"^[0-9a-f]{16}\.jpg$")
 
 #: 握手时回给客户端的能力位。加一条就得真有一条。
-CAPABILITIES: tuple[str, ...] = ("rpc", "events", "media.covers", "job.actions",
-                                 "webview.reverse")
+#: ``media.covers`` 与 ``media.chapters`` 分两条是因为它们真的是两个键空间
+#: （``image-cache/covers`` 的文件名 vs reader-cache 的三段摘要），客户端要能分辨
+#: 自己拿到的是哪一种地址；合成一条就再也问不出"这本书的插图能不能渲染"。
+CAPABILITIES: tuple[str, ...] = ("rpc", "events", "media.covers", "media.chapters",
+                                 "job.actions", "webview.reverse")
 
 #: 反向调用（§8 R1：可见 WebView 归 Flutter）的默认预算（秒）。
 #: 与 ``headless_browser`` 的 20s 同值——那条是今天内核渲染的预算，换宿主不该更短。
@@ -713,25 +717,48 @@ class GatewayService(Service):
             self._arm_idle_timer()
 
     async def _media(self, request: web.Request) -> web.Response:
+        """``GET /media/{key}``：两种 key 形状，一套 Range 语义。
+
+        两条都是**服务端自己发出去的地址**（封面名出自 ``SourceService._normalize_cover``，
+        插图名出自 ``ReadingCache.media_key``），所以这里不猜、不试、不"看起来像就取"：
+        形状对不上直接 404。缓存那一路的语法也不在这儿重写一遍——问的是
+        ``reading_cache.is_media_key``，那把尺与写盘的那把尺同源（§4.4「不新造一套键空间」）。
+        """
         key = request.match_info["key"]
-        if not _MEDIA_KEY_RE.match(key):
-            return web.Response(status=404, text="unknown media key")
-        root = self._covers_dir()
-        if root is None:
-            return web.Response(status=503, text="封面目录不可用")
-        # key 已被正则钉死成 [0-9a-f]{16}.jpg：拼不出目录穿越。
-        path = root / key
-        if not path.is_file():
-            return web.Response(status=404, text="not found")
-        whole = path.stat().st_size
-        body = path.read_bytes()
+        if _MEDIA_KEY_RE.match(key):
+            root = self._covers_dir()
+            if root is None:
+                return web.Response(status=503, text="封面目录不可用")
+            # key 已被正则钉死成 [0-9a-f]{16}.jpg：拼不出目录穿越。
+            path = root / key
+            if not path.is_file():
+                return web.Response(status=404, text="not found")
+            return self._ranged(request, path.read_bytes(), "image/jpeg")
+        from app.services.reading_cache import is_media_key
+
+        if is_media_key(key):
+            cache = self._reader_cache()
+            if cache is None:
+                return web.Response(status=503, text="正文缓存不可用")
+            body = cache.media_bytes(key)
+            if not body:
+                # 空字节是"这张图当年就没取到"（``_load_protected_images`` 失败时落
+                # ``b""``），缓存里真躺着它。回 200 零字节会让客户端的 errorBuilder
+                # 永远不触发——图位上是一片什么都没有的空白，而不是一句"取不到"。
+                return web.Response(status=404, text="not found")
+            return self._ranged(request, body, _sniff_media_type(body))
+        return web.Response(status=404, text="unknown media key")
+
+    @staticmethod
+    def _ranged(request: web.Request, body: bytes, content_type: str) -> web.Response:
+        """整份或半份：Range 是 HTTP 语义，不归 RPC 信封管。"""
+        whole = len(body)
         headers = {"Accept-Ranges": "bytes"}
         status = 200
         spec = request.headers.get("Range", "")
         if spec.startswith("bytes="):
             span = _parse_range(spec[6:], whole)
             if span is None:
-                # 越界回裸 416：Range 是 HTTP 语义，不归 RPC 信封管。
                 return web.Response(status=416,
                                     headers={"Content-Range": f"bytes */{whole}"})
             start, end = span
@@ -739,7 +766,7 @@ class GatewayService(Service):
             status = 206
             headers["Content-Range"] = f"bytes {start}-{end}/{whole}"
         return web.Response(body=body, status=status,
-                            content_type="image/jpeg", headers=headers)
+                            content_type=content_type, headers=headers)
 
     def _covers_dir(self) -> Path | None:
         """封面落点：走与 SourceService 同一条 ``StorageService.cache_dir`` 口径。"""
@@ -752,6 +779,42 @@ class GatewayService(Service):
         except Exception:
             logger.debug("网关取封面目录失败", exc_info=True)
             return None
+
+    def _reader_cache(self):
+        """正文缓存的读端：与 ReadingService 同一个 ``StorageService.paths.cache`` 口径。
+
+        这里**不自己拼 reader-cache 的路**：目录布局归 ``ReadingCache``，网关只是替它把
+        字节递出去。两处各拼一遍 ``<cache>/reader-cache`` 的话，改布局那天网关会开始
+        回 404，而阅读面一切正常（记忆 ``refactor-regression-orphan-methods`` 那一族）。
+        """
+        if self.hub is None:
+            return None
+        try:
+            from app.core.storage import StorageService
+            from app.services.reading_cache import ReadingCache
+
+            return ReadingCache(self.hub.require(StorageService).paths.cache)
+        except Exception:
+            logger.debug("网关取正文缓存目录失败", exc_info=True)
+            return None
+
+
+def _sniff_media_type(payload: bytes) -> str:
+    """按文件头认类型：缓存里没存 content-type，字节自己是唯一证人。
+
+    认不出来回 ``application/octet-stream`` 而不是猜 ``image/jpeg``——Flutter 的解码器
+    看的是字节，类型不对不会让图坏，但一条"写着 jpeg 的 png"会在排查时骗人。
+    """
+    if payload.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if payload.startswith(b"GIF8"):
+        return "image/gif"
+    if payload[:4] == b"RIFF" and payload[8:12] == b"WEBP":
+        return "image/webp"
+    return "application/octet-stream"
+
 
 
 def _parse_range(spec: str, size: int) -> tuple[int, int] | None:

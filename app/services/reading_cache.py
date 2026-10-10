@@ -5,6 +5,7 @@ import base64
 import binascii
 import hashlib
 import json
+import re
 import shutil
 import time
 import uuid
@@ -13,6 +14,25 @@ from pathlib import Path
 
 from app.services.engine.reading_engine import ChapterContent, ContentBlock
 from app.services.engine.rule_engine import ChapterItem
+
+#: ``GET /media/{key}`` 的第二种 key 形状（设计 §4.4）：
+#: ``<书目录摘要>-<章文件摘要>-<块序号>``。
+#:
+#: 三段全是 :class:`ReadingCache` **自己已经写在盘上的名字**——前两段就是
+#: ``_book_dir()`` 的目录名与 ``content/*.json`` 的文件名，第三段是那份 JSON 里
+#: ``blocks`` 的下标。所以这一格不是新造一套键空间，是把已有的键拼成一条能取回
+#: 字节的地址；而正文插图（``_load_protected_images`` 换成字节的那些块）只有
+#: 这一条路能跨进程渲染：字节按 §4.4 不过协议面，``url`` 那一格是远端地址，
+#: 受保护图带着它去取恰好缺了服务端那份 cookie/UA。
+#:
+#: 分隔符用 ``-`` 不用 ``/``：``{key}`` 是一段的路径参数，而三段只可能是十六进制
+#: 与十进制——``.`` 与 ``/`` 在语法层就进不来，目录穿越拼不出来。
+MEDIA_KEY_RE = re.compile(r"^([0-9a-f]{64})-([0-9a-f]{64})-([0-9]{1,6})$")
+
+
+def is_media_key(key: str) -> bool:
+    """这条 key 是不是正文插图那一族（网关只问形状，认不认得路由归 ``MEDIA_KEY_RE``）。"""
+    return MEDIA_KEY_RE.match(str(key or "")) is not None
 
 
 class ReadingCache:
@@ -125,6 +145,47 @@ class ReadingCache:
 
     def has_content(self, source_url: str, book_url: str, chapter_url: str) -> bool:
         return self._content_path(source_url, book_url, chapter_url).is_file()
+
+    # ------------------------------------------------------------------ #
+    # /media 的键：正文里那些字节块的地址（设计 §4.4）
+    # ------------------------------------------------------------------ #
+    def media_key(self, source_url: str, book_url: str, chapter_url: str,
+                  block_index: int) -> str:
+        """这块字节在 ``/media`` 那一条路上的名字。
+
+        两个摘要走的是 :meth:`_digest`，与 ``save_content`` 落盘用的那两个**是同一个
+        调用**——键与磁盘名字对不上就是两份真相，所以这里不另算一遍。
+        """
+        return (f"{self._digest(source_url, book_url)}-{self._digest(chapter_url)}"
+                f"-{int(block_index)}")
+
+    def media_bytes(self, key: str) -> bytes | None:
+        """按 ``/media`` 的 key 取回那块字节；取不到就是 None（不猜、不回空串）。
+
+        只认 ``bytes`` 为真的那一格：文本块本来就该过协议面，给它一条二进制路等于
+        多一个能读正文的口子。缓存文件不在/版本不对/下标越界/base64 坏了，一律 None——
+        网关那边据此回 404，而不是回一份"看着像"的载荷。
+        """
+        match = MEDIA_KEY_RE.match(str(key or ""))
+        if match is None:
+            return None
+        book_digest, chapter_digest, index = match.groups()
+        # 三段都已被正则钉死成十六进制/十进制：拼不出 ``..``，也拼不出分隔符。
+        path = self.root / book_digest / "content" / f"{chapter_digest}.json"
+        data = self._read(path)
+        if not isinstance(data, dict) or data.get("version") != self.VERSION:
+            return None
+        blocks = data.get("blocks")
+        position = int(index)
+        if not isinstance(blocks, list) or position >= len(blocks):
+            return None
+        item = blocks[position]
+        if not isinstance(item, dict) or not item.get("bytes"):
+            return None
+        try:
+            return base64.b64decode(str(item.get("value") or ""))
+        except (binascii.Error, ValueError):
+            return None
 
     def cache_counts(self, source_url: str, book_url: str) -> tuple[int, int]:
         chapters = self.load_catalog(source_url, book_url) or []

@@ -780,6 +780,121 @@ def test_local_book_source_url_is_one_constant_two_places() -> None:
             f"{rel} 里出现了第二个 {LOCAL_BOOK_SOURCE_URL!r} 字面量：界面自己发明判据的地方")
 
 
+def _py_function_source(py_rel: str, func: str) -> str:
+    """某个 Python 函数/方法的**源码那一段**（连 docstring 一起给）。
+
+    用来钉"这一格是怎么算出来的"——字面量比对只能证明两处写了同一个词，
+    证明不了其中一处没有另算一遍。
+    """
+    source = _py_source(py_rel)
+    tree = ast.parse(source)
+    node = next((n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and n.name == func), None)
+    if node is None:
+        pytest.fail(f"{py_rel} 里没有函数 {func}——守卫要读的位置挪了")
+    return ast.get_source_segment(source, node) or ""
+
+
+def test_media_key_field_is_one_name_three_places() -> None:
+    """正文插图的地址：服务端发、Dart 收、屏上用，三处必须都叫 `mediaKey`。
+
+    这一格是 G3-D4 新加的协议面字段，也是两种语言里第一次出现"同一个字段名手写三遍"。
+    名字漂了**不会报错**：Dart 那句是 `json['mediaKey'] ?? ''`，取不到就是空串，
+    空串等于"这块没有二进制路"，于是图位上一片空白，而两侧各自的测试都在读自己
+    抄的那个名——两边都绿，用户看到的缺图。
+    """
+    row = _py_function_source("app/services/reading/reading_service.py", "_block_row")
+    assert '"mediaKey": media_key' in row, \
+        "服务端发的那一格不再叫 mediaKey（或不再由入参填）"
+    assert '"media_key"' not in row, "同一份回话里出现第二个名：客户端只会读到空串"
+
+    doc = _read("features/reader/data/chapter_document.dart")
+    assert re.search(r"mediaKey:\s*'\$\{json\['mediaKey'\]", doc), \
+        "Dart 收这一格的那一句挪了/换了名"
+    assert "final String mediaKey;" in doc, "字段名不是 mediaKey"
+
+    screen = _read("features/reader/presentation/reader_screen.dart")
+    assert "block?.mediaKey" in screen, \
+        "阅读屏不再从 mediaKey 取地址——它多半改回自己拼 URL 了（§4.4 不许）"
+
+    # 反面形状：整个 Dart 工程里不许出现 snake_case 的那个名当协议键读。
+    doubles = sorted({(path.relative_to(DART_LIB).as_posix(), found.group(1))
+                      for path in _dart_files()
+                      for found in re.finditer(r"""json\[['"]([^'"]+)['"]\]""",
+                                               path.read_text(encoding="utf-8"))
+                      if found.group(1) in ("media_key", "mediakey", "MediaKey")})
+    assert doubles == [], f"Dart 侧用这几个拼法读协议键：{doubles}"
+
+
+def test_chapter_media_grammar_lives_in_the_cache_only() -> None:
+    """两种 /media key 里，正文那一种的语法只许住在 ``reading_cache`` 一处。
+
+    网关要是把那个正则抄第二份，缓存改名（比如给下标补零）时它不会跟着改：
+    合法的 key 被判成 404，而 reading_cache 自己的测试全绿——断的是接线，
+    不是实现（记忆里 `refactor-regression-orphan-methods` 那个形状）。
+    """
+    offenders = []
+    for py in sorted((ROOT / "app").rglob("*.py")):
+        if "__pycache__" in py.parts:
+            continue
+        if "[0-9a-f]{64}" in _py_source(
+                py.relative_to(ROOT).as_posix()) and py.name != "reading_cache.py":
+            offenders.append(py.relative_to(ROOT).as_posix())
+    assert offenders == [], f"第二处抄了正文插图 key 的语法：{offenders}"
+
+    media = _py_function_source("app/services/gateway/service.py", "_media")
+    assert "is_media_key(key)" in media, "网关不再问缓存那把尺，而是自己判形状"
+    assert "cache.media_bytes(key)" in media, "网关不再把取字节交回缓存"
+    for banned in ("sha256", "hexdigest", "_digest"):
+        # 封面那一发的 `_MEDIA_KEY_RE.match` 是**它自己的**形状（名字出自
+        # SourceService 落在盘上的文件名），不在 ban 之列；这里禁的是"自己算摘要"。
+        assert banned not in media, f"网关自己算了 key：{banned}"
+
+
+def test_chapter_media_key_shares_the_caches_own_digests() -> None:
+    """发出去的 key 必须由**写盘那两支 _digest** 拼成，不在这里另算一遍摘要。
+
+    这是 §4.4「不新造一套键空间」的可执行形式：`media_key` 与 `_book_dir`/
+    `_content_path` 用的是同一个调用形状，所以"地址"与"盘上的名字"是同一件事。
+    自己另算（哪怕同样 sha256）时，改 join 符、改编码、改参数序都不报错——
+    只会让 /media 永远 404。
+    """
+    maker = _py_function_source("app/services/reading_cache.py", "media_key")
+    assert "self._digest(source_url, book_url)" in maker
+    assert "self._digest(chapter_url)" in maker
+    for banned in ("hashlib", "md5", "sha256", "hexdigest"):
+        assert banned not in maker, f"media_key 里自己算摘要：{banned}"
+
+    # 正对照：那两个形状确实就是落盘路径用的，不是守卫在这里空转。
+    assert "self._digest(source_url, book_url)" in _py_function_source(
+        "app/services/reading_cache.py", "_book_dir")
+    assert "self._digest(chapter_url)" in _py_function_source(
+        "app/services/reading_cache.py", "_content_path")
+
+
+def test_media_key_is_handed_out_from_the_content_key_only() -> None:
+    """发地址的那一处只许由 ``_content_key`` 那个三元组喂，且全库只喂一次。
+
+    字节是照着 `(源 url 归一化后, book.url, chapter.url)` 落盘的。用请求参数里的
+    ``source_url`` 去算，出来的就是另一个摘要——地址对不上盘，而且只在"书源 url
+    带斜杠/带协议差异"那种书上偶发，是最难复现的那一类。
+    """
+    document = _py_function_source("app/services/reading/reading_service.py",
+                                   "chapter_document")
+    assert "block_rows(shown.blocks, self._cache," in document
+    assert "self._content_key(source, book, chapter)" in document, \
+        "发地址用的不是那个归一化三元组"
+
+    callers = sorted({py.relative_to(ROOT).as_posix()
+                      for py in (ROOT / "app").rglob("*.py")
+                      if "__pycache__" not in py.parts
+                      and re.search(r"\bblock_rows\(", _py_source(
+                          py.relative_to(ROOT).as_posix()))})
+    assert callers == ["app/services/reading/reading_service.py"], \
+        f"block_rows 出现了第二处调用点（第二个发地址的口）：{callers}"
+
+
 # 黄金样本那一族的守卫（覆盖表、时效摘要、请求合法性、账目自洽、job 的事件交付）
 # 全部住在 tests/test_gateway_golden_corpus.py：这里只留跨语言字面量那几支。
 # 搬过来的理由就是这份文件自己的主张——同一处事实不许有第二份写法。

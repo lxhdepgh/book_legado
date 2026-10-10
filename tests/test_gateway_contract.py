@@ -421,8 +421,15 @@ class EventStreamConfigTests(unittest.TestCase):
             CAPABILITIES, GatewayService, WEBVIEW_TIMEOUT)
 
         self.assertEqual(sorted(CAPABILITIES),
-                         sorted(["rpc", "events", "media.covers", "job.actions",
-                                 "webview.reverse"]))
+                         sorted(["rpc", "events", "media.covers", "media.chapters",
+                                 "job.actions", "webview.reverse"]))
+        # media.chapters 与 media.covers 分开报：一条断了另一条还活着（封面在缓存
+        # 目录里、插图在 reader-cache 的章文件中），合成一条就会一起说谎。
+        from app.services.reading_cache import ReadingCache, is_media_key
+
+        self.assertTrue(callable(is_media_key)
+                        and hasattr(ReadingCache, "media_bytes"),
+                        "报了 media.chapters 能力，可正文插图那一路的判形/取字节口不在")
         self.assertTrue(any(m.mode == "job" for m in METHODS),
                         "报了 job.actions 能力却没有任何 job 动作")
         # webview.reverse 的落点是一条**反向**通路：/ws 上发 request 帧、/rpc 上收答复。

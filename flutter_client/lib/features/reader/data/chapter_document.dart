@@ -24,6 +24,7 @@ class ContentBlock {
     required this.binary,
     required this.title,
     required this.headers,
+    this.mediaKey = '',
   });
 
   /// 见 [kContentBlockKinds]。表外的值按"未知块"处理（画原文那一段），不崩屏。
@@ -33,14 +34,24 @@ class ContentBlock {
   /// 而字节不能过协议面），地址在 [url]。
   final String? value;
 
-  /// 媒体地址。`binary == true` 时它是**唯一**的取内容路径：
-  /// 受保护图（要带 cookie/UA 的那种）就是这一格救回来的——`ContentBlock.url`
-  /// 那一格是第八十六轮补的，之前过完协议面就永久没地址了。
+  /// 媒体地址。这一格现在只管**公开可取**的那一种：受保护图（要带 cookie/UA 的那种）
+  /// 过协议面时字节已被服务端拿走（`ContentBlock.url` 那一格是第八十六轮补的，
+  /// 之前过完协议面就永久没地址了），而 Dart 这边没有那份 cookie——所以那种块
+  /// 看 [mediaKey]，别看这里。
   final String url;
 
-  /// 服务端把值换成了字节（值这一格因此是 null）。`Image.network` 用的就是
-  /// "url + headers"这一对，不是 value。
+  /// 服务端把值换成了字节（值这一格因此是 null）。
   final bool binary;
+
+  /// 服务端发的那条 `GET /media/{key}` 的 key（第九十五轮）。**非空 = 字节此刻在
+  /// 服务端缓存里**，取它不需要 cookie；空串 = 这一格没有可渲染地址（没有缓存、
+  /// 或者这块本来就不是字节），退回 [url]。
+  ///
+  /// 为什么不让客户端自己算：那段 key 是缓存写在盘上的两个摘要（见
+  /// `app/services/reading_cache.py::ReadingCache.media_key`），客户端手拼就是
+  /// 第二条键空间——协议面缺的那一格要么上钉常量、要么上钉服务端，不许界面自己
+  /// 发明判据（第八十九轮换源那一格同一条规矩）。
+  final String mediaKey;
 
   final String title;
 
@@ -58,6 +69,7 @@ class ContentBlock {
         url: '${json['url'] ?? ''}',
         binary: json['binary'] == true,
         title: '${json['title'] ?? ''}',
+        mediaKey: '${json['mediaKey'] ?? ''}',
         headers: <String, String>{
           for (final entry in (json['headers'] as Map? ?? const <String, Object?>{})
               .entries)
@@ -67,7 +79,8 @@ class ContentBlock {
 
   @override
   String toString() => 'ContentBlock($kind'
-      '${isText ? ', ${value?.length ?? 0} 字' : ', url=$url'})';
+      '${isText ? ', ${value?.length ?? 0} 字' : ', url=$url'}'
+      '${mediaKey.isEmpty ? '' : ', mediaKey'})';
 }
 
 /// 一章的文档。

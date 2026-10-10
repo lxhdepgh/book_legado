@@ -8,7 +8,7 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-bookshelf.add-1387248500000000",
+    "id": "r4-bookshelf.add-1392018218000000",
     "action": "bookshelf.add",
     "seq": 14,
     "payload": {
@@ -56,7 +56,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-bookshelf.add-1387248500000000",
+    "id": "r4-bookshelf.add-1392018218000000",
     "ok": true,
     "data": true,
     "error": null,
@@ -66,7 +66,7 @@
   "inline_row_count": null,
   "bytes": 4,
   "sha256": "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b",
-  "client_wall_ms": 5.7,
+  "client_wall_ms": 5.6,
   "wire_bytes": 106,
   "field_names": []
 }

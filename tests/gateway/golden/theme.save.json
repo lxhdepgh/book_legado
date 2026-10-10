@@ -8,7 +8,7 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-theme.save-1387249781000000",
+    "id": "r4-theme.save-1392019312000000",
     "action": "theme.save",
     "seq": 29,
     "payload": {
@@ -19,7 +19,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-theme.save-1387249781000000",
+    "id": "r4-theme.save-1392019312000000",
     "ok": true,
     "data": {
       "skin_id": "warm_amber",
@@ -33,7 +33,7 @@
   "inline_row_count": null,
   "bytes": 51,
   "sha256": "acbde8a63646452561012fd0a51908ffee610277372e2f8e6b7fc4104956c47d",
-  "client_wall_ms": 5.4,
+  "client_wall_ms": 3.4,
   "wire_bytes": 155,
   "field_names": [
     "eink",

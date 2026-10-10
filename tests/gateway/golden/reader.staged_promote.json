@@ -8,14 +8,14 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-reader.staged_promote-1387251093000000",
+    "id": "r4-reader.staged_promote-1392019968000000",
     "action": "reader.staged_promote",
     "seq": 24,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-reader.staged_promote-1387251093000000",
+    "id": "r4-reader.staged_promote-1392019968000000",
     "ok": true,
     "data": true,
     "error": null,
@@ -25,7 +25,7 @@
   "inline_row_count": null,
   "bytes": 4,
   "sha256": "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b",
-  "client_wall_ms": 6.2,
+  "client_wall_ms": 4.2,
   "wire_bytes": 114,
   "field_names": []
 }

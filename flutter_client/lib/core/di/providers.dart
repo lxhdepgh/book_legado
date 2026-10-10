@@ -9,10 +9,20 @@ library;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../events/engine_event.dart';
+import '../rpc/engine_endpoint.dart';
 import '../rpc/engine_repository.dart';
 
 final Provider<EngineRepository> engineRepositoryProvider =
     Provider<EngineRepository>((ref) => const UnwiredEngineRepository());
+
+/// 网关那四个连接参数（§4.4 那条二进制出口的落点）。
+///
+/// 默认 `null` = 这一程没有可渲染的二进制地址：替身起的界面与 widget 测试都没有
+/// 子进程，于是图片退回 `url` 那一格（公开图照样画，受保护图回到第八十六轮那副样子）。
+/// 这一格不进 [EngineRepository]：仓库面是"动作"，二进制那条路**按设计就不走 RPC**，
+/// 把它塞进仓库就等于让替身也要伪造一个能取字节的地址。
+final Provider<EngineEndpoint?> engineEndpointProvider =
+    Provider<EngineEndpoint?>((ref) => null);
 
 /// 事件流（§4.3）：一根流供所有屏听，别每屏各连一次 `/ws`。
 ///

@@ -8,18 +8,18 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-search.start-1387248281000000",
+    "id": "r4-search.start-1392017984000000",
     "action": "search.start",
     "seq": 12,
     "payload": {
       "keyword": "基线书",
       "scope": "G2离线",
-      "search_id": 6374
+      "search_id": 11144
     }
   },
   "response": {
     "v": 1,
-    "id": "r4-search.start-1387248281000000",
+    "id": "r4-search.start-1392017984000000",
     "ok": true,
     "data": {
       "started": true,
@@ -41,7 +41,7 @@
   "event_sample": {
     "name": "SearchFinishedEvent",
     "payload": {
-      "search_id": "6374",
+      "search_id": "11144",
       "items": [
         {
           "name": "基线书",
@@ -83,10 +83,10 @@
           ]
         }
       ],
-      "timestamp": 1791606374.966908,
+      "timestamp": 1791611144.6789415,
       "finished": true
     },
-    "payload_bytes": 760,
+    "payload_bytes": 762,
     "payload_list_key": "items",
     "row_count": 1,
     "inline_row_count": 1,

@@ -8,7 +8,7 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-reader.position_save-1387251000000000",
+    "id": "r4-reader.position_save-1392019921000000",
     "action": "reader.position_save",
     "seq": 14,
     "payload": {
@@ -23,13 +23,13 @@
         "chapter_pos": 15801,
         "chapter_paragraph": 48,
         "font_size": 18,
-        "last_read_at": 1791606377
+        "last_read_at": 1791611146
       }
     }
   },
   "response": {
     "v": 1,
-    "id": "r4-reader.position_save-1387251000000000",
+    "id": "r4-reader.position_save-1392019921000000",
     "ok": true,
     "data": {
       "chapter_url": "http://127.0.0.1:8797/g3/ch/2.html",
@@ -40,7 +40,7 @@
       "chapter_pos": 5802,
       "chapter_paragraph": 7,
       "font_size": 18,
-      "last_read_at": 1791606377
+      "last_read_at": 1791611146
     },
     "error": null,
     "code": null
@@ -48,8 +48,8 @@
   "row_count": 1,
   "inline_row_count": null,
   "bytes": 228,
-  "sha256": "9f59df5274989891d682c18aa3fc017c5cb3f4811d510d40a26de8aa8eb5a045",
-  "client_wall_ms": 7.9,
+  "sha256": "33d480186fe471c185f8c9cb57883d0e1ddf71913026b7742006707f0b55115c",
+  "client_wall_ms": 3.8,
   "wire_bytes": 354,
   "field_names": [
     "chapter_index",

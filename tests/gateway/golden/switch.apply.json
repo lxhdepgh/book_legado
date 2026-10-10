@@ -8,7 +8,7 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-switch.apply-1387252546000000",
+    "id": "r4-switch.apply-1392021343000000",
     "action": "switch.apply",
     "seq": 5,
     "payload": {
@@ -33,7 +33,7 @@
         "originName": "G3换源x",
         "latestChapterTitle": "第 4 章",
         "totalChapterNum": 0,
-        "lastCheckTime": 1791606379017,
+        "lastCheckTime": 1791611147799,
         "lastCheckCount": 0,
         "durChapterTitle": null,
         "durChapterIndex": 0,
@@ -90,7 +90,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-switch.apply-1387252546000000",
+    "id": "r4-switch.apply-1392021343000000",
     "ok": true,
     "data": {
       "applied": true,
@@ -103,7 +103,7 @@
   "inline_row_count": null,
   "bytes": 60,
   "sha256": "d1c44bc9b51f903f28bba6969ac6019b2dd636d59e4eeb30e6d979f7126bedae",
-  "client_wall_ms": 7.2,
+  "client_wall_ms": 5.0,
   "wire_bytes": 164,
   "field_names": [
     "applied",

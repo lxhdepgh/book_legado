@@ -8,14 +8,14 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-check.snapshot-1387248937000000",
+    "id": "r4-check.snapshot-1392018640000000",
     "action": "check.snapshot",
     "seq": 17,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-check.snapshot-1387248937000000",
+    "id": "r4-check.snapshot-1392018640000000",
     "ok": true,
     "data": {
       "running": false,
@@ -54,7 +54,7 @@
             "raw_url": "http://127.0.0.1:8797/g2",
             "status": "ok",
             "status_code": 200,
-            "response_time_ms": 0.794299878180027,
+            "response_time_ms": 0.7364999037235975,
             "error": null,
             "search_status": "ok",
             "book_count": 1,
@@ -142,10 +142,10 @@
   },
   "row_count": 1,
   "inline_row_count": null,
-  "bytes": 1818,
-  "sha256": "460df6298aca46221c3d08c8198f45ce2454c93456376d49dab713e61365dc00",
-  "client_wall_ms": 1.0,
-  "wire_bytes": 2102,
+  "bytes": 1819,
+  "sha256": "932ccb7326ded81429f23d9042798d65273648129fe02ab8c50ae0a6cef04b33",
+  "client_wall_ms": 0.9,
+  "wire_bytes": 2103,
   "field_names": [
     "cancelled",
     "deep_queue",

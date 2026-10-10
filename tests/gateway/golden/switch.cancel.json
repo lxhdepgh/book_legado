@@ -8,14 +8,14 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-switch.cancel-1387252546000000",
+    "id": "r4-switch.cancel-1392021343000000",
     "action": "switch.cancel",
     "seq": 4,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-switch.cancel-1387252546000000",
+    "id": "r4-switch.cancel-1392021343000000",
     "ok": true,
     "data": {
       "cancelled": false
@@ -27,7 +27,7 @@
   "inline_row_count": null,
   "bytes": 19,
   "sha256": "a61696054371ffe2c1e0b2b8d03785a3ce11b4e14a93cfbbffae5fb27303a4a0",
-  "client_wall_ms": 0.6,
+  "client_wall_ms": 0.4,
   "wire_bytes": 122,
   "field_names": [
     "cancelled"

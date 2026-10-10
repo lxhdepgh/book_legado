@@ -8,7 +8,7 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-reader.open-1387250125000000",
+    "id": "r4-reader.open-1392019656000000",
     "action": "reader.open",
     "seq": 3,
     "payload": {
@@ -58,7 +58,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-reader.open-1387250125000000",
+    "id": "r4-reader.open-1392019656000000",
     "ok": true,
     "data": {
       "book": {
@@ -122,7 +122,7 @@
   "inline_row_count": null,
   "bytes": 990,
   "sha256": "b67936423ef9647f410881c8e9281ce7de530da7355b138b02ff5a84cebf7d44",
-  "client_wall_ms": 19.3,
+  "client_wall_ms": 11.2,
   "wire_bytes": 1185,
   "field_names": [
     "book",

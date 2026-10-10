@@ -6,7 +6,7 @@ flet 落点参照表（``tests/gateway/projection/reader.content.json``）都是
 再读一遍（Dart 侧排版 ↔ flet 投影，按字符偏移比对），它需要一个跟踪在仓库里的靶子——
 靶子一旦和样本漂了，实弹臂读数就会指向另一本书，而"两边一致"照样绿。
 
-五笔账，与 ``tests/test_gateway_golden_corpus.py`` 同一族：
+六笔账，与 ``tests/test_gateway_golden_corpus.py`` 同一族：
 
 1. **建源那一发**：``source_dict(8797)`` 必须与 ``source.save`` 样本里的载荷逐键相等；
 2. **搜索页**：按 ``ruleSearch`` 解析出的那本书，字段必须与 ``reader.open`` 载荷里的
@@ -23,8 +23,13 @@ flet 落点参照表（``tests/gateway/projection/reader.content.json``）都是
    管线，读数必须分别等于 ``projection/reader.content.webview.json``，且两份 ``
    looks_like_gate`` 一读真一读假。这一笔钉的是"读到 4 段只可能是宿主答的"这句话。
 
-正对照散在第 1、4、6 笔里：换一个端口建源、往语料里多打一个字、把墙喂进宿主那把尺，
-读数必须跟着动——不然这些比对可能只是在比"两边都读同一个常量"。
+7. **二进制地址**（G3-D4 的锚点）：``reader.content`` 样本里那一格 ``mediaKey`` 必须
+   还能由 ``ReadingCache.media_key`` 从样本自己的请求载荷现算出来——``schema_digest``
+   只覆盖动作表/入参 schema/出参投影，不含出参**内容**，所以语料族的时效守卫对这一格
+   是瞎的：改了摘要或拼法，样本照旧"没过时"，发出去的地址却再也没人答得上。
+
+正对照散在第 1、4、6、7 笔里：换一个端口建源、往语料里多打一个字、把墙喂进宿主那把尺、
+把三个坐标各挪一格，读数必须跟着动——不然这些比对可能只是在比"两边都读同一个常量"。
 """
 from __future__ import annotations
 
@@ -260,6 +265,43 @@ def test_clamp_sample_reads_the_same_ruler() -> None:
     clamped = _sample("reader.position_save--clamped")["response"]["data"]
     assert clamped["chapter_pos"] == ruler["total"]
     assert clamped["chapter_paragraph"] == len(ruler["paragraphs"]) - 1
+
+
+def test_golden_media_key_is_the_caches_own_derivation(tmp_path: Path) -> None:
+    """第 7 笔：样本里那一格 ``mediaKey`` 必须还能由缓存自己的函数从**同一发载荷**算出来。
+
+    为什么这一笔不能省（G3-D4）：``schema_digest`` 覆盖的是动作表、入参 schema 和出参
+    投影，它**不含出参字段的内容**——加一整格 mediaKey 之后摘要仍是 ``879d1fbcfdf0``。
+    也就是说语料那一族的时效守卫对这一格是瞎的：改了 ``ReadingCache._digest`` 或
+    ``media_key`` 的拼法，样本照旧"没过时"，而发出去的地址再也没人答得上（404）。
+    这一笔把那条路钉回真函数：地址由 `media_key` 现算，比的是样本里存着的那一串。
+    """
+    from app.services.reading_cache import ReadingCache, is_media_key
+
+    sample = _sample("reader.content")
+    payload = sample["request"]["payload"]
+    rows = sample["response"]["data"]["blocks"]
+    cache = ReadingCache(tmp_path)
+    derived = [cache.media_key(payload["source_url"], payload["book_url"],
+                               payload["chapter_url"], index)
+               for index in range(len(rows))]
+
+    binary = [index for index, row in enumerate(rows) if row["binary"]]
+    assert binary == [1], "语料那张图挪位/增多了：这一笔的下标锚要跟着改"
+    emitted = [row["mediaKey"] for row in rows]
+    assert emitted == [value if index == 1 else ""
+                       for index, value in enumerate(derived)], \
+        "样本发的地址与缓存现算的地址不再是同一串——那一条 /media 路由就成了死路"
+    assert is_media_key(emitted[1]) is True, "样本里的地址过不了网关自己那把尺"
+    assert is_media_key("") is False, "空串（文本块那一格）被当成了合法地址"
+    # 正对照：三个坐标各挪一格，读数必须跟着动——不然上面那条相等只是在比常量。
+    assert derived[0] != derived[1], "下标没进 key：一章里两张图会撞成同一条地址"
+    assert cache.media_key(payload["source_url"], "http://127.0.0.1:8797/g3/book/2.html",
+                           payload["chapter_url"], 1) != emitted[1]
+    # 归一化那一头：这一格是照 `_content_key` 的三元组算的，多一个斜杠就是另一个摘要。
+    # 钉的是"发地址用的那串与落盘用的那串逐字符同源"，不是"key 看起来像哈希"。
+    assert cache.media_key(payload["source_url"] + "/", payload["book_url"],
+                           payload["chapter_url"], 1) != emitted[1]
 
 
 def test_reverse_channel_shapes_are_the_anchor() -> None:

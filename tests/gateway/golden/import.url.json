@@ -8,7 +8,7 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-import.url-1387249093000000",
+    "id": "r4-import.url-1392018750000000",
     "action": "import.url",
     "seq": 20,
     "payload": {
@@ -19,7 +19,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-import.url-1387249093000000",
+    "id": "r4-import.url-1392018750000000",
     "ok": true,
     "data": {
       "kind": "book_source",
@@ -35,7 +35,7 @@
   "inline_row_count": null,
   "bytes": 78,
   "sha256": "61cf24bd1f165b14d885a6847f7893319a7b75246b33b366f387c306b03d7cf4",
-  "client_wall_ms": 10.5,
+  "client_wall_ms": 7.0,
   "wire_bytes": 186,
   "field_names": [
     "count",

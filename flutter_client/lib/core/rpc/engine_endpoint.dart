@@ -28,6 +28,22 @@ class EngineEndpoint {
   Uri get wsUri =>
       Uri(scheme: 'ws', host: host, port: port, path: '/ws');
 
+  /// 一条二进制出口的地址（§4.4：`GET /media/{key}`）。
+  ///
+  /// 令牌走 query 而不是 header，是因为这条地址最终交出去的是别人的控件
+  /// （`Image.network`/`media_kit`）——它们各自能带的东西不一样，URL 本身是唯一
+  /// 两边都认的把手。**因此这一串的每一个字符都是可渲染的凭据**：不许打进日志、
+  /// 不许进 widget key、不许当"连的是哪儿"那一句读数的素材（[toString] 打了掩码，
+  /// 这条方法的返回值可没有）。key 是服务端发下来的（`ContentBlock.mediaKey`），
+  /// 这里只贴，不解释、不拼摘要。
+  Uri mediaUri(String key) => Uri(
+        scheme: 'http',
+        host: host,
+        port: port,
+        path: '/media/$key',
+        queryParameters: <String, String>{'token': token},
+      );
+
   factory EngineEndpoint.fromHandshake(Map<String, Object?> json) {
     int asInt(Object? value) => switch (value) {
           final int n => n,

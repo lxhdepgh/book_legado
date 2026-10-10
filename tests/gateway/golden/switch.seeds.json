@@ -8,7 +8,7 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-switch.seeds-1387252328000000",
+    "id": "r4-switch.seeds-1392021109000000",
     "action": "switch.seeds",
     "seq": 1,
     "payload": {
@@ -56,7 +56,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-switch.seeds-1387252328000000",
+    "id": "r4-switch.seeds-1392021109000000",
     "ok": true,
     "data": [
       {
@@ -143,7 +143,7 @@
   "inline_row_count": 2,
   "bytes": 1389,
   "sha256": "72d6cc34063d2a88f359e59e1b16fb43304f6a311383c14ae4d20a1540c39be1",
-  "client_wall_ms": 1.8,
+  "client_wall_ms": 1.4,
   "wire_bytes": 1629,
   "field_names": [
     "author",

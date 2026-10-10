@@ -27,6 +27,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../../../core/di/providers.dart';
 import '../../../core/rpc/envelope.dart';
 import '../../../core/widgets/failure_banner.dart';
 import '../../../core/widgets/state_bar.dart';
@@ -420,6 +421,7 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
         key: ValueKey('reader.media.${line.kind}.${line.block?.url ?? ''}'),
         block: line.block,
         style: line.meta,
+        mediaUri: _mediaUriFor(line.block),
       );
     }
     // 键里的段号是**整篇**口径：追加之后每一章都有自己的第 0 段，撞了键就把
@@ -438,6 +440,19 @@ class _ReaderScreenState extends ConsumerState<ReaderScreen> {
         ),
       ),
     );
+  }
+
+  /// 服务端发下来的那条二进制地址（§4.4）：只有 `mediaKey` 非空的块有。
+  ///
+  /// 两种 null 是两件事，屏上却都退回 `url` 那一格：这一格本来就没地址（公开图，
+  /// 服务端没把它换成字节）、或者这一程根本没有网关子进程（替身界面/widget 测试）。
+  /// 地址是**服务端算的**（`ReadingCache.media_key` 那两支摘要），这里只贴不拼——
+  /// 客户端手拼摘要就是第二条键空间（第八十九轮那条「要么上钉常量、要么上钉服务端」）。
+  Uri? _mediaUriFor(ContentBlock? block) {
+    final key = block?.mediaKey ?? '';
+    if (key.isEmpty) return null;
+    // read 不是 watch：这一格跟着进程活，握手之后不会变，变了也是连不上那一屏的事。
+    return ref.read(engineEndpointProvider)?.mediaUri(key);
   }
 
   /// 退出：先问 `reader.staged`，需要问的那一臂等用户答完再关会话（规矩 6）。
@@ -586,15 +601,24 @@ class _ChapterDivider extends StatelessWidget {
 
 /// 一个媒体块那一行。
 ///
-/// 图片走 `Image.network(url, headers)`：**字节不过协议面**（设计 §4.4），
-/// 受保护图（要带 cookie/UA 的那种）靠的就是这一对；`value` 那一格在 Dart 这边恒空。
+/// 图片有两个取处，按 [mediaUri] 有没有来分：**服务端发过地址**（`mediaKey` 非空，
+/// 也就是那块字节真在缓存里）就走 `GET /media/{key}`（§4.4），这一路不需要请求头，
+/// cookie 在服务侧已经用过了；没发地址就退回 `url + headers` 那一对（公开图）。
+/// `value` 那一格在 Dart 这边恒空——字节不过协议面。
 /// 音视频只把地址显示出来——这一版没有 url_launcher 依赖，放一颗"打开"按钮
 /// 就是点了没反应的占位。
 class _MediaLine extends StatelessWidget {
-  const _MediaLine({required this.block, required this.style, super.key});
+  const _MediaLine(
+      {required this.block,
+      required this.style,
+      this.mediaUri,
+      super.key});
 
   final ContentBlock? block;
   final String style;
+
+  /// 服务端为这一块发下来的 `GET /media/{key}` 地址；null = 这一块没有可取的字节。
+  final Uri? mediaUri;
 
   /// 加载态与失败态占同一个高度的盒子（成功加载的图片仍按原图高）。
   ///
@@ -610,11 +634,17 @@ class _MediaLine extends StatelessWidget {
   Widget build(BuildContext context) {
     final source = block;
     if (source == null) return const SizedBox.shrink();
-    if (source.kind == 'image' && source.url.isNotEmpty) {
+    final target = mediaUri?.toString() ??
+        (source.url.isNotEmpty ? source.url : null);
+    if (source.kind == 'image' && target != null) {
       return Padding(
         padding: const EdgeInsets.symmetric(vertical: 8),
-        child: Image.network(source.url,
-            headers: source.headers.isEmpty ? null : source.headers,
+        child: Image.network(target,
+            // 走 /media 那一路时不带 headers：令牌已经在地址里，而把书源的
+            // cookie 递给回环网关是一次没有读者的转发。
+            headers: mediaUri != null || source.headers.isEmpty
+                ? null
+                : source.headers,
             errorBuilder: (context, _, _) =>
                 _box(_MediaFallback(block: source, style: style)),
             loadingBuilder: (context, child, progress) => progress == null

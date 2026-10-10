@@ -8,7 +8,7 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-reader.position_get-1387251031000000",
+    "id": "r4-reader.position_get-1392019937000000",
     "action": "reader.position_get",
     "seq": 17,
     "payload": {
@@ -18,7 +18,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-reader.position_get-1387251031000000",
+    "id": "r4-reader.position_get-1392019937000000",
     "ok": true,
     "data": {
       "chapter_url": "",
@@ -29,7 +29,7 @@
       "chapter_pos": 5802,
       "chapter_paragraph": 7,
       "font_size": 18,
-      "last_read_at": 1791606377
+      "last_read_at": 1791611146
     },
     "error": null,
     "code": null
@@ -37,8 +37,8 @@
   "row_count": 1,
   "inline_row_count": null,
   "bytes": 177,
-  "sha256": "7bf34bf9238353c6e801c55c8e3c8d3ea1c756d3af004058df77d4854044be6e",
-  "client_wall_ms": 1.3,
+  "sha256": "20e3db241c06447bf604bec01aa19b53f9c5f1dbb9fb7903615627b3ddbc0ba2",
+  "client_wall_ms": 0.6,
   "wire_bytes": 302,
   "field_names": [
     "chapter_index",

@@ -8,7 +8,7 @@
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-source.batch_enable-1387249343000000",
+    "id": "r4-source.batch_enable-1392018968000000",
     "action": "source.batch_enable",
     "seq": 23,
     "payload": {
@@ -20,7 +20,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-source.batch_enable-1387249343000000",
+    "id": "r4-source.batch_enable-1392018968000000",
     "ok": true,
     "data": 1,
     "error": null,
@@ -30,7 +30,7 @@
   "inline_row_count": null,
   "bytes": 1,
   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
-  "client_wall_ms": 128.5,
+  "client_wall_ms": 116.5,
   "wire_bytes": 109,
   "field_names": []
 }
