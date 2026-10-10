@@ -17,6 +17,8 @@ library;
 
 import 'package:flutter/material.dart';
 
+import '../../app/router.dart';
+
 /// 分组里的一页签。
 class GroupTab {
   const GroupTab({
@@ -103,6 +105,8 @@ class _TabbedGroupState extends State<TabbedGroup> implements GroupTabs {
       _index = next;
       _mounted.add(next);
     });
+    // 记住这一分组最后停的页签（flet `_last_tab` 等价物）
+    rememberTab(widget.groupKey, widget.tabs[next].label);
   }
 
   @override

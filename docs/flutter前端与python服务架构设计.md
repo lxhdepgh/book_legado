@@ -336,7 +336,7 @@ Range——封面名（`^[0-9a-f]{16}\.jpg$`，出自 `SourceService._normalize_
 （`<书摘要>-<章摘要>-<块下标>`，语法住在 `app/services/reading_cache.py`，网关只问
 `is_media_key`/`media_bytes`）；协议面新增 `mediaKey` 那一格由服务端发、恒在，Dart 只贴不拼。
 剩下的是 G4 的插件决定 |
-| **G4** | `rss` / 漫画 / 朗读 / 工具域 / 老板键托盘；删 flet 依赖与 4 个 UI 耦合服务；PyInstaller spec 去 flet* | 2–3 周 | flet 从 `requirements.txt` 消失后全库仍绿；打包冒烟（照真果鉴 `smoke_windows.py` 那条：解压产物跑一次 `--package-smoke`）**G4-F1 已交（2026-10-10 第九十九轮）**：`platform_support.py` 不再 import flet，R3 四条降级路径仍在位，无头装配仍全绿；G4-F2（真正删除 flet）待 Dart 工具域完成后执行 |
+| **G4** | `rss` / 漫画 / 朗读 / 工具域 / 老板键托盘；删 flet 依赖与 4 个 UI 耦合服务；PyInstaller spec 去 flet* | 2–3 周 | flet 从 `requirements.txt` 消失后全库仍绿；打包冒烟（照真果鉴 `smoke_windows.py` 那条：解压产物跑一次 `--package-smoke`）**G4-F1 已交（2026-10-10 第九十九轮）**：`platform_support.py` 不再 import flet，R3 四条降级路径仍在位，无头装配仍全绿；G4-F2（真正删除 flet）待 Dart 工具域完成后执行；**G4-E0 已交（第一百轮）**：导航落点优先级三级优先落地，`_lastTab` 字典 + 书架探测缓存注入 |
 
 累计 **9–12 周**单人全职（G0 之外）。参照系：真果鉴这条路线做出来的是
 `lib/` 30,348 行 Dart + Go 核心 19,445 行 + 30 个 Dart 测试文件 + 4,420 行 Go 测试。
@@ -827,7 +827,10 @@ Range——封面名（`^[0-9a-f]{16}\.jpg$`，出自 `SourceService._normalize_
   比较代替 `ft.PagePlatform` 枚举，模块本身不再 import flet；R3 四条降级路径仍在位（BrowserService
   无 page_provider 返回 None → `_render_without_ui`，MediaPlay 只记账，BossKey 诚实拒绝，
   `looks_like_gate` 已搬到 flet-free 的 `block_pages`）；无头装配仍全绿（`--serve` 路径一行 flet
-  都不碰）；G4-F2（真正从 `requirements.txt` 删除 flet）待 Dart 工具域完成后执行）
+  都不碰）；G4-F2（真正从 `requirements.txt` 删除 flet）待 Dart 工具域完成后执行；
+  第一百轮：**G4-E0（导航落点优先级）**——Dart 侧接上 flet `_anchor` 三级优先：`router.dart` 新增
+  `_lastTab` 字典与 `rememberTab`，每次切页签时记录；`bootstrap.dart` 注入书架探测（启动时查一次
+  `listBookshelf` 缓存结果）；`initialTabOf` 按"记住的页签 > 书架探测 > 组内第一个"落地阅读组）
 - `docs/M7打包说明.md`（PyInstaller 命令与 flet* hidden-import 清单位置）
 - 参照仓库：`github.com/jerunshi/guoapp1`（浅克隆 `D:/tmp/guoapp1`，不在本项目版本控制内）
 - 记忆：`tts-pyttsx3-com-same-thread`、`quickjs-native-crash-risk`、`engine-hub-loop-split`、

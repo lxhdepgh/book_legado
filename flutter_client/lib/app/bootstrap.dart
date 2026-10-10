@@ -88,6 +88,18 @@ Future<BootstrapResult> bootstrapEngine() async {
   // 句柄与界面共用这一个仓库实例：各 new 一个的话 `engine.shutdown` 发两遍，
   // 第二遍打在已经退场的进程上，表现是退出时多一条没来由的 transport 错。
   final repository = RpcEngineRepository(client);
+
+  // G4-E0：注入书架探测（阅读组落地优先级第二档：架上有书先落书架）
+  // 缓存启动时的结果（shelf 状态变化频率低，不必每次切分组都查）。
+  bool shelfHasBooks = false;
+  try {
+    final items = await repository.listBookshelf();
+    shelfHasBooks = items.isNotEmpty;
+  } catch (_) {
+    // 探不到就按空架处理
+  }
+  setShelfProbe(() => shelfHasBooks);
+
   return BootstrapResult(
     repository: repository,
     handle: EngineHandle(started, client, repository),

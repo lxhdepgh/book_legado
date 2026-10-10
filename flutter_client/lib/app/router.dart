@@ -111,18 +111,55 @@ String? groupOfDestination(String destination) => switch (destination) {
       _ => null,
     };
 
-/// 分组的落地页签：这里只实现 flet `_anchor` 三级里的**第三档**（组内第一个）。
+/// 每组最后停留的页签：再点该入口时回到上次看的位置（flet `_last_tab` 等价物）。
+final _lastTab = <String, String>{};
+
+/// 分组的落地页签：三级优先级——记住的页签 > 书架探测 > 组内第一个。
 ///
-/// 前两档（记住的页签 > 书架探测）在 Dart 侧还**没有人持有**：`TabbedGroup` 的当前页签
-/// 不跨分组进出留存，书架探测要的是"架上非空"这一个布尔（flet 由装配根注入
-/// `shelf_probe` 可调用，视图层不 import 服务那条红线不变）。这一条是 G4-E0 的活，
-/// **必须在删 flet 之前接上**，否则参照实现一没，这条行为就永久丢了。
-String? initialTabOf(String groupRoute) => switch (groupRoute) {
-      readingGroupRoute => '找书',
-      sourcesGroupRoute => '管理',
-      settingsGroupRoute => '外观',
-      _ => null,
-    };
+/// - **第一档**：如果这一组之前停过某个页签，就落回那里（flet 行为，记忆
+///   `navigation-rail-old-architecture-shape`）。
+/// - **第二档**（仅阅读组）：架上有书先落「书架」，空架落「找书」（flet
+///   `_shelf_has_books` 等价物；probe 由装配根经 `setShelfProbe` 注入）。
+/// - **第三档**：组内第一个页签（当前实现）。
+String? initialTabOf(String groupRoute) {
+  // 第一档：记住的页签
+  final last = _lastTab[groupRoute];
+  if (last != null) {
+    final tabs = tabsOf(groupRoute);
+    if (tabs.any((t) => t.label == last)) return last;
+  }
+
+  // 第二档：书架探测（仅阅读组）
+  if (groupRoute == readingGroupRoute && _shelfProbe != null) {
+    try {
+      final hasBooks = _shelfProbe!();
+      // 阅读组的页签顺序：找书 → 书架 → 订阅
+      return hasBooks ? '书架' : '找书';
+    } catch (_) {
+      // 探测失败退回第三档
+    }
+  }
+
+  // 第三档：组内第一个
+  return switch (groupRoute) {
+    readingGroupRoute => '找书',
+    sourcesGroupRoute => '管理',
+    settingsGroupRoute => '外观',
+    _ => null,
+  };
+}
+
+/// 书架探测回调：返回 true 表示架上有书。由装配根注入（视图层不许 import 服务）。
+/// 注意：这是**同步**回调，调用方不应 await。
+bool Function()? _shelfProbe;
+
+/// 设置书架探测回调。应在应用启动时调用一次。
+void setShelfProbe(bool Function() probe) => _shelfProbe = probe;
+
+/// 记录某分组最后停留的页签。每次用户切页签时调用。
+void rememberTab(String groupRoute, String tabLabel) {
+  _lastTab[groupRoute] = tabLabel;
+}
 
 /// 一条分组路由 → 它的页签表。
 List<GroupTab> tabsOf(String groupRoute) => switch (groupRoute) {
