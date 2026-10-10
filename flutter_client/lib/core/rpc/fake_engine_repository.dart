@@ -898,6 +898,78 @@ class FakeEngineRepository implements EngineRepository {
   @override
   Future<String?> qrDecode(String imageData) async => null;
 
+  // -- G4-E: 工具域替身实现 --
+  @override
+  Future<String?> browserOpenPage(String url) async => null;
+
+  @override
+  Future<void> browserNavigate(String sessionId, String url) async {}
+
+  @override
+  Future<void> browserClose(String sessionId) async {}
+
+  @override
+  Future<List<Map<String, Object?>>> replaceList() async => [];
+
+  @override
+  Future<void> replaceAdd({
+    required String name,
+    required String pattern,
+    required String replacement,
+    bool enabled = true,
+  }) async {}
+
+  @override
+  Future<void> replaceUpdate({
+    required String ruleId,
+    required String name,
+    required String pattern,
+    required String replacement,
+    bool enabled = true,
+  }) async {}
+
+  @override
+  Future<void> replaceDelete(String ruleId) async {}
+
+  @override
+  Future<void> replaceToggleGlobal(bool enabled) async {}
+
+  @override
+  Future<List<Map<String, Object?>>> fontScanSystem() async => [];
+
+  @override
+  Future<void> fontAddUser(String filePath) async {}
+
+  @override
+  Future<void> fontRemove(String fontId) async {}
+
+  @override
+  Future<void> fontSelect(String family) async {}
+
+  @override
+  Future<void> exportEpub(String bookKey, String outputPath) async {}
+
+  @override
+  Future<void> exportTxt(String bookKey, String outputPath) async {}
+
+  @override
+  Future<void> webdavBackup() async {}
+
+  @override
+  Future<void> webdavRestore(String backupId) async {}
+
+  @override
+  Future<List<Map<String, Object?>>> webdavListBackups() async => [];
+
+  @override
+  Future<void> webbridgeStart(int port) async {}
+
+  @override
+  Future<void> webbridgeStop() async {}
+
+  @override
+  Future<Map<String, Object?>> webbridgeStatus() async => {};
+
   Future<void> dispose() async {
     _calls.clear();
     _payloads.clear();

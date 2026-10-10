@@ -548,6 +548,81 @@ abstract class EngineRepository {
   Future<String?> qrDecode(String imageData) async =>
       throw _missing('qr.decode');
 
+  // browser.* - 浏览器会话管理（CDP 投屏）
+  Future<String?> browserOpenPage(String url) async =>
+      throw _missing('browser.open_page');
+
+  Future<void> browserNavigate(String sessionId, String url) async =>
+      throw _missing('browser.navigate');
+
+  Future<void> browserClose(String sessionId) async =>
+      throw _missing('browser.close');
+
+  // replace.* - 替换规则 CRUD
+  Future<List<Map<String, Object?>>> replaceList() async =>
+      throw _missing('replace.list');
+
+  Future<void> replaceAdd({
+    required String name,
+    required String pattern,
+    required String replacement,
+    bool enabled = true,
+  }) async =>
+      throw _missing('replace.add');
+
+  Future<void> replaceUpdate({
+    required String ruleId,
+    required String name,
+    required String pattern,
+    required String replacement,
+    bool enabled = true,
+  }) async =>
+      throw _missing('replace.update');
+
+  Future<void> replaceDelete(String ruleId) async =>
+      throw _missing('replace.delete');
+
+  Future<void> replaceToggleGlobal(bool enabled) async =>
+      throw _missing('replace.toggle_global');
+
+  // font.* - 字体管理
+  Future<List<Map<String, Object?>>> fontScanSystem() async =>
+      throw _missing('font.scan_system');
+
+  Future<void> fontAddUser(String filePath) async =>
+      throw _missing('font.add_user');
+
+  Future<void> fontRemove(String fontId) async =>
+      throw _missing('font.remove');
+
+  Future<void> fontSelect(String family) async =>
+      throw _missing('font.select');
+
+  // export.* - 书籍导出
+  Future<void> exportEpub(String bookKey, String outputPath) async =>
+      throw _missing('export.epub');
+
+  Future<void> exportTxt(String bookKey, String outputPath) async =>
+      throw _missing('export.txt');
+
+  // webdav.* - WebDAV 备份
+  Future<void> webdavBackup() async => throw _missing('webdav.backup');
+
+  Future<void> webdavRestore(String backupId) async =>
+      throw _missing('webdav.restore');
+
+  Future<List<Map<String, Object?>>> webdavListBackups() async =>
+      throw _missing('webdav.list_backups');
+
+  // webbridge.* - 网络桥
+  Future<void> webbridgeStart(int port) async =>
+      throw _missing('webbridge.start');
+
+  Future<void> webbridgeStop() async => throw _missing('webbridge.stop');
+
+  Future<Map<String, Object?>> webbridgeStatus() async =>
+      throw _missing('webbridge.status');
+
   EngineFailure _missing(String action) => EngineFailure(
         EngineFailureKind.unavailable,
         '当前环境不支持 $action',

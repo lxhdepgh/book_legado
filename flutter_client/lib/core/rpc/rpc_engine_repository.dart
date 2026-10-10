@@ -89,6 +89,164 @@ class RpcEngineRepository implements EngineRepository {
     return data is String ? data : null;
   }
 
+  // -- G4-E: 工具域实现 --
+  // browser.* - 浏览器会话管理
+  @override
+  Future<String?> browserOpenPage(String url) async {
+    final data = await client.call('browser.open_page',
+        payload: <String, Object?>{'url': url});
+    return data is String ? data : null;
+  }
+
+  @override
+  Future<void> browserNavigate(String sessionId, String url) async {
+    await client.call('browser.navigate',
+        payload: <String, Object?>{'session_id': sessionId, 'url': url});
+  }
+
+  @override
+  Future<void> browserClose(String sessionId) async {
+    await client.call('browser.close',
+        payload: <String, Object?>{'session_id': sessionId});
+  }
+
+  // replace.* - 替换规则 CRUD
+  @override
+  Future<List<Map<String, Object?>>> replaceList() async {
+    final data = await client.call('replace.list');
+    if (data is List) {
+      return data.cast<Map<String, Object?>>();
+    }
+    return [];
+  }
+
+  @override
+  Future<void> replaceAdd({
+    required String name,
+    required String pattern,
+    required String replacement,
+    bool enabled = true,
+  }) async {
+    await client.call('replace.add', payload: <String, Object?>{
+      'name': name,
+      'pattern': pattern,
+      'replacement': replacement,
+      'enabled': enabled,
+    });
+  }
+
+  @override
+  Future<void> replaceUpdate({
+    required String ruleId,
+    required String name,
+    required String pattern,
+    required String replacement,
+    bool enabled = true,
+  }) async {
+    await client.call('replace.update', payload: <String, Object?>{
+      'rule_id': ruleId,
+      'name': name,
+      'pattern': pattern,
+      'replacement': replacement,
+      'enabled': enabled,
+    });
+  }
+
+  @override
+  Future<void> replaceDelete(String ruleId) async {
+    await client.call('replace.delete',
+        payload: <String, Object?>{'rule_id': ruleId});
+  }
+
+  @override
+  Future<void> replaceToggleGlobal(bool enabled) async {
+    await client.call('replace.toggle_global',
+        payload: <String, Object?>{'enabled': enabled});
+  }
+
+  // font.* - 字体管理
+  @override
+  Future<List<Map<String, Object?>>> fontScanSystem() async {
+    final data = await client.call('font.scan_system');
+    if (data is List) {
+      return data.cast<Map<String, Object?>>();
+    }
+    return [];
+  }
+
+  @override
+  Future<void> fontAddUser(String filePath) async {
+    await client.call('font.add_user',
+        payload: <String, Object?>{'file_path': filePath});
+  }
+
+  @override
+  Future<void> fontRemove(String fontId) async {
+    await client.call('font.remove',
+        payload: <String, Object?>{'font_id': fontId});
+  }
+
+  @override
+  Future<void> fontSelect(String family) async {
+    await client.call('font.select',
+        payload: <String, Object?>{'family': family});
+  }
+
+  // export.* - 书籍导出
+  @override
+  Future<void> exportEpub(String bookKey, String outputPath) async {
+    await client.call('export.epub', payload: <String, Object?>{
+      'book_key': bookKey,
+      'output_path': outputPath,
+    });
+  }
+
+  @override
+  Future<void> exportTxt(String bookKey, String outputPath) async {
+    await client.call('export.txt', payload: <String, Object?>{
+      'book_key': bookKey,
+      'output_path': outputPath,
+    });
+  }
+
+  // webdav.* - WebDAV 备份
+  @override
+  Future<void> webdavBackup() async => await client.call('webdav.backup');
+
+  @override
+  Future<void> webdavRestore(String backupId) async {
+    await client.call('webdav.restore',
+        payload: <String, Object?>{'backup_id': backupId});
+  }
+
+  @override
+  Future<List<Map<String, Object?>>> webdavListBackups() async {
+    final data = await client.call('webdav.list_backups');
+    if (data is List) {
+      return data.cast<Map<String, Object?>>();
+    }
+    return [];
+  }
+
+  // webbridge.* - 网络桥
+  @override
+  Future<void> webbridgeStart(int port) async {
+    await client.call('webbridge.start',
+        payload: <String, Object?>{'port': port});
+  }
+
+  @override
+  Future<void> webbridgeStop() async => await client.call('webbridge.stop');
+
+  @override
+  Future<Map<String, Object?>> webbridgeStatus() async {
+    final data = await client.call('webbridge.status');
+    if (data is Map) {
+      return Map<String, Object?>.from(data);
+    }
+    return {};
+  }
+
   /// 反向渲染的答复（§8 R1）。两处与全表不同，都不是风格：
   ///
   /// 1. **`singleFlight: false`**。同 action 只许在飞一发"这条是**答两条不同的渲染**
