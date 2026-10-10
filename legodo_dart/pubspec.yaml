@@ -38,6 +38,10 @@ dependencies:
   go_router: ^18.0.2
   http: ^1.6.0
   file_picker: ^6.2.1
+  
+  # [Android 裁剪] WebView + TTS 纯 Dart 实现（替代 Python Playwright/pyttsx3）
+  webview_flutter: ^4.8.0
+  flutter_tts: ^4.0.2
 
 dev_dependencies:
   flutter_test:

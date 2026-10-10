@@ -1,54 +1,103 @@
-/// 浏览器工具页（占位）：通用内置浏览器（CDP 投屏架构）。
+/// 浏览器工具页：使用 webview_flutter 加载网页。
 ///
-/// 注意：Flutter Windows 没有成熟的 WebView 插件，因此采用与 Flet 版本相同的
-/// CDP 投屏架构：Python 侧用 Playwright 打开 Chromium，通过 WebSocket 发送
-/// JPEG 帧给 Flutter，用户手势（点击/滚动/输入）发回 Python 执行。
-///
-/// 当前为占位实现，完整功能需要：
-/// 1. 事件订阅机制（接收服务端推送的帧）
-/// 2. 手势捕获与坐标换算
-/// 3. 会话管理（open/navigate/close）
+/// Windows 需要 WebView2 Runtime（Win10/11 通常已预装），
+/// Android 使用系统 WebView，iOS 使用 WKWebView。
 library;
 
 import 'package:flutter/material.dart';
+import 'package:webview_flutter/webview_flutter.dart';
 
-class BrowserScreen extends StatelessWidget {
+class BrowserScreen extends StatefulWidget {
   const BrowserScreen({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Scaffold(
-      appBar: AppBar(title: const Text('浏览器')),
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(Icons.public, size: 64, color: Colors.grey),
-            const SizedBox(height: 16),
-            Text('内置浏览器',
-                style: theme.textTheme.headlineSmall?.copyWith(
-                  fontWeight: FontWeight.bold,
-                )),
-            const SizedBox(height: 8),
-            Text('CDP 投屏架构', style: theme.textTheme.bodyMedium),
-            const SizedBox(height: 16),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 32),
-              child: Text(
-                '此功能需要完整的 CDP 投屏实现：\n'
-                '- Python 侧 Playwright + Chromium\n'
-                '- WebSocket 帧传输\n'
-                '- 手势捕获与坐标换算\n\n'
-                '当前为占位页面，后续完善。',
-                textAlign: TextAlign.center,
-                style: theme.textTheme.bodySmall?.copyWith(
-                  color: Colors.grey,
-                ),
-              ),
-            ),
-          ],
+  State<BrowserScreen> createState() => _BrowserScreenState();
+}
+
+class _BrowserScreenState extends State<BrowserScreen> {
+  late WebViewController _controller;
+  String _url = '';
+  bool _isLoading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onPageStarted: (url) {
+            setState(() {
+              _isLoading = true;
+              _url = url;
+            });
+          },
+          onPageFinished: (url) {
+            setState(() {
+              _isLoading = false;
+              _url = url;
+            });
+          },
         ),
+      )
+      ..loadRequest(Uri.parse('https://www.baidu.com'));
+  }
+
+  void _navigate(String url) {
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      url = 'https://$url';
+    }
+    _controller.loadRequest(Uri.parse(url));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: TextField(
+          onSubmitted: _navigate,
+          decoration: InputDecoration(
+            hintText: '输入网址',
+            border: InputBorder.none,
+            suffixIcon: IconButton(
+              icon: const Icon(Icons.search),
+              onPressed: () {
+                final text = (context.findRenderObject() as RenderBox?)
+                    ?.parent
+                    ?.debugGetNearestAncestorOfType<TextField>()
+                    ?.value
+                    .text;
+                if (text != null && text.isNotEmpty) {
+                  _navigate(text);
+                }
+              },
+            ),
+          ),
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => _controller.goBack(),
+          ),
+          IconButton(
+            icon: const Icon(Icons.arrow_forward),
+            onPressed: () => _controller.goForward(),
+          ),
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: () => _controller.reload(),
+          ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          WebViewWidget(controller: _controller),
+          if (_isLoading)
+            Container(
+              alignment: Alignment.topCenter,
+              child: const LinearProgressIndicator(),
+            ),
+        ],
       ),
     );
   }
