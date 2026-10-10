@@ -1,0 +1,29 @@
+# ========== UI 模式（Flet 前端）==========
+# 若要启用 Flet UI，取消下方注释并运行 pip install -r requirements.txt
+# G4-F2 决策：flet 依赖标记为可选，等待 Android 打包需求明确后再决定是否真正删除
+# flet>=0.86.5
+# flet-desktop>=0.86.5
+
+# ========== 核心引擎依赖（必须）==========
+aiohttp>=3.9.0
+beautifulsoup4>=4.12.0
+charset-normalizer>=3.0.0
+html5lib>=1.1
+elementpath>=5.0.0
+jsonpath-ng>=1.7.0
+opencc-python-reimplemented>=0.1.7
+regex>=2024.0.0
+fonttools>=4.55
+pillow>=10.4
+pycryptodome>=3.20
+quickjs>=1.19.4
+py7zr>=0.22
+rarfile>=4.2
+EbookLib>=0.18
+pymupdf>=1.24
+feedparser>=6.0.10
+pyttsx3>=2.90
+edge-tts>=6.1
+qrcode>=7.4
+opencv-python-headless>=4.8
+playwright>=1.40.0  # 浏览器探针（可选）
