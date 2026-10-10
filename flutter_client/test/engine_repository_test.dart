@@ -338,4 +338,153 @@ void main() {
                   contains('ReaderSessionError'))));
     });
   });
+
+  // ------------------------------------------------------------------ #
+  // switch.*：换源那一族的四条形状规矩（G3-D3）
+  // ------------------------------------------------------------------ #
+  group('switch.* 仓库面', () {
+    test('switch.seeds 回的是裸行数组；回对象或 null 都是形状变了', () async {
+      final seeds = await _with('{"v":1,"id":"d-1","ok":true,"data":['
+              '{"name":"换源目标书","author":"作者戊","url":"https://s/a/1",'
+              '"origin":"https://s/a","origin_name":"G3换源a"}]}')
+          .switchSeeds(book: const <String, Object?>{'name': '换源目标书'});
+      expect(seeds, hasLength(1));
+      // 种子的"来源"就藏在行里的 `origin`：`SwitchCandidate.fromSeed` 认这一格，
+      // 空 origin 的行点下去 `switch.apply` 会报出一条取不到的源。
+      expect(seeds.first.origin, 'https://s/a');
+      expect(seeds.first.originName, 'G3换源a');
+      expect(seeds.first.identityKey, 'https://s/a|https://s/a/1');
+
+      for (final body in <String>[
+        '{"v":1,"id":"d-1","ok":true,"data":null}',
+        '{"v":1,"id":"d-1","ok":true,"data":{"name":"一行而不是数组"}}',
+      ]) {
+        await expectLater(
+            _with(body).switchSeeds(book: const <String, Object?>{}),
+            throwsA(isA<EngineFailure>()
+                .having((EngineFailure e) => e.kind, 'kind',
+                    EngineFailureKind.transport)
+                .having((EngineFailure e) => e.action, 'action',
+                    'switch.seeds')),
+            reason: body);
+      }
+    });
+
+    test('switch.scan 是 job：四格都落 payload，回话里一根候选都没有', () async {
+      final sent = <Map<String, Object?>>[];
+      final repository = RpcEngineRepository(RpcClient(_endpoint,
+          client: MockClient((request) async {
+            sent.add(jsonDecode(utf8.decode(request.bodyBytes))
+                as Map<String, Object?>);
+            return http.Response(
+                '{"v":1,"id":"d-1","ok":true,"data":{"started":true,'
+                '"action":"switch.scan"}}', 200,
+                headers: {'content-type': 'application/json'});
+          })));
+      final accepted = await repository.switchScan(
+          book: const <String, Object?>{'name': '换源目标书', 'origin': 'https://s/x'},
+          switchId: 6379028,
+          keyword: '换源目标书',
+          group: 'G3换源');
+      expect(accepted.started, isTrue);
+      expect(accepted.action, 'switch.scan');
+      // 四格恒带（黄金样本 `switch.scan.json` 的 request.payload 就是这四格）。
+      // `switch_id` 少了服务端按 0 办；`group` 少了就从不联网变成扫全库——
+      // 两者都不报错，只是把这一轮变成另一件事。
+      expect(sent.last['payload'], <String, Object?>{
+        'book': {'name': '换源目标书', 'origin': 'https://s/x'},
+        'switch_id': 6379028,
+        'keyword': '换源目标书',
+        'group': 'G3换源',
+      });
+      // 默认值也必须是**显式**的两格：只传 book/switch_id 时 keyword/group 送空串，
+      // 而不是省键（省键等于让服务端猜它自己的默认值）。
+      await repository.switchScan(
+          book: const <String, Object?>{}, switchId: 1);
+      expect(sent.last['payload'], <String, Object?>{
+        'book': <String, Object?>{}, 'switch_id': 1, 'keyword': '', 'group': '',
+      });
+    });
+
+    test('switch.snapshot 的 switch_id 服务端可能回数字，读出来必须是同一个字符串', () async {
+      // 契约上服务端把它折成 str（`sid = str(switch_id or 0)`），黄金样本里就是
+      // `"6379028"`。但 JSON 里数字与字符串在信封层是同一条通道——万一哪回它是数字，
+      // 模型按 int 读会得到 6379028，而 notifier 拿 `'$_switchId'` 比的是文本；
+      // 两种读法必须收敛到同一个数串，否则"只认本轮"那半边守卫会静默失效。
+      for (final raw in <String>['"6379028"', '6379028']) {
+        final run = await _with('{"v":1,"id":"d-1","ok":true,"data":{'
+                '"switch_id":$raw,"running":true,"cancelled":false,'
+                '"done":2,"total":3,"failures":1,"starved":0,'
+                '"candidates":[],"error":""}}')
+            .switchSnapshot();
+        expect(run.switchId, '6379028', reason: 'wire 形态 $raw');
+        expect(run.running, isTrue);
+        expect(run.done, 2);
+        expect(run.total, 3);
+        expect(run.failures, 1, reason: 'failures 读成 0 = 界面把失败源说成"都在跑"');
+        expect(run.candidates, isEmpty);
+      }
+    });
+
+    test('switch.cancel 的那一格必须是布尔：缺键要响，false 与 true 各读各的', () async {
+      expect(await _with('{"v":1,"id":"d-1","ok":true,"data":{"cancelled":false}}')
+          .switchCancel(), isFalse);
+      expect(await _with('{"v":1,"id":"d-1","ok":true,"data":{"cancelled":true}}')
+          .switchCancel(), isTrue);
+      // 缺键与裸布尔都得响：前者会让界面把"什么都没在跑"写成「已停止换源扫描」，
+      // 后者是形状变了（这一发回的是**对象里那一格**，不是受理凭据）。
+      for (final body in <String>[
+        '{"v":1,"id":"d-1","ok":true,"data":{}}',
+        '{"v":1,"id":"d-1","ok":true,"data":true}',
+        '{"v":1,"id":"d-1","ok":true,"data":null}',
+      ]) {
+        await expectLater(
+            _with(body).switchCancel(),
+            throwsA(isA<EngineFailure>()
+                .having((EngineFailure e) => e.kind, 'kind',
+                    EngineFailureKind.transport)
+                .having((EngineFailure e) => e.action, 'action',
+                    'switch.cancel')),
+            reason: body);
+      }
+    });
+
+    test('switch.apply 的三格各管一件事，applied 缺键不许读成"没换成"', () async {
+      final sent = <Map<String, Object?>>[];
+      final repository = RpcEngineRepository(RpcClient(_endpoint,
+          client: MockClient((request) async {
+            sent.add(jsonDecode(utf8.decode(request.bodyBytes))
+                as Map<String, Object?>);
+            return http.Response(
+                '{"v":1,"id":"d-1","ok":true,"data":{"applied":true,'
+                '"source_url":"https://s/b"}}', 200,
+                headers: {'content-type': 'application/json'});
+          })));
+      final result = await repository.applySwitch(
+          record: const <String, Object?>{'url': 'https://s/x/1', 'origin': 'https://s/x'},
+          sourceUrl: 'https://s/b',
+          book: const <String, Object?>{'url': 'https://s/b/1', 'origin': 'https://s/b'});
+      expect(result.applied, isTrue);
+      expect(result.sourceUrl, 'https://s/b');
+      expect(sent.last['action'], 'switch.apply');
+      expect(sent.last['payload'], <String, Object?>{
+        'record': {'url': 'https://s/x/1', 'origin': 'https://s/x'},
+        'source_url': 'https://s/b',
+        'book': {'url': 'https://s/b/1', 'origin': 'https://s/b'},
+      }, reason: 'record 找回书架那一行、source_url 找回那条源、book 是换成哪一本——'
+          '少一格服务端就按缺省办，而三种缺法都回同一句"没换成"');
+
+      await expectLater(
+          _with('{"v":1,"id":"d-1","ok":true,"data":{"source_url":"https://s/b"}}')
+              .applySwitch(
+                  record: const <String, Object?>{},
+                  sourceUrl: 'https://s/b',
+                  book: const <String, Object?>{}),
+          throwsA(isA<EngineFailure>()
+              .having((EngineFailure e) => e.kind, 'kind',
+                  EngineFailureKind.transport)
+              .having((EngineFailure e) => e.action, 'action', 'switch.apply')),
+          reason: 'applied 缺键读成 false = 把"这一发没成"说成"记录被删了或与其他书冲突"');
+    });
+  });
 }

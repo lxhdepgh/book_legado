@@ -1,4 +1,4 @@
-/// [EngineRepository] 的 RPC 实现：把契约面上那 44 发落到 §4.1 那一个动词上。
+/// [EngineRepository] 的 RPC 实现：把契约面上那 49 发落到 §4.1 那一个动词上。
 ///
 /// 每一发都做**形状检查**（数组就该是数组、对象就该是对象），检查不过抛
 /// `EngineFailureKind.transport`。这不是防御癖：服务端回 `null` 与回 `[]`
@@ -10,6 +10,7 @@ import '../events/engine_event.dart';
 import '../events/engine_event_client.dart';
 import '../settings/settings_map.dart';
 import '../../features/bookshelf/data/bookshelf_item.dart';
+import '../../features/bookshelf/data/source_switch_models.dart';
 import '../../features/check/data/check_models.dart';
 import '../../features/find_books/data/book_row.dart';
 import '../../features/find_books/data/category_row.dart';
@@ -318,6 +319,79 @@ class RpcEngineRepository implements EngineRepository {
             'source_json': sourceJson,
             'depth': depth,
           }), 'check.source'));
+
+  // ------------------------------------------------------------------ #
+  // switch.*
+  // ------------------------------------------------------------------ #
+  // 两处形状规矩与全表不同，都不是风格：
+  // 1. `switch.scan` 是 **job**：回话里只有受理凭据，候选一根不在这发上。
+  //    所以这里不许"顺手"把 `data` 当候选解——`JobAccepted.fromJson` 只认两格。
+  // 2. `switch.cancel` 回的是**对象里那一格布尔**（`{cancelled: bool}`），不是裸布尔：
+  //    那一格说的是"有没有真叫停下什么"，`false` 时界面别写"已停止"。
+  @override
+  Future<List<BookRow>> switchSeeds({
+    required Map<String, Object?> book,
+  }) async =>
+      _rows(await client.call('switch.seeds',
+          payload: <String, Object?>{'book': book}), 'switch.seeds')
+          .map(BookRow.fromJson)
+          .toList(growable: false);
+
+  @override
+  Future<JobAccepted> switchScan({
+    required Map<String, Object?> book,
+    required int switchId,
+    String keyword = '',
+    String group = '',
+  }) async =>
+      JobAccepted.fromJson(_asMap(await client.call('switch.scan', payload: <String, Object?>{
+        'book': book,
+        'switch_id': switchId,
+        'keyword': keyword,
+        'group': group,
+      }), 'switch.scan'));
+
+  @override
+  Future<SwitchRun> switchSnapshot() async => SwitchRun.fromJson(
+      _asMap(await client.call('switch.snapshot'), 'switch.snapshot'));
+
+  @override
+  Future<bool> switchCancel() async {
+    final data =
+        _asMap(await client.call('switch.cancel'), 'switch.cancel');
+    final cancelled = data['cancelled'];
+    if (cancelled is! bool) {
+      throw EngineFailure(EngineFailureKind.transport,
+          'switch.cancel 的回话里没有布尔 cancelled（收到 ${data.keys.join(',')}）：'
+              '那一格分的是"有没有真叫停下一轮"与"这一发没打通"，'
+              '缺了它界面就只能把"什么都没在跑"写成"已停止"',
+          action: 'switch.cancel');
+    }
+    return cancelled;
+  }
+
+  @override
+  Future<SwitchApplyResult> applySwitch({
+    required Map<String, Object?> record,
+    required String sourceUrl,
+    required Map<String, Object?> book,
+  }) async {
+    final data = _asMap(await client.call('switch.apply', payload: <String, Object?>{
+      'record': record,
+      'source_url': sourceUrl,
+      'book': book,
+    }), 'switch.apply');
+    final applied = data['applied'];
+    if (applied is! bool) {
+      // 这一格不许读成 false：服务端把"没换成"的三种成因（记录被删、与本条冲突、
+      // 源取不到——那一种它是**抛**）压在同一个布尔上，界面上已经只有两句话可说。
+      // 缺键再折成 false 就是给那两句话之外又造出第三种假话。
+      throw EngineFailure(EngineFailureKind.transport,
+          'switch.apply 的回话里没有布尔 applied（收到 ${data.keys.join(',')}）',
+          action: 'switch.apply');
+    }
+    return SwitchApplyResult.fromJson(data);
+  }
 
   // ------------------------------------------------------------------ #
   // reader.*

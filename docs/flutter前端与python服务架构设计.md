@@ -316,8 +316,10 @@ flet 那本 `_continuous_loaded` 台账**有意不抄**（它在"翻章→退回
 本轮按"过程中不跑测试"的授权执行，**通过数与变异核验欠到批量验证那一趟**，日志里只留静态读数。
 **服务面那一档已交（2026-10-10 第九十三轮，G3-D3 前半）**：`switch.seeds/scan/snapshot/cancel/apply`
 五发登记上表（44→49），扫描走 `mode="job"`，进度与整份候选各一条事件，排队规则收进服务侧一份；
-五发的黄金样本与进度面守卫在手，Dart 那半（仓库面 + 换源屏）是同一门的第二次提交。
-剩下的 R1 那一半在 **G3-D4**（`GET /media/{key}`）与 G4 的插件决定 |
+五发的黄金样本与进度面守卫在手。
+**Dart 那一档也交了（2026-10-10 第九十四轮，G3-D3 后半）**：仓库面五发、两个模型文件、
+换源屏与 notifier 落地，`_UNWIRED_PENDING_GATE` 那五张欠据划掉——当场复核 `never_called` 为**空**，
+49 发第一次全有调用点。剩下的 R1 那一半在 **G3-D4**（`GET /media/{key}`）与 G4 的插件决定 |
 | **G4** | `rss` / 漫画 / 朗读 / 工具域 / 老板键托盘；删 flet 依赖与 4 个 UI 耦合服务；PyInstaller spec 去 flet* | 2–3 周 | flet 从 `requirements.txt` 消失后全库仍绿；打包冒烟（照真果鉴 `smoke_windows.py` 那条：解压产物跑一次 `--package-smoke`） |
 
 累计 **9–12 周**单人全职（G0 之外）。参照系：真果鉴这条路线做出来的是
@@ -594,6 +596,38 @@ flet 那本 `_continuous_loaded` 台账**有意不抄**（它在"翻章→退回
 > 抓取当场从真进程取到的数（种子 2 行 / 本轮扫 3/3 源 / 候选 3 行 / 写回后目录 2 章）。
 > Dart 那半（仓库面 5 发、两个模型、换源屏、widget/golden）在**同一门的第二次提交**，
 > 五张具名欠据已写进 `_UNWIRED_PENDING_GATE`，划掉的判据是 `core/rpc/` 里出现这五个字面量。
+>
+> **G3-D3 后半交（Dart，2026-10-10，第九十四轮，`docs/dev-logs/2026-10-10.md` §「第九十四轮 下」）**：
+> 判据当场复核——`_dart_action_calls()` 扫到 **49** 个 action、`never_called` 是**空**，
+> `_UNWIRED_PENDING_GATE` 从 5 条回到 **0 条**（这张表自 G2-E 立起来第一次是空的，判据照跑）。
+> 落的是 `source_switch_models.dart`（311 行，一半模型一半文案——文案收在一处是因为 flet 那一屏
+> 状态/进度/候选共用一个 `_status` 槽，两侧都只留一个槽才比得出句子）、
+> `source_switch_notifier.dart`（339 行）、`source_switch_dialog.dart`（207 行）、
+> `source_switch_screen_test.dart`（502 行 / 18 条 widget），加仓库面 5 条与黄金契约 5 条；
+> `_feeds` 绑定表 25→**30** 格。仓库面钉的是两处形状规矩：`switch.scan` 的回执只有
+> `{started, action}`（不许顺手把 `data` 当候选解），`switch.cancel` 回的是**对象里那一格布尔**
+> （缺它就抛，因为 `applied`/`cancelled` 这类布尔已经各背着两三种成因）；
+> `switch.apply` 本轮改成硬要求 `applied` 是布尔。模型里最要紧的一格是
+> `SwitchRun.fromFinishedEvent` **故意不读** done/total/failures/starved——收尾帧带的是结论，
+> 读成 0 就会把跑完的一轮在界面上写成"扫了 0 个源"。
+> 两条与 flet **有意不同**都写明在文件头：种子那一发失败时除了同一句文案还往 `failures` 推一条
+> （"本地已有 0 个结果"与"这一发没打通"在界面上不能同形），写回成功后不自动 pop
+> （句子留在对话框自己的状态格里，少一次 pop 就少一条"pop 与在途事件谁先到"的竞态）。
+> 本轮最贵的一格是**协议面缺的那一个判据**：flet 收本地书换源入口靠的是控制器注入的
+> `record["local"]`，而那一格从来不过协议面。选了"把服务端 `is_local_source_url` 的那一个
+> 字面量钉进 Dart（`kLocalBookSourceUrl` + 精确相等）并让跨语言守卫钉住它"，
+> 否掉了启发式 `startsWith('file')`、否掉了为一条 UI 规则改契约重抓 61 份样本、
+> 也否掉了默默复刻一份谓词——**要么上钉常量，要么上钉服务端，不许界面自己发明判据**。
+> 新守卫两支：`test_source_switch_wording_is_read_from_flet_into_dart`（用词表由 flet 的 AST 给：
+> 对话框整份模块 + 控制器那五个函数，切出 **23** 个语词，去掉两句 logger-only 是 **21** 个，
+> 逐个要在 Dart 的字面量里出现；排除表具名且当场反查它还在不在，死配置也红）与
+> `test_local_book_source_url_is_one_constant_two_places`。
+> 顺手挖出一条仪器债：`_py_source` 改读 **utf-8-sig**——`app/` 底下当场数过 **8 份**文件带 BOM
+> （包括本轮要读的这份换源对话框），按 utf-8 读会把 U+FEFF 留给 `ast.parse`，
+> 报出来的 SyntaxError 长得像"flet 源坏了"。内存变异六发（`.probe/g3d3_mutation_inprocess.py`，
+> 退出码 0）：基线 2 绿 + M1–M6 全部响在该触的那一句上；M3 读到 15 个语词、跌破 18 的底价。
+> **同一授权执行**：本轮没有套件读数，这一轮 2 支守卫的文件级变异核验与上一轮欠着的 18 发
+> 一起欠在批量验证那一趟。
 
 ---
 
@@ -675,7 +709,10 @@ flet 那本 `_continuous_loaded` 台账**有意不抄**（它在"翻章→退回
   屏侧 GlobalKey 改整篇段号、30 条新守卫，以及"按授权不跑测试、通过数与变异核验欠到批量验证"这一条；
   第九十三轮：**G3-D3 前半（服务面）**——`switch.*` 五发上表（49 条动作）、换源扫描走 `mode="job"`
   与两条新事件、排队规则收进服务侧一份、`/g3sw` 六源四页语料与 `/hits.json` 前后差量账、
-  61 份黄金样本重抓、进度面那支从现场函数体推导的守卫）
+  61 份黄金样本重抓、进度面那支从现场函数体推导的守卫；
+  第九十四轮：**G3-D3 后半（Dart）**——仓库面五发与换源屏落地、欠据清零（49/49 有调用点）、
+  语词表守卫（flet 的 AST 给 21 个语词）与"协议面缺的那一格：要么上钉常量要么上钉服务端"，
+  以及 `_py_source` 那一条 BOM 仪器债）
 - `docs/M7打包说明.md`（PyInstaller 命令与 flet* hidden-import 清单位置）
 - 参照仓库：`github.com/jerunshi/guoapp1`（浅克隆 `D:/tmp/guoapp1`，不在本项目版本控制内）
 - 记忆：`tts-pyttsx3-com-same-thread`、`quickjs-native-crash-risk`、`engine-hub-loop-split`、

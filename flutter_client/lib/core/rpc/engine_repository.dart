@@ -8,7 +8,7 @@
 /// 实体在 feature，是 §6.1 那个 feature-first 目录换来的一条代价——
 /// 反过来让 core 只认 `Map` 就是今天 RPC 出口那个形状，两侧都得自己解释一遍字段。
 ///
-/// 方法表 = `app/gateway/methods.py` 那张表，**一条不漏**（44 发，含
+/// 方法表 = `app/gateway/methods.py` 那张表，**一条不漏**（49 发，含
 /// `engine.webContentReady`——那一条方向是反的：引擎在 `<useweb>` 那一族源上求客户端
 /// 渲染一次，客户端把结果从 /rpc 交回去；接它的是 `core/webview/webview_host.dart`，
 /// 不是某一屏的按钮）。
@@ -31,6 +31,7 @@ import '../../features/sources/data/import_outcome.dart';
 import '../../features/sources/data/source_audit.dart';
 import '../../features/sources/data/source_record.dart';
 import '../../features/bookshelf/data/bookshelf_item.dart';
+import '../../features/bookshelf/data/source_switch_models.dart';
 import '../events/engine_event.dart';
 import '../settings/settings_map.dart';
 import 'engine_status.dart';
@@ -64,11 +65,13 @@ class GatewayInfo {
       );
 }
 
-/// 两个 job 动作的受理凭据（`{"started":true,"action":…}`）。
+/// `mode="job"` 那三发（`check.start` / `search.start` / `switch.scan`）的受理凭据
+/// （`{"started":true,"action":…}`）。
 ///
 /// **它不是结果**。`mode="job"` 的动作回这个就收摊，真结果一根不落在 RPC 上，
 /// 只走 `/ws` 的事件流（`search.start` → `SearchFinishedEvent`，
-/// `check.start` → `CheckFinishedEvent`）。拿它当"任务成功了"是这一发最容易读错的地方：
+/// `check.start` → `CheckFinishedEvent`，`switch.scan` → 那两条 `SourceSwitch*`）。
+/// 拿它当"任务成功了"是这一发最容易读错的地方：
 /// `started` 只说服务端肯起，起了之后一条源都检测不出来也照样回 `started:true`。
 class JobAccepted {
   const JobAccepted({required this.started, required this.action});
@@ -275,6 +278,58 @@ abstract class EngineRepository {
     String depth = 'list',
   }) async =>
       throw _missing('check.source');
+
+  // ------------------------------------------------------------------ #
+  // switch.*（换源：先本地种子，再联网扫描，扫描是 job）
+  // ------------------------------------------------------------------ #
+  // 这一族与 check.* 是同一个形状：受理凭据里没有结果，逐源进度与整份候选走事件流，
+  // 断线/切页期间丢掉的那些由 `switch.snapshot` 补回来。关联靠客户端生成的
+  // `switch_id`（服务端原样回带，`search.start` 的 `search_id` 同一套办法）。
+  // 排队规则（谁进扫描队列、谁先扫）在**服务端**（`order_switch_sources`）：
+  // 客户端不排、不筛，也不自己判"这条源能不能搜"。
+
+  /// 换源对话框打开时先读的**本地种子**：之前搜索落库的同名书，不联网、秒开。
+  ///
+  /// 回的是裸书行（一行本就来自一条源），所以是 [BookRow] 而不是候选包装。
+  /// [book] 传**书架那一行原样那份字典**（服务端只读 name/author 去取同名书）。
+  Future<List<BookRow>> switchSeeds({
+    required Map<String, Object?> book,
+  }) async =>
+      throw _missing('switch.seeds');
+
+  /// 起一轮换源联网扫描（`mode="job"`）：这一发只回受理凭据。
+  ///
+  /// [switchId] 由客户端生成、本轮事件原样回带——**不许省**：`_start_job` 的回包里
+  /// 没有任务号，晚到的进度与收尾只能靠它认本轮（服务端把它折成字符串再回带）。
+  /// [group] 空串 = 全部启用源；**分组不存在时不回退到全部**（那是转圈而不是答案）。
+  /// 已经在跑的一轮会被**合作式叫停**再由这一轮接手，已扫出的候选不扔。
+  Future<JobAccepted> switchScan({
+    required Map<String, Object?> book,
+    required int switchId,
+    String keyword = '',
+    String group = '',
+  }) async =>
+      throw _missing('switch.scan');
+
+  /// 当前/最近一轮的回放快照（进度不许只活在事件流里）。
+  Future<SwitchRun> switchSnapshot() async => throw _missing('switch.snapshot');
+
+  /// 叫停在跑的那一轮，回的是**这一发有没有真叫停下什么**（`cancelled:false` =
+  /// 没有轮次在跑，界面别写"已停止"）。它不是"请求受理了没有"。
+  Future<bool> switchCancel() async => throw _missing('switch.cancel');
+
+  /// 选中那条候选写回书架。
+  ///
+  /// 三个参数各管一件事：[record] 是**书架那一行**（服务端按它的 url/source_url 找回
+  /// 记录，找不到就 `applied:false`），[sourceUrl] 是候选那一条源的 url（服务端按它
+  /// 取回书源对象——取不到时这一发**报错**，不回 false），
+  /// [book] 是候选那一行的书快照（`url` 是新源的那一条）。
+  Future<SwitchApplyResult> applySwitch({
+    required Map<String, Object?> record,
+    required String sourceUrl,
+    required Map<String, Object?> book,
+  }) async =>
+      throw _missing('switch.apply');
 
   // ------------------------------------------------------------------ #
   // reader.*（阅读会话）

@@ -22,4 +22,13 @@ abstract final class EngineEventNames {
 
   /// 某个服务的状态迁移（仪表盘那一行读它）。
   static const String serviceStateChanged = 'ServiceStateChangedEvent';
+
+  /// 换源扫描的进度（`switch_id` + `done`/`total` + `failures`/`starved`）。
+  /// 它和下一条挂的是同一轮：`switch_id` 认不出自己那轮的帧必须整帧丢掉，
+  /// 否则上一轮"扫完 3 个"会把这一轮的"扫完 1 个"盖回去。
+  static const String sourceSwitchProgress = 'SourceSwitchProgressEvent';
+
+  /// 换源扫描收尾（`switch_id` + `candidates` + `cancelled` + `error`）。
+  /// 候选名单**只在这条里**，进度帧里没有——所以那五格里只有这一条带数据。
+  static const String sourceSwitchFinished = 'SourceSwitchFinishedEvent';
 }

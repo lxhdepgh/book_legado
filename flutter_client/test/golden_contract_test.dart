@@ -14,6 +14,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:legodo_client/core/rpc/engine_status.dart';
 import 'package:legodo_client/core/rpc/envelope.dart';
 import 'package:legodo_client/features/bookshelf/data/bookshelf_item.dart';
+import 'package:legodo_client/features/bookshelf/data/source_switch_models.dart';
 import 'package:legodo_client/features/check/data/check_models.dart';
 import 'package:legodo_client/features/find_books/data/book_row.dart';
 import 'package:legodo_client/features/find_books/data/category_row.dart';
@@ -234,7 +235,7 @@ Object? _nodeAt(Object? data, List<String> path) {
   return node;
 }
 
-/// 绑定表：25 个模型类 ↔ 20 发样本。少一格就是有一批键没人核（正对照在下面的计数里）。
+/// 绑定表：30 个模型类 ↔ 23 发样本。少一格就是有一批键没人核（正对照在下面的计数里）。
 const List<_Feed> _feeds = <_Feed>[
   _Feed('features/bookshelf/data/bookshelf_item.dart', 'BookshelfItem', 'bookshelf.list'),
   _Feed('features/find_books/data/book_row.dart', 'BookRow', 'browse.books'),
@@ -262,6 +263,16 @@ const List<_Feed> _feeds = <_Feed>[
   _Feed('features/reader/data/reader_session.dart', 'CloseOutcome', 'reader.close'),
   _Feed('features/reader/data/content_search_result.dart', 'ContentSearchResult', 'reader.search_content'),
   _Feed('features/reader/data/content_search_result.dart', 'ContentHit', 'reader.search_content', ['hits']),
+  // 换源那一族（G3-D3）：模型都钉在 `switch.*` 那五发的真载荷上。
+  // `SwitchProgress` 绑的是快照而不是进度帧样本——进度帧的六格是快照那九格的子集，
+  // 而载荷样本里唯一带这组键名的常驻节点就是快照（`switch.scan` 的 progress_sample
+  // 由下面那一格具体取值兜）。
+  _Feed('features/bookshelf/data/source_switch_models.dart', 'SwitchCandidate', 'switch.snapshot', ['candidates']),
+  _Feed('features/bookshelf/data/source_switch_models.dart', 'SwitchProgress', 'switch.snapshot'),
+  _Feed('features/bookshelf/data/source_switch_models.dart', 'SwitchRun', 'switch.snapshot'),
+  _Feed('features/bookshelf/data/source_switch_models.dart', 'SwitchApplyResult', 'switch.apply'),
+  // 种子那一发回的是**裸书行**，与 `browse.books` 同一套 35 键（服务端都走 `_book_item_dict`）。
+  _Feed('features/find_books/data/book_row.dart', 'BookRow', 'switch.seeds'),
 ];
 
 void main() {
@@ -357,7 +368,7 @@ void main() {
     });
   });
 
-  test('每一发样本都是合法信封、且服务端认账（56 发全覆盖）', () {
+  test('每一发样本都是合法信封、且服务端认账（61 发全覆盖）', () {
     final dir = Directory('${_repoRoot.path}/tests/gateway/golden');
     final names = dir
         .listSync()
@@ -367,7 +378,8 @@ void main() {
         .toList()
         ..sort();
     // 正对照：样本面塌了（目录空/改名）这格会假绿，所以先钉数量。
-    expect(names.length, greaterThanOrEqualTo(56), reason: '黄金样本只剩 ${names.length} 发');
+    // 56 → 61 这一跳是 G3-D3 那五发（`switch.*`）；改这一格之前先数一遍目录。
+    expect(names.length, greaterThanOrEqualTo(61), reason: '黄金样本只剩 ${names.length} 发');
 
     // 语料里有一族**故意失败**的信封：协议面必须有一发让客户端看清"错误信封长什么样"
     // （会话不是这本书 → 拒答而不是回空目录，回空目录看起来像书坏了）。
@@ -405,14 +417,15 @@ void main() {
         reason: '这些样本与 engine.hello 的 schema_digest 不一致——重抓样本');
   });
 
-  group('模型吃的每一个键都在真载荷里（25 个类 ↔ 20 发样本）', () {
+  group('模型吃的每一个键都在真载荷里（30 个类 ↔ 23 发样本）', () {
     test('绑定表与扫描器都接上了（正对照）', () {
-      expect(_feeds.length, greaterThanOrEqualTo(25),
+      expect(_feeds.length, greaterThanOrEqualTo(30),
           reason: '绑定表只剩 ${_feeds.length} 格——删一格就是有一批键没人核');
       final total = _feeds.fold<int>(
           0, (sum, feed) => sum + feed.consumedKeys().length);
-      // 实测 158 个键（25 个类各自读的 `['key']` 之和：reader 那一族这轮带进 67 个）。
-      // 留 8 的余量给模型加字段，但绑定表被人删一格（最少 2 个键）一定跌破。
+      // 这一格是**仪器接上没接上**的读数，不是契约：下限留得比实测低一截，
+      // 但绑定表被人删一格（最少 2 个键）一定跌破。实测总数在批量验证那一轮
+      // （任务 #29）现量现写，这里不存旧值——存了就成了"没人测也像个数"。
       expect(total, greaterThanOrEqualTo(150),
           reason: '只抽到 $total 个键——扫描器或类名不对，这条不是在放行');
     });
@@ -863,6 +876,129 @@ void main() {
       });
       expect(noFts.hits, isEmpty);
       expect(noFts.ftsAvailable, isFalse);
+    });
+  });
+
+  group('switch.* 那一族解得开：轮次、候选、两份事件样本与写回（G3-D3）', () {
+    Map<String, Object?> data(String name) =>
+        Map<String, Object?>.from(_envelopeOf(_load(name))['data']! as Map);
+
+    Map<String, Object?> requestPayload(String name) =>
+        Map<String, Object?>.from((_load(name)['request']! as Map)['payload']! as Map);
+
+    test('switch.snapshot：九键快照，候选三行里同站两本都在', () {
+      final run = SwitchRun.fromJson(data('switch.snapshot'));
+      // 本轮身份：服务端 `sid = str(switch_id or 0)` 折成**字符串**回带，样本里就是 `"6379028"`。
+      // 模型这一格必须是 String——按数字读会永远读到 0，"只认当前那一轮"那半边守卫整个失效。
+      expect(run.switchId, '6379028');
+      expect(run.running, isFalse);
+      expect(run.cancelled, isFalse);
+      expect(run.done, 3);
+      expect(run.total, 3);
+      expect(run.failures, 0);
+      expect(run.starved, 0);
+      expect(run.error, isEmpty);
+      expect(run.candidates, hasLength(3));
+      for (final candidate in run.candidates) {
+        expect(candidate.sourceUrl, isNotEmpty,
+            reason: 'switch.apply 的 source_url 就是这一格，空的行点下去什么都没换');
+        expect(candidate.sourceName, isNotEmpty);
+        expect(candidate.book.url, isNotEmpty,
+            reason: '空的 book.url 让 identityKey 只剩站点名，同站两本会并成一行');
+      }
+      // **同站两本**是真形状：a 站有 book/1 与 book/2 两条候选。
+      // 行键少了 `book.url` 那一半就会把两本渲染成一本（少一本可选的书）。
+      expect(run.candidates.map((c) => c.sourceUrl).toSet().length, lessThan(3),
+          reason: '正对照：来源 url 本来就会撞——不撞的话下面那条 identityKey 唯一性就是自证');
+      expect(run.candidates.map((c) => c.identityKey).toSet(), hasLength(3));
+      // 顺序原样保留（`rank_switch_matches` 排的那一份），客户端不重排。
+      expect(run.candidates.map((c) => c.identityKey).toList(),
+          <String>[
+            'http://127.0.0.1:8797/g3sw/a|http://127.0.0.1:8797/g3sw/a/book/1.html',
+            'http://127.0.0.1:8797/g3sw/b|http://127.0.0.1:8797/g3sw/b/book/1.html',
+            'http://127.0.0.1:8797/g3sw/a|http://127.0.0.1:8797/g3sw/a/book/2.html',
+          ],
+          reason: '候选顺序在服务侧（同站优先 + url 字典序）；这里读出来变了序就是 Dart 侧重排过');
+    });
+
+    test('switch.scan 的两份事件样本：收尾那五格不带计数，进度那一帧只带计数', () {
+      final finished =
+          Map<String, Object?>.from((_load('switch.scan')['event_sample']! as Map)['payload']! as Map);
+      expect(finished.keys.toSet(),
+          <String>{'switch_id', 'candidates', 'cancelled', 'error', 'timestamp'});
+      // 这一格是 `SwitchRun.fromFinishedEvent` **不读** done/total/failures/starved 的证人：
+      // 载荷里本就没有那四格（计数只在进度帧里发）。哪天服务端把它们加进收尾事件，
+      // 这条就红——红的意思是"模型那边可以开始读了，注释要重看"。
+      expect(finished.containsKey('done'), isFalse);
+      expect(finished.containsKey('total'), isFalse);
+      final run = SwitchRun.fromFinishedEvent(finished);
+      expect(run.switchId, '6379028', reason: '收尾与快照带的是同一个本轮身份');
+      expect(run.candidates, hasLength(3));
+      expect(run.running, isFalse, reason: '收尾事件之后没有"还在跑"这一说');
+      expect(run.cancelled, isFalse);
+      expect(run.error, isEmpty);
+
+      final progressSample = _load('switch.scan')['progress_sample']! as Map;
+      final frames = (progressSample['frames']! as List)
+          .cast<Map<String, Object?>>();
+      expect(frames, isNotEmpty, reason: '正对照：没有进度帧，下面读的全是空表');
+      final progress = SwitchProgress.fromMap(frames.first);
+      expect(progress.switchId, '6379028');
+      expect(progress.done, 3);
+      expect(progress.total, 3);
+      expect(progress.failures, 0);
+      expect(progress.starved, 0);
+      // 模型读的五个键名必须是事件载荷键名的子集（`timestamp` 除外：那是丢旧不回用的）。
+      final wireFields =
+          (progressSample['payload_field_names']! as List).cast<String>();
+      for (final key in <String>['switch_id', 'done', 'total', 'failures', 'starved']) {
+        expect(wireFields, contains(key),
+            reason: '进度帧从来不吐 $key——模型里那一格是死的，界面读到的是默认 0');
+      }
+    });
+
+    test('switch.seeds：裸书行两条，候选的站点取自行里的 origin', () {
+      final rows = (_envelopeOf(_load('switch.seeds'))['data']! as List)
+          .cast<Map<String, Object?>>();
+      expect(rows, hasLength(2));
+      final seeds = rows.map((row) => SwitchCandidate.fromSeed(BookRow.fromJson(row))).toList();
+      for (final seed in seeds) {
+        expect(seed.sourceUrl, isNotEmpty,
+            reason: '种子的 source_url = 那一行的 origin（服务端 `origin_order`/`origins` 都在这套键里）');
+        expect(seed.sourceName, isNotEmpty);
+      }
+      expect(seeds.map((s) => s.identityKey).toSet(), hasLength(2));
+      // 种子**不排除当前源**（flet 也只让扫描队列排自己：`order_switch_sources`）。
+      // 这一格钉的是"客户端不许在这里替服务端多做一道过滤"——样本里就有一条是当前源。
+      final ownOrigin =
+          '${(Map<String, Object?>.from(requestPayload('switch.seeds')['book']! as Map))['origin'] ?? ''}';
+      expect(ownOrigin, isNotEmpty);
+      expect(seeds.map((s) => s.sourceUrl), contains(ownOrigin),
+          reason: '种子行里已经没有当前源了——那条排除规则改过地方，界面这侧的比对要重看');
+    });
+
+    test('switch.apply：回带的 source_url 就是请求那一格，且三格各有职守', () {
+      final result = SwitchApplyResult.fromJson(data('switch.apply'));
+      final payload = requestPayload('switch.apply');
+      expect(result.applied, isTrue);
+      expect(result.sourceUrl, '${payload['source_url']}',
+          reason: '回话里的 url 与送出去的那一格对不上 = 换到的不是点的那条源');
+      final record = Map<String, Object?>.from(payload['record']! as Map);
+      final book = Map<String, Object?>.from(payload['book']! as Map);
+      expect(result.sourceUrl, '${book['origin']}');
+      // 三格的分工在这一发里看得见：record 还在旧源上，book 已经在新源上。
+      expect('${record['origin']}', isNot(result.sourceUrl),
+          reason: 'record 是"要换的那一行"、book 是"换成哪一本"，两者同源时这一发没演到换');
+      expect('${record['url']}', isNot('${book['url']}'));
+      expect('${record['name']}', '${book['name']}', reason: '换源的前提就是同名书');
+    });
+
+    test('switch.cancel：false 是真的"没在跑"，那一格不许缺', () {
+      final sample = data('switch.cancel');
+      expect(sample.keys, <String>{'cancelled'});
+      expect(sample['cancelled'], isFalse,
+          reason: '抓样那一拍没有轮次在跑（空闲支）。在跑那一支由 pytest 的 SWITCH_CONCURRENCY=1 臂出证据，'
+              '界面那两句话的分叉在 source_switch_screen_test.dart 里按替身走');
     });
   });
 }

@@ -22,6 +22,8 @@ import pytest
 
 from app.gateway.methods import BY_ACTION
 from app.gateway.protocol import ERROR_CODES, PROTOCOL_VERSION
+from app.services.content.local_book_service import (
+    LOCAL_BOOK_SOURCE_URL, is_local_source_url)
 from app.themes.builtin_themes import BUILTIN_SKINS
 from app.views.navigation import NARROW_WIDTH_THRESHOLD
 
@@ -227,21 +229,16 @@ def test_widget_key_lookalikes_are_not_mistaken_for_actions() -> None:
 #: `engine.webContentReady` 从"反向通道例外"那一张表里挪了出来——它的 Dart 调用点在
 #: `core/webview/webview_host.dart` 那条链上（宿主答回去用的就是这一发），
 #: 所以它现在与其余 43 发一样**必须有调用点**，那张例外表删掉了。
-#: 表现在是空的，而**判据照跑**——它的作用是下一门（G3-D 的换源、G4 的那几族）
+#: 表现在是空的，而**判据照跑**——它的作用是下一门（G4 的那几族：rss/漫画/朗读/工具）
 #: 落地时的同一张嘴，不是历史装饰。
 #: 口径提醒：这里数的"Dart 侧有人落"是**协议面在 Dart 有实现**（`core/rpc/` 那三个文件
 #: 里的字面量），不是"界面调了它"；后者由 widget/golden 测试那一面负责（G3-C3）。
 #:
-#: 第九十三轮（G3-D3）把换源那一族五发登记上表，Dart 的仓库面与换源屏在同一门的
-#: 第二发提交里接——这一张欠据管的就是那半截。划掉的判据是 `core/rpc/` 里出现这五个
-#: 字面量，不是"屏幕看着像"。
-_UNWIRED_PENDING_GATE: dict[str, str] = {
-    "switch.seeds": "G3-D3 的 Dart 换源屏：打开对话框先读本地种子（不联网那一发）",
-    "switch.scan": "G3-D3 的 Dart 换源屏：mode=job + 进度事件，换源那一轮的结果从 /ws 走",
-    "switch.snapshot": "G3-D3 的 Dart 换源屏：断线重连补回'扫到第几源'的那一发",
-    "switch.cancel": "G3-D3 的 Dart 换源屏：停止按钮那一发（合作式叫停，保留已扫出的候选）",
-    "switch.apply": "G3-D3 的 Dart 换源屏：选中候选写回书架那一发",
-}
+#: 第九十三轮（G3-D3）把换源那一族五发登记上表，第九十四轮在同一门的第二发提交里划掉：
+#: 五个字面量都落在 `core/rpc/rpc_engine_repository.dart`（当场数过：49 发全部有调用点，
+#: `never_called` 为空），换源屏那一面另有 `test/source_switch_screen_test.dart` 接住。
+#: 划掉的判据是 `core/rpc/` 里出现这五个字面量，不是"屏幕看着像"。
+_UNWIRED_PENDING_GATE: dict[str, str] = {}
 
 
 def _dart_action_calls() -> dict[str, list[str]]:
@@ -375,7 +372,33 @@ def _py_source(rel: str) -> str:
     path = ROOT / rel
     if not path.is_file():
         pytest.fail(f"flet 侧源文件不见了：{rel}（守卫读的是它的字面量，挪了请一起改）")
-    return path.read_text(encoding="utf-8")
+    # **utf-8-sig 不是讲究**：`app/` 底下当场数过有 8 份文件带 BOM（`app/views/reading/`
+    # 那一族全在里面）。按 utf-8 读会把 U+FEFF 留在第一行开头，`ast.parse` 当场
+    # SyntaxError——那条红看起来像"flet 源坏了"，其实是仪器读错了字节序。
+    return path.read_text(encoding="utf-8-sig")
+
+
+def _cjk_literals_from(node: ast.AST) -> list[str]:
+    '''从一个 AST 节点往下抽所有**含汉字**的字符串常量（出现序、去重）。
+
+    **裸表达式**位置的字符串常量一律不收：那是 docstring（函数自己的、以及里面
+    嵌套函数/类的），不是要上屏的话。只按"含不含换行"过滤是不够的——
+    `"""把 pending 持久化到 SettingsService。"""` 就是单行的，第一次跑就撞上去了。
+    （这一份 docstring 用三单引号就是被这一行逼的：例子里那对三双引号会提前收掉它。）
+    '''
+    docstring_ids = {id(child.value) for child in ast.walk(node)
+                     if isinstance(child, ast.Expr)
+                     and isinstance(child.value, ast.Constant)
+                     and isinstance(child.value.value, str)}
+    out: list[str] = []
+    for const in (n for n in ast.walk(node)
+                  if isinstance(n, ast.Constant) and isinstance(n.value, str)):
+        value = const.value
+        if id(const) in docstring_ids:
+            continue
+        if re.search(r"[一-鿿]", value) and value not in out:
+            out.append(value)
+    return out
 
 
 def _cjk_literals_in_function(py_rel: str, func: str) -> list[str]:
@@ -390,22 +413,12 @@ def _cjk_literals_in_function(py_rel: str, func: str) -> list[str]:
                  and n.name == func), None)
     if node is None:
         pytest.fail(f"{py_rel} 里没有函数 {func}——守卫要读的位置挪了")
-    # **裸表达式**位置的字符串常量一律不收：那是 docstring（函数自己的、以及里面
-    # 嵌套函数/类的），不是要上屏的话。只按"含不含换行"过滤是不够的——
-    # `"""把 pending 持久化到 SettingsService。"""` 就是单行的，第一次跑就撞上去了。
-    docstring_ids = {id(child.value) for child in ast.walk(node)
-                     if isinstance(child, ast.Expr)
-                     and isinstance(child.value, ast.Constant)
-                     and isinstance(child.value.value, str)}
-    out: list[str] = []
-    for const in (n for n in ast.walk(node)
-                  if isinstance(n, ast.Constant) and isinstance(n.value, str)):
-        value = const.value
-        if id(const) in docstring_ids:
-            continue
-        if re.search(r"[\u4e00-\u9fff]", value) and value not in out:
-            out.append(value)
-    return out
+    return _cjk_literals_from(node)
+
+
+def _cjk_literals_in_module(py_rel: str) -> list[str]:
+    """整份模块的字面量：flet 那些对话框把文案写在控件构造处，没有函数可点名。"""
+    return _cjk_literals_from(ast.parse(_py_source(py_rel)))
 
 
 def _dart_literals(rel: str) -> str:
@@ -675,6 +688,96 @@ def test_appearance_status_lines_are_one_sentence_two_places() -> None:
     assert f"'{switch_label}'" in _read(
         "features/settings/presentation/appearance_screen.dart"), \
         f"flet 的开关写着 {switch_label!r}，Dart 那一格不是这一句"
+
+
+#: 换源那一族里**不上屏**的那两句：flet 只把它们写进日志，界面看不到。
+#:
+#: 为什么单列而不是直接从比对里漏掉：Dart 侧同一分支走的是「换源失败：<原因>」那一句
+#: （前缀来自 `_run_switch`/`_do_switch` 都有的 `换源失败：`），加上横幅一条声音。
+#: 所以这两句确实不需要 Dart 复刻——但"不需要"要有名字，不然下一个人只会把它们当成
+#: 抽漏了，然后顺手把整个函数从扫描面里删掉。
+_SWITCH_LOGGER_ONLY_SENTENCES = {"换源种子获取失败", "换源写回失败"}
+
+
+def test_source_switch_wording_is_read_from_flet_into_dart() -> None:
+    """换源那一屏每句上屏的话，用词表由 flet 的 AST 给，Dart 那两份文件必须都接住。
+
+    扫两处而不是只扫对话框：flet 把句子拆在**两个文件**里——控件形状与按钮标签在
+    `app/views/reading/source_switch_dialog.py`，而所有状态句在
+    `app/controllers/bookshelf_controller.py` 的 `_seed_switch`/`_start_switch`/
+    `_run_switch`/`_stop_switch`/`_do_switch` 五发里（`正在扫描 i/N 个书源` 那一句就带
+    四个数各来自不同表，与 `_summary_line` 同一族）。
+
+    不在扫描面的那一支也写明：`_confirm_switch` 的「该候选的来源书源已不在列表中，
+    无法换源」是 flet **独有**的分支——它手里握着源对象，取不取得到当场就知道；
+    跨进程这一侧取不到时服务端是**抛**（`switch.apply` 的三种成因之一），Dart 说的是
+    「换源失败：<原因>」。把这一句要求进 Dart，等于要求客户端预知服务端的判断。
+
+    比的是 Dart 的**字面量**而不是整份文件：注释里会复述上屏的话，拿整文件 substring 比，
+    界面那句改错了注释还替它顶着（`_dart_literals` 那份说明写的就是这一发）。
+    """
+    pieces = _cjk_literals_in_module("app/views/reading/source_switch_dialog.py")
+    for func in ("_seed_switch", "_start_switch", "_run_switch", "_stop_switch",
+                 "_do_switch"):
+        for piece in _cjk_literals_in_function(
+                "app/controllers/bookshelf_controller.py", func):
+            if piece not in pieces:
+                pieces.append(piece)
+    runs = _cjk_runs(pieces)
+
+    # 排除表必须是**活配置**：这句话在 flet 侧不存在时，它就不是"排除"，是死条目。
+    vanished = sorted(_SWITCH_LOGGER_ONLY_SENTENCES - set(runs))
+    assert not vanished, (f"排除表里的 {vanished} 在 flet 侧已经抽不到了——"
+                          "那句要么改名了要么删了，这张表要跟着改，不许留着当装饰")
+
+    kept = [word for word in runs if word not in _SWITCH_LOGGER_ONLY_SENTENCES]
+    # 第九十四轮当场数过：整批 23 个语词，去掉那两句 logger 的是 21 个。
+    # 余量留 3：五个函数名里丢掉任意一个都会跌破 18（`_run_switch` 自己带 6 个）。
+    assert len(kept) >= 18, (f"只抽到 {len(kept)} 个语词（当场测得的是 21）——"
+                             "扫描面缩了就是仪器没接上，这条守卫不许靠“少抽”变绿")
+
+    dart = (_dart_literals("features/bookshelf/data/source_switch_models.dart")
+            + "\n"
+            + _dart_literals("features/bookshelf/presentation/source_switch_dialog.dart"))
+    missing = sorted(word for word in kept if word not in dart)
+    assert not missing, (f"flet 的换源屏用这些词，Dart 那两份文件里没有：{missing}\n"
+                         "改文案要两边各改一次，漏一边就是同一轮换源在两个界面说两种话")
+
+
+def test_local_book_source_url_is_one_constant_two_places() -> None:
+    """本地书伪源那一个 url：Python 有谓词，Dart 只许有**同一个字面量的精确相等**。
+
+    为什么这一格值得单独钉：书架上"这本是本地文件"在 flet 侧靠控制器注入的
+    `record["local"]`，而那一格**从来不过协议面**（`bookshelf.list` 里没有它）。
+    Dart 收换源入口时必须自己判，能判的就只有 `source_url` 这一个字段——
+    于是它落的判据必须与服务端 `is_local_source_url` 是同一个：精确相等、同一个串。
+
+    反面形状有两种，都在这条守卫的下半身：界面写 `startsWith('localsource')`
+    （前缀判据，服务端那边多一个变体就漏）；或者在 `bookshelf_screen.dart` 里
+    再抄一遍那个 url（两处字面量，改了服务端那份它不跟着改）。
+    """
+    shelf = _read("features/bookshelf/data/bookshelf_item.dart")
+    dart_value = _literal(shelf, r"const String kLocalBookSourceUrl\s*=\s*'([^']+)'",
+                          "kLocalBookSourceUrl")
+    assert dart_value == LOCAL_BOOK_SOURCE_URL, (
+        f"Dart 写的是 {dart_value!r} 而服务端是 {LOCAL_BOOK_SOURCE_URL!r}；"
+        "串不一样时那一本的入口就不会收起")
+    # 递得回去：Dart 拿去问服务端的那一串，服务端的谓词必须认。
+    assert is_local_source_url(dart_value) is True
+    # 正对照：谓词不是"什么 url 都算本地"。
+    assert is_local_source_url("https://example.com/a") is False
+    assert is_local_source_url("") is False
+
+    # 判据只许有一处：那一行必须还是精确相等，且别处不再抄第二个字面量。
+    assert "bool get isLocal => sourceUrl == kLocalBookSourceUrl;" in shelf, \
+        "`isLocal` 不再是「同一个字段的精确相等」——判据换了，服务端那边没换"
+    for rel in ("features/bookshelf/presentation/bookshelf_screen.dart",
+                "features/bookshelf/presentation/source_switch_dialog.dart",
+                "features/bookshelf/domain/source_switch_notifier.dart"):
+        # 读**字面量**不读整份文件：这三处都在注释里复述过那一个 url（讲的就是
+        # "为什么服务端那边多一个变体会漏"），拿 substring 比就是把说明当成读取。
+        assert LOCAL_BOOK_SOURCE_URL not in _dart_literals(rel), (
+            f"{rel} 里出现了第二个 {LOCAL_BOOK_SOURCE_URL!r} 字面量：界面自己发明判据的地方")
 
 
 # 黄金样本那一族的守卫（覆盖表、时效摘要、请求合法性、账目自洽、job 的事件交付）

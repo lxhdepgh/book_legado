@@ -17,6 +17,7 @@ import '../../../core/widgets/state_bar.dart';
 import '../../reader/domain/reader_controller.dart';
 import '../data/bookshelf_item.dart';
 import '../domain/bookshelf_notifier.dart';
+import 'source_switch_dialog.dart';
 
 class BookshelfScreen extends ConsumerWidget {
   const BookshelfScreen({super.key});
@@ -80,6 +81,21 @@ class BookshelfRow extends StatelessWidget {
       subtitle: item.subtitle.isEmpty
           ? null
           : Text(item.subtitle, maxLines: 1, overflow: TextOverflow.ellipsis),
+      // 换源入口（flet 那边在行管理菜单里，`build_manage_dialog` 的第一项）。
+      // **本地书不给这一格**：它没有规则源，"换一个源"无从谈起，而真点下去
+      // `switch.apply` 会把 `origin` 从 `localsource://local_book` 改写成某个网络源
+      // ——本地文件那条绑定就没了。flet 用控制器注入的 `record["local"]` 收起它，
+      // 协议面上没有那一格，所以这边读的是同一个常量的精确相等（`isLocal`，
+      // 由跨语言守卫钉住那个字面量）。
+      trailing: item.isLocal
+          ? null
+          : IconButton(
+              key: const Key('bookshelf.switch'),
+              icon: const Icon(Icons.swap_horiz),
+              tooltip: '换源',
+              onPressed: () => openSourceSwitch(context,
+                  record: item.raw, name: item.name),
+            ),
       // 点一行就是开读（§9 门 G3「从书架开一本书」）。`book` 传的是**行快照原样那份字典**：
       // 服务端 `as_book_item` 认字典，界面不许在这里重拼字段（少一格就是少一格，
       // 而 `reader.open` 的回话会告诉你它认成了什么）。

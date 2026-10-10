@@ -13,6 +13,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import '../../features/bookshelf/data/bookshelf_item.dart';
+import '../../features/bookshelf/data/source_switch_models.dart';
 import '../../features/check/data/check_models.dart';
 import '../../features/find_books/data/book_row.dart';
 import '../../features/find_books/data/category_row.dart';
@@ -439,6 +440,66 @@ class FakeEngineRepository implements EngineRepository {
         autoDisabled: false,
         raw: <String, Object?>{},
       );
+
+  // ------------------------------------------------------------------ #
+  // switch.*（换源那五发）
+  // ------------------------------------------------------------------ #
+
+  /// `switch.seeds` 的替身行（字段名不能叫 `switchSeeds`：那是契约方法的名字，
+  /// 同名会在类里撞成一个定义）。默认**空表**而不是几条手搓样例：空表是"本地没搜过
+  /// 这本"那一支，屏上必须走 [kSwitchEmptyCandidates] 那句话；给了行才演"本地已有 N 个结果"。
+  List<BookRow> switchSeedRows = const <BookRow>[];
+
+  /// `switch.snapshot` 的回话，同时是 `switch.scan` 起轮后 notifier 回放的那一份。
+  SwitchRun switchRun = SwitchRun.idle;
+
+  /// `switch.cancel` 那一格：默认 false（"什么都没在跑"是点开对话框就按停止的样子）。
+  /// 测试按这一条把 [switchRun] 摆成 running，就能演"叫停真的停到了"。
+  bool switchCancelResult = false;
+
+  /// `switch.apply` 的回话。默认 applied=true；false 那一支由测试改这一格。
+  SwitchApplyResult switchApplyResult =
+      const SwitchApplyResult(applied: true, sourceUrl: '');
+
+  @override
+  Future<List<BookRow>> switchSeeds({required Map<String, Object?> book}) =>
+      _guard(() => switchSeedRows, 'switch.seeds', <String, Object?>{'book': book});
+
+  @override
+  Future<JobAccepted> switchScan({
+    required Map<String, Object?> book,
+    required int switchId,
+    String keyword = '',
+    String group = '',
+  }) =>
+      _guard(() => const JobAccepted(started: true, action: 'switch.scan'),
+          'switch.scan', <String, Object?>{
+        'book': book,
+        'switch_id': switchId,
+        'keyword': keyword,
+        'group': group,
+      });
+
+  @override
+  Future<SwitchRun> switchSnapshot() => _guard(() => switchRun, 'switch.snapshot');
+
+  @override
+  Future<bool> switchCancel() => _guard(() => switchCancelResult, 'switch.cancel');
+
+  @override
+  Future<SwitchApplyResult> applySwitch({
+    required Map<String, Object?> record,
+    required String sourceUrl,
+    required Map<String, Object?> book,
+  }) =>
+      _guard(
+          () => SwitchApplyResult(
+              applied: switchApplyResult.applied, sourceUrl: sourceUrl),
+          'switch.apply', <String, Object?>{
+        'record': record,
+        'source_url': sourceUrl,
+        'book': book,
+      });
 
   // ------------------------------------------------------------------ #
   // reader.*

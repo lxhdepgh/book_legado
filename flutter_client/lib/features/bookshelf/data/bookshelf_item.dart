@@ -9,6 +9,16 @@
 /// （它把进度归一交给 `SourceService.reading_state`），这里 port 的就是那一段归一。
 library;
 
+/// 本地书的伪源常量（对 `app/services/content/local_book_service.py::LOCAL_BOOK_SOURCE_URL`）。
+///
+/// 为什么在客户端也留一份：flet 那侧"这行是不是本地书"是控制器算好后塞进
+/// `record["local"]` 的，而那一格**不在协议面上**（`bookshelf.list` 的 36 个键里没有它）。
+/// 这里不是另起一套判据——`is_local_source_url` 的本体就是与这一个常量的**精确相等**，
+/// 读的是同一份数据里的同一个字段。字面量由跨语言守卫
+/// `tests/test_gateway_contract_single_source.py::test_local_book_source_url_is_one_constant_two_places`
+/// 钉住：那边改了常量而这边没跟上，就是红。
+const String kLocalBookSourceUrl = 'localsource://local_book';
+
 class BookshelfItem {
   const BookshelfItem({
     required this.name,
@@ -43,6 +53,14 @@ class BookshelfItem {
   /// ListView 的行键。用 `url` 不用下标：换源会原地改写同一行的 `url`，
   /// 下标键会让 Flutter 把旧行的封面/进度滑移到新书上。
   String get identityKey => url.isNotEmpty ? url : '$sourceUrl/$name';
+
+  /// 这一行是不是**本地书**（导入的文件，没有规则源）。
+  ///
+  /// 用的地方只有一处：本地书没有"换一个源"可做（换源入口要收起，同
+  /// `bookshelf_view.py::build_manage_dialog` 的 `if not record.get("local")`）。
+  /// 判据与 flet 同一条精确相等，不认前缀——`file://` 那种"书地址像本地"的形状
+  /// 在阅读域另有认领路径（`_local_source_for`），不在这一格。
+  bool get isLocal => sourceUrl == kLocalBookSourceUrl;
 
   factory BookshelfItem.fromJson(Map<String, Object?> json) {
     final asMap = json.map((key, value) => MapEntry(key.toString(), value));
