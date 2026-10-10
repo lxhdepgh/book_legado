@@ -26,9 +26,28 @@ def run(cmd: list[str], cwd: Path | None = None) -> None:
         sys.exit(1)
 
 
-def build_backend() -> None:
-    """打包 Python 后端为可执行文件。"""
-    print("\n[1/3] Packing Python backend...", flush=True)
+def build_backend(target: str = "windows") -> None:
+    """打包 Python 后端为可执行文件。
+    
+    Android 需要使用 Chaquopy 或 Pydroid3 打包为 .so 库，
+    当前简化方案：复用 Windows exe（需后续完善）。
+    """
+    print(f"\n[1/3] Packing Python backend for {target}...", flush=True)
+    
+    if target == "android":
+        # Android 需要特殊的 Python 打包方式
+        # 方案1: 使用 Chaquopy（推荐）
+        # 方案2: 使用 Pydroid3 + termux
+        # 当前：提示用户手动配置
+        print("[WARN] Android backend packaging requires Chaquopy or custom setup", flush=True)
+        print("[INFO] Please configure Python backend manually for Android:", flush=True)
+        print("  - Option 1: Use Chaquopy plugin in build.gradle", flush=True)
+        print("  - Option 2: Bundle Python runtime with APK", flush=True)
+        backend_dir = DART_CLIENT / "backend"
+        if backend_dir.exists():
+            print(f"[OK] Found existing backend at: {backend_dir}", flush=True)
+        return
+    
     backend_script = PROJECT_ROOT / "build_backend.ps1"
     if backend_script.exists():
         # Windows: 使用 PowerShell
@@ -137,15 +156,15 @@ def main() -> None:
     print("  (WebView/TTS: Pure Dart)")
     print("=" * 60)
 
-    # Step 1: Pack Python backend (desktop only)
-    if args.target in ("windows", "linux", "macos"):
-        build_backend()
+    # Step 1: Pack Python backend (desktop + android)
+    if args.target in ("windows", "linux", "macos", "android"):
+        build_backend(args.target)
 
     # Step 2: Build Flutter
     output_dir = build_flutter(args.target)
 
-    # Step 3: Copy backend and create package (desktop only)
-    if args.target in ("windows", "linux", "macos"):
+    # Step 3: Copy backend and create package (desktop + android)
+    if args.target in ("windows", "linux", "macos", "android"):
         copy_backend(output_dir)
 
     package = create_package(output_dir, args.target)
@@ -154,7 +173,7 @@ def main() -> None:
     print("  Build Complete!")
     print("=" * 60)
     print(f"\nPackage: {package}")
-    if args.target in ("windows", "linux", "macos"):
+    if args.target in ("windows", "linux", "macos", "android"):
         print("\nFeatures:")
         print("  - WebView browser (platform-native WebView)")
         print("  - TTS text-to-speech (system TTS)")
