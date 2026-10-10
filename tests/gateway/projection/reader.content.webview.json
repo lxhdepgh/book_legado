@@ -1,0 +1,70 @@
+{
+  "note": "G3-D1 反向 WebView 通道的锚点：同一章的两种形状各过一遍纯管线。host 是宿主交回的那一页（?rendered=1），wall 是引擎自己渲染到的那一页。",
+  "corpus": "tests/gateway/fake_source_reader.py#/g3web",
+  "ruler": "app.core.text_layout.chapter_paragraphs/paragraph_offsets/chapter_text_length over 引擎的 .list@html 纯管线（与投影表同一把尺）",
+  "keyword": "阅读反查书",
+  "group": "G3反向",
+  "chapter_index": 0,
+  "chapter_url": "http://127.0.0.1:8797/g3web/ch/1.html",
+  "toc_href": "/g3web/ch/1.html,{\"webView\":true}",
+  "chapter_count": 2,
+  "host": {
+    "paragraph_count": 4,
+    "total_chars": 1961,
+    "offsets": [
+      0,
+      81,
+      756,
+      963
+    ],
+    "title": "第1章 反查章",
+    "rows": [
+      {
+        "index": 0,
+        "offset": 0,
+        "length": 80,
+        "head": "反查第1章第1段雪落窗台灯火远河"
+      },
+      {
+        "index": 1,
+        "offset": 81,
+        "length": 674,
+        "head": "反查第1章第2段雪落窗台灯火远河"
+      },
+      {
+        "index": 2,
+        "offset": 756,
+        "length": 206,
+        "head": "反查第1章第3段雪落窗台灯火远河"
+      },
+      {
+        "index": 3,
+        "offset": 963,
+        "length": 998,
+        "head": "反查第1章第4段雪落窗台灯火远河"
+      }
+    ],
+    "carries_usehtml": true
+  },
+  "wall": {
+    "paragraph_count": 1,
+    "total_chars": 8,
+    "offsets": [
+      0
+    ],
+    "title": "第1章 反查章",
+    "rows": [
+      {
+        "index": 0,
+        "offset": 0,
+        "length": 8,
+        "head": "阅读正文需要登录"
+      }
+    ],
+    "carries_usehtml": false
+  },
+  "gate": {
+    "wall": true,
+    "host": false
+  }
+}

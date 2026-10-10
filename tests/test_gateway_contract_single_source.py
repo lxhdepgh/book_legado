@@ -217,17 +217,18 @@ def test_widget_key_lookalikes_are_not_mistaken_for_actions() -> None:
         "bookshelf.list", "source.batch_enable", "reader.open"], _action_literals(sample)
 
 
-#: 反向通道那一发不是客户端能调的（是引擎求客户端渲染 `<useweb>`，§8 R1，G3 才接）。
-_REVERSE_CHANNEL = {"engine.webContentReady"}
-
 #: 协议面先落地、Dart 侧还没人落的那几发：每条**必须写明是哪一门欠的**。
 #:
 #: 这一张表是"欠据"，不是逃生口——下面那条判据比的是**键集相等**，所以
 #: ① 新加动作既没接 Dart 又不具名 → 红；② Dart 接上了却没把这一格划掉
 #: → 一样红。两头都咬，欠据就悄悄不成长期账单。
 #:
-#: 第八十八轮（G3-C2）把那 13 条 reader 欠据划完了：现在表是空的，而**判据照跑**——
-#: 它的作用是下一门（G3-D 的换源、G4 的那几族）落地时的同一张嘴，不是历史装饰。
+#: 第八十八轮（G3-C2）把那 13 条 reader 欠据划完了；第九十轮（G3-D1）把
+#: `engine.webContentReady` 从"反向通道例外"那一张表里挪了出来——它的 Dart 调用点在
+#: `core/webview/webview_host.dart` 那条链上（宿主答回去用的就是这一发），
+#: 所以它现在与其余 43 发一样**必须有调用点**，那张例外表删掉了。
+#: 表现在是空的，而**判据照跑**——它的作用是下一门（G3-D 的换源、G4 的那几族）
+#: 落地时的同一张嘴，不是历史装饰。
 #: 口径提醒：这里数的"Dart 侧有人落"是**协议面在 Dart 有实现**（`core/rpc/` 那三个文件
 #: 里的字面量），不是"界面调了它"；后者由 widget/golden 测试那一面负责（G3-C3）。
 _UNWIRED_PENDING_GATE: dict[str, str] = {}
@@ -248,9 +249,9 @@ def test_action_table_and_dart_callers_cover_each_other() -> None:
     前半个方向：表外动作在服务端回 `bad_request`，用户看到的是"点了没反应"。
     后半个方向是 G2-E 才补上的，查"服务端建好了、Dart 一行都没调"——
     那种动作不会报错，只会让某一屏永远缺一块（`refactor-regression-orphan-methods`
-    的同一条：接线断了，测试全绿）。今天允许的例外只有两类，而且都必须**具名**：
-    反向通道那一条（客户端本来就不会调它），和 `_UNWIRED_PENDING_GATE` 那几张欠据
-    （协议面先行、写明哪一门来接）。加动作时忘了接界面，这里当场红。
+    的同一条：接线断了，测试全绿）。今天允许的例外只有一类，而且必须**具名**：
+    `_UNWIRED_PENDING_GATE` 那几张欠据（协议面先行、写明哪一门来接）。
+    加动作时忘了接界面，这里当场红。
     """
     used = _dart_action_calls()
     assert used, "Dart 里一个 action 都没扫到——仪器没接上"
@@ -258,7 +259,7 @@ def test_action_table_and_dart_callers_cover_each_other() -> None:
     assert not unknown, f"客户端在调用没登记过的动作：{unknown}"
 
     never_called = sorted(set(BY_ACTION) - set(used))
-    pending = sorted(_REVERSE_CHANNEL | set(_UNWIRED_PENDING_GATE))
+    pending = sorted(_UNWIRED_PENDING_GATE)
     # 这一条是**双向**咬的：动作从表上没了、欠据还挂着，或者界面接上了、欠据没划掉，
     # 两个方向都会让这两个集合不相等（后一个方向的牙齿由变异核验钉着，
     # 见 ``.probe/g3b_mutation_check.py`` 的"表上删掉一条 reader 动作"那一发）。

@@ -735,6 +735,12 @@ class WebviewReverseCallTests(_FramesByType, unittest.TestCase):
                 self.assertEqual(result["body"], "<p>渲染出来了</p>")
                 self.assertEqual(result["headers"], {"content-type": "text/html"})
                 self.assertEqual(result["status"], 200)
+                # 宿主没交 `js_result` 时这个键**不许出现**：`_evaluate_webjs` 与
+                # `web_page_renderer` 读的都是"有没有这个键"，恒塞一个空串会把
+                # "宿主压根没跑脚本"写成"脚本返回了空"——那是两件事（服务端 docstring
+                # 里写的就是这一条，钉它的却是这一行）。
+                self.assertNotIn("jsResult", result,
+                                 "没跑脚本也塞了 jsResult 键：空串会被下游读成脚本的返回值")
             self.assertEqual(self.harness.gateway._pending_webviews, {},
                              "答完就必须从在途表里摘掉；留着就是每本书漏一条 future")
         self.harness.drive(_drive)
@@ -813,7 +819,12 @@ class WebviewReverseCallTests(_FramesByType, unittest.TestCase):
         self.harness.drive(_drive)
 
     def test_late_answer_is_reported_not_raised(self) -> None:
-        """引擎已经按预算走人，客户端才把渲染送回——这条得是 delivered:false，不是炸。"""
+        """引擎已经按预算走人，客户端才把渲染送回——这条得是 delivered:false，不是炸。
+
+        引擎那一侧的"走人"报的是 :class:`WebviewUnavailable` 而不是
+        :class:`asyncio.TimeoutError`：后者会被 RPC 出口折成"动作超过服务端预算 60s"，
+        而墙钟只有 20 秒出头——指错预算比不指更糟（落点实弹臂的 A 臂就是这么撞上的）。
+        """
         async def _drive(session, base, token):
             async with session.ws_connect(f"{base}/ws?token={token}") as ws:
                 json.loads((await ws.receive()).data)
@@ -821,8 +832,9 @@ class WebviewReverseCallTests(_FramesByType, unittest.TestCase):
                     self.harness.gateway.request_web_content("https://loopback.test/c",
                                                             None, {}, timeout=0.2))
                 frame = await self._next_request(ws)
-                with self.assertRaises(asyncio.TimeoutError):
+                with self.assertRaises(WebviewUnavailable) as caught:
                     await asyncio.wrap_future(pending)
+                self.assertIn("0.2s 内没答", str(caught.exception))
                 _, env = await _rpc(session, base, token, _envelope(
                     "engine.webContentReady",
                     {"request_id": frame["request_id"], "body": "迟到的正文"}))

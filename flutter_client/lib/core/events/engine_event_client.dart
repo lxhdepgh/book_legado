@@ -10,6 +10,11 @@
 /// 3. **错误只在这根流上出声，不往屏幕上扔字符串**：断线时界面上"正在搜索"还挂着，
 ///    没有这条 error 就分不清"没结果"和"收不到结果"（记忆 `zero-counts-need-a-positive-control`
 ///    的同一条道理：仪器掉线时的 0 不能当成测量值）。
+///
+/// `/ws` 上有两种出口，因为帧本身有两种方向：`event`/`batch`/`snapshot` 是引擎**报**
+/// 出来的（[events]），`request` 是引擎**求**客户端办事的（[webviewRequests]，§8 R1）。
+/// 后者不能塞进事件流：事件是"发生过什么"，订阅者爱听不听；反向请求是"现在等你回答"，
+/// 漏掉一条 = 引擎那侧白等 20s，而事件流的 broadcast 语义恰恰允许没人听。
 library;
 
 import 'dart:async';
@@ -19,6 +24,7 @@ import 'dart:io';
 import '../rpc/engine_endpoint.dart';
 import '../rpc/envelope.dart';
 import 'engine_event.dart';
+import 'webview_request.dart';
 
 /// 一帧 → 零或多条事件。帧形状照 `service.py` 的 `_h_ws` / `_make_forwarder` / `_flush_pending`。
 ///
@@ -45,11 +51,12 @@ List<EngineEvent> decodeFrame(Map<String, Object?> frame) {
       // 这里不重复判：重复判就有两份"什么算不符"，迟早飘。
       return const <EngineEvent>[];
     case 'request':
-      // 服务端→客户端的反向 WebView 渲染请求（§8 R1）。G2 这四个屏一条都不触发它；
-      // 真触发了说明有 `<useweb>` 源在跑，这时候**出声**比默默吞掉诚实。
-      throw EngineFailure(EngineFailureKind.unavailable,
-          '引擎发来反向 WebView 请求（request_id=${frame['request_id']}），'
-          '这一条要 G3 的 WebView 宿主才接得住');
+      // 反向渲染请求不是事件：它有自己那条口（[EngineEventClient.webviewRequests]
+      // + `decodeWebviewRequest`）。走到这里说明调用方拿事件解码器去解了请求帧，
+      // 这时候**出声**比默默回一条空列表诚实——后者表现为"引擎一根事件都没发"。
+      throw EngineFailure(EngineFailureKind.transport,
+          'request 帧（request_id=${frame['request_id']}）不当事件解：'
+          '它要从 webviewRequests 那条口交给 WebView 宿主，答回去用的是 engine.webContentReady');
     default:
       throw EngineFailure(EngineFailureKind.transport,
           '未知的事件帧类型：$type（帧的键：${frame.keys.join(',')}）');
@@ -84,6 +91,8 @@ class EngineEventClient {
   final List<Duration> backoff;
 
   final StreamController<EngineEvent> _events = StreamController<EngineEvent>.broadcast();
+  final StreamController<WebviewRequest> _webviews =
+      StreamController<WebviewRequest>.broadcast();
 
   WebSocket? _socket;
   StreamSubscription<dynamic>? _sub;
@@ -92,6 +101,13 @@ class EngineEventClient {
 
   /// 只读事件流（broadcast：书架、检测、找书各听各的，互相不挤掉）。
   Stream<EngineEvent> get events => _events.stream;
+
+  /// 引擎求这一次渲染的那条口（broadcast，理由同 [events]）。
+  ///
+  /// **没有宿主时它一条也不会掉进 [events]**：G3-D1 这一轮产品侧没有可见 WebView，
+  /// 所以这一格默认没人听——那时引擎按 20s 预算拿到"宿主在 20s 内没答这次渲染"
+  /// 并退回非浏览器路径。把这一格接上的是 `core/webview/webview_host.dart`。
+  Stream<WebviewRequest> get webviewRequests => _webviews.stream;
 
   /// 连上过没有。测试与"断线"那一格文案都读它，不读屏幕上的条数。
   bool get isConnected => _socket != null;
@@ -135,6 +151,13 @@ class EngineEventClient {
       return;
     }
     try {
+      // 方向先分岔：`request` 是引擎求客户端办事，其余是引擎报出来的。
+      // 分岔放在这里而不是让 decodeFrame 也认得 request——那样一帧就有两个出口，
+      // "谁负责答"会飘。
+      if (decoded['type'] == 'request') {
+        _webviews.add(decodeWebviewRequest(decoded));
+        return;
+      }
       for (final event in decodeFrame(decoded)) {
         _events.add(event);
       }
@@ -180,5 +203,6 @@ class EngineEventClient {
     _socket = null;
     if (socket != null) await socket.close();
     await _events.close();
+    await _webviews.close();
   }
 }

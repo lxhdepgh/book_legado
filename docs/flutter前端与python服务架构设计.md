@@ -301,8 +301,15 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 `reader.*` 13 发里 12 发进了 `features/reader/`，`reader.position_get` 是唯一只证往返的那格（书架那句
 "读到哪了"由 `bookshelf.list` 的 `reading` 供，flet 侧同样没有 UI 调用点）。扫调用点那把尺本轮
 从"认字面量排邻居"改成**只认调用位**（`heroTag:` 与模式常量顶穿过 `Key(` 那条前缀）。
-剩下的 **R1 那一半在 G3-D**（换源走 `mode="job"` + 事件、连续阅读 append、`/ws` 反向帧与
-`engine.webContentReady` 靶子、`GET /media/{key}`） |
+**R1 那一半的第一档也交了（2026-10-10 第九十一轮，G3-D1）**：`/ws` 反向 `request` 帧与
+`engine.webContentReady` 在 Dart 侧有了模型、宿主接缝与真调用点，判据第二条第一次有两个宿主语言的
+读数（Dart 自己当宿主：**服务端 4 段 1961 字 · Dart 4 段 1961 字 · 锚点 4 段 1961 字**、墙钟 909ms、
+`engine.webContentReady 出 6142B 入 91B`；Python aiohost 同一条路 407ms 同数），
+锚点是 `tests/gateway/projection/reader.content.webview.json`（语料新加的 `/g3web` 那一族
+**两种形状**各过一遍纯管线），不作答那一臂把报错归回宿主那 20s 而不是 `reader.content` 的 60s。
+**可见 WebView 插件不在本轮**（零新依赖、只留 seam；G4 选型清单在日志 §8）。
+剩下的 R1 那一半在 **G3-D2/D3/D4**（连续阅读 append、换源走 `mode="job"` + 事件、
+`GET /media/{key}`）与 G4 的插件决定 |
 | **G4** | `rss` / 漫画 / 朗读 / 工具域 / 老板键托盘；删 flet 依赖与 4 个 UI 耦合服务；PyInstaller spec 去 flet* | 2–3 周 | flet 从 `requirements.txt` 消失后全库仍绿；打包冒烟（照真果鉴 `smoke_windows.py` 那条：解压产物跑一次 `--package-smoke`） |
 
 累计 **9–12 周**单人全职（G0 之外）。参照系：真果鉴这条路线做出来的是
@@ -487,6 +494,42 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 > Dart `243 passed / 6 skipped`（带 `LEGODO_PYTHON` 则 `248 passed / 1 skipped`；本轮新增
 > 屏 29 + 尺 23 + 实弹 3 = 55 条）；`flutter analyze` 仍 6 条既有 info。
 > 账见同日志第八十九轮。**G3 只剩 R1 那一半**（G3-D）。
+>
+> **G3-D1 交（2026-10-10，第九十一轮，`docs/dev-logs/2026-10-10.md`）**：R1 那一半的**反向通道**
+> 在 Dart 侧落地，判据第二条第一次有**两个宿主语言**的读数——Dart 自己当宿主那臂
+> **服务端 4 段 1961 字 · Dart 4 段 1961 字 · 锚点 4 段 1961 字**（墙钟 909ms，
+> `engine.webContentReady 出 6142B 入 91B`），Python 侧 aiohost 那臂同一条路 407ms 同数。
+> 语料新加 `/g3web` 那一族的**两种形状**（墙带 `type="password"`、`?rendered=1` 是宿主答的那一版）
+> 与 `/hits.json` **取页账**（被取的一方记账，不是宿主自报），锚点表
+> `tests/gateway/projection/reader.content.webview.json`（host 4 段 / 1961 字 /
+> 偏移 `[0,81,756,963]`，wall 1 段 / 8 字）由第 6 笔守卫在两形状上各复现一遍。
+> Dart 侧三面：`core/events/webview_request.dart` 86 行（一帧**只有一个出口**——`decodeFrame`
+> 现在对 request 帧抛 transport）、`core/webview/webview_host.dart` 187 行
+> （`WebviewHost` 抽象 + `ScriptedWebviewHost` + `attachWebviewHost`；broadcast 不缓存，
+> 所以 attach 必须赶在任何 `reader.content` 之前）、仓库面 `engine.webContentReady` 两处**不是风格**
+> 的取舍：`singleFlight: false`（这一发是答**两条不同 request_id** 的渲染，顶替会把已交出的正文
+> 读成"我没答上"；对照是 `client.inFlight` 为空，且两并发用**同一个** client）与
+> `js_result` **按 null 不进 payload**（"宿主没跑脚本"≠"脚本返回了空"，下游读的是有没有这个键）。
+> 服务端一处生产改动（本轮唯一）：`request_web_content` 到点那句裸 `TimeoutError` 归回
+> `WebviewUnavailable("宿主在 20s 内没答这次渲染")`——它此前被 `_h_rpc` 折成
+> "reader.content 超过服务端预算 60s"，**墙钟 21.4s 报 60s、指着错的预算**；这条错是 Dart 实弹臂
+> 撞出来的，现由那一臂反向钉着（不作答臂 20725ms、错里必须含「宿主在」「20s」且不含「超过服务端预算」）。
+> 可见 WebView 插件按上一轮决策**不进本轮**（零新依赖，只留 seam），G4 选型清单与三条硬判据
+> （后台渲染 / cookie 同源 / `javaScript` 能跑）见日志 §8，pub 读数是当天取的：
+> `flutter_inappwebview` 6.1.5（Windows 那半 0.6.0，两条都约两年没发版）、`webview_windows` 0.4.0
+> （约两年）、`desktop_webview_window` 0.3.0（约四个月，三者里唯一还在动的）。
+> 仪器两条：`engine.shutdown` 关的是整棵子进程树（SIGTERM 会留孤儿无头内核攥着 profile，
+> "删临时目录"报 errno 32，形状与测试失败同；句柄释放比进程退还晚一拍，故删除带短重试、当趟第 2 次成功）；
+> `flutter test --plain-name` **打不中测试时也退 0**，变异判据改成"退出码 + 选中数"。
+> 变异核验 **18 发全红**（语料 5 / 服务端 5 / Dart 8，其中两发是跨语言的——`_onData` 那一行分岔
+> 离线面完全绕得过，只有实弹臂看得见），干净状态 14 条 selector 每条"选中且绿"。
+> 清点重测：44 条动作里**无 Dart 调用点的那一格从 1 变成 0**，"反向通道例外"那张表删掉、
+> `_UNWIRED_PENDING_GATE` 成空表而判据照跑（口径提醒：调用位口径下字面量只长在 `core/rpc/`，
+> 本轮那个"0 条不在 core/"与上一轮"19 条只在 core/"**没有可比性**）。
+> 回归：Python `2014 passed, 161 subtests passed in 162.29s`；
+> Dart `259 passed / 9 skipped`（带 env `267 passed / 1 skipped`；本轮新增 16 + 3 = 19 条）；
+> `flutter analyze` 10 条 info（6 既有 + 本轮 4 条同族 `use_null_aware_elements`，
+> 与相邻 `saveTheme` 同一写法，故意不改成 `?`）。
 
 ---
 
@@ -498,7 +541,7 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
   G1 另外立了 `tests/gateway/projection/*.json`：那一摞不是信封样本而是**flet 那屏自己算出来的
   参照表**（书名/副标题/状态行的逐行文本），它没有请求也没有响应，混进 `golden/` 只会逼
   守卫为它开一条特例。
-- **Python 面**：现有回归（2026-10-09 第八十九轮后实测 `2013 passed, 161 subtests passed`）基本不动；
+- **Python 面**：现有回归（2026-10-10 第九十一轮后实测 `2014 passed, 161 subtests passed`）基本不动；
   网关测试全离线（`127.0.0.1` 假服务，沿用
   记忆里"离线回环探针"的套路，不批量访问真实站点）。
   一条跑法上的坑：一次全量会在机器上留下约 **1100 个 TIME_WAIT**（Windows 默认 120s 退），
@@ -518,6 +561,16 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
   读过，一行不写脏），假源走 `tests/gateway/fake_source_reader.py`（**仓库里那份语料**，
   不是 `.probe/` 里被忽略的那一份）——它的 `PORT` 行给内核真值、`/g3/source.json` 让客户端现取建源字典，
   所以参照表与语料同源、Dart 侧一个字都不用自己编。
+  反向通道那一族另有三条仪器规矩（第九十一轮）：
+  ① **内核在场是这条族的前置条件，不是环境噪音**——`main.py:_engine_browser_fetchers` 在
+  `browser.available_fetcher() is None` 时返回 `(None, None)`，webView 选项的页会退回纯 HTTP，
+  于是"宿主没被叫到"与"通道断了"**同形**。所以臂里先读 `chromium_installed()`/`browsers_path()`
+  当先决读数、缺了就 `markTestSkipped` 并**把原因说出来**，绝不许静默通过。
+  ② **收尾必须先 `engine.shutdown` 再 SIGTERM**：只 SIGTERM 网关会留下一棵孤儿 headless chromium
+  抱着临时数据目录（删目录报 `errno 32`）；而且就算优雅收尾完了，**目录句柄的释放比进程退出晚一拍**，
+  所以删除要短时间重试（本轮实测：两臂都在第 2 次尝试删净）。
+  ③ **`flutter test --plain-name` 一条都没选中时也退 0**（pytest 的 `-k` 退 5），所以变异判据必须读
+  "退出码 + 选中条数"两样，只看退出码会把"仪器没接上"记成"守卫很硬"。
 - **调用点扫描的口径**：判据问的是"客户端在不在调这一发"，所以只认**长在调用位上的**字面量
   （`call('a.b')` 那一族）；`Key('a.b')`、`heroTag: 'a.b'`、预算表的 `'a.b': 60`、
   `static const String k = 'a.b'` 都是同形状的邻居不是调用点（第八十九轮就是这么把口径从
@@ -547,7 +600,13 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 - `docs/dev-logs/2026-10-07.md` §10（线程亲和修法与 0.4s 退出读数）、`docs/known-issues/004_…md`
 - `docs/dev-logs/2026-10-08.md`（第七十九~八十四轮：G0 护栏、R1/R2/R3/R4/R6 的读数与仪器坑、G1、005）
 - `docs/dev-logs/2026-10-09.md`（第八十五轮：**G2 整道门**——31 条动作、语料库被现契约钉住、
-  Dart 四屏、R4 三项复量，以及那个把 1.7 倍改判成 1.39 倍的出口投影）
+  Dart 四屏、R4 三项复量，以及那个把 1.7 倍改判成 1.39 倍的出口投影；
+  第八十六~八十九轮：**G3 的落点那一半**——位置契约这把尺、`reader.*` 13 发靶子、
+  flet 三张投影表、Dart 的 reader 仓库面与阅读屏、三头并排的实弹读数）
+- `docs/dev-logs/2026-10-10.md`（第九十一轮：**G3-D1 反向 WebView 通道**——`/ws` 的 `request` 帧
+  在 Dart 侧有模型与宿主接缝、`engine.webContentReady` 有真调用点、语料 `/g3web` 两形状与取页账、
+  两个宿主语言各自答回同一章（4 段 / 1961 字）、报错归回宿主那 20s、18 发变异全红、
+  以及留给 G4 的 WebView 插件选型清单）
 - `docs/M7打包说明.md`（PyInstaller 命令与 flet* hidden-import 清单位置）
 - 参照仓库：`github.com/jerunshi/guoapp1`（浅克隆 `D:/tmp/guoapp1`，不在本项目版本控制内）
 - 记忆：`tts-pyttsx3-com-same-thread`、`quickjs-native-crash-risk`、`engine-hub-loop-split`、

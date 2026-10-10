@@ -1,4 +1,4 @@
-/// [EngineRepository] 的 RPC 实现：把契约面上那 43 发落到 §4.1 那一个动词上。
+/// [EngineRepository] 的 RPC 实现：把契约面上那 44 发落到 §4.1 那一个动词上。
 ///
 /// 每一发都做**形状检查**（数组就该是数组、对象就该是对象），检查不过抛
 /// `EngineFailureKind.transport`。这不是防御癖：服务端回 `null` 与回 `[]`
@@ -53,6 +53,47 @@ class RpcEngineRepository implements EngineRepository {
   Future<void> shutdown({String reason = 'flutter client'}) async {
     await client.call('engine.shutdown',
         payload: <String, Object?>{'reason': reason}, singleFlight: false);
+  }
+
+  /// 反向渲染的答复（§8 R1）。两处与全表不同，都不是风格：
+  ///
+  /// 1. **`singleFlight: false`**。同 action 只许在飞一发"这条是**答两条不同的渲染**
+  ///    用的——预取一章以上时引擎会连着求两次。顶替发生时，被顶掉那一发的答案
+  ///    在服务端**已经解开了等待**（正文已经交出去了），客户端却抛 `cancelled`，
+  ///    宿主于是以为"我没答上"而再答一遍。收摊那一发同样是"发出去就别再顶"。
+  /// 2. **`js_result` 缺键与空串是两件事**，所以它按 null 不进 payload
+  ///    （契约面那条规矩的实现处；服务端读的是返回字典里有没有这个键）。
+  @override
+  Future<WebviewDelivery> webContentReady({
+    required String requestId,
+    String body = '',
+    Map<String, Object?>? headers,
+    int status = 200,
+    String url = '',
+    String cookie = '',
+    String error = '',
+    Object? jsResult,
+  }) async {
+    final data = _asMap(
+        await client.call('engine.webContentReady', payload: <String, Object?>{
+          'request_id': requestId,
+          'body': body,
+          if (headers != null) 'headers': headers,
+          'status': status,
+          'url': url,
+          'cookie': cookie,
+          'error': error,
+          if (jsResult != null) 'js_result': jsResult,
+        }, singleFlight: false),
+        'engine.webContentReady');
+    final delivered = data['delivered'];
+    if (delivered is! bool) {
+      throw EngineFailure(EngineFailureKind.transport,
+          'engine.webContentReady 的回话里没有布尔 delivered（收到 ${data.keys.join(',')}）：'
+          '那一格分的是"引擎还收不收这份"与"这一发根本没打通"，缺了宿主只能猜',
+          action: 'engine.webContentReady');
+    }
+    return WebviewDelivery(delivered: delivered);
   }
 
   /// 第一次有人听才连（bootstrap 时连一次 = 一个没人在听的流；

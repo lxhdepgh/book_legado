@@ -115,7 +115,7 @@ def _log_task(task: asyncio.Task) -> None:
 
 
 class WebviewUnavailable(RuntimeError):
-    """没有 WebView 宿主可接这次渲染（一个 /ws 会话都没连着，或会话中途断了）。
+    """没有 WebView 宿主可接这次渲染（一个 /ws 会话都没连着、会话中途断了，或连了但到点没答）。
 
     单独一个类型，是为了让注入侧能按"内核不在场"那一条老口径降级：
     ``BrowserService.available_fetcher()`` 返回 None 时引擎走纯 HTTP，
@@ -343,6 +343,8 @@ class GatewayService(Service):
         **没人连就别等**：没有会话时立刻抛 :class:`WebviewUnavailable`，因为这条线
         上永远不会有人回答；让引擎当场拿到异常退回纯 HTTP 路径，比挂满 20s 预算
         再超时便宜得多（``BrowserService.available_fetcher()`` 今天就是这个口径）。
+        连了但**到点没答**也抛同一个类（带"宿主在 Ns 内没答"那句）：那还是"没人接得住
+        这次渲染"，不是"这个业务动作跑不完"——两者混在一句话里，读表的人就会去查错的预算。
         """
         if not self._ws_clients:
             raise WebviewUnavailable("没有已连接的 WebView 宿主（/ws 会话为 0）")
@@ -366,6 +368,14 @@ class GatewayService(Service):
         try:
             await self._send(frame)
             return await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError as exc:
+            # 这一格超时**不是**"动作超预算"。原样让 ``TimeoutError`` 穿出去，会被
+            # ``_h_rpc`` 那句 :class:`asyncio.TimeoutError` 折成
+            # "reader.content 超过服务端预算 60s"——落点实弹臂的 A 臂量到的形状：
+            # 墙钟 21.4s 却报 60s，指错了地方。归回 :class:`WebviewUnavailable`，
+            # 与"没会话""宿主死了"同一类：**这次渲染没人接得住**，不是业务跑不完。
+            raise WebviewUnavailable(
+                f"宿主在 {timeout:g}s 内没答这次渲染（{url}）") from exc
         finally:
             self._pending_webviews.pop(request_id, None)
 

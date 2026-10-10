@@ -43,7 +43,11 @@ ENVELOPE_KEYS = ["code", "data", "error", "id", "ok", "v"]
 NO_SAMPLE_REASON = {
     "engine.webContentReady":
         "反向 WebView 那一发要先有一次在途的 webview.content 请求才回得来，"
-        "靶子在 §8 R1 那趟探针里（`.probe` 的 R1 脚本），不属于这一轮的动作面抓取",
+        "而那一发得让无头内核先在场（`main.py:_engine_browser_fetchers` 没内核就整条"
+        "退回纯 HTTP），所以它不在这一轮的**静态**抓取里。它的形状由两处真往返钉："
+        "`tests/test_gateway_inproc.py` 的 webview 那一族（在途/晚到/失败/停服四臂），"
+        "两侧实弹臂 `.probe/g3d1_reverse_channel_live.py`（Python 起宿主）与 "
+        "`flutter_client/test/webview_reverse_channel_live_arm_test.dart`（Dart 起宿主）",
 }
 
 

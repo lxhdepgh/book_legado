@@ -77,6 +77,7 @@ class FakeEngineRepository implements EngineRepository {
     ),
     this.failure,
     this.delay = Duration.zero,
+    this.webviewDelivered = true,
   });
 
   /// 从**黄金样本里的原始行**造替身（G1 判据"同书单比对"的入口——喂进去的是真
@@ -130,6 +131,12 @@ class FakeEngineRepository implements EngineRepository {
   SaveOutcome saveOutcome;
   ImportOutcome importOutcome;
   GatewayInfo info;
+
+  /// `engine.webContentReady` 那一发的回执：false 演的是"宿主答晚了，引擎已经走人"。
+  ///
+  /// 它必须可写：宿主那条链路上"晚到"与"没打通"在界面上是两句话（记忆里
+  /// `zero-counts-need-a-positive-control` 那一族——仪器没接上时读数会朝你期望的方向假）。
+  bool webviewDelivered;
 
   /// 非空 = 这台"没有这个能力"：每个方法都抛它。
   /// 可写：「刷新失败要留着旧数据」那条规矩要在同一发测试里先成功后失败。
@@ -213,6 +220,33 @@ class FakeEngineRepository implements EngineRepository {
       () {},
       'engine.shutdown',
       <String, Object?>{'reason': reason});
+
+  /// 反向渲染的答复：照常按 action 记账，`payloadFor('engine.webContentReady')`
+  /// 读的就是宿主发出去那八格。[webviewDelivered] 用来演"答晚了"那一支。
+  @override
+  Future<WebviewDelivery> webContentReady({
+    required String requestId,
+    String body = '',
+    Map<String, Object?>? headers,
+    int status = 200,
+    String url = '',
+    String cookie = '',
+    String error = '',
+    Object? jsResult,
+  }) =>
+      _guard(
+          () => WebviewDelivery(delivered: webviewDelivered),
+          'engine.webContentReady',
+          <String, Object?>{
+            'request_id': requestId,
+            'body': body,
+            if (headers != null) 'headers': headers,
+            'status': status,
+            'url': url,
+            'cookie': cookie,
+            'error': error,
+            if (jsResult != null) 'js_result': jsResult,
+          });
 
   @override
   Future<List<BookshelfItem>> listBookshelf({bool includeStaged = false}) => _guard(

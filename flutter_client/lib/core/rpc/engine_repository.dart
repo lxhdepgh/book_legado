@@ -8,8 +8,10 @@
 /// 实体在 feature，是 §6.1 那个 feature-first 目录换来的一条代价——
 /// 反过来让 core 只认 `Map` 就是今天 RPC 出口那个形状，两侧都得自己解释一遍字段。
 ///
-/// 方法表 = `app/gateway/methods.py` 那张表去掉 `engine.webContentReady`
-/// （那一条是服务端**反向**调用客户端，方向不在仓库这一侧；G3 的 WebView 宿主才接）。
+/// 方法表 = `app/gateway/methods.py` 那张表，**一条不漏**（44 发，含
+/// `engine.webContentReady`——那一条方向是反的：引擎在 `<useweb>` 那一族源上求客户端
+/// 渲染一次，客户端把结果从 /rpc 交回去；接它的是 `core/webview/webview_host.dart`，
+/// 不是某一屏的按钮）。
 /// 这条对齐由 `tests/test_gateway_contract_single_source.py` 从 Python 侧扫 Dart 字面量钉住。
 library;
 
@@ -80,6 +82,26 @@ class JobAccepted {
       );
 }
 
+/// 一次反向渲染答复的**收件回执**（`{"delivered":true|false}`）。
+///
+/// `delivered:false` 不是失败，也不许当失败处理：它是"引擎已经按 20s 预算走人了，
+/// 这一份没人要了"（服务端那句日志是"来晚了或没人等"）。客户端把它折成错误，
+/// 用户就会在已经退回纯 HTTP 的那一发上看到第二条不相干的错。
+///
+/// 反过来，`delivered:true` 也只说"解开了那次等待"，不说正文好不好——渲染失败
+/// （`error` 非空）同样能 delivered:true，因为"失败"这件事已经作为异常交给引擎了。
+class WebviewDelivery {
+  const WebviewDelivery({required this.delivered});
+
+  final bool delivered;
+
+  factory WebviewDelivery.fromJson(Map<String, Object?> json) =>
+      WebviewDelivery(delivered: json['delivered'] == true);
+
+  @override
+  String toString() => 'WebviewDelivery(delivered=$delivered)';
+}
+
 /// 规矩：**失败以 Future 的错误交付，不同步抛**。
 ///
 /// 这条不是风格问题。`RpcEngineRepository` 的失败一定在 Future 上（网络那一发本来就异步），
@@ -99,6 +121,29 @@ abstract class EngineRepository {
   /// 客户端主动收摊（§4.6）：置服务端退出标志，父进程随即走 `hub.shutdown()`。
   Future<void> shutdown({String reason = 'flutter client'}) async =>
       throw _missing('engine.shutdown');
+
+  /// 把一次反向渲染的结果交回去（§8 R1，设计里 `<useweb>` 那一族源的唯一出路）。
+  ///
+  /// 八个参数与服务端那一发逐格对齐（`service.py:web_content_ready`），**包括两个
+  /// 不许混的缺省**：
+  /// - `jsResult` 不给 = 宿主没跑脚本；给空串 = 脚本跑了、返回了空。服务端只在非 null
+  ///   时把这个键塞进返回字典，所以这里也不许把 null 折成 `''` 发出去。
+  /// - `error` 非空时服务端把这一次**折成异常**交回引擎（引擎据此退回非浏览器路径），
+  ///   而不是当成"正文是空串"的成功。
+  ///
+  /// 回话里的 `delivered` 说的是"引擎还要不要这一份"：它按 20s 预算走人之后的答复
+  /// 是 `false`——那不是失败（见 [WebviewDelivery]）。
+  Future<WebviewDelivery> webContentReady({
+    required String requestId,
+    String body = '',
+    Map<String, Object?>? headers,
+    int status = 200,
+    String url = '',
+    String cookie = '',
+    String error = '',
+    Object? jsResult,
+  }) async =>
+      throw _missing('engine.webContentReady');
 
   /// 事件流（§4.3）。默认体给一条**带错误的流**而不是空流：
   /// 空流的意思是"这条引擎一根事件都不发"，而真实情况是"这根流没接上"——
