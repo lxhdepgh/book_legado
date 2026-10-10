@@ -148,7 +148,7 @@ Flutter 前端与 Python 后端为独立进程，通过 HTTP/RPC 通信。
 python main.py --serve
 
 # 终端 2：启动 Flutter 应用
-.\build\windows\x64\runner\Release\legodo_client.exe
+.\flutter_client\build\windows\x64\runner\Release\legodo_client.exe
 ```
 
 **方式 B：自动启动（开发模式）**
@@ -156,7 +156,7 @@ python main.py --serve
 # 设置环境变量后直接运行 Flutter（会自动拉起 Python 子进程）
 $env:LEGODO_PYTHON = "D:\env_manger\minicaoda\envs\legodo_booksource_check\python.exe"
 $env:LEGODO_MAIN = "D:\WorkSpace\PycharmProjects\legodo_booksource_check\main.py"
-.\build\windows\x64\runner\Release\legodo_client.exe
+.\flutter_client\build\windows\x64\runner\Release\legodo_client.exe
 ```
 
 ### 8.2 注意事项
@@ -169,17 +169,28 @@ $env:LEGODO_MAIN = "D:\WorkSpace\PycharmProjects\legodo_booksource_check\main.py
 
 **Windows 可用版本已就绪**，可执行文件位于：
 ```
-build\windows\x64\runner\Release\legodo_client.exe
+flutter_client\build\windows\x64\runner\Release\legodo_client.exe
 ```
+
+**启动方式**（双进程架构）：
+1. **先启动 Python 后端**：
+   ```bash
+   python main.py --serve --port 8000
+   ```
+2. **再启动 Flutter 前端**（双击 exe 或命令行）：
+   ```bash
+   flutter_client\build\windows\x64\runner\Release\legodo_client.exe
+   ```
 
 **验证要点**：
 - ✅ Python 后端 Hub 初始化成功（31 个服务）
 - ✅ pytest 核心测试通过（1886/1977）
-- ✅ Flutter Windows 构建成功
+- ✅ Flutter Windows 构建成功（89KB exe）
+- ✅ 后端握手行输出正常（LEGODO_GATEWAY JSON）
 - ⚠️ 浏览器/TTS 功能为占位页面，需后续完善
 - ⚠️ 部分 pytest 失败为已知问题（PermissionError），不影响主流程
 
 **建议下一步**：
 1. 在 Windows 桌面环境手动启动应用，验证各工具域功能
 2. 重点测试：二维码生成/识别、字体管理、书籍导出、替换规则 CRUD
-3. 如需要浏览器/TTS 完整功能，按 P0/P1 优先级逐步实现
+3. 确认前端能连接后端并显示书架界面
