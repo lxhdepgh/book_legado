@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "description": "browse.books 入参。",
+  "properties": {
+    "source_url": {
+      "type": "string",
+      "description": "bookSourceUrl。"
+    },
+    "category": {
+      "type": "object",
+      "description": "browse.categories 回的那一条（{title,url}）原样传回；服务端负责还原成引擎侧的分类对象。"
+    },
+    "page": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "1 起；越界的服务端夹到 1。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "category",
+    "source_url"
+  ]
+}

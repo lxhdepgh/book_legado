@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "description": "source.group 入参。",
+  "properties": {
+    "url": {
+      "type": "string",
+      "description": "bookSourceUrl。"
+    },
+    "group": {
+      "type": "string",
+      "description": "逗号分隔的分组名；空串=移出所有分组。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "group",
+    "url"
+  ]
+}

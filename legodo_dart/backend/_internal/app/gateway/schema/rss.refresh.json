@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "description": "rss.refresh 入参：抓取并刷新单个源。回 data 是本次**新增**的文章条数（按 (source_id,url) 去重，老文章只更新标题/正文/日期，已读与收藏标记不动）。",
+  "properties": {
+    "source_id": {
+      "type": "string",
+      "description": "订阅源 id（feed 地址原样）。抓不到 feed 时这一发回的是**错误信封**（code=engine，error 里带异常名），不是安静的 0——「0 新增」与「没抓着」是两件事，界面得能把后者念出来。源不存在则回 0（这一发不报错：列表刚被另一侧删掉时不该炸界面）。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "source_id"
+  ]
+}

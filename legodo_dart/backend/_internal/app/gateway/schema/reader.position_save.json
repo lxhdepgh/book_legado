@@ -1,0 +1,67 @@
+{
+  "type": "object",
+  "description": "reader.position_save 入参：落一篇阅读位置。必须先 reader.open（name/author 由会话那本书补，位置又是按 book_url upsert 的）。服务端会按 chapter_index 把章认回目录那一条、再按本章的可显示自然段字符流收口偏移与段号，然后落库并回一份落库后的形状。",
+  "properties": {
+    "source_url": {
+      "type": "string",
+      "description": "bookSourceUrl。"
+    },
+    "book_url": {
+      "type": "string",
+      "description": "books/bookUrl。"
+    },
+    "position_json": {
+      "type": "object",
+      "description": "要落的位置，键名就是存档那一套（ReadingPosition.as_reading 的口径，两侧读同一份存档）。服务端不会替你取「当前位置」：空对象按第 0 章章首落库，退出时那份进度走 reader.close 的 save_progress。",
+      "properties": {
+        "chapter_url": {
+          "type": "string",
+          "description": "可空：服务端按 chapter_index 从目录重认，客户端报了但不一致也以目录为准（books 表没有 chapter_url 这一列）。"
+        },
+        "chapter_name": {
+          "type": "string",
+          "description": "可空：同上，目录里那条的 name 优先。"
+        },
+        "chapter_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "章序号（reader.toc 那一行的 index）。这是续读定位用的数，不是 url。"
+        },
+        "scroll_offset": {
+          "type": "number",
+          "description": "像素级滚动偏移，只在同一客户端、同一字体/窗口下可比；跨端续读不靠它。"
+        },
+        "scroll_ratio": {
+          "type": "number",
+          "description": "文档内比例。范围由服务端夹到 [0,1]，所以这里不写 minimum/maximum——两处各判一次会给出两种答案。"
+        },
+        "chapter_pos": {
+          "type": "integer",
+          "description": "章内字符偏移——位置契约的主坐标：它是「第 chapter_paragraph 段段首 + 段内比例」导出的数，不是像素插值。负数与超出本章总长的都在落库前夹回，所以 schema 不设上下限（两处各判一次会给出两种答案）。"
+        },
+        "chapter_paragraph": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "章内自然段序号（可显示形态下数的）。null=这条没存过段号（v8 之前的老存档），续读退回裸像素。段号越界由服务端夹到最后一段，schema 不另设下限。"
+        },
+        "font_size": {
+          "type": "integer",
+          "description": "落库时那本书的字号，书架「按字号续读」用；缺省 16。小于 1 的由服务端抬到 1。"
+        },
+        "last_read_at": {
+          "type": "integer",
+          "description": "客户端时间戳（秒）。落库以服务端时间为准，这一格只是随档带上。"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "book_url",
+    "position_json",
+    "source_url"
+  ]
+}

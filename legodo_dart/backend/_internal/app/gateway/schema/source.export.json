@@ -1,0 +1,6 @@
+{
+  "type": "object",
+  "description": "source.export 入参：无。",
+  "properties": {},
+  "additionalProperties": false
+}

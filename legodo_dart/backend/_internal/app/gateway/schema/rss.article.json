@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "description": "rss.article 入参：打开一篇文章（右栏正文那一屏）。回 data 里带已去标签的 text；文章不在回 null（被删除/换源清掉了），客户端要把 null 当「这条没了」而不是「这条没正文」。",
+  "properties": {
+    "article_id": {
+      "type": "integer",
+      "description": "rss.articles 那一行的 id（表内自增行号）。**跨刷新不稳**：删源会连文章一起删，重新抓取走的是按 (source_id,url) 去重的 upsert，老文章的 id 保留、新文章拿到新 id。所以这一格只能来自刚刚取过的那一发 rss.articles，不能缓存到本地存储里改天再点。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "article_id"
+  ]
+}

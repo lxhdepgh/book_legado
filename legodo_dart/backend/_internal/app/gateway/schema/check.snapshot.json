@@ -1,0 +1,6 @@
+{
+  "type": "object",
+  "description": "check.snapshot 入参：无。",
+  "properties": {},
+  "additionalProperties": false
+}

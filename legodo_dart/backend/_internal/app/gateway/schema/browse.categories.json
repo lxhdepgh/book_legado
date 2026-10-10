@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "description": "browse.categories 入参。",
+  "properties": {
+    "source_url": {
+      "type": "string",
+      "description": "bookSourceUrl；服务端按它取回源对象再解析 exploreUrl。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "source_url"
+  ]
+}

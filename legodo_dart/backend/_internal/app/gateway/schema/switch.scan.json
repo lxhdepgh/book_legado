@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "description": "switch.scan 入参（mode=job：这条只负责发起一轮换源联网核对，逐源进度与整份候选走事件流）。",
+  "properties": {
+    "book": {
+      "type": "object",
+      "description": "要换源的那本书（书架那一行）。服务端从里面读 name/author 做命中判定与排序，读 source_url/origin 排除当前源自身——所以 origin 一定要带上，不带就等于让当前那条源也参加扫描。"
+    },
+    "switch_id": {
+      "type": "integer",
+      "description": "这一轮扫描的身份证，由客户端生成（与 search.start 的 search_id 同一套关联办法：受理回包只有 {started, action}，晚到的进度与收尾只能靠它认本轮）。同一轮的事件都原样回带这一格；已经在跑的一轮会被合作式叫停再由这一轮接手。"
+    },
+    "keyword": {
+      "type": "string",
+      "description": "搜索关键词；空串按 book.name。命中判定是「书名包含关键词」（Legado 默认不校验作者，作者只当排序加分项），口径见 docs/找书与换源逻辑对齐.md §2.2。"
+    },
+    "group": {
+      "type": "string",
+      "description": "只扫这一个分组的书源；空串=全部启用源（参考实现里换源那一格分组偏好）。取值口径与 search.start 的 scope 同一个 searchable_sources，分组名用 search.scopes 回的那一条原样传回。分组不存在时**不回退到全部**：回退等于用一个打错的组名把整库联网扫一遍，界面上只是一直转圈。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "book",
+    "switch_id"
+  ]
+}

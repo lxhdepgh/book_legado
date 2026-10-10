@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "description": "source.enable 入参。",
+  "properties": {
+    "url": {
+      "type": "string",
+      "description": "bookSourceUrl。"
+    },
+    "enabled": {
+      "type": "boolean",
+      "description": "true=启用，false=停用。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "enabled",
+    "url"
+  ]
+}

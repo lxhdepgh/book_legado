@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "description": "settings.write 入参。",
+  "properties": {
+    "key": {
+      "type": "string",
+      "description": "设置键。"
+    },
+    "value": {
+      "description": "任意 JSON 值；存下去时按 JSON 文本落库，读回来还是同一个形状。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "key",
+    "value"
+  ]
+}

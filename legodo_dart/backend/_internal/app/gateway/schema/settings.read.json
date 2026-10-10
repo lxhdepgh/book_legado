@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "description": "settings.read 入参。",
+  "properties": {
+    "keys": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "要读的键名单；服务面无「列出所有键」的能力，协议面也不给它（webbridge.token 这类不该被整库端出去）。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "keys"
+  ]
+}
