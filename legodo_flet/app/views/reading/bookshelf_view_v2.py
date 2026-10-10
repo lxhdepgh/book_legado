@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import flet as ft
 
-from ..common import EmptyState, FailureBanner
+from ..common import EmptyState, FailureBanner, StateBar
 
 
 class BookshelfRow(ft.ListTile):
@@ -149,8 +149,16 @@ class BookshelfViewV2(ft.Column):
         )
 
         # ------------------------------------------------------------------ #
-        # 状态行
+        # 状态行（使用 StateBar 统一管理）
         # ------------------------------------------------------------------ #
+        self._status_bar = StateBar(
+            failed_text="书架加载失败",
+            loading_text="正在加载书架…",
+            data_text=lambda: f"书架共 {self._record_count} 本",
+        )
+        self._record_count = 0  # 用于动态计算状态文本
+        
+        # 兼容旧接口：保留 _status_host 供外部调用 set_status_text
         self._status = ft.Text("", size=12, color=ft.Colors.GREY_600)
         self._status_host = ft.Container(
             visible=False,
@@ -193,7 +201,8 @@ class BookshelfViewV2(ft.Column):
             self._appbar,
             self._failure_banner,
             self._filter_host,
-            self._status_host,
+            self._status_host,  # 兼容旧接口
+            self._status_bar,   # 新的 StateBar（统一管理状态）
             ft.Stack(
                 controls=[
                     self._list,
@@ -279,13 +288,18 @@ class BookshelfViewV2(ft.Column):
                 )
                 self._grid.controls.append(card)
 
-        # 更新状态行
+        # 更新状态行（同时更新旧接口和新的 StateBar）
+        self._record_count = len(books)
         self.set_status_text(f"书架共 {len(books)} 本")
+        self._status_bar.show_data()
 
     def set_status_text(self, text: str) -> None:
-        """设置状态行文本。"""
+        """设置状态行文本（兼容旧接口，同时更新 StateBar）。"""
         self._status.value = text or ""
         self._status_host.visible = bool(text)
+        # 如果传入的是动作消息，也更新 StateBar
+        if text and not text.startswith("书架共"):
+            self._status_bar.show_message(text)
 
     def show_error(self, message: str) -> None:
         """显示错误横幅。"""
