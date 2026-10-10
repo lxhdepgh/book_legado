@@ -1,21 +1,21 @@
 {
   "action": "search.scopes",
   "protocol_version": 1,
-  "schema_digest": "34822a1a5e7e",
+  "schema_digest": "879d1fbcfdf0",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "list",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-search.scopes-1301812500000000",
+    "id": "r4-search.scopes-1387248265000000",
     "action": "search.scopes",
     "seq": 11,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-search.scopes-1301812500000000",
+    "id": "r4-search.scopes-1387248265000000",
     "ok": true,
     "data": [
       {
@@ -102,7 +102,7 @@
   "inline_row_count": 19,
   "bytes": 742,
   "sha256": "0c8ff005a396b85fd19dab1696b05214e6dec5f1816d7f455c44c38999f4215e",
-  "client_wall_ms": 6.5,
+  "client_wall_ms": 6.8,
   "wire_bytes": 919,
   "field_names": [
     "count",

@@ -22,7 +22,6 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit
 
 import flet as ft
 
@@ -442,26 +441,15 @@ class BookshelfController(BaseController):
             dialog.set_running(False, f"换源失败：{exc}")
 
     def _switch_candidates(self, record: dict) -> list:
-        """扫描顺序：同站优先、已失效靠后；排除当前源自身。"""
+        """扫描顺序：同站优先、已失效靠后；排除当前源自身。
+
+        规则本体在 ``ReadingService.order_switch_sources``（G3-D3 起）：协议面上那条
+        ``switch.scan`` 也要排这一份队列，两边各写一遍就迟早飘。这里只负责
+        "从哪儿拿源"（控制器缓存的那份列表）与"当前是哪条源"。
+        """
         own = str((record or {}).get("source_url")
                   or (record or {}).get("origin") or "")
-        token = _site_token(own)
-        pool = []
-        for source in self._sources:
-            url = str(getattr(source, "bookSourceUrl", "") or "")
-            if url == own:
-                continue
-            if not getattr(source, "enabled", False):
-                continue
-            if not str(getattr(source, "searchUrl", "") or "").strip():
-                continue
-            pool.append(source)
-        pool.sort(key=lambda s: (
-            0 if token and token == _site_token(
-                str(getattr(s, "bookSourceUrl", "") or "")) else 1,
-            0 if getattr(s, "enabled", False) else 1,
-            str(getattr(s, "bookSourceUrl", "") or "")))
-        return pool
+        return self._reading.order_switch_sources(self._sources, own)
 
     def _to_candidate(self, match: dict) -> dict:
         """服务候选 ``{source_url,source_name,book:快照}`` → 对话框渲染形态。"""
@@ -535,15 +523,3 @@ class BookshelfController(BaseController):
             return self._view.page
         except Exception:
             return None
-
-
-def _site_token(url: str) -> str:
-    """书源 URL 的站点名（旧换源排序里的 host 令牌近似：去 www 的主机首段）。"""
-    try:
-        host = urlsplit(str(url or "")).hostname or ""
-    except ValueError:
-        return ""
-    host = host.lower()
-    if host.startswith("www."):
-        host = host[4:]
-    return host.split(".")[0] if host else ""

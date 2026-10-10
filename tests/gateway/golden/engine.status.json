@@ -1,21 +1,21 @@
 {
   "action": "engine.status",
   "protocol_version": 1,
-  "schema_digest": "34822a1a5e7e",
+  "schema_digest": "879d1fbcfdf0",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "list",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-engine.status-1301813796000000",
+    "id": "r4-engine.status-1387249796000000",
     "action": "engine.status",
     "seq": 30,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-engine.status-1301813796000000",
+    "id": "r4-engine.status-1387249796000000",
     "ok": true,
     "data": [
       {
@@ -23,271 +23,271 @@
         "state": "RUNNING",
         "last_error": null,
         "started_at": null,
-        "updated_at": 1791520938.6133862,
+        "updated_at": 1791606373.9347155,
         "progress": null
       },
       {
         "service_id": "EventBus",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5505972,
+        "updated_at": 1791606373.5505972,
         "progress": null
       },
       {
         "service_id": "EngineHub",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.3952153,
-        "updated_at": 1791520938.3952153,
+        "started_at": 1791606373.547598,
+        "updated_at": 1791606373.547598,
         "progress": null
       },
       {
         "service_id": "StorageService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.3967247,
-        "updated_at": 1791520938.3967247,
+        "started_at": 1791606373.5495987,
+        "updated_at": 1791606373.5495987,
         "progress": null
       },
       {
         "service_id": "SettingsService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5505972,
+        "updated_at": 1791606373.5505972,
         "progress": null
       },
       {
         "service_id": "RuleEngineService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.3967247,
-        "updated_at": 1791520938.3967247,
+        "started_at": 1791606373.5495987,
+        "updated_at": 1791606373.5495987,
         "progress": null
       },
       {
         "service_id": "BookCacheService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5515964,
+        "updated_at": 1791606373.5515964,
         "progress": null
       },
       {
         "service_id": "DownloadService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.6133862,
-        "updated_at": 1791520938.6133862,
+        "started_at": 1791606373.9347155,
+        "updated_at": 1791606373.9347155,
         "progress": null
       },
       {
         "service_id": "BookmarkService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5505972,
+        "updated_at": 1791606373.5505972,
         "progress": null
       },
       {
         "service_id": "ContentSearchService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5515964,
+        "updated_at": 1791606373.5515964,
         "progress": null
       },
       {
         "service_id": "ImageBookService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.6133862,
-        "updated_at": 1791520938.6133862,
+        "started_at": 1791606373.9347155,
+        "updated_at": 1791606373.9347155,
         "progress": null
       },
       {
         "service_id": "ReadingService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5515964,
+        "updated_at": 1791606373.5515964,
         "progress": null
       },
       {
         "service_id": "SourceService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.4801984,
-        "updated_at": 1791520938.4801984,
+        "started_at": 1791606373.6326022,
+        "updated_at": 1791606373.6326022,
         "progress": null
       },
       {
         "service_id": "SourceCheckService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.3967247,
-        "updated_at": 1791520938.3967247,
+        "started_at": 1791606373.5495987,
+        "updated_at": 1791606373.5495987,
         "progress": 1.0
       },
       {
         "service_id": "RuleRepairService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.3967247,
-        "updated_at": 1791520938.3967247,
+        "started_at": 1791606373.5495987,
+        "updated_at": 1791606373.5495987,
         "progress": null
       },
       {
         "service_id": "CompatAuditService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5515964,
+        "updated_at": 1791606373.5515964,
         "progress": null
       },
       {
         "service_id": "OnlineImportService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.6133862,
-        "updated_at": 1791520938.6133862,
+        "started_at": 1791606373.9347155,
+        "updated_at": 1791606373.9347155,
         "progress": null
       },
       {
         "service_id": "RssService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5515964,
+        "updated_at": 1791606373.5515964,
         "progress": null
       },
       {
         "service_id": "LocalBookService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5515964,
+        "updated_at": 1791606373.5515964,
         "progress": null
       },
       {
         "service_id": "ReadAloudService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.6118789,
-        "updated_at": 1791520938.6118789,
+        "started_at": 1791606373.9337153,
+        "updated_at": 1791606373.9337153,
         "progress": null
       },
       {
         "service_id": "MediaPlayService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5515964,
+        "updated_at": 1791606373.5515964,
         "progress": null
       },
       {
         "service_id": "WebDavService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.3967247,
-        "updated_at": 1791520938.3967247,
+        "started_at": 1791606373.5495987,
+        "updated_at": 1791606373.5495987,
         "progress": null
       },
       {
         "service_id": "BookExportService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.6133862,
-        "updated_at": 1791520938.6133862,
+        "started_at": 1791606373.9347155,
+        "updated_at": 1791606373.9347155,
         "progress": null
       },
       {
         "service_id": "ReplaceRuleService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5515964,
+        "updated_at": 1791606373.5515964,
         "progress": null
       },
       {
         "service_id": "DictService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5515964,
+        "updated_at": 1791606373.5515964,
         "progress": null
       },
       {
         "service_id": "FontService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5515964,
+        "updated_at": 1791606373.5515964,
         "progress": null
       },
       {
         "service_id": "QrCodeService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.3967247,
-        "updated_at": 1791520938.3967247,
+        "started_at": 1791606373.5495987,
+        "updated_at": 1791606373.5495987,
         "progress": null
       },
       {
         "service_id": "UpdateService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.6118789,
-        "updated_at": 1791520938.6118789,
+        "started_at": 1791606373.9337153,
+        "updated_at": 1791606373.9337153,
         "progress": null
       },
       {
         "service_id": "WebBridgeService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.6118789,
-        "updated_at": 1791520938.6118789,
+        "started_at": 1791606373.9347155,
+        "updated_at": 1791606373.9347155,
         "progress": null
       },
       {
         "service_id": "BossKeyService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.6118789,
-        "updated_at": 1791520938.6118789,
+        "started_at": 1791606373.9347155,
+        "updated_at": 1791606373.9347155,
         "progress": null
       },
       {
         "service_id": "BackgroundService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5515964,
+        "updated_at": 1791606373.5515964,
         "progress": null
       },
       {
         "service_id": "BrowserService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.397231,
-        "updated_at": 1791520938.397231,
+        "started_at": 1791606373.5495987,
+        "updated_at": 1791606373.5495987,
         "progress": null
       },
       {
         "service_id": "ThemeService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.6118789,
-        "updated_at": 1791520938.6118789,
+        "started_at": 1791606373.9347155,
+        "updated_at": 1791606373.9347155,
         "progress": null
       },
       {
         "service_id": "GatewayService",
         "state": "RUNNING",
         "last_error": null,
-        "started_at": 1791520938.39774,
-        "updated_at": 1791520938.39774,
+        "started_at": 1791606373.5505972,
+        "updated_at": 1791606373.5505972,
         "progress": null
       }
     ],
@@ -296,10 +296,10 @@
   },
   "row_count": 34,
   "inline_row_count": 34,
-  "bytes": 4975,
-  "sha256": "cf8ad002c49cf8b0d32c574335767e4f2f8311de59e73ca92887fccd1992e52f",
-  "client_wall_ms": 0.8,
-  "wire_bytes": 5484,
+  "bytes": 5035,
+  "sha256": "8136948a72e02056266c588c43c071e273b1cd846969993bbdfc3363b4a3eee2",
+  "client_wall_ms": 1.0,
+  "wire_bytes": 5544,
   "field_names": [
     "last_error",
     "progress",

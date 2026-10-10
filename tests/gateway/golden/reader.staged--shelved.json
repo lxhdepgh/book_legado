@@ -1,21 +1,21 @@
 {
   "action": "reader.staged",
   "protocol_version": 1,
-  "schema_digest": "34822a1a5e7e",
+  "schema_digest": "879d1fbcfdf0",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "在架的书没有暂存记录：退出时不该问「放入书架吗」",
   "data_shape": "null",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-reader.staged-1301814375000000",
+    "id": "r4-reader.staged-1387251031000000",
     "action": "reader.staged",
     "seq": 19,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-reader.staged-1301814375000000",
+    "id": "r4-reader.staged-1387251031000000",
     "ok": true,
     "data": null,
     "error": null,
@@ -25,7 +25,7 @@
   "inline_row_count": null,
   "bytes": 4,
   "sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
-  "client_wall_ms": 0.3,
+  "client_wall_ms": 0.7,
   "wire_bytes": 106,
   "field_names": []
 }

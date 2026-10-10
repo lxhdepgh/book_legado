@@ -20,11 +20,14 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from app.core.events import (
     ProgressSavedEvent,
     ReadingSessionChangedEvent,
     SearchFinishedEvent,
+    SourceSwitchFinishedEvent,
+    SourceSwitchProgressEvent,
 )
 from app.core.lifecycle import Service
 from app.core.text_layout import chapter_paragraphs, chapter_text_length
@@ -147,6 +150,25 @@ def _switch_failure_reason(exc: Exception) -> str:
     if "UnsupportedJavaApiError" in str(exc):
         return "接口未模拟"
     return "规则或解析错误"
+
+
+def _site_token(url: str) -> str:
+    """书源 URL 的站点名（旧换源排序里的 host 令牌近似：去 www 的主机首段）。
+
+    从 ``app/controllers/bookshelf_controller.py`` 搬进来（G3-D3）：**扫描排队规则
+    只能有一份**。它在控制器里时，进程内的 flet 对话框拿得到，而协议面上那条
+    ``switch.scan`` 拿不到——跨进程宿主只能自己抄一遍"同站优先"，抄出来的那份
+    与 flet 那份迟早飘（记忆 ``refactor-regression-orphan-methods`` 的反面：
+    规则没断，只是长在了错的层上）。
+    """
+    try:
+        host = urlsplit(str(url or "")).hostname or ""
+    except ValueError:
+        return ""
+    host = host.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host.split(".")[0] if host else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -392,6 +414,12 @@ class ReadingService(Service):
         self._prefetch_task: asyncio.Task | None = None
         # 长驻搜索模型（searchId/页码/generation 的唯一持有者）。
         self._search_model: SearchModel | None = None
+        # 当前/最近一轮换源扫描的回放快照（None = 这一进程还没扫过）。
+        # 与 SourceCheckService._run 同一件事：切页/断线期间丢掉的事件由它补回来，
+        # 而"扫到第几源"这份状态只有服务端有。
+        self._switch_run: dict | None = None
+        #: 换源扫描的合作式停止位（``switch_cancel`` 置位，worker 每取一个源问一次）。
+        self._switch_stop: asyncio.Event | None = None
 
     # ------------------------------------------------------------------ #
     # 生命周期：经 hub 补齐未注入的基础设施
@@ -1023,12 +1051,46 @@ class ReadingService(Service):
     # ------------------------------------------------------------------ #
     # 换源（先本地种子、后联网扫描；见 docs/找书与换源逻辑对齐.md）
     # ------------------------------------------------------------------ #
-    async def switch_seeds(self, item) -> list[dict]:
+    @staticmethod
+    def order_switch_sources(sources, own_url: str = "",
+                             group: str = "") -> list:
+        """换源扫描的候选队列：过滤 + 排序，**这一份是全库唯一的一条规则**。
+
+        过滤走 :meth:`searchable_sources`（启用 + 配了 ``searchUrl`` + 分组匹配），
+        再排掉当前源自身。为什么复用而不是另写一套判据：换源扫描本质就是一轮搜索，
+        两边判得不一样就会出现"找书能搜到、换源扫不到"这种没人能解释的差。
+
+        ``group`` 是参考实现里那一格换源分组（对齐文档 §2.2：Legado 的"分组为空取
+        全部启用"）。**分组不存在时不回退到全部**——Legado 那样是为了一条陈旧的
+        用户偏好，而在这里的回退等于"打了个不存在的组名，结果整个库都联网扫一遍"：
+        界面看到的是转圈，用户以为点错了。空队列就是空队列，``total=0`` 说得出原因。
+
+        排序：同站（host 首段相同）优先，其次书源 URL 字典序。它承担参考实现里
+        ``originOrder``（书源顺序）+ 同站推断那两格（对齐文档 §2.3）。
+
+        为什么放在服务侧而不是界面侧：跨进程那条 ``switch.scan`` 也得起同一轮扫描，
+        而它手里只有一个 url 和一份源列表。规则留在 ``BookshelfController`` 里，
+        Dart 那侧就得自己抄一遍排序——抄的那份永远是它自己想要的顺序（记忆
+        ``measurement-corpus-must-not-be-self-proving`` 同一族：两侧各算一遍
+        "谁在前"，比对就只比得了两份主观）。
+        """
+        own = str(own_url or "")
+        token = _site_token(own)
+        pool = [source for source in
+                ReadingService.searchable_sources(sources, group or None)
+                if str(getattr(source, "bookSourceUrl", "") or "") != own]
+        pool.sort(key=lambda s: (
+            0 if token and token == _site_token(
+                str(getattr(s, "bookSourceUrl", "") or "")) else 1,
+            str(getattr(s, "bookSourceUrl", "") or "")))
+        return pool
+
+    async def switch_seeds(self, book) -> list[dict]:
         """换源对话框打开时的本地种子：之前搜索落库的同名书（不联网，秒开）。
 
         站点可达性未知，只当候选——真正的核对由 :meth:`switch_source` 联网完成。
         """
-        record = as_book_item(item)
+        record = as_book_item(book)
         if self._search_store is None:
             return []
         try:
@@ -1040,11 +1102,11 @@ class ReadingService(Service):
         return [_book_item_dict(book) for book in stored or []]
 
     async def switch_source(self, item, candidates, keyword: str = "",
-                           on_progress=None) -> list:
+                           on_progress=None, should_stop=None) -> list:
         """换源联网核对 + 候选排序。
 
         ``candidates`` 为按优先级排好序的书源列表（同站同域名在前、已判失效在
-        后，排序在调用侧 ``BookshelfController._switch_candidates`` 里做）。
+        后，排序在 :meth:`order_switch_sources`）。
         扫描是**有界并发 + 每源超时**（Legado 的 `mapParallel(threadCount=32)` +
         `withTimeout`，我们按实测拐点收：见 ``SWITCH_CONCURRENCY``）：逐源串行的话，
         上千个书源里只要有几个慢站就把整轮拖到用户以为卡死；单源失败只计入
@@ -1052,6 +1114,11 @@ class ReadingService(Service):
         ``on_progress(completed, total, failures, starved)`` 用 0.5s 节流回调，
         供界面刷进度；``starved`` 是"本机繁忙"的源数——那些不是书源的错，
         不能和 ``failures`` 混成一个数（见 :func:`_switch_starved`）。
+        ``should_stop()`` 为真时 worker **取下一个源之前**收手，已扫到的命中照常
+        排序返回（G3-D3 给 ``mode="job"`` 那条路用的合作式停止）。为什么不复用
+        ``task.cancel()``：取消会让这一轮一个候选都不留，而用户点"停止"想看的是
+        "目前已经扫出来哪几个"；跨进程那侧也拿不到这个 task 对象（那是服务循环上
+        的句柄），只能靠一个服务端的状态位。默认 None，flet 对话框那条路原样不动。
         命中判定用**书名包含**（Legado 默认不校验作者，作者只当加分项），
         最后按 (书名精确 > 作者对得上 > 书源优先级 > 站名) 排序返回
         ``{"source_url", "source_name", "book": 快照}`` 列表。
@@ -1088,6 +1155,11 @@ class ReadingService(Service):
 
         async def worker() -> None:
             while True:
+                if should_stop is not None and should_stop():
+                    # 停在**取下一个源之前**：在途那一发已经花掉的钱不退，但也不会
+                    # 再往网络上添新的。剩下的源不计入 completed——分母是本轮计划
+                    # 源数，快照读到的 done < total 才是"被叫停了"的形状。
+                    return
                 try:
                     source = queue.get_nowait()
                 except asyncio.QueueEmpty:
@@ -1165,6 +1237,134 @@ class ReadingService(Service):
         except Exception as exc:
             logger.warning("换源写回失败：%s", exc)
             return False
+
+    # ------------------------------------------------------------------ #
+    # 换源的协议门面（§9 门 G3-D3：switch.*，扫描走 mode="job"，结果走事件流）
+    #
+    # 这一族与 ``check.*`` 是同一个形状：受理回包里没有结果，进度与结论从 /ws 推，
+    # 断线/切页期间丢的那些由 ``switch.snapshot`` 补。关联办法也一样——
+    # ``switch_id`` 由客户端生成、服务端原样回带（``search.start`` 已经这么办了）：
+    # ``_start_job`` 的凭据只有 ``{started, action}``，任务体里的事件是异步到达的，
+    # 没有这个号，界面就把上一轮的迟到结果当本轮渲染（记忆
+    # ``ui-progress-must-travel-as-events``：那一族事故都是"接错了线"而不是"没接线"）。
+    # ------------------------------------------------------------------ #
+    async def switch_scan(self, book, switch_id: int = 0,
+                          keyword: str = "", group: str = "") -> dict:
+        """起一轮换源扫描：进度发 ``SourceSwitchProgressEvent``，收尾发一条 finished。
+
+        一轮只跑一条：已经在跑时先把那一轮**合作式叫停**、等它收口，再开新的
+        （与 ``SourceCheckService.check_all`` 同一条理由——两份流水线同时打同一批
+        站点对既浪费又容易被封，也让界面上同时飘着两个 switch_id 的进度）。
+        三种收尾（扫完 / 被叫停 / 起扫前就出错）**都发 finished**：不发，跨进程那侧
+        的转圈就永远停不下来，而"停不下来"看起来像书源慢而不是像契约破了。
+        ``run`` 那份状态留在服务上（``self._switch_run``），本方法回的是它的快照，
+        方便进程内测试直接断言——事件是发给界面的，不是发给测试的。
+        ``group`` 非空时只扫那个分组，判据与 ``search.start`` 的 ``scope`` 是同一个
+        :meth:`searchable_sources`（离线语料与验证探针全靠这一格把扫描圈在回环上）。
+        """
+        record = book if isinstance(book, dict) else _book_item_dict(book)
+        own = str(record.get("source_url") or record.get("origin") or "")
+        sid = str(switch_id or 0)
+        previous = self._switch_run
+        if previous is not None and previous.get("running"):
+            stop = self._switch_stop
+            if stop is not None:
+                stop.set()
+            done = previous.get("finished")
+            if done is not None:
+                await done.wait()
+
+        stop = asyncio.Event()
+        self._switch_stop = stop
+        run = {"switch_id": sid, "running": True, "cancelled": False,
+               "done": 0, "total": 0, "failures": 0, "starved": 0,
+               "candidates": [], "error": "", "finished": asyncio.Event()}
+        self._switch_run = run
+
+        def on_progress(completed: int, total: int, failures: int,
+                        starved: int = 0) -> None:
+            run.update({"done": completed, "total": total,
+                        "failures": failures, "starved": starved})
+            self._publish(SourceSwitchProgressEvent(
+                switch_id=sid, done=completed, total=total,
+                failures=failures, starved=starved))
+
+        candidates: list = []
+        try:
+            if self._source_service is None:
+                raise RuntimeError("SourceService 未就绪：换源扫描没有源可查")
+            sources = self.order_switch_sources(
+                await self._source_service.list_sources(), own, group)
+            run["total"] = len(sources)
+            key = str(keyword or "") or str(record.get("name") or "")
+            candidates = list(await self.switch_source(
+                book, sources, keyword=key, on_progress=on_progress,
+                should_stop=stop.is_set) or [])
+            run["candidates"] = candidates
+        except Exception as exc:      # 任务体在网关的后台任务里，抛穿就等于没有收尾
+            run["error"] = f"{type(exc).__name__}: {exc}"
+            logger.warning("换源扫描失败（switch_id=%s）：%s", sid, exc)
+        finally:
+            run["cancelled"] = stop.is_set()
+            run["running"] = False
+            self._switch_stop = None
+            run["finished"].set()
+            self._publish(SourceSwitchFinishedEvent(
+                switch_id=sid, candidates=candidates,
+                cancelled=bool(run["cancelled"]), error=str(run["error"])))
+        return self.switch_run_dict(run)
+
+    @staticmethod
+    def switch_run_dict(run: dict | None) -> dict:
+        """换源轮次 → 纯 JSON 快照：把内部持有者（``asyncio.Event``）摘掉。
+
+        事件与 RPC 都不能携带协程对象——``to_json`` 会把它们折成 ``repr`` 字符串，
+        界面读到一句 ``"<asyncio.locks.Event ...>"`` 还以为是错误文案（红线 §0.3 第 10
+        条：载荷是纯数据快照）。
+        """
+        return {key: value for key, value in (run or {}).items()
+                if key != "finished"}
+
+    async def switch_snapshot(self) -> dict:
+        """当前/最近一轮换源扫描的回放快照（断线重连补进度用）。
+
+        与 ``check.snapshot`` 同一件事：切页 / 重连期间丢掉的那些进度包，客户端
+        拿不到第二份，而"扫到第几源、几个失败"只有服务端知道。这一发是协程，
+        经 EngineProxy 跳回服务循环读——同步读那份 dict 会拿到撕裂的进度。
+        """
+        if self._switch_run is None:
+            return {"switch_id": "", "running": False, "cancelled": False,
+                    "done": 0, "total": 0, "failures": 0, "starved": 0,
+                    "candidates": [], "error": ""}
+        return self.switch_run_dict(self._switch_run)
+
+    def switch_cancel(self) -> dict:
+        """叫停在跑的换源扫描（同步入口：停止按钮不该排队等 loop）。
+
+        只置那个位，不 ``task.cancel()``：这一轮的活是网关的后台任务在跑的，
+        取消它就把已经扫出来的候选一起扔了，而用户点停止想看的是"目前有哪些"。
+        没有轮次在跑时 ``cancelled=False``——这一格回的是"这一发有没有真叫停下
+        什么"，不是"调用成功了吗"（回 True 会让界面写"已停止"，而什么都没在跑）。
+        """
+        stop = self._switch_stop
+        if stop is None or stop.is_set():
+            return {"cancelled": False}
+        stop.set()
+        return {"cancelled": True}
+
+    async def apply_switch(self, record, source_url: str, book) -> dict:
+        """换源写回的 JSON 面：源按 url 取回，再把书与书架记录交给旧链路。
+
+        与 :meth:`apply_source_switch` 的分工：那一格吃的是 BookSource 对象
+        （进程内控制器手里就有），这一格吃 url——跨进程那侧报不出对象，
+        只报得到它从 ``switch.seeds`` / finished 事件里读回的那个 url。
+        源取不到时**抛穿**而不是回 False：换源写回失败有三种成因（源没了、
+        记录被另一侧删了、与本条冲突），把它们都折成"没换成"这一句，界面就再也
+        分不出该提示哪一个。
+        """
+        source = await self._source_by_url(source_url)
+        ok = await self.apply_source_switch(record, source, as_book_item(book))
+        return {"applied": bool(ok), "source_url": str(source_url or "")}
 
     # ------------------------------------------------------------------ #
     # 阅读面（§9 门 G3：协议面上的 reader.*）

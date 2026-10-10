@@ -66,6 +66,8 @@ COALESCED_EVENTS: frozenset[str] = frozenset({
     "ImportProgressEvent",
     "RepairProgressEvent",
     "ServiceStateChangedEvent",
+    # 换源扫描的逐源计数：晚半秒看到的 done 也是对的，而一轮扫描能推几百条。
+    "SourceSwitchProgressEvent",
 })
 
 #: 断线重连要回放的状态事件（"最近一份"就够；成批历史各自的 snapshot 动作给）。

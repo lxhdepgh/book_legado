@@ -285,6 +285,174 @@ def cont_source_dict(port: int) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- #
+# 换源那一族：六条源，**三条该被扫、两条不该、一条就是当前那一条**（§9 G3-D3 的靶子）
+# --------------------------------------------------------------------------- #
+#: 为什么换源要一整套源而不是复用 ``/g3`` 那一条：``switch.scan`` 的读数不是
+#: "有没有找到书"，而是**这一轮扫了几条源、按什么顺序排、谁被过滤掉了**。
+#: 一条源做不了这三件事——过滤那一步在只有一条源的语料上，"排除停用的"与
+#: "把停用的也扫了"读出来都是"1 个候选"（记忆 ``measurement-corpus-must-not-be-self-proving``）。
+#:
+#: 六条各管一格：
+#:   * ``x`` 这本书**当前挂着**的那条源：它照样精确命中同名同作者，而队列里不能有它。
+#:     为什么给它一个精确命中而不是随便一条：万一"排除当前源"断了，它的行会排在
+#:     候选**第一格**（排序第一判据），样本与守卫一眼就读得出"换成自己了"；给它一条
+#:     命不中的源，断了也读不出来（记忆 ``zero-counts-need-a-positive-control``）。
+#:   * ``a`` 两条命中——``换源目标书``（书名精确 + 作者对得上）与 ``换源目标书 卷二``
+#:     （书名只**包含**关键词）：排序那一步要的就是这两种命中之差。
+#:   * ``b`` 一条命中，书名精确而**作者不同**：排第三判据（作者只当加分项）的证据。
+#:   * ``c`` 一条都不命中（只有 ``旁书一本``）：这一条**要**被扫，``total`` 里得有它，
+#:     而候选里不能有它——"扫过但没找到"与"没扫"必须是两个数。
+#:   * ``d`` 与 ``a`` 同样会命中，但 ``enabled=False``；``e`` 同样会命中，但没有
+#:     ``searchUrl``。这两条是**过滤那一步的对照臂**：它们的页面照样在服务器上，
+#:     只是引擎一次都没来取过——``GET /hits.json`` 里读不出 ``/g3sw/d/search`` 这一格
+#:     （没有键 = 没被取过），而 ``/g3sw/a/search`` 有数
+#:     （记忆 ``zero-counts-need-a-positive-control``：0 要有非 0 的同伴才叫读数）。
+SW_TARGET = "换源目标书"
+SW_GROUP = "G3换源"
+SW_AUTHOR = "作者戊"
+#: 每个 stem 一章几段、有几章：章数不同的两条源才是"换成乙之后目录真的换了"的靶子
+#: ——目录条数若处处相同，换源写回那条链就只是把 url 换了个名字。
+SW_STEMS = ("a", "b", "c", "d", "e", "x")
+SW_ROWS: dict[str, list[tuple[str, str]]] = {
+    "a": [(SW_TARGET, SW_AUTHOR), (SW_TARGET + " 卷二", SW_AUTHOR)],
+    "b": [(SW_TARGET, "作者己")],
+    "c": [("旁书一本", "作者庚")],
+    "d": [(SW_TARGET, SW_AUTHOR)],
+    "e": [(SW_TARGET, SW_AUTHOR)],
+    "x": [(SW_TARGET, SW_AUTHOR)],
+}
+SW_CHAPTERS: dict[str, int] = {"a": 3, "b": 2, "c": 1, "d": 3, "e": 3, "x": 4}
+SW_CURRENT = "x"
+SW_DISABLED = "d"
+SW_NO_SEARCH_URL = "e"
+
+
+def sw_base_url(port: int, stem: str) -> str:
+    return f"http://127.0.0.1:{port}/g3sw/{stem}"
+
+
+def sw_search_html(stem: str) -> str:
+    items = "".join(
+        f'<li><a href="/g3sw/{stem}/book/{i}.html">{name}</a>'
+        f'<i>{author}</i><span>连载</span></li>'
+        for i, (name, author) in enumerate(SW_ROWS[stem], start=1))
+    return f'<ul class="list">{items}</ul>'
+
+
+def sw_book_html(stem: str, index: int) -> str:
+    name, author = SW_ROWS[stem][index - 1]
+    return (f"<html><body><h1>{name}</h1><p class=\"author\">{author}</p>"
+            f"<p class=\"intro\">这是 {stem} 那一条源上《{name}》的简介。</p>"
+            f"<a class=\"toc\" href=\"/g3sw/{stem}/toc.html\">目录</a>"
+            f"<p class=\"last\">第 {SW_CHAPTERS[stem]} 章</p></body></html>")
+
+
+def sw_toc_html(stem: str) -> str:
+    """目录：章名带**源的名字**——换成另一条源之后目录行必须换，否则"真换了源"无从可证。"""
+    return ("<html><body><ul>" + "".join(
+        f'<li><a href="/g3sw/{stem}/ch/{i}.html">第{i}章 {stem}源章</a></li>'
+        for i in range(1, SW_CHAPTERS[stem] + 1)) + "</ul></body></html>")
+
+
+def sw_chapter_html(stem: str, index: int) -> str:
+    """正文：三条自然段，段长按 stem 变（三条源的正文互不相同，落点尺才认得出是谁）。"""
+    counts = (2, 5, 3) if stem in ("a", "d", "e") else (4, 1, 6, 2)
+    paras = [f"{stem}源第{index}章第{n}段" + "山风月夜声光影花雪路桥水田家园" * count
+             for n, count in enumerate(counts, start=1)]
+    body = "\n".join(f"<p>{text}</p>" for text in paras)
+    return f"<html><body><div class='list'>{body}</div></body></html>"
+
+
+def sw_source_dict(port: int, stem: str) -> dict:
+    """一条换源语料源。``d`` 停用、``e`` 没有 ``searchUrl``——那两格就是过滤的靶子。"""
+    url = sw_base_url(port, stem)
+    source = {
+        "bookSourceName": f"G3换源{stem}",
+        "bookSourceUrl": url,
+        "bookSourceGroup": SW_GROUP,
+        "bookSourceType": 0,
+        "enabled": stem != SW_DISABLED,
+        "enabledExplore": False,
+        "ruleSearch": {"bookList": "ul.list li", "name": "a@text",
+                       "bookUrl": "a@href", "author": "i@text", "kind": "span@text"},
+        "ruleBookInfo": {"name": "h1@text", "author": "p.author@text",
+                         "intro": ".intro@text", "tocUrl": "a.toc@href",
+                         "lastChapter": "p.last@text"},
+        "ruleToc": {"chapterList": "li", "chapterName": "a@text",
+                    "chapterUrl": "a@href"},
+        "ruleContent": {"content": ".list@html"},
+    }
+    # 停用与无规则**分两格**：合成一条源就只能证明"有一条源没参加"，
+    # 而两个过滤分支（enabled / searchUrl）各自都得有自己的 witness。
+    if stem != SW_NO_SEARCH_URL:
+        source["searchUrl"] = f"{url}/search?key={{{{key}}}}"
+    return source
+
+
+def sw_source_list(port: int) -> list[dict]:
+    """六条源一次交付：非 Python 的宿主（Dart 那条实弹臂）照这一发建源，不抄规则。"""
+    return [sw_source_dict(port, stem) for stem in SW_STEMS]
+
+
+async def sw_response(request: web.Request) -> web.Response | None:
+    """``/g3sw`` 那一族的路由。不匹配时返回 ``None``，由调用方继续往下分发。
+
+    为什么抽成函数而不只挂在 :func:`create_app` 里：黄金样本那一趟
+    （``.probe/g3_golden_capture.py``）为了同端口供 ``/g2`` 用的是它自己的 inline 应用，
+    换源这一族得挂到**同一个端口**上，才能和写进 ``search_books`` 的那些 url 对上。
+    两处各写一遍路由，迟早有一处漏掉一条臂（这一族的对照全靠路径分得清）。
+    """
+    path = request.path
+    if path == "/g3sw/sources.json":
+        return web.json_response(sw_source_list(request.app["source_port"]))
+    if not path.startswith("/g3sw/"):
+        return None
+    parts = path.split("/")
+    stem = parts[2] if len(parts) > 2 else ""
+    # 按**那一段的名字**比（去掉 ``.html`` 后缀），既不按整段前缀比也不兜底：
+    # ``/g3sw/a/book/1.html`` 切出来第 3 段是 ``book``（不含斜杠），拿
+    # ``startswith("book/")`` 去认永远认不到，书籍页会一路掉到末尾那一支被答成
+    # 搜索页——页面上没有 ``a.toc``，引擎取不到 tocUrl，于是目录塌成一章，
+    # 而这条链的错只显在"章数对不上"那里，看着像语料配错了。
+    # 反过来，写成"其余都算搜索页"会让 ``/g3sw/a/toc`` 少写后缀时答成搜索页，
+    # 目录就永远只剩一行——两种写法都得**指名**才分得清谁没接上。
+    tail = parts[3] if len(parts) > 3 else ""
+    name = tail.split(".", 1)[0]
+    if stem not in SW_STEMS:
+        # 不落到调用方那一支 fallthrough：那会把换源族的未知地址答成
+        # /g3 的搜索页，于是"这条源没配规则"与"路径写错了"读出来一样。
+        return web.Response(status=404)
+
+    def _index(bound: int) -> int:
+        digits = "".join(c for c in (parts[4] if len(parts) > 4 else "")
+                         if c.isdigit())
+        # 夹到**各自**的边界：书籍页有几条命中行、正文页有几章，是两个数。
+        # 拿命中行数去夹章号会让 ``/g3sw/x/ch/3.html`` 答成第 1 章（x 只有一条命中），
+        # 于是"换成另一条源之后正文真的换了"那条判据读的是同一份字节。
+        return max(1, min(int(digits or 1), max(bound, 1)))
+
+    if name == "book":
+        return web.Response(text=sw_book_html(stem, _index(len(SW_ROWS[stem]))),
+                            content_type="text/html")
+    if name == "toc":
+        return web.Response(text=sw_toc_html(stem), content_type="text/html")
+    if name == "ch":
+        _hit(path)
+        return web.Response(text=sw_chapter_html(stem, _index(SW_CHAPTERS[stem])),
+                            content_type="text/html")
+    if name == "search" or name == "":
+        # 搜索页（``/{stem}/search?key=…``；``/{stem}`` 本身也给搜索形状）。
+        # **必须记账**：过滤那两条对照臂判的是"引擎来没来过"，而来没来过只有语料
+        # 这一边说得清。
+        # 认**这一段**而不是"其余都算搜索"：``/g3sw/x/toc`` 少写一个 ``.html``
+        # 就会被兜成搜索页，于是目录永远只有一行（那一个 ``li`` 指向 book 页），
+        # 而错的形状看着像"这条源的目录就这么短"。
+        _hit(path)
+        return web.Response(text=sw_search_html(stem), content_type="text/html")
+    return web.Response(status=404)
+
+
 def create_app(port: int) -> web.Application:
     async def handler(request: web.Request) -> web.Response:
         path = request.path
@@ -302,6 +470,9 @@ def create_app(port: int) -> web.Application:
             return web.json_response(web_source_dict(request.app["source_port"]))
         if path == "/g3cont/source.json":
             return web.json_response(cont_source_dict(request.app["source_port"]))
+        sw = await sw_response(request)
+        if sw is not None:
+            return sw
         if path.startswith("/g3cont/ch/"):
             digits = "".join(char for char in path.rsplit("/", 1)[-1] if char.isdigit())
             number = int(digits or 1)
@@ -355,6 +526,9 @@ def create_app(port: int) -> web.Application:
     app.router.add_get("/g3cont", handler)
     app.router.add_get("/g3cont/", handler)
     app.router.add_get("/g3cont/{tail:.*}", handler)
+    app.router.add_get("/g3sw", handler)
+    app.router.add_get("/g3sw/", handler)
+    app.router.add_get("/g3sw/{tail:.*}", handler)
     return app
 
 

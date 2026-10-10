@@ -374,6 +374,28 @@ class EventStreamConfigTests(unittest.TestCase):
             ghost = sorted(set(group) - known)
             self.assertEqual(ghost, [], f"{label} 里有不存在的事件：{ghost}")
 
+    def test_only_count_carrying_events_are_coalesced(self) -> None:
+        """合流那一张表的判据是"这条只带计数"：结果类事件一条都不许进。
+
+        反过来的代价不是延迟而是**丢数据**——``CheckFinished`` / 换源的 ``Finished``
+        一条就是一行结果，合掉就是那一行没了。这一支钉的是新加事件时有人顺手把
+        结果类也塞进合流表（那种改动全库仍然绿，只是界面少几行）。
+        """
+        from app.services.gateway.service import COALESCED_EVENTS
+
+        self.assertIn("SourceSwitchProgressEvent", COALESCED_EVENTS,
+                      "换源扫描的逐源计数不走合流，一轮几百条全直发？")
+        for result in ("SourceSwitchFinishedEvent", "SearchFinishedEvent",
+                       "CheckFinishedEvent", "RssRefreshedEvent",
+                       "BackupFinishedEvent", "ImportFinishedEvent"):
+            self.assertNotIn(result, COALESCED_EVENTS,
+                             f"{result} 是结果类事件，合流就是丢数据")
+        for count_only in ("DownloadProgressEvent", "RssRefreshProgressEvent",
+                           "BackupProgressEvent", "ExportProgressEvent",
+                           "ImportProgressEvent", "RepairProgressEvent"):
+            self.assertIn(count_only, COALESCED_EVENTS,
+                          f"{count_only} 只带计数却没进合流表——判据与表不符")
+
     def test_event_types_cover_the_frozen_table(self) -> None:
         """事件面靠反射；护栏把它钉成一个**下限清单**，少一个就是有人改名或漏 import。"""
         from app.services.gateway.service import event_types
@@ -387,7 +409,8 @@ class EventStreamConfigTests(unittest.TestCase):
             "ImportProgressEvent", "ReadAloudStateEvent", "MediaPlayStateEvent",
             "RssRefreshedEvent", "RssRefreshProgressEvent", "ReplaceRulesChangedEvent",
             "BackupFinishedEvent", "BackupProgressEvent", "UpdateAvailableEvent",
-            "ExportProgressEvent",
+            "ExportProgressEvent", "SourceSwitchProgressEvent",
+            "SourceSwitchFinishedEvent",
         }
         self.assertEqual(sorted(expected - names), [],
                          "这些事件不在反射结果里（改名？模块没被 import？）")

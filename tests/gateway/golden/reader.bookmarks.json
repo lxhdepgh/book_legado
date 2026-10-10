@@ -1,14 +1,14 @@
 {
   "action": "reader.bookmarks",
   "protocol_version": 1,
-  "schema_digest": "34822a1a5e7e",
+  "schema_digest": "879d1fbcfdf0",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "list",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-reader.bookmarks-1301814328000000",
+    "id": "r4-reader.bookmarks-1387250937000000",
     "action": "reader.bookmarks",
     "seq": 10,
     "payload": {
@@ -17,7 +17,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-reader.bookmarks-1301814328000000",
+    "id": "r4-reader.bookmarks-1387250937000000",
     "ok": true,
     "data": [
       {
@@ -26,7 +26,7 @@
         "chapter_index": 1,
         "offset": 0.25,
         "summary": "G3 样本书签",
-        "created_at": 1791520941.0057688
+        "created_at": 1791606377.6075108
       }
     ],
     "error": null,
@@ -35,8 +35,8 @@
   "row_count": 1,
   "inline_row_count": 1,
   "bytes": 161,
-  "sha256": "778dab49d8bd0e610cd440d608023f10d77c4ef4d2fa8d91f8c7b734a7f126b8",
-  "client_wall_ms": 1.3,
+  "sha256": "0747a5691741ebf9d6074d79ebd1b698ad00e0ebf17b8d574af82e721e3c4dc5",
+  "client_wall_ms": 7.2,
   "wire_bytes": 277,
   "field_names": [
     "book_url",

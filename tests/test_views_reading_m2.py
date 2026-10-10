@@ -90,6 +90,8 @@ def _stub_services():
         search_books=AsyncMock(return_value=[]),
         stop_search=AsyncMock(),
         switch_source=AsyncMock(return_value=[]),
+        # 换源扫描队列的规则本体在服务侧（G3-D3）：替身只还原"原样返回"
+        order_switch_sources=lambda sources, own_url="", group="": list(sources),
         apply_source_switch=AsyncMock(return_value=True),
         close_book=AsyncMock(),
         staged_record=lambda: None,
@@ -343,6 +345,75 @@ class SourceSwitchProgressTests(unittest.IsolatedAsyncioTestCase):
         finally:
             controller._switch_dialog = None
             controller.detach()
+
+
+class SwitchQueueDelegationTests(unittest.TestCase):
+    """换源扫描队列的**规则本体**在服务侧（G3-D3）：控制器只交"从哪儿拿源"。
+
+    这一条钉的是"没发生"（记忆 ``guard-tests-assert-absence``）：控制器里若还留一份
+    自己的过滤/排序，进程内的 flet 对话框照样好用，而协议面上那条 ``switch.scan``
+    就得由 Dart 再抄一遍——抄出来的那份永远是抄的人想要的顺序。所以判据不是
+    "看着对"，而是"控制器经手的那一段什么也没改"。
+    """
+
+    def _controller(self, reading) -> BookshelfController:
+        services = {ReadingService: reading,
+                    SourceService: SimpleNamespace(
+                        list_bookshelf=AsyncMock(return_value=[]),
+                        list_sources=AsyncMock(return_value=[]))}
+        return BookshelfController(_FakeHub(services))
+
+    def test_controller_hands_the_service_its_list_and_asks_back(self):
+        reading = _stub_services()[ReadingService]
+        seen: dict = {}
+        queue = ["服务排出来的队列"]
+
+        def order(sources, own_url="", group=""):
+            seen["sources"] = sources
+            seen["own_url"] = own_url
+            seen["group"] = group
+            return queue
+
+        reading.order_switch_sources = order
+        controller = self._controller(reading)
+        cached = ["甲", "乙"]
+        controller._sources = cached
+        # **同一个对象**回来才算"没经手"：控制器只要自己排过或筛过，这里就对不上
+        self.assertIs(controller._switch_candidates({"source_url": "https://a"}),
+                      queue)
+        self.assertIs(seen["sources"], cached, "交给服务的不是控制器缓存那份源列表")
+        self.assertEqual(seen["own_url"], "https://a")
+        self.assertEqual(seen["group"], "",
+                         "flet 那一侧没有分组偏好，必须走默认（全库可搜源）")
+
+    def test_own_source_falls_back_to_the_origin_key(self):
+        """书架记录的"当前源"有两个键（``source_url`` 与 ``origin``），都得认。
+
+        只认一个的话，另一种记录会把当前源自己排进候选队列——扫到自己、再"换"回
+        自己，用户看到的就是候选里那条眼熟的源。
+        """
+        reading = _stub_services()[ReadingService]
+        seen: dict = {}
+        reading.order_switch_sources = lambda sources, own_url="", group="": (
+            seen.__setitem__("own_url", own_url) or [])
+        controller = self._controller(reading)
+        controller._sources = []
+        controller._switch_candidates({"origin": "https://o"})
+        self.assertEqual(seen["own_url"], "https://o", "origin 那一支没被认出来")
+        controller._switch_candidates({"source_url": "https://s",
+                                       "origin": "https://o"})
+        self.assertEqual(seen["own_url"], "https://s",
+                         "两个键都在时应以 source_url 为准")
+        controller._switch_candidates(None)
+        self.assertEqual(seen["own_url"], "", "没有记录也不能报错")
+
+    def test_the_rule_has_no_second_home_in_the_controller(self):
+        import app.controllers.bookshelf_controller as module
+
+        self.assertFalse(hasattr(module, "_site_token"),
+                         "站点令牌又长回控制器了：服务侧那份就成了两份尺")
+        self.assertNotIn("urlsplit", vars(module),
+                         "控制器不再自己拆 url，没有理由 import 它")
 
 
 class _FakeDialogPage:

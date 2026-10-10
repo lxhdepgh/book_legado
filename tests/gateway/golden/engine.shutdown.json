@@ -1,14 +1,14 @@
 {
   "action": "engine.shutdown",
   "protocol_version": 1,
-  "schema_digest": "34822a1a5e7e",
+  "schema_digest": "879d1fbcfdf0",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "子进程收到后自行收摊，rc 见下",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-engine.shutdown-1301814531000000",
+    "id": "r4-engine.shutdown-1387253421000000",
     "action": "engine.shutdown",
     "seq": 0,
     "payload": {
@@ -17,7 +17,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-engine.shutdown-1301814531000000",
+    "id": "r4-engine.shutdown-1387253421000000",
     "ok": true,
     "data": {
       "stopping": true,
@@ -30,7 +30,7 @@
   "inline_row_count": null,
   "bytes": 53,
   "sha256": "57a68753bdfc5664eb5b9a7b25dd7652672a0e121fd1d72884dd49f65adf82ab",
-  "client_wall_ms": 0.8,
+  "client_wall_ms": 1.2,
   "wire_bytes": 160,
   "field_names": [
     "reason",

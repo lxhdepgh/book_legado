@@ -314,8 +314,10 @@ class FakeEngineRepository extends EngineRepository { /* 测试替身，黄金�
 flet 那本 `_continuous_loaded` 台账**有意不抄**（它在"翻章→退回"之后会永久关掉自动接，Dart 查的是挂载表本身）。
 屏侧的 GlobalKey 键改成**整篇段号**（撞一次键就把上一章那一行报成本章落点）。
 本轮按"过程中不跑测试"的授权执行，**通过数与变异核验欠到批量验证那一趟**，日志里只留静态读数。
-剩下的 R1 那一半在 **G3-D3/D4**（换源走 `mode="job"` + 事件、
-`GET /media/{key}`）与 G4 的插件决定 |
+**服务面那一档已交（2026-10-10 第九十三轮，G3-D3 前半）**：`switch.seeds/scan/snapshot/cancel/apply`
+五发登记上表（44→49），扫描走 `mode="job"`，进度与整份候选各一条事件，排队规则收进服务侧一份；
+五发的黄金样本与进度面守卫在手，Dart 那半（仓库面 + 换源屏）是同一门的第二次提交。
+剩下的 R1 那一半在 **G3-D4**（`GET /media/{key}`）与 G4 的插件决定 |
 | **G4** | `rss` / 漫画 / 朗读 / 工具域 / 老板键托盘；删 flet 依赖与 4 个 UI 耦合服务；PyInstaller spec 去 flet* | 2–3 周 | flet 从 `requirements.txt` 消失后全库仍绿；打包冒烟（照真果鉴 `smoke_windows.py` 那条：解压产物跑一次 `--package-smoke`） |
 
 累计 **9–12 周**单人全职（G0 之外）。参照系：真果鉴这条路线做出来的是
@@ -560,6 +562,38 @@ flet 那本 `_continuous_loaded` 台账**有意不抄**（它在"翻章→退回
 > 全部**欠到批量验证那一趟**，这里不抄上一轮的值也不写估计值。静态面当场取到：
 > `dart analyze test lib` → 10 issues found，0 error / 0 warning，且那 10 条全是既有 info、
 > 本轮新文件一条都没有。
+>
+> **G3-D3 前半交（服务面，2026-10-10，第九十三轮，`docs/dev-logs/2026-10-10.md`）**：换源那一轮
+> 联网扫描从界面回调搬进协议面。动作表 44→**49**：`switch.seeds`（本地种子，不联网）、
+> `switch.scan`（**`mode="job"`**，30s）、`switch.snapshot`（回放"扫到第几源"）、
+> `switch.cancel`（`mode="sync"`，合作式叫停——置一个服务端状态位而不是 `task.cancel()`，
+> 取消会把已扫出的候选一起扔了）、`switch.apply`（按 url 取回候选那条源再写回）。
+> 新增两条事件（反射出来的事件面现在是 **24 类**）：`SourceSwitchProgressEvent`（只带计数，进
+> `COALESCED_EVENTS`）与 `SourceSwitchFinishedEvent`（整份排序候选，**不进**合流——
+> 一条就是一行结果，合掉就是丢数据，守卫两头都钉）。关联沿用 `search.start` 那办法：
+> `switch_id` 由客户端生成、服务端原样回带，因为 `_start_job` 的凭据只有 `{started, action}`。
+> **扫描排队规则全库只剩一份**：`_site_token` 与那套过滤/排序从 `BookshelfController`
+> 搬进 `ReadingService.order_switch_sources`（判据复用 `searchable_sources`，不另写一套），
+> 控制器只交"从哪儿拿源"与"当前是哪条源"；**分组不存在时不回退到全部**——
+> 那等于打了个不存在的组名就整个库联网扫一遍。`switch_scan` 一轮只跑一条（第二轮起时
+> 先把在跑那轮叫停并等它收口），三种收尾（扫完/被叫停/起扫前出错）**都发** finished。
+> 语料新档 `/g3sw` 六条源、**四页齐全**（搜索→书籍→目录→正文），章数按源互异；
+> 该不该扫那一格由语料侧 `/hits.json` 的**前后差量**钉（d 停用、e 无 `searchUrl`、x 是当前源，
+> 三条 delta 必须是 0，而同形状还在线上的 a/b/c 必须非 0）。黄金样本重抓到 **61 份**
+> （48 主动作 + 13 变体），本轮五发各有样本，`switch.scan` 一份同时带
+> `event_sample`（整份候选 3 行）与 `progress_sample`；进度面新开一支守卫
+> `tests/test_gateway_job_progress_corpus.py`（**5 条 / 274 行**）——它"哪条 job 该有进度面"
+> **从现场函数体推**而不是抄一张表，并点名要求 `switch.scan` 必须在推导结果里。
+> 仪器三条规矩本轮各加一条（见日志 §5/§6）：路由**按段名指名**（`startswith("book/")` 那种
+> 前缀判法让书籍页掉成搜索页，目录于是塌成 1 章；写成"其余都算搜索"又让 `/toc` 永远只剩一行）、
+> 计数取数**不许用 `or`**（`int(p.get("failures") or -1)` 在真是 0 时也读出 −1，
+> 那条"回环上不该有失败"永远红，且红的形状与"事件里没这个键"一模一样）、
+> 样本落盘按**字节**判行列并重试行锁。
+> **本轮按同一授权执行**：Python 全库、这 18 条新守卫（服务面 9 + 控制器委托 3 +
+> 合流判据 1 + 进度面语料 5）的变异核验全部**欠到批量验证那一趟**，这里只有静态读数与
+> 抓取当场从真进程取到的数（种子 2 行 / 本轮扫 3/3 源 / 候选 3 行 / 写回后目录 2 章）。
+> Dart 那半（仓库面 5 发、两个模型、换源屏、widget/golden）在**同一门的第二次提交**，
+> 五张具名欠据已写进 `_UNWIRED_PENDING_GATE`，划掉的判据是 `core/rpc/` 里出现这五个字面量。
 
 ---
 
@@ -638,7 +672,10 @@ flet 那本 `_continuous_loaded` 台账**有意不抄**（它在"翻章→退回
   两个宿主语言各自答回同一章（4 段 / 1961 字）、报错归回宿主那 20s、18 发变异全红、
   以及留给 G4 的 WebView 插件选型清单；
   第九十二轮：**G3-D2 连续阅读（离线面）**——append 下一章的迟滞/段起点折算/本章口径落库、
-  屏侧 GlobalKey 改整篇段号、30 条新守卫，以及"按授权不跑测试、通过数与变异核验欠到批量验证"这一条）
+  屏侧 GlobalKey 改整篇段号、30 条新守卫，以及"按授权不跑测试、通过数与变异核验欠到批量验证"这一条；
+  第九十三轮：**G3-D3 前半（服务面）**——`switch.*` 五发上表（49 条动作）、换源扫描走 `mode="job"`
+  与两条新事件、排队规则收进服务侧一份、`/g3sw` 六源四页语料与 `/hits.json` 前后差量账、
+  61 份黄金样本重抓、进度面那支从现场函数体推导的守卫）
 - `docs/M7打包说明.md`（PyInstaller 命令与 flet* hidden-import 清单位置）
 - 参照仓库：`github.com/jerunshi/guoapp1`（浅克隆 `D:/tmp/guoapp1`，不在本项目版本控制内）
 - 记忆：`tts-pyttsx3-com-same-thread`、`quickjs-native-crash-risk`、`engine-hub-loop-split`、

@@ -123,6 +123,55 @@ class ReadingSessionChangedEvent(AppEvent):
 
 
 # --------------------------------------------------------------------------- #
+# G3-D3 换源扫描事件（§9 门 G3：换源从进程内回调改走事件流，供跨进程宿主订阅）。
+# 命名沿用 §4.3 的两段式：进度一条只带计数，结果一条带整份候选。
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class SourceSwitchProgressEvent(AppEvent):
+    """换源联网扫描的逐源进度（§9 G3-D3：switch_id, done, total, failures, starved）。
+
+    发布方：ReadingService.switch_scan()（把 ``switch_source`` 的 ``on_progress``
+    转成事件）；订阅方：换源屏 / flet 换源对话框。
+    ``switch_id`` 由客户端生成并原样回带（与 ``SearchFinishedEvent`` 同一套关联办法：
+    ``mode="job"`` 的受理回包里没有任务号，晚到的事件只能靠它认本轮）。
+    ``failures`` 与 ``starved`` 必须**分两格**：后者是"本机忙不过来"——那些源被掐掉
+    是我们自己排队挤的，不是站点的错（见 ``reading_service._switch_starved``）。
+    合成一个数，界面写"38 个失败"，用户去删的是 38 个好源。
+    """
+
+    switch_id: str
+    done: int
+    total: int
+    failures: int = 0
+    starved: int = 0
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass(frozen=True)
+class SourceSwitchFinishedEvent(AppEvent):
+    """一轮换源扫描收口（§9 G3-D3：switch_id, candidates, cancelled, error）。
+
+    发布方：ReadingService.switch_scan()（正常扫完 / 被取消 / 起扫前就出错，三种
+    收尾**都发这一条**）；订阅方：换源屏 / flet 换源对话框。
+    ``candidates`` 是排好序的整份候选，每行 ``{source_url, source_name, book}``
+    ——与 ``switch_source`` 的返回值同一个形状（同一批结果走两条路回客户端却有两种
+    字段，客户端就得写两套 fromJson，设计 §4.5 点名要避免的债）。
+    为什么只在收尾发一次而不是逐源增量：候选顺序是整轮排出来的（书名精确 > 作者 >
+    书源优先级），扫到一半排序会跳，flet 那一侧同样是扫完才渲染。
+    ``cancelled=True`` 表示这一轮是被叫停的：界面那句"扫描完成，N 个候选"与
+    "已停止换源扫描"分别对应两种文案。``error`` 非空表示这一轮根本没扫成
+    （起扫前就抛穿）——不发这条，界面上的转圈就永远停不下来。
+    """
+
+    switch_id: str
+    candidates: list
+    cancelled: bool = False
+    error: str = ""
+    timestamp: float = field(default_factory=time.time)
+
+
+# --------------------------------------------------------------------------- #
 # M3 书源域事件（§4.3 事件表 + 契约 §2；命名即约定，不可变快照）。
 # 以下事件随书源域服务里程碑落地：命名/字段顺序以集成契约为准。
 # --------------------------------------------------------------------------- #

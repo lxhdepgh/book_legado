@@ -1,21 +1,21 @@
 {
   "action": "engine.hello",
   "protocol_version": 1,
-  "schema_digest": "34822a1a5e7e",
+  "schema_digest": "879d1fbcfdf0",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "真库只读副本 + 3 条回环假源 + G2 自建的那条分类源",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-engine.hello-1301811937000000",
+    "id": "r4-engine.hello-1387247250000000",
     "action": "engine.hello",
     "seq": 1,
     "payload": {}
   },
   "response": {
     "v": 1,
-    "id": "r4-engine.hello-1301811937000000",
+    "id": "r4-engine.hello-1387247250000000",
     "ok": true,
     "data": {
       "protocol_version": 1,
@@ -27,7 +27,7 @@
         "job.actions",
         "webview.reverse"
       ],
-      "schema_digest": "34822a1a5e7e",
+      "schema_digest": "879d1fbcfdf0",
       "actions": [
         "bookshelf.add",
         "bookshelf.list",
@@ -71,20 +71,25 @@
         "source.group",
         "source.list",
         "source.save",
+        "switch.apply",
+        "switch.cancel",
+        "switch.scan",
+        "switch.seeds",
+        "switch.snapshot",
         "theme.preferences",
         "theme.save"
       ],
-      "pid": 79888
+      "pid": 117848
     },
     "error": null,
     "code": null
   },
   "row_count": 1,
   "inline_row_count": null,
-  "bytes": 934,
-  "sha256": "ea0002ec515ed67eed286731065568a3b1ba2d445d13ce3cade49234740d457c",
-  "client_wall_ms": 6.2,
-  "wire_bytes": 1093,
+  "bytes": 1013,
+  "sha256": "e97c04c97f7c587e414b9483442b0601ff2ab0022822e3915afb2233b8a30db9",
+  "client_wall_ms": 6.0,
+  "wire_bytes": 1177,
   "field_names": [
     "actions",
     "build",

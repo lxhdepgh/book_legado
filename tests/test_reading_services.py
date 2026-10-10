@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +24,8 @@ from app.core.events import (
     ProgressSavedEvent,
     ReadingSessionChangedEvent,
     SearchFinishedEvent,
+    SourceSwitchFinishedEvent,
+    SourceSwitchProgressEvent,
 )
 from app.core.lifecycle import ServiceState
 from app.core.settings import SettingsService
@@ -498,6 +501,259 @@ def test_switch_never_runs_more_workers_than_the_cap(env, monkeypatch):
 
     assert engine.max_active == 3, f"并发峰值应是上限值，实测 {engine.max_active}"
     assert len(engine.seen) == total, "每个候选源都要扫到"
+
+
+# --------------------------------------------------------------------------- #
+# 10.6 换源的协议门面（G3-D3：switch.* 那一族的服务侧形状）
+#
+# 这一族钉四件事：**排队规则只有一份**（过滤 + 同站排序都在服务里，界面与 RPC 共用）、
+# **job 的三种收尾都发 finished**（扫完 / 叫停 / 起扫前出错——少一种，跨进程那侧的
+# 转圈就永远停不下来）、**合作式停止保留已扫出的候选**，以及**快照里没有内部持有者**。
+# 事件一律走真 :class:`EventBus`：进度若只存在于服务里的一个数上，那条 ``/ws``
+# 就没有第二条路（记忆 ``ui-progress-must-travel-as-events``）。
+# --------------------------------------------------------------------------- #
+def _sw_source(url, *, group="", enabled=True, search_url="/q", name=None):
+    return SimpleNamespace(bookSourceUrl=url, bookSourceName=name or url,
+                           enabled=enabled, searchUrl=search_url,
+                           bookSourceGroup=group)
+
+
+class _SwEngine:
+    """换源扫描的引擎替身：按源回指定行，并记下**被叫到过**的源。
+
+    ``seen`` 是这一族的关键读数——"停用的源没被扫"这件事只能由"引擎没被叫到"来判，
+    由候选条数反推会让"扫了但没命中"与"没扫"混成同一个数。
+    """
+
+    def __init__(self, rows=None, *, delay: float = 0.0):
+        self.rows = rows or {}
+        self.delay = delay
+        self.seen: list[str] = []
+
+    async def search(self, source, keyword, page=1):
+        self.seen.append(source.bookSourceUrl)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        return list(self.rows.get(source.bookSourceUrl, []))
+
+
+class _SwSources:
+    """SourceService 替身：库里有哪几条源、按 url 取回哪一条、写回成没成。"""
+
+    def __init__(self, sources, *, raise_list: bool = False):
+        self.sources = list(sources)
+        self.switch_calls: list = []
+        self.raise_list = raise_list
+
+    async def list_sources(self):
+        if self.raise_list:
+            raise RuntimeError("书库读不到")
+        return list(self.sources)
+
+    async def load_source(self, url):
+        for source in self.sources:
+            if source.bookSourceUrl == url:
+                return source
+        return None
+
+    def switch_bookshelf_source(self, record, source, book):
+        self.switch_calls.append((record, source, book))
+        return True
+
+
+def _sw_service(env, sources, engine) -> ReadingService:
+    svc = ReadingService(rule_engine=engine, storage=env.storage,
+                         settings=env.settings, source_service=sources)
+    svc.bus = env.bus
+    asyncio.run(svc.on_start())
+    return svc
+
+
+def _collect(sink: list):
+    async def handler(event):
+        sink.append(event)
+    return handler
+
+
+def test_order_switch_sources_is_the_one_filter_rule() -> None:
+    """过滤三条 + 同站优先：这一格是全库唯一的一条排队规则。"""
+    sources = [
+        _sw_source("http://own.example.com/a"),                       # 当前源：排掉
+        _sw_source("http://off.example.com/b", enabled=False),        # 停用：排掉
+        _sw_source("http://nosearch.example.com/c", search_url="   "),  # 无搜索规则
+        _sw_source("http://www.own.example.com/d"),                   # 与当前同站
+        _sw_source("http://other.example.com/e"),
+    ]
+    pool = ReadingService.order_switch_sources(sources, "http://own.example.com/a")
+    assert [s.bookSourceUrl for s in pool] == [
+        "http://www.own.example.com/d", "http://other.example.com/e"]
+    # 正对照：同站那一格**确实**是因为同站才排前的——换一个 own_url，同两条行的
+    # 先后就反过来（那时只剩字典序）。少了这一发，"排前"可能是字典序顺手给的。
+    swapped = ReadingService.order_switch_sources(sources, "http://other.example.com/e")
+    assert [s.bookSourceUrl for s in swapped] == [
+        "http://own.example.com/a", "http://www.own.example.com/d"]
+
+
+def test_order_switch_sources_group_absent_scans_nothing() -> None:
+    """分组打错**不回退到全部启用源**：回退等于用一个错组名把整库联网扫一遍。"""
+    sources = [_sw_source("src-a", group="甲"), _sw_source("src-b", group="乙")]
+    assert [s.bookSourceUrl for s in
+            ReadingService.order_switch_sources(sources, "", "甲")] == ["src-a"]
+    assert ReadingService.order_switch_sources(sources, "", "打错的组") == []
+
+
+def test_switch_scan_scans_only_the_queue_and_delivers_ranked_candidates(env) -> None:
+    """一轮扫描：进度与收尾都带客户端那个 switch_id，被过滤的源一次都没被叫到。"""
+    sources = [
+        _sw_source("src-own"),
+        _sw_source("src-a", group="换源", name="源甲"),
+        _sw_source("src-b", group="换源", name="源乙"),
+        _sw_source("src-c", group="换源", name="源丙"),
+        _sw_source("src-off", group="换源", enabled=False, name="源停"),
+        _sw_source("src-no", group="换源", search_url="", name="源无规则"),
+    ]
+    hit = lambda name, author, url, origin: BookItem(  # noqa: E731
+        name=name, author=author, url=url, origin=origin)
+    engine = _SwEngine({
+        "src-a": [hit("换源目标书", "作者戊", "b-a", "src-a"),
+                  hit("换源目标书 卷二", "作者戊", "b-a2", "src-a")],
+        "src-b": [hit("换源目标书", "作者己", "b-b", "src-b")],
+        "src-c": [hit("旁书一本", "作者庚", "b-c", "src-c")],
+        # 这两条源**会**命中：它们出现在替身的行表里，却绝不能出现在引擎被叫到的名单里。
+        "src-off": [hit("换源目标书", "作者戊", "b-off", "src-off")],
+        "src-no": [hit("换源目标书", "作者戊", "b-no", "src-no")],
+    })
+    svc = _sw_service(env, _SwSources(sources), engine)
+    progress, finished = [], []
+    env.bus.subscribe(SourceSwitchProgressEvent, _collect(progress))
+    env.bus.subscribe(SourceSwitchFinishedEvent, _collect(finished))
+    run = asyncio.run(svc.switch_scan(
+        {"name": "换源目标书", "author": "作者戊", "url": "b-own",
+         "source_url": "src-own", "origin": "src-own"},
+        switch_id=42, group="换源"))
+    _drain(env.pending)
+
+    assert sorted(engine.seen) == ["src-a", "src-b", "src-c"], "停用的与没规则的没被扫"
+    assert run["total"] == 3 and run["done"] == 3
+    assert len(finished) == 1, "收尾必须恰好一条：两条会让界面的计数抖一下"
+    event = finished[0]
+    assert event.switch_id == "42" and event.cancelled is False and event.error == ""
+    # 排序三判据各有一行证据：精确同名 + 作者对得上 > 精确同名 > 只包含关键词
+    assert [(c["source_url"], c["book"]["url"]) for c in event.candidates] == [
+        ("src-a", "b-a"), ("src-b", "b-b"), ("src-a", "b-a2")]
+    assert progress and all(p.switch_id == "42" and p.total == 3 for p in progress)
+    assert progress[-1].done == 3 and progress[-1].failures == 0
+    snapshot = asyncio.run(svc.switch_snapshot())
+    assert snapshot["candidates"] == event.candidates, "快照与事件必须是同一批候选"
+
+
+def test_switch_scan_group_absent_yields_an_empty_round(env) -> None:
+    """打错的分组：``total=0``、引擎一次没被叫到、仍然有一条 finished。"""
+    engine = _SwEngine({})
+    svc = _sw_service(env, _SwSources([_sw_source("src-a", group="甲")]), engine)
+    finished = []
+    env.bus.subscribe(SourceSwitchFinishedEvent, _collect(finished))
+    run = asyncio.run(svc.switch_scan(
+        {"name": "书名", "url": "u"}, switch_id=1, group="不存在的组"))
+    _drain(env.pending)
+    assert engine.seen == [] and run["total"] == 0 and run["candidates"] == []
+    assert len(finished) == 1 and finished[0].error == ""
+
+
+def test_switch_scan_still_delivers_finished_when_the_sweep_raises(env) -> None:
+    """起扫前就出错也要发 finished：不发，界面上那个转圈就永远停不下来。"""
+    svc = _sw_service(env, _SwSources([], raise_list=True), _SwEngine({}))
+    finished, progress = [], []
+    env.bus.subscribe(SourceSwitchFinishedEvent, _collect(finished))
+    env.bus.subscribe(SourceSwitchProgressEvent, _collect(progress))
+    run = asyncio.run(svc.switch_scan({"name": "书名", "url": "u"}, switch_id=3))
+    _drain(env.pending)
+    assert len(finished) == 1 and finished[0].candidates == []
+    assert "书库读不到" in finished[0].error
+    assert run["running"] is False and progress == []
+
+
+def test_switch_cancel_keeps_the_candidates_already_scanned(env, monkeypatch) -> None:
+    """合作式叫停：已扫出的候选留下，剩下的源不再取，``done < total``。"""
+    from app.services.reading import reading_service as rs
+    monkeypatch.setattr(rs, "SWITCH_CONCURRENCY", 1)
+    sources = [_sw_source(f"src-{i:02d}", group="甲") for i in range(20)]
+    engine = _SwEngine({s.bookSourceUrl: [BookItem(
+        name="书名", author="作者", url=f"b-{s.bookSourceUrl}",
+        origin=s.bookSourceUrl)] for s in sources}, delay=0.01)
+    svc = _sw_service(env, _SwSources(sources), engine)
+
+    async def drive():
+        task = asyncio.ensure_future(
+            svc.switch_scan({"name": "书名", "url": "u"}, switch_id=5, group="甲"))
+        while len(engine.seen) < 3:
+            await asyncio.sleep(0.005)
+        assert svc.switch_cancel() == {"cancelled": True}
+        return await task
+
+    run = asyncio.run(drive())
+    assert run["cancelled"] is True and run["done"] < run["total"]
+    assert 0 < len(run["candidates"]) < run["total"], "停止不能把已扫出的候选一起扔了"
+    assert len(engine.seen) < 20, "叫停之后还在取新源 = 那一发停止没接上线"
+    # 正对照（反向）：没有轮次在跑时那一发回 False，界面别写"已停止"
+    assert svc.switch_cancel() == {"cancelled": False}
+
+
+def test_a_second_scan_takes_over_the_round_already_running(env, monkeypatch) -> None:
+    """一轮只跑一条：新的一轮先合作式叫停旧的，两边的 finished 各自带自己的号。"""
+    from app.services.reading import reading_service as rs
+    monkeypatch.setattr(rs, "SWITCH_CONCURRENCY", 1)
+    sources = [_sw_source(f"src-{i:02d}", group="甲") for i in range(20)]
+    engine = _SwEngine({s.bookSourceUrl: [BookItem(
+        name="书名", author="作者", url=f"b-{s.bookSourceUrl}",
+        origin=s.bookSourceUrl)] for s in sources}, delay=0.01)
+    svc = _sw_service(env, _SwSources(sources), engine)
+    record = {"name": "书名", "url": "u"}
+
+    async def drive():
+        first = asyncio.ensure_future(svc.switch_scan(record, switch_id=1, group="甲"))
+        while len(engine.seen) < 2:
+            await asyncio.sleep(0.005)
+        second = asyncio.ensure_future(svc.switch_scan(record, switch_id=2, group="甲"))
+        return await first, await second
+
+    first_run, second_run = asyncio.run(drive())
+    assert first_run["cancelled"] is True and second_run["cancelled"] is False
+    assert asyncio.run(svc.switch_snapshot())["switch_id"] == "2"
+    # 两份收尾分得清是谁的：混成一个号，界面就会把上一轮的迟到结果当本轮渲染
+    assert {first_run["switch_id"], second_run["switch_id"]} == {"1", "2"}
+
+
+def test_switch_snapshot_is_plain_json_without_the_internal_gate(env) -> None:
+    """快照里不许带内部持有者：那个收口闸门只归服务自己用。"""
+    svc = _sw_service(env, _SwSources([_sw_source("src-a", group="甲")]),
+                      _SwEngine({}))
+    asyncio.run(svc.switch_scan({"name": "书名", "url": "u"}, switch_id=9, group="甲"))
+    _drain(env.pending)
+    snapshot = asyncio.run(svc.switch_snapshot())
+    assert "finished" not in snapshot
+    wire = json.dumps(snapshot, ensure_ascii=False)
+    assert "Event" not in wire, f"闸门漏进了 JSON 面：{wire[:120]}"
+    # 正对照：这一发里确实有一个非空的内部键在别处（服务对象上），只是不上协议面
+    assert svc._switch_run["finished"] is not None
+
+
+def test_apply_switch_resolves_the_source_and_restores_the_book(env) -> None:
+    """写回那一发：源按 url 取回对象，书快照在服务边界还原成 BookItem。"""
+    sources = [_sw_source("src-a")]
+    store = _SwSources(sources)
+    svc = _sw_service(env, store, _SwEngine({}))
+    out = asyncio.run(svc.apply_switch(
+        {"url": "b-old", "source_url": "src-old"}, "src-a",
+        {"name": "书", "author": "作者", "url": "b-a"}))
+    assert out == {"applied": True, "source_url": "src-a"}
+    _, source, book = store.switch_calls[0]
+    assert source is sources[0], "按 url 取回的必须是库里那条源对象"
+    assert isinstance(book, BookItem) and book.url == "b-a", (
+        "字典没还原就在写回里取空串——引擎和书架都从这一格读 url")
+    # 源不存在时**抛穿**而不是回 False：三种失败成因不能折成一句"没换成"
+    with pytest.raises(ValueError):
+        asyncio.run(svc.apply_switch({"url": "x"}, "src-missing", {"name": "书"}))
 
 
 def test_search_store_seeds_expire_on_start(env):

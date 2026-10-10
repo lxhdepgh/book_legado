@@ -1,14 +1,14 @@
 {
   "action": "reader.content",
   "protocol_version": 1,
-  "schema_digest": "34822a1a5e7e",
+  "schema_digest": "879d1fbcfdf0",
   "captured_from": "main.py --serve（真子进程，回环）",
   "corpus": "同一章的第二发（从盘上读回）：口径与地址都得原样还在",
   "data_shape": "object",
   "data_truncated": false,
   "request": {
     "v": 1,
-    "id": "r4-reader.content-1301814312000000",
+    "id": "r4-reader.content-1387250921000000",
     "action": "reader.content",
     "seq": 8,
     "payload": {
@@ -19,7 +19,7 @@
   },
   "response": {
     "v": 1,
-    "id": "r4-reader.content-1301814312000000",
+    "id": "r4-reader.content-1387250921000000",
     "ok": true,
     "data": {
       "chapterUrl": "http://127.0.0.1:8797/g3/ch/2.html",
@@ -63,7 +63,7 @@
   "inline_row_count": null,
   "bytes": 17834,
   "sha256": "0da2e6b59fc099414505460229e54008850d359430a78419d6dc6f191413102c",
-  "client_wall_ms": 2.5,
+  "client_wall_ms": 3.8,
   "wire_bytes": 17987,
   "field_names": [
     "blocks",

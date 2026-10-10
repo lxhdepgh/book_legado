@@ -231,7 +231,17 @@ def test_widget_key_lookalikes_are_not_mistaken_for_actions() -> None:
 #: 落地时的同一张嘴，不是历史装饰。
 #: 口径提醒：这里数的"Dart 侧有人落"是**协议面在 Dart 有实现**（`core/rpc/` 那三个文件
 #: 里的字面量），不是"界面调了它"；后者由 widget/golden 测试那一面负责（G3-C3）。
-_UNWIRED_PENDING_GATE: dict[str, str] = {}
+#:
+#: 第九十三轮（G3-D3）把换源那一族五发登记上表，Dart 的仓库面与换源屏在同一门的
+#: 第二发提交里接——这一张欠据管的就是那半截。划掉的判据是 `core/rpc/` 里出现这五个
+#: 字面量，不是"屏幕看着像"。
+_UNWIRED_PENDING_GATE: dict[str, str] = {
+    "switch.seeds": "G3-D3 的 Dart 换源屏：打开对话框先读本地种子（不联网那一发）",
+    "switch.scan": "G3-D3 的 Dart 换源屏：mode=job + 进度事件，换源那一轮的结果从 /ws 走",
+    "switch.snapshot": "G3-D3 的 Dart 换源屏：断线重连补回'扫到第几源'的那一发",
+    "switch.cancel": "G3-D3 的 Dart 换源屏：停止按钮那一发（合作式叫停，保留已扫出的候选）",
+    "switch.apply": "G3-D3 的 Dart 换源屏：选中候选写回书架那一发",
+}
 
 
 def _dart_action_calls() -> dict[str, list[str]]:
