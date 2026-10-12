@@ -260,11 +260,14 @@ class SourceCheckService(Service):
                     logger.info("执行第 %s/%s 批（%s 条源）", 
                                batch_idx + 1, total_batches, len(batch))
                     
-                    batch_results, batch_tiering = await self._run_tiered(batch, run)
+                    # 方案7修复：传递已完成的源数，让进度连续累加
+                    settled_before = len(all_results)
+                    batch_results, batch_tiering = await self._run_tiered(
+                        batch, run, settled_before=settled_before)
                     all_results.extend(batch_results)
                     
-                    # 流式反馈：每批完成后更新进度
-                    self.status.progress = (batch_idx + 1) / total_batches
+                    # 流式反馈：每批完成后更新进度（基于实际完成数）
+                    self.status.progress = len(all_results) / len(sources)
                     logger.info("批次 %s/%s 完成，当前进度 %.1f%%", 
                                batch_idx + 1, total_batches, 
                                self.status.progress * 100)
@@ -295,7 +298,7 @@ class SourceCheckService(Service):
                 "deferred": 0, "queued": 0, "by_reason": {}}
 
     async def _run_tiered(self, sources: list[BookSource],
-                          run: dict) -> tuple[list[dict], dict]:
+                          run: dict, settled_before: int = 0) -> tuple[list[dict], dict]:
         """浅遍扫全书 + 按限额补验队列里欠着的那一片，返回结果与本轮的分级账目。
 
         第六十四轮 (C) 实测"浅遍跑完紧接着在同一轮里补验"每一档都是净亏
