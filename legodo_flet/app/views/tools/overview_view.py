@@ -14,7 +14,7 @@ from app.core.registry import (DEST_TOOLS_BROWSER, DEST_TOOLS_DICT,
                                DEST_TOOLS_EXPORT, DEST_TOOLS_FONT,
                                DEST_TOOLS_QR, DEST_TOOLS_REPLACE,
                                DEST_TOOLS_UPDATE, DEST_TOOLS_WEBDAV,
-                               DEST_TOOLS_WEB_BRIDGE, DEST_TOOLS_TTS)
+                               DEST_TOOLS_WEB_BRIDGE)
 
 #: 工具卡片清单：(目的地, 标题, 图标, 说明)。
 _TOOLS: tuple[tuple[str, str, str, str], ...] = (
@@ -27,7 +27,6 @@ _TOOLS: tuple[tuple[str, str, str, str], ...] = (
     (DEST_TOOLS_WEBDAV, "备份", ft.Icons.UPLOAD_FILE, "WebDAV 备份 / 恢复"),
     (DEST_TOOLS_UPDATE, "更新", ft.Icons.SYSTEM_UPDATE, "检查更新 / 下载安装包"),
     (DEST_TOOLS_WEB_BRIDGE, "网络桥", ft.Icons.LAN, "本机 HTTP/WebSocket 书源管理 / 调试"),
-    (DEST_TOOLS_TTS, "朗读", ft.Icons.SETTINGS_VOICE, "听书语音档（系统 / edge / HTTP-TTS）"),
 )
 
 
