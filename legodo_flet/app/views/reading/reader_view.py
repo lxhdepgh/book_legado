@@ -28,7 +28,6 @@ import flet as ft
 from app.core.text_layout import paragraph_lines
 from app.views.reading.bookmark_panel import BookmarkPanel
 from app.views.reading.content_search_bar import ContentSearchBar
-from app.views.reading.read_aloud_bar import ReadAloudBar
 from app.views.reading.video_play_bar import VideoPlayBar
 
 #: 正文段/小标题的标记：改字号行距要就地重排已挂出来的控件（见 apply_preferences）。

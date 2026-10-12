@@ -77,7 +77,6 @@ _AUDIT = "app.services.sources.compat_audit_service.CompatAuditService"
 _SETTINGS = "app.core.settings.SettingsService"
 _THEME = "app.services.tools.theme_service.ThemeService"
 _RSS = "app.services.content.rss_service.RssService"
-_READALOUD = "app.services.content.read_aloud.ReadAloudService"
 _UPDATE = "app.services.tools.update_service.UpdateService"
 _BROWSER = "app.services.tools.browser_service.BrowserService"
 _REPLACE = "app.services.tools.replace_rule_service.ReplaceRuleService"
@@ -86,7 +85,6 @@ _QR = "app.services.tools.qr_code_service.QrCodeService"
 _EXPORT = "app.services.tools.book_export_service.BookExportService"
 _WEBDAV = "app.services.tools.web_dav_service.WebDavService"
 _WEB_BRIDGE = "app.services.tools.web_bridge_service.WebBridgeService"
-_TTS = "app.services.content.read_aloud.ReadAloudService"  # TTS 控制复用朗读域
 
 METHODS: tuple[Method, ...] = (
     _m("engine.hello", _SELF, "hello", (), 2.0,
@@ -240,23 +238,6 @@ METHODS: tuple[Method, ...] = (
        ("request_id", "body", "headers", "status", "url", "cookie", "error",
         "js_result"), 5.0,
        summary="WebView 渲染结果交回：解开一次服务端→客户端的 webview.content 反向请求"),
-    # -- G4-D: 朗读域（TTS 控制 + 语音档管理） --
-    _m("readaloud.speak", _READALOUD, "speak",
-       ("book_url", "text", "opts"), 30.0, mode="job",
-       summary="开始朗读：选后端 → 发声；进度与状态走事件流"),
-    _m("readaloud.stop", _READALOUD, "stop_speaking", (), 5.0, mode="sync",
-       summary="停止当前朗读"),
-    _m("readaloud.set_voice", _READALOUD, "set_voice_by_id", ("profile_id",), 5.0,
-       mode="sync", summary="按语音档 id 切换音色（builtin = 内置语音）"),
-    _m("readaloud.set_rate", _READALOUD, "set_rate", ("rate_key",), 5.0, mode="sync",
-       summary="设置语速档位（slow/normal/fast/very_fast，仅系统 TTS 后端生效）"),
-    _m("readaloud.profiles", _READALOUD, "list_profiles", (), 5.0,
-       summary="列出所有已登记的 TTS 语音档"),
-    _m("readaloud.add_profile", _READALOUD, "add_profile",
-       ("name", "url", "headers", "engine_type"), 5.0,
-       summary="登记一条新的 TTS 语音档"),
-    _m("readaloud.remove_profile", _READALOUD, "remove_profile", ("profile_id",), 5.0,
-       summary="删除一条 TTS 语音档"),
     # update.* - 更新检查域（M5，契约 §1.17）
     _m("update.check", _UPDATE, "check_update", (), 10.0,
        summary="检查更新：返回最新版本信息或 None（已是最新/网络失败）"),

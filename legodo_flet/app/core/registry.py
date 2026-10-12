@@ -97,9 +97,6 @@ DEST_TOOLS_UPDATE = "tools.update"          # 更新检查（检查 / 提示 / �
 #: 网络桥设置页（M5 §1.15 界面承接）。**不并入** :data:`TOOLS_DESTINATIONS`
 #: （那条元组冻结 8 项，M5 测试按精确长度回查）。
 DEST_TOOLS_WEB_BRIDGE = "tools.webbridge"   # 本地 HTTP/WebSocket 网桥开关与令牌
-#: 听书语音档管理页（tts_profiles 的增删与默认档）。同样**不并入**冻结的
-#: TOOLS_DESTINATIONS 元组。
-DEST_TOOLS_TTS = "tools.tts"                # 朗读语音档（引擎类型 / HTTP-TTS 地址）
 
 #: M5 工具组已注册目的地（供导航层/测试一次性回查；**冻结 8 项**——M5 测试
 #: 按精确长度回查。工具入口页 tools.overview 另列 :data:`DEST_TOOLS_OVERVIEW`，
@@ -184,7 +181,6 @@ NAV_META: dict[str, tuple] = {
     DEST_TOOLS_WEBDAV:   (GROUP_CONFIG, "备份",    True),
     DEST_TOOLS_UPDATE:   (GROUP_CONFIG, "更新",     True),
     DEST_TOOLS_WEB_BRIDGE: (GROUP_CONFIG, "网络桥", True),
-    DEST_TOOLS_TTS:      (GROUP_CONFIG, "朗读",     True),
 }
 
 

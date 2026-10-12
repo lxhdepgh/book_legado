@@ -187,16 +187,14 @@ def _build_hub():
     hub.register(CompatAuditService())
     hub.register(OnlineImportService())
 
-    # M4 服务集合：内容形态域四服务（§8.2 M4）。新依赖（feedparser/ebooklib/
-    # pymupdf/pyttsx3/edge-tts）均按服务懒加载，仅 requirements 记录。
+    # M4 服务集合：内容形态域三服务（§8.2 M4）。新依赖（feedparser/ebooklib/
+    # pymupdf）均按服务懒加载，仅 requirements 记录。
     from app.services.content.local_book_service import LocalBookService
     from app.services.content.media_play import MediaPlayService
-    from app.services.content.read_aloud import ReadAloudService
     from app.services.content.rss_service import RssService
 
     hub.register(RssService())
     hub.register(LocalBookService())
-    hub.register(ReadAloudService())
     hub.register(MediaPlayService())
 
     # M5 服务集合：工具域十服务（§8.2 M5，§1.5/1.7/1.8/1.9/1.10/1.12/1.15/1.17/1.19 + §3.3/3.11）。

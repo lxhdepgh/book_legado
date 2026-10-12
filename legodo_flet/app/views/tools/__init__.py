@@ -5,7 +5,7 @@
 视图数据一律经所属 Controller 从 ``ServiceHub.get()`` 取服务后注入；
 唯一例外通道是 BrowserView 实现 BrowserInteractionCallback（core 协议，不违反依赖方向）。
 
-工具组九个目的地（注册进 ViewRegistry）：
+工具组八个目的地（注册进 ViewRegistry）：
 
 - :class:`DictPopup`          划词取词弹窗；
 - :class:`ReplaceRuleView`    全局替换规则管理；
@@ -15,7 +15,6 @@
 - :class:`WebDavView`         备份设置页（WebDAV 连接 / 备份 / 恢复）；
 - :class:`UpdateView`         更新检查（检查 / 提示 / 下载）；
 - :class:`WebBridgeView`      网络桥设置页（开关 / 端口 / 令牌 / 端点清单）。
-- :class:`TtsProfileView`     听书语音档（tts_profiles 增删 + 默认档）。
 """
 from __future__ import annotations
 
@@ -23,7 +22,7 @@ from app.core.hub import ServiceHub
 from app.core.registry import (DEST_TOOLS_DICT,
                                DEST_TOOLS_EXPORT, DEST_TOOLS_FONT,
                                DEST_TOOLS_OVERVIEW, DEST_TOOLS_QR,
-                               DEST_TOOLS_REPLACE, DEST_TOOLS_TTS,
+                               DEST_TOOLS_REPLACE,
                                DEST_TOOLS_UPDATE,
                                DEST_TOOLS_WEBDAV, DEST_TOOLS_WEB_BRIDGE,
                                TOOLS_DESTINATIONS, ViewRegistry)
@@ -38,7 +37,6 @@ from app.views.tools.export_view import ExportView
 from app.views.tools.webdav_view import WebDavView
 from app.views.tools.update_view import UpdateView
 from app.views.tools.web_bridge_view import WebBridgeView
-from app.views.tools.tts_view import TtsProfileView
 
 # [已移除] 浏览器控制器
 # from app.controllers.tools.browser_controller import BrowserController
@@ -50,15 +48,13 @@ from app.controllers.tools.export_controller import ExportController
 from app.controllers.tools.webdav_controller import WebDavController
 from app.controllers.tools.update_controller import UpdateController
 from app.controllers.tools.web_bridge_controller import WebBridgeController
-from app.controllers.tools.tts_controller import TtsProfileController
 
 __all__ = [
     "DictPopup", "ReplaceRuleView", "FontView", "QrCodeView",
-    "ExportView", "WebDavView", "UpdateView", "WebBridgeView", "TtsProfileView",
+    "ExportView", "WebDavView", "UpdateView", "WebBridgeView",
     "DictPopupController", "ReplaceRuleController",
     "FontController", "QrCodeController", "ExportController",
     "WebDavController", "UpdateController", "WebBridgeController",
-    "TtsProfileController",
     "register_destinations", "TOOLS_DESTINATIONS",
 ]
 
@@ -115,11 +111,6 @@ def register_destinations(registry: ViewRegistry, hub: ServiceHub) -> ViewRegist
         DEST_TOOLS_WEB_BRIDGE,
         lambda: _build(hub, WebBridgeView, WebBridgeController),
         required_services=("WebBridgeService",), hidden=True)
-    # 听书语音档页：tts_profiles 的 CRUD 面（朗读条的音色下拉吃这张表）
-    registry.register(
-        DEST_TOOLS_TTS,
-        lambda: _build(hub, TtsProfileView, TtsProfileController),
-        required_services=("ReadAloudService",), hidden=True)
     return registry
 
 
