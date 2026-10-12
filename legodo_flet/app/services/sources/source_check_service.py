@@ -598,15 +598,6 @@ class SourceCheckService(Service):
         return (entry["consecutive_fail"] >= self._low_priority_threshold or
                 success_rate < self._skip_deep_threshold)
 
-        finally:
-            self._task = None
-        # 审计的尾巴要在进度到 100% 之后立刻收掉：留着不等人，占的是子进程池的队列
-        # （退回线程池时占的就是下一条检测、阅读页都要用的默认线程池）。
-        await self._drain_audits()
-        if reap:
-            self._reap_audit_pool()
-        self.status.progress = min(1.0, settled / plan_total) if plan_total else None
-        return results
 
     def _reap_audit_pool(self) -> None:
         """大轮跑完就把审计进程池关掉，把 worker 涨出来的内存还给系统。
