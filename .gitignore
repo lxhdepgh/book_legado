@@ -21,10 +21,18 @@ wheelhouse/
 build/LegadoReader/
 !LegadoReader.spec
 
-# Dart subproject packaging output
-legodo_dart/backend/
+# Dart subproject backend (copied from root app/)
+legodo_dart/app_backend/__pycache__/
+legodo_dart/app_backend/**/*.pyc
 legodo_dart/build/
 legodo_dart/dist/
+
+# Flet subproject backend (copied from root app/)
+legodo_flet/app_backend/__pycache__/
+legodo_flet/app_backend/**/*.pyc
+
+# Dart subproject packaging output
+legodo_dart/backend/
 
 # Flet subproject packaging output
 legodo_flet/dist/

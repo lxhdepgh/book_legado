@@ -27,7 +27,7 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parent  # 项目根目录
-_APP_SOURCE = _PROJECT_ROOT / "app"  # Python 后端源码
+_APP_SOURCE = _SCRIPT_DIR / "app_backend"  # Python 后端源码（本地副本）
 _OUTPUT_DIR = _SCRIPT_DIR / "dist"
 
 

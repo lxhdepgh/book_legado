@@ -6,6 +6,8 @@
     python main.py --serve                   # 无头模式：仅 GatewayService（供远程调用）
     python main.py --connect URL --token T   # 环回模式：连接外部 Python 后端
     python main.py --smoke-test              # 冻结包动态依赖冒烟
+
+注意：本项目的后端代码位于 app_backend/ 目录（与顶层 app/ 分离，避免多子项目冲突）。
 """
 import asyncio
 import logging
@@ -13,15 +15,24 @@ import os
 import sys
 from pathlib import Path
 
-# 确保项目根目录在 sys.path 中（沿用旧 main.py 方式）
+# 确保 legodo_flet 根目录在 sys.path 中
 # legodo_flet/app/main.py → legodo_flet 根 = ../ 
 _FLET_ROOT = Path(__file__).resolve().parent.parent
+
+# 添加 app_backend/ 到 sys.path（本项目专属后端）
+_BACKEND_DIR = _FLET_ROOT / "app_backend"
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+
+# 同时保留 legodo_flet 根目录（供前端视图导入，如 app.themes、app.views）
 if str(_FLET_ROOT) not in sys.path:
-    sys.path.insert(0, str(_FLET_ROOT))
-# 同时保留上级项目根（供 app.core / app.services 等跨子项目导入）
+    sys.path.insert(1, str(_FLET_ROOT))
+
+# 同时保留上级项目根（供跨子项目导入，如果需要）
 _PROJECT_ROOT = _FLET_ROOT.parent
 if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+    sys.path.insert(2, str(_PROJECT_ROOT))
+
 _ROOT = _FLET_ROOT
 
 logger = logging.getLogger(__name__)
@@ -484,6 +495,11 @@ def main():
             connect_token = sys.argv[i + 1]
 
     import flet as ft
+
+    # DEBUG: Print sys.path before MD3 theme import
+    import sys as _sys
+    print(f"DEBUG: sys.path[0:4] = {_sys.path[:4]}", flush=True)
+    print(f"DEBUG: CWD = {Path.cwd()}", flush=True)
 
     # Apply MD3 theme before building UI
     from app.themes.md3_theme import apply_to_page
