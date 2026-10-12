@@ -270,8 +270,8 @@ class ImportProgressEvent(AppEvent):
     ``total`` 为 0 表示这一阶段条数不可预估（例如整段网络拉取），界面走不定长进度条。
     """
 
-    kind: str
-    phase: str
+    kind: str = ""
+    phase: str = ""
     done: int = 0
     total: int = 0
     timestamp: float = field(default_factory=time.time)
