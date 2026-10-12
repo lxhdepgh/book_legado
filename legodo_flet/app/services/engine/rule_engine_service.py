@@ -28,6 +28,8 @@ from typing import Any
 import aiohttp
 
 from app.services.engine.reading_engine import LegadoReadingEngine
+from app.services.engine.reading_engine_android import ReadingEngineAndroid
+from app.services.engine.rule_pre_executor import RulePreExecutor
 from app.services.engine.rule_engine import dns_ip_resolver
 from app.services.engine._prefs import set_override
 
@@ -97,7 +99,8 @@ class RuleEngineService(Service):
 
     def __init__(self, state_dir=None, pool_size: int = DEFAULT_POOL_SIZE,
                  timeout: int = 15, connect_timeout: float | None = None,
-                 webview_fetcher=None, verification_fetcher=None):
+                 webview_fetcher=None, verification_fetcher=None,
+                 android_mode: bool = False, pre_executor=None):
         super().__init__()
         self.state_dir = state_dir
         self.pool_size = max(1, int(pool_size))
@@ -105,6 +108,8 @@ class RuleEngineService(Service):
         self.connect_timeout = connect_timeout
         self.webview_fetcher = webview_fetcher
         self.verification_fetcher = verification_fetcher
+        self.android_mode = android_mode  # Android 模式：禁用 WebView
+        self.pre_executor = pre_executor  # RulePreExecutor 实例（预渲染缓存）
         # bookSourceUrl -> LegadoReadingEngine（OrderedDict 实现 LRU）。
         self._pool: OrderedDict[str, LegadoReadingEngine] = OrderedDict()
         self._pool_lock = asyncio.Lock()
@@ -219,14 +224,27 @@ class RuleEngineService(Service):
         return connector
 
     def _new_engine(self) -> LegadoReadingEngine:
-        engine = LegadoReadingEngine(
-            timeout=self.timeout,
-            webview_fetcher=self.webview_fetcher,
-            verification_fetcher=self.verification_fetcher,
-            state_dir=self.state_dir,
-            connect_timeout=self.connect_timeout,
-            shared_connector=self._shared_connector(),
-        )
+        """创建新引擎实例（根据 android_mode 选择引擎类型）。"""
+        if self.android_mode:
+            # Android 模式：使用无 WebView 的引擎，优先从预渲染缓存读取
+            engine = ReadingEngineAndroid(
+                pre_executor=self.pre_executor,
+                timeout=self.timeout,
+                state_dir=self.state_dir,
+                connect_timeout=self.connect_timeout,
+                shared_connector=self._shared_connector(),
+            )
+        else:
+            # 桌面模式：标准引擎（支持 WebView）
+            engine = LegadoReadingEngine(
+                timeout=self.timeout,
+                webview_fetcher=self.webview_fetcher,
+                verification_fetcher=self.verification_fetcher,
+                state_dir=self.state_dir,
+                connect_timeout=self.connect_timeout,
+                shared_connector=self._shared_connector(),
+            )
+        
         # F7：视图装配期经 inject_interaction_loop 写入 _interaction_loop；
         # 池化引擎在装配后才懒建，这里继承 UI loop，让 webview/验证码回调
         # 派到 UI 线程（未注入时 interaction_loop=None，引擎降级到当前 loop）。

@@ -395,7 +395,8 @@ class ReadingService(Service):
 
     def __init__(self, rule_engine=None, storage=None, settings=None,
                  source_service=None, cache: ReadingCache | None = None,
-                 search_store: SearchBookStore | None = None) -> None:
+                 search_store: SearchBookStore | None = None,
+                 pre_executor=None) -> None:
         super().__init__()
         # 协作者全部可注入（测试替身）；未注入时 on_start 经 hub 解析。
         self._engine = rule_engine
@@ -404,6 +405,7 @@ class ReadingService(Service):
         self._source_service = source_service
         self._cache = cache
         self._search_store = search_store
+        self._pre_executor = pre_executor  # RulePreExecutor 实例（预渲染缓存）
         # 当前阅读会话状态（同步直达属性，供 EngineProxy 透传）。
         self._current_source = None
         self._current_book = None
@@ -753,6 +755,27 @@ class ReadingService(Service):
 
     async def _fetch_remote(self, chapter, key, source, book,
                             next_url: str = "") -> ChapterContent:
+        """获取远程章节内容（优先从预渲染缓存读取）。"""
+        
+        # Step 1: 尝试从预渲染缓存读取
+        if self._pre_executor:
+            try:
+                chapter_url = getattr(chapter, "url", "")
+                if chapter_url:
+                    cached_html = await self._pre_executor.get_cached_template(chapter_url)
+                    if cached_html:
+                        logger.debug("命中预渲染缓存：%s", chapter_url)
+                        # 解析静态 HTML 为 ChapterContent
+                        document = await self._parse_static_html(cached_html, chapter)
+                        # 写入内存缓存和磁盘缓存
+                        self._remember_document(key, document)
+                        if book is not None and self._cache is not None:
+                            self._cache.save_content(key[0], key[1], key[2], document)
+                        return document
+            except Exception as exc:
+                logger.warning("预渲染缓存读取失败，降级到网络请求：%s", exc)
+        
+        # Step 2: 预渲染缓存未命中，走原有逻辑
         if _is_local_source(source):
             # 本地书的正文在导入时已逐章落盘；走到这里只剩"缓存被清了"一种可能。
             # 绝不能派引擎去抓 file:// —— 那是一条必然失败的联网请求，
@@ -767,6 +790,68 @@ class ReadingService(Service):
             self._cache.save_content(key[0], key[1], key[2], document)
         self._remember_document(key, document)
         return document
+    
+    async def _parse_static_html(self, html: str, chapter) -> ChapterContent:
+        """解析静态 HTML 为 ChapterContent（预渲染缓存已是纯正文）。
+        
+        Args:
+            html: 预渲染的 HTML 字符串（已是提取后的正文，可能含 <p>/<div> 标签）
+            chapter: 章节对象
+            
+        Returns:
+            ChapterContent
+        """
+        from bs4 import BeautifulSoup
+        from app.services.engine.reading_engine import ContentBlock, ChapterContent
+        
+        soup = BeautifulSoup(html, "html.parser")
+        
+        # 提取标题（优先用 chapter 对象的属性）
+        title = getattr(chapter, "title", "") or getattr(chapter, "name", "")
+        
+        # 先定位正文容器（常见选择器）
+        body_container = None
+        for selector in [".content", "#content", "article", ".text", "main"]:
+            container = soup.select_one(selector)
+            if container:
+                body_container = container
+                break
+        
+        if body_container is None:
+            # 降级：用整个 body
+            body_container = soup.find("body") or soup
+        
+        # 从正文容器中提取文本块
+        text_blocks = []
+        
+        # 尝试按 <p> 标签拆分（最常见）
+        paragraphs = body_container.find_all("p")
+        if paragraphs:
+            for p in paragraphs:
+                text = p.get_text(strip=True)
+                if text:
+                    text_blocks.append(ContentBlock(kind="text", value=text))
+        else:
+            # 没有 <p> 标签，尝试按 <div> 拆分
+            divs = body_container.find_all("div")
+            if divs and len(divs) > 1:
+                for div in divs:
+                    text = div.get_text(strip=True)
+                    if text:
+                        text_blocks.append(ContentBlock(kind="text", value=text))
+            else:
+                # 纯文本或混合标签，按行拆分
+                full_text = body_container.get_text(separator="\n", strip=True)
+                if full_text:
+                    lines = [line.strip() for line in full_text.split("\n") if line.strip()]
+                    for line in lines:
+                        text_blocks.append(ContentBlock(kind="text", value=line))
+        
+        return ChapterContent(
+            blocks=text_blocks,
+            title=title,
+            raw_content=html
+        )
 
     def _forget_flight(self, key, task) -> None:
         if self._content_flight.get(key) is task:

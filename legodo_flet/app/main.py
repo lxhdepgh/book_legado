@@ -151,14 +151,28 @@ def _build_hub():
     # :func:`_engine_browser_fetchers`）。
     browser = BrowserService()
     webview, verification = _engine_browser_fetchers(browser)
+    
+    # 静态预渲染：创建 RulePreExecutor（桌面端启用，Android 端禁用）
+    from app.services.engine.rule_pre_executor import RulePreExecutor
+    pre_executor = RulePreExecutor(
+        browser_service=browser,
+        storage=None,  # 延迟注入，on_start 时从 hub 获取
+        engine=None
+    )
+    hub.register(pre_executor)  # 注册到 hub
+    
     hub.register(RuleEngineService(
-        webview_fetcher=webview, verification_fetcher=verification))
+        webview_fetcher=webview,
+        verification_fetcher=verification,
+        android_mode=False,      # 桌面端保持标准模式
+        pre_executor=pre_executor  # 启用预渲染
+    ))
     hub.register(BookCacheService())
     hub.register(DownloadService())
     hub.register(BookmarkService())
     hub.register(ContentSearchService())
     hub.register(ImageBookService())
-    hub.register(ReadingService())
+    hub.register(ReadingService(pre_executor=pre_executor))  # 注入预执行器
 
     # M3 服务集合：书源域五服务（§8.2 M3）。SourceService 外壳化后，
     # ReadingService 的 on_start 经 hub.require(SourceService) 解析（集成点）。
