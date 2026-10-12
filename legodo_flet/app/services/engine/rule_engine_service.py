@@ -27,10 +27,10 @@ from typing import Any
 
 import aiohttp
 
-from app.services.engine.reading_engine import LegadoReadingEngine
+from app.services.engine.reading_engine import LegadoReadingEngine, ChapterContent
 from app.services.engine.reading_engine_android import ReadingEngineAndroid
 from app.services.engine.rule_pre_executor import RulePreExecutor
-from app.services.engine.rule_engine import dns_ip_resolver
+from app.services.engine.rule_engine import dns_ip_resolver, ChapterItem
 from app.services.engine._prefs import set_override
 
 logger = logging.getLogger(__name__)
@@ -278,11 +278,134 @@ class RuleEngineService(Service):
         return await resolve_explore_categories(source, runtime)
 
     async def content_document(self, source, chapter, next_chapter_url: str = "",
-                               need_save: bool = True):
-        """正文管线（带替换规则/图片内联的结构化文档，非纯文本）。"""
+                               need_save: bool = True) -> ChapterContent:
+        """正文管线（带替换规则/图片内联的结构化文档，非纯文本）。
+        
+        增强版：优先从预渲染缓存读取，未命中则提取 + 触发后台预渲染后续章节。
+        """
+        chapter_url = getattr(chapter, "url", "") or ""
+        
+        # Step 1: 尝试从预渲染缓存读取
+        if self.pre_executor and chapter_url:
+            try:
+                cached_html = await self.pre_executor.get_cached_template(chapter_url)
+                if cached_html:
+                    logger.debug("命中预渲染缓存：%s", chapter_url)
+                    # 解析静态 HTML 为 ChapterContent
+                    document = await self._parse_prerendered_html(cached_html, chapter)
+                    return document
+            except Exception as exc:
+                logger.warning("预渲染缓存读取失败，降级到引擎提取：%s", exc)
+        
+        # Step 2: 缓存未命中，用引擎提取正文
         engine = await self._get_engine(source)
-        return await engine.content_document(
+        document = await engine.content_document(
             source, chapter, next_chapter_url, need_save=need_save)
+        
+        # Step 3: 触发后台预渲染后续章节（不阻塞当前阅读）
+        if chapter_url and next_chapter_url:
+            asyncio.create_task(
+                self._prerender_next_chapter(source, chapter, next_chapter_url),
+                name=f"prerender-{chapter_url}"
+            )
+        
+        return document
+    
+    async def _parse_prerendered_html(self, html: str, chapter) -> ChapterContent:
+        """解析预渲染的 HTML 为 ChapterContent。
+        
+        Args:
+            html: 预渲染的 HTML 字符串（完整页面或纯正文）
+            chapter: 章节对象
+            
+        Returns:
+            ChapterContent
+        """
+        from bs4 import BeautifulSoup
+        from app.services.engine.reading_engine import ContentBlock
+        
+        soup = BeautifulSoup(html, "html.parser")
+        
+        # 提取标题
+        title = getattr(chapter, "title", "") or getattr(chapter, "name", "")
+        
+        # 先定位正文容器（常见选择器）
+        body_container = None
+        for selector in [".content", "#content", "article", ".text", "main"]:
+            container = soup.select_one(selector)
+            if container:
+                body_container = container
+                break
+        
+        if body_container is None:
+            # 降级：用整个 body
+            body_container = soup.find("body") or soup
+        
+        # 从正文容器中提取文本块
+        text_blocks = []
+        
+        # 尝试按 <p> 标签拆分
+        paragraphs = body_container.find_all("p")
+        if paragraphs:
+            for p in paragraphs:
+                text = p.get_text(strip=True)
+                if text:
+                    text_blocks.append(ContentBlock(kind="text", value=text))
+        else:
+            # 没有 <p> 标签，尝试按 <div> 拆分
+            divs = body_container.find_all("div")
+            if divs and len(divs) > 1:
+                for div in divs:
+                    text = div.get_text(strip=True)
+                    if text:
+                        text_blocks.append(ContentBlock(kind="text", value=text))
+            else:
+                # 纯文本或混合标签，按行拆分
+                full_text = body_container.get_text(separator="\n", strip=True)
+                if full_text:
+                    lines = [line.strip() for line in full_text.split("\n") if line.strip()]
+                    for line in lines:
+                        text_blocks.append(ContentBlock(kind="text", value=line))
+        
+        return ChapterContent(
+            blocks=text_blocks,
+            title=title,
+            raw_content=html
+        )
+    
+    async def _prerender_next_chapter(self, source, current_chapter, next_chapter_url: str):
+        """后台预渲染下一章（不阻塞当前阅读）。
+        
+        Args:
+            source: 书源对象
+            current_chapter: 当前章节对象
+            next_chapter_url: 下一章 URL
+        """
+        if not self.pre_executor or not next_chapter_url:
+            return
+        
+        try:
+            logger.info("后台预渲染下一章：%s", next_chapter_url)
+            
+            # 创建临时 ChapterItem
+            temp_chapter = ChapterItem(
+                url=next_chapter_url,
+                name="",
+                index=getattr(current_chapter, "index", 0) + 1
+            )
+            
+            # 调用预执行器渲染并缓存
+            rendered = await self.pre_executor.pre_execute_chapter(
+                next_chapter_url, source=source, rules=None, force_refresh=False
+            )
+            
+            if rendered:
+                logger.info("后台预渲染完成：%s (%d 字符)", next_chapter_url, len(rendered.content_html))
+            else:
+                logger.warning("后台预渲染返回空结果：%s", next_chapter_url)
+                
+        except Exception as exc:
+            logger.warning("后台预渲染失败：%s - %s", next_chapter_url, exc)
 
     async def fetch_media(self, value: str, source, base_url: str = "",
                           extra_headers=None) -> bytes:
