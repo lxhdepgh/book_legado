@@ -22,7 +22,7 @@ hiddenimports = [
     "playwright.async_api",
     # 服务懒加载
     "feedparser", "ebooklib", "lxml", "fitz",
-    "pyttsx3", "edge_tts", "qrcode", "cv2",
+    "qrcode", "cv2",
     "py7zr", "rarfile",
     
     # 【核心服务层】必须显式声明（PyInstaller 无法静态分析懒加载的服务）
@@ -51,7 +51,6 @@ hiddenimports = [
     # M4: 内容形态域
     "app.services.content.rss_service",
     "app.services.content.local_book_service",
-    "app.services.content.read_aloud",
     "app.services.content.media_play",
     # M5: 工具域
     "app.services.tools.background_service",

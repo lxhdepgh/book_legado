@@ -282,15 +282,6 @@ class ImportProgressEvent(AppEvent):
 # 以下事件随内容形态域服务里程碑落地：命名/字段顺序以集成契约为准。
 # --------------------------------------------------------------------------- #
 
-@dataclass(frozen=True)
-class ReadAloudStateEvent(AppEvent):
-    """朗读状态事件（契约 §2 / §4.3：state, book_url, chapter, position）。
-
-    发布方：ReadAloudService（speak/stop/进度变化时）；订阅方：Flet 迷你播放条。
-    ``state`` 取值如 "idle"/"speaking"/"paused"/"error"；
-    ``chapter`` 为当前朗读章节索引；``position`` 为朗读进度（0-1 或秒，
-    M4 系统 TTS 后端不精确上报时为 0）。事件不携带后端对象引用。
-    """
 
     state: str
     book_url: str

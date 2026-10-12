@@ -94,14 +94,11 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
     """v4：M4 内容形态域（契约 §8 / §6.3）。
 
     本函数是 M4 四线并行共享的迁移点：
-    - 本线（ReadAloudService + MediaPlayService）交付：``tts_profiles`` 表 +
+    - 本线``tts_profiles`` 表 +
       ``books.play_position`` 视频/音频书播放位置列；
     - RSS 线（RssService）应在本函数内**追加** ``rss_sources``/``rss_articles``
       等表 DDL（不要整体替换本函数）；LocalBook 线无新增表（复用 books 登记）。
 
-    - ``tts_profiles``：HTTP-TTS / 朗读语音配置登记。``headers`` 存 JSON 文本
-      （请求头映射）；``engine_type`` 取值 system / edge / http，标识该 profile
-      由哪个 TtsBackend 消费。
     - ``books.play_position``：视频书/音频书在当前 ``chapter_index`` 内的播放
       位置（秒）。v2 books 表已有 ``chapter_index``（复用为播放章节索引），
       仅缺"秒级播放位置"一列，故以 ALTER TABLE 补齐（§8：以 v2 实际列名为准）。
@@ -111,17 +108,6 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS tts_profiles ("
         "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "  name        TEXT NOT NULL DEFAULT '',"
-        "  url         TEXT NOT NULL DEFAULT '',"
-        "  headers     TEXT NOT NULL DEFAULT '{}',"
-        "  engine_type TEXT NOT NULL DEFAULT 'system'"
-        ")")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tts_profiles_engine "
-        "ON tts_profiles(engine_type)")
-
-    # books 表播放位置列：列已存在则跳过（幂等，便于多线合并/重跑）。
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(books)")}
     if "play_position" not in cols:
         conn.execute(
             "ALTER TABLE books ADD COLUMN "

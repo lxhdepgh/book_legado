@@ -72,7 +72,6 @@ COALESCED_EVENTS: frozenset[str] = frozenset({
 
 #: 断线重连要回放的状态事件（"最近一份"就够；成批历史各自的 snapshot 动作给）。
 SNAPSHOT_EVENTS: frozenset[str] = frozenset({
-    "ReadAloudStateEvent",
     "MediaPlayStateEvent",
 })
 

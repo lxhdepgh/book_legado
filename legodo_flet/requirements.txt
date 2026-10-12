@@ -34,12 +34,6 @@ pymupdf>=1.24
 # feedparser 纯 Python（py3-none-any wheel），解析 RSS/Atom；sgmllib 由其
 # 自带 feedparser-sgmllib 包提供，三端无原生分支。跨平台。
 feedparser>=6.0.10
-# [M4-朗读] ReadAloudService 三后端（services/content/read_aloud.py 懒加载 import）。
-# pyttsx3 为系统 TTS 桥（Win SAPI / macOS NSSpeech / Linux espeak），无音频设备环境
-# 加载失败时服务自动降级回退 edge-tts；edge-tts 为纯 Python aiohttp 在线神经语音。
-# 两库均跨平台可装（pyttsx3 经 pywin32/comtypes 在 Windows 走 SAPI），服务未用不 import。
-pyttsx3>=2.90
-edge-tts>=6.1
 # [M5-二维码] QrCodeService（services/tools/qr_code_service.py 懒加载 import）。
 # qrcode 纯 Python（py3-none-any wheel）生成二维码 PNG（渲染后端走 Pillow）；
 # opencv-python-headless 三端有 abi3 wheels（win_amd64/macosx/manylinux），

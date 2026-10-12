@@ -8,7 +8,7 @@ playwright>=1.49,<2
 # [老板键] WinTray 挂系统托盘图标要 win32gui.Shell_NotifyIcon
 # （services/tools/win_tray.py 里懒 import win32api/win32con/win32gui：非 Windows
 # 或缺库时 is_available() 返回 False，功能降级成"快捷键页写一句本机没有托盘能力"，
-# 其它一切照旧，绝不带着 ImportError 往上冒）。pywin32 本来经 pyttsx3 传递装上，
+# 其它一切照旧，绝不带着 ImportError 往上冒）。pywin32 是托盘服务（Windows 专属）的依赖，
 # 这里显式钉住是因为托盘那条线只在桌面 Windows 生效，且懒 import 会让 PyInstaller
 # 的依赖分析看不见它。sys_platform 标记让 Linux/macOS 与移动端不去装。
 # 实测环境是 312（六元组写法、消息环停止路径都在这一版上量的）。
