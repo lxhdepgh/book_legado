@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "rule_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "rule_id"
+  ],
+  "additionalProperties": false
+}

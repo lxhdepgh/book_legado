@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "book_key": {
+      "type": "string"
+    },
+    "output_path": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "book_key",
+    "output_path"
+  ],
+  "additionalProperties": false
+}

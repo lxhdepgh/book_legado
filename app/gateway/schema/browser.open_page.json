@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "description": "打开内置浏览器页面",
+  "properties": {
+    "url": {
+      "type": "string",
+      "description": "要打开的 URL"
+    }
+  },
+  "required": ["url"],
+  "additionalProperties": false
+}

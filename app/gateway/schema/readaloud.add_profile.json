@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "url": {
+      "type": "string"
+    },
+    "headers": {
+      "type": "object"
+    },
+    "engine_type": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "url"
+  ],
+  "additionalProperties": false
+}

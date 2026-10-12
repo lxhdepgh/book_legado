@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "properties": {
+    "rule_id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "pattern": {
+      "type": "string"
+    },
+    "replacement": {
+      "type": "string"
+    },
+    "enabled": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "rule_id",
+    "name",
+    "pattern",
+    "replacement",
+    "enabled"
+  ],
+  "additionalProperties": false
+}

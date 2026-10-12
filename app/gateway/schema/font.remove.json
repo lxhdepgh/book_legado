@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "font_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "font_id"
+  ],
+  "additionalProperties": false
+}
