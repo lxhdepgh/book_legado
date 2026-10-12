@@ -33,7 +33,6 @@ from app.services.reading.reading_service import ReadingService
 from app.services.reading.bookmark_service import BookmarkService
 from app.services.reading.content_search import ContentSearchService
 from app.services.content.media_play import FletVideoBackend, MediaPlayService
-from app.services.content.read_aloud import ReadAloudService
 from app.services.content.local_book_service import is_local_source_url
 from app.services.sources.rule_repair_service import RuleRepairService
 from app.services.engine.rule_engine import display_intro, html_to_text

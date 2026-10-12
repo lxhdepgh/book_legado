@@ -221,19 +221,6 @@ class ReaderView(ft.Column):
         self._immersive_btn = ft.IconButton(
             ft.Icons.FULLSCREEN, tooltip="沉浸模式",
             on_click=lambda e: self._fire(self.on_toggle_immersive))
-        # 朗读入口与「书内搜索」「阅读设置」并排（第二十九轮：用户要求朗读放到
-        # 区域上方、和这两个动作放在一起）。它管**收起/展开**顶部那条朗读面板——
-        # 面板挂在工具栏正下方（见 ``_reader_page``），默认展开；不给一颗收起的键，
-        # 就等于在正文上方永久占一条高度。
-        # 只有一条不让坏：**正在念的时候那一条不许藏着**（桌面模式没有通知栏，
-        # 收起之后屏幕上就没有能按停的地方）。这条规则只写在 :meth:`sync_read_aloud`
-        # 一处：speaking 时它把面板钉成展开，同时把这颗键禁用并写明原因——禁用而不
-        # 说原因，用户只会以为它坏了。
-        self._read_aloud_open = True
-        self._read_aloud_available = False
-        self._read_aloud_btn = ft.IconButton(
-            ft.Icons.GRAPHIC_EQ, tooltip="朗读",
-            on_click=lambda e: self.toggle_read_aloud_panel())
         self._toolbar = ft.Container(
             visible=True, padding=ft.Padding(6, 2, 6, 2),
             content=ft.Row([
@@ -247,7 +234,6 @@ class ReaderView(ft.Column):
                               on_click=lambda e: self._fire(self.on_open_bookmarks)),
                 ft.IconButton(ft.Icons.SEARCH, tooltip="书内搜索",
                               on_click=lambda e: self._fire(self.on_open_search)),
-                self._read_aloud_btn,
                 ft.IconButton(ft.Icons.SETTINGS_OUTLINED, tooltip="阅读设置",
                               on_click=lambda e: self._fire(self.on_open_settings)),
                 self._immersive_btn,
@@ -287,10 +273,6 @@ class ReaderView(ft.Column):
             ], spacing=6))
         # 朗读迷你播放条（设计 §1.1：桌面无通知栏，播放控制全靠这条）。开了一章
         # 才由控制器亮出来——没书的时候它没话可说。
-        # 第二十九轮挪到**工具栏正下方**（用户："朗读功能放到区域上方，和书内
-        # 搜索、设置放在一起"）：它和那两颗按钮是同一块"阅读时手要够到的控制区"，
-        # 沉在窗口底部时它贴着状态栏，离自己的入口有一屏远。
-        self.read_aloud = ReadAloudBar()
         # 视频书面板（§1.4）：放工具栏下面而不是底部——正文一直要滚，播放器跟着滚
         # 就没法边看边放；它自己也是"控制器亮了才可见"。
         self.video_play = VideoPlayBar()
@@ -319,7 +301,7 @@ class ReaderView(ft.Column):
             ], spacing=6))
         self._reader_page = ft.Column(
             expand=True, spacing=0,
-            controls=[self._toolbar, self.read_aloud, self.video_play,
+            controls=[self._toolbar, self.video_play,
                       self._reader_scroll, self.selection_bar,
                       self.repair_offer, self._status_bar])
 
@@ -775,39 +757,6 @@ class ReaderView(ft.Column):
     def set_nav_enabled(self, prev: bool, next_: bool) -> None:
         self._prev_btn.disabled = not prev
         self._next_btn.disabled = not next_
-
-    # ------------------------------------------------------------------ #
-    # 朗读：工具栏入口 + 顶部那条面板
-    # ------------------------------------------------------------------ #
-    def set_read_aloud_available(self, available: bool) -> None:
-        """控制器写入"这一会儿到底能不能念"（有朗读服务 + 有可念的章）。
-
-        不可用时入口整颗禁用：亮着按不动比不亮更让人以为是坏了。
-        """
-        self._read_aloud_available = bool(available)
-        self.sync_read_aloud()
-
-    def toggle_read_aloud_panel(self) -> None:
-        """收起/展开那一条。**念着的时候收不起来**——规则在 :meth:`sync_read_aloud`。"""
-        self._read_aloud_open = not self._read_aloud_open
-        self.sync_read_aloud()
-
-    def sync_read_aloud(self) -> None:
-        """按"可用性 + 折叠 + 正在念"重算那一条和那颗键；朗读态只认 ``read_aloud.state``。"""
-        speaking = self.read_aloud.state == "speaking"
-        if speaking:
-            # 念着的时候屏幕上必须有一条看得见的路能按停（桌面没有通知栏）：正在念
-            # 就不允许那一条藏着。按钮同一时刻也被禁掉（下面），所以屏幕上不会出现
-            # "看着能按、按下去没反应"的键。
-            self._read_aloud_open = True
-        self.read_aloud.visible = (self._read_aloud_available
-                                   and self._read_aloud_open)
-        btn = self._read_aloud_btn
-        btn.icon = (ft.Icons.GRAPHIC_EQ if self._read_aloud_open
-                    else ft.Icons.GRAPHIC_EQ_OUTLINED)
-        btn.disabled = not self._read_aloud_available or speaking
-        btn.tooltip = ("朗读中：先停止才能收起" if speaking
-                       else ("收起朗读" if self._read_aloud_open else "展开朗读"))
 
     @property
     def preferences(self) -> dict:
