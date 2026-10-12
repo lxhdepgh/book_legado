@@ -283,13 +283,6 @@ class ImportProgressEvent(AppEvent):
 # --------------------------------------------------------------------------- #
 
 
-    state: str
-    book_url: str
-    chapter: int = 0
-    position: float = 0.0
-    timestamp: float = field(default_factory=time.time)
-
-
 @dataclass(frozen=True)
 class MediaPlayStateEvent(AppEvent):
     """视频书播放状态事件（契约 §2 / §4.3：state, book_url, chapter）。
