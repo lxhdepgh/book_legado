@@ -533,6 +533,30 @@ class SourceCheckService(Service):
             # 方案5：更新历史成功率
             self._update_source_history(result)
 
+        async def runner():
+            return await self._checker(
+                sources, concurrency=self._concurrency, timeout=self._timeout,
+                on_result=on_result, auto_disable=self._auto_disable,
+                depth=depth)
+
+        self._task = asyncio.create_task(runner())
+        try:
+            results = await self._task
+        except asyncio.CancelledError:
+            if run is not None:
+                run["cancelled"] = True
+            self._cancel_audits()
+            raise
+        finally:
+            self._task = None
+        # 审计的尾巴要在进度到 100% 之后立刻收掉：留着不等人，占的是子进程池的队列
+        # （退回线程池时占的就是下一条检测、阅读页都要用的默认线程池）。
+        await self._drain_audits()
+        if reap:
+            self._reap_audit_pool()
+        self.status.progress = min(1.0, settled / plan_total) if plan_total else None
+        return results
+
     def _update_source_history(self, result: dict) -> None:
         """更新源的历史成功率统计（用于智能跳过策略）。"""
         url = str(result.get("raw_url") or "")
@@ -574,20 +598,6 @@ class SourceCheckService(Service):
         return (entry["consecutive_fail"] >= self._low_priority_threshold or
                 success_rate < self._skip_deep_threshold)
 
-        async def runner():
-            return await self._checker(
-                sources, concurrency=self._concurrency, timeout=self._timeout,
-                on_result=on_result, auto_disable=self._auto_disable,
-                depth=depth)
-
-        self._task = asyncio.create_task(runner())
-        try:
-            results = await self._task
-        except asyncio.CancelledError:
-            if run is not None:
-                run["cancelled"] = True
-            self._cancel_audits()
-            raise
         finally:
             self._task = None
         # 审计的尾巴要在进度到 100% 之后立刻收掉：留着不等人，占的是子进程池的队列
