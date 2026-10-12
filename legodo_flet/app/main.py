@@ -481,6 +481,9 @@ def main():
 
     import flet as ft
 
+    # Apply MD3 theme before building UI
+    from app.themes.md3_theme import apply_to_page
+
     # 视图在函数里才 import（不是模块顶层）：审计跑在子进程里，Windows 的 spawn
     # 会在每个子进程里把 `__main__`（也就是本文件）重新 import 一遍，顶层那行
     # flet + 视图树会让每个 worker 白背 ~126 ms 的导入和几十 MB 常驻。
@@ -500,6 +503,9 @@ def main():
 
     try:
         def _on_page(page):
+            # Apply MD3 theme to page (light/dark/system from saved preference)
+            apply_to_page(page, theme_mode="system")
+
             if hub is not None:
                 _apply_saved_theme(page, hub)
                 _wire_browser_page(hub, page)

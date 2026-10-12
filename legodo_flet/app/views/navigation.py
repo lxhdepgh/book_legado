@@ -37,6 +37,12 @@ from app.core.registry import (ViewRegistry,
                                DEST_MANGA_READER, GROUP_READING,
                                DEST_SETTINGS_APPEARANCE, DEST_SETTINGS_DASHBOARD,
                                DEST_SETTINGS_SHORTCUTS)
+from app.views.common.md3_styles import (
+    RADIUS_CARD,
+    SPACE_MD,
+    NAV_RAIL_WIDTH,
+    NAV_RAIL_WIDE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -214,16 +220,30 @@ class SectionView(ft.Column):
         #: 用户点页签时通知外壳同步 current（目的地已由外壳装配，视图不持导航）
         self.on_tab_selected = None       # (destination: str) -> None
 
-        tab_bar = ft.TabBar(tabs=[
-            ft.Tab(label=title, icon=_ICONS.get(dest, ft.Icons.CIRCLE))
-            for dest, title in tabs])
+        tab_bar = ft.TabBar(
+            tabs=[
+                ft.Tab(label=title, icon=_ICONS.get(dest, ft.Icons.CIRCLE))
+                for dest, title in tabs
+            ],
+            indicator_color=ft.Colors.PRIMARY,
+            indicator_tab_size=True,
+            overlay_color=ft.Colors.PRIMARY.with_opacity(0.08),
+        )
         self._pages = [ft.Container(expand=True) for _ in self._dests]
         self._tabs = ft.Tabs(
-            length=len(self._dests), selected_index=0, expand=True,
+            length=len(self._dests),
+            selected_index=0,
+            expand=True,
             on_change=self._on_change,
-            content=ft.Column(spacing=0, expand=True, controls=[
-                tab_bar, ft.TabBarView(expand=True, controls=self._pages),
-            ]))
+            content=ft.Column(
+                spacing=0,
+                expand=True,
+                controls=[
+                    tab_bar,
+                    ft.TabBarView(expand=True, controls=self._pages),
+                ],
+            ),
+        )
         self.controls = [self._tabs]
 
     # ------------------------------------------------------------------ #
@@ -322,18 +342,33 @@ class NavigationHost:
         self._standalone = None                   # 整页目的地当前视图（阅读器/工具子页）
 
         entries = [ft.NavigationRailDestination(
-            icon=_GROUP_ICONS.get(group, _FALLBACK_ICON), label=group)
+            icon=ft.Icon(_GROUP_ICONS.get(group, _FALLBACK_ICON)),
+            label=ft.Text(group))
             for group in self._groups]
-        # 宽档展开标签（图标+文字），窄档只显示图标（节省空间，对齐 Dart NavigationRailLabelType.all）
+        # MD3-styled NavigationRail: pill indicator, comfortable spacing
         self._rail = ft.NavigationRail(
-            destinations=entries, selected_index=0,
+            destinations=entries,
+            selected_index=0,
             extended=not self._is_narrow(),
-            use_indicator=True, on_change=self._on_rail_change)
+            label_type=ft.NavigationRailLabelType.ALL,
+            use_indicator=True,
+            indicator_shape=ft.RoundedRectangleBorder(
+                radius=RADIUS_CARD,
+            ),
+            indicator_color=ft.Colors.PRIMARY_CONTAINER,
+            on_change=self._on_rail_change,
+        )
+        # MD3-styled NavigationBar: tonal surface with pill indicators
         self._bar = ft.NavigationBar(
             destinations=[ft.NavigationBarDestination(
-                icon=_GROUP_ICONS.get(group, _FALLBACK_ICON), label=group)
+                icon=ft.Icon(_GROUP_ICONS.get(group, _FALLBACK_ICON)),
+                label=group)
                 for group in self._groups],
-            selected_index=0, on_change=self._on_bar_change)
+            selected_index=0,
+            height=80,
+            elevation=3,
+            on_change=self._on_bar_change,
+        )
 
         self.root = self.render()
         self.show(initial_destination or self._anchor(GROUP_READING))
