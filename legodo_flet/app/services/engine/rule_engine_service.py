@@ -324,7 +324,11 @@ class RuleEngineService(Service):
         from bs4 import BeautifulSoup
         from app.services.engine.reading_engine import ContentBlock
         
-        soup = BeautifulSoup(html, "html.parser")
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception as exc:
+            logger.warning("HTML 解析失败，降级到引擎提取：%s", exc)
+            raise
         
         # 提取标题
         title = getattr(chapter, "title", "") or getattr(chapter, "name", "")
@@ -338,8 +342,12 @@ class RuleEngineService(Service):
                 break
         
         if body_container is None:
-            # 降级：用整个 body
-            body_container = soup.find("body") or soup
+            # 降级：用整个 body（不是整个 soup，避免提取 head/导航栏）
+            body_container = soup.find("body")
+            if body_container is None:
+                # 连 body 都没有，说明这不是完整页面，直接抛出让引擎处理
+                logger.debug("预渲染 HTML 无 body 标签，无法解析")
+                raise ValueError("非完整页面格式，需用引擎提取")
         
         # 从正文容器中提取文本块
         text_blocks = []
