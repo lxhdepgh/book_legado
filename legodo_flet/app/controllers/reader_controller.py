@@ -27,7 +27,7 @@ import logging
 import flet as ft
 
 from app.core.events import (BookmarkChangedEvent, MediaPlayStateEvent,
-                             ReadAloudStateEvent, ReadingSessionChangedEvent)
+                             ReadingSessionChangedEvent)
 from app.controllers.base import BaseController
 from app.services.reading.reading_service import ReadingService
 from app.services.reading.bookmark_service import BookmarkService
@@ -61,10 +61,6 @@ _APPEND_TRIGGER_DISTANCE = 180.0
 _APPEND_REARM_DISTANCE = 500.0
 
 
-def _spoken_text(lines) -> str:
-    """正文行 → 朗读稿：段首缩进的全角空格必须去掉，不然 TTS 每段先喘一口。"""
-    return "\n".join(s for s in (str(line).strip("　 \t") for line in lines) if s)
-
 
 def _definition_text(value) -> str:
     """释义载荷 → 可显示文本（渲染契约：带标记的原文一律不能照抄上屏）。
@@ -82,7 +78,7 @@ def _definition_text(value) -> str:
 
 class ReaderController(BaseController):
     """阅读器：目录 / 正文 / 续读 / 偏好 / 沉浸 / 快捷键 / 上下章 / 书签 / 书内搜索 /
-    朗读 / 视频书 / 划词查词典 / 退出阅读（试读暂存询问入架）。"""
+    视频书 / 划词查词典 / 退出阅读（试读暂存询问入架）。"""
 
     destination = "reading.reader"
 
@@ -99,8 +95,6 @@ class ReaderController(BaseController):
         self._reading = self.service(ReadingService)
         self._bookmarks = self.service(BookmarkService)
         self._content_search = self.service(ContentSearchService)
-        # 朗读是可选形态：替身表/精简装配里没有 ReadAloudService 时播放条整条不出现。
-        self._tts = self._safe_service(ReadAloudService)
         # 自愈同样是可选形态：没有 RuleRepairService 时失败条上不给"自动修复"动作。
         self._repair = self._safe_service(RuleRepairService)
         # 词典同样是可选形态：没有 DictService 时「查词典」给一句明确的话，不静默。
@@ -132,16 +126,6 @@ class ReaderController(BaseController):
         self._restoring_scroll = False
         self._pending_document_offset = 0.0
 
-        # 朗读状态：一次只允许一条循环在跑，换号（generation）让在途那条自己收工
-        self._tts_playing = False
-        self._tts_generation = 0
-        self._tts_follow = True
-        # 当前章的朗读稿：正文挂出来时顺手留一份纯文本，播放条按章取用
-        self._tts_text = ""
-        self._tts_text_url = ""
-        # 音色（tts_profiles 表）：清单缓存在本地，选中的那条决定 speak 走哪个引擎
-        self._tts_profiles: list[dict] = []
-        self._tts_profile: dict | None = None
 
         # 视频书面板：播放列表按正文出现的顺序累积（url 去重），面板只在真播时亮
         self._video_items: list[dict] = []
@@ -176,13 +160,6 @@ class ReaderController(BaseController):
         self._view.content_search_bar.on_search = self.search_in_book
         self._view.content_search_bar.on_jump = self.jump_to_hit
         self._view.content_search_bar.on_close = lambda: self._view.show_side_panel("")
-        bar = getattr(self._view, "read_aloud", None)
-        if bar is not None:
-            bar.on_toggle = self.toggle_read_aloud
-            bar.on_stop = self.stop_read_aloud
-            bar.on_follow_changed = self.set_read_aloud_follow
-            bar.on_rate_changed = self.set_read_aloud_rate
-            bar.on_voice_changed = self.set_read_aloud_voice
         video = getattr(self._view, "video_play", None)
         if video is not None:
             video.on_play_index = self._pick_video      # (index) 播放列表里选一条
@@ -199,7 +176,6 @@ class ReaderController(BaseController):
         # 事件订阅
         self.subscribe(BookmarkChangedEvent, self._on_bookmark_changed)
         self.subscribe(ReadingSessionChangedEvent, self._on_session_changed)
-        self.subscribe(ReadAloudStateEvent, self._on_read_aloud_state)
         self.subscribe(MediaPlayStateEvent, self._on_media_play_state)
         # 滚动保存 0.5s 节流（§7.4：对齐旧 _save_scroll_position_after_delay）
         self._save_position = self.throttle(self._persist_position, 0.5)
@@ -217,20 +193,13 @@ class ReaderController(BaseController):
         self.ui_call(self._load_preferences())
 
     def on_detach(self) -> None:
-        """离开阅读器就叫停后台预取与朗读。
+        """离开阅读器就叫停后台预取。
 
         切页不等于退出阅读——会话还留在服务里，副本也留着（回来还能接上），但
         引擎不该在用户已经去看书源页的时候继续替那本书拉后面十章。
 
-        朗读随视图一起停是**有意的**：设计 §1.1 设想过全局播放覆盖层，M6 拆层后
-        播放条挂在阅读器这一块整页视图上，切页即随视图拆走——声音继续放着却没
-        地方按停，比安静更糟。视频面板同一处境（画面跟着视图走了声音还在放）。
         """
         self._reading.stop_prefetch()
-        if self._tts is not None and self._tts_playing:
-            self._tts_playing = False
-            self._tts_generation += 1
-            self.ui_call(self._stop_backend("已离开阅读器"))
         self._stop_video_playback()
 
     def _safe_service(self, stype):
@@ -257,33 +226,6 @@ class ReaderController(BaseController):
         saved = await self._reading.get_reader_preference("shortcuts", None)
         if isinstance(saved, dict):
             self._shortcuts = merge_reader_shortcuts(saved)
-        # 语速不属于排版（不参与重排），但和快捷键一样是"进程级读一次"的偏好
-        rate = await self._reading.get_reader_preference("tts_rate", None)
-        bar = getattr(self._view, "read_aloud", None) if self._view else None
-        if rate is not None and bar is not None:
-            bar.set_rate(str(rate))
-        await self._load_voice_profiles(bar)
-
-    async def _load_voice_profiles(self, bar) -> None:
-        """音色下拉的选项来自 tts_profiles：进阅读器时拉一次。
-
-        表是空的（还没在 配置 → 朗读 里登记过）也要拉——不拉就分不清"没有语音档"
-        和"这条语音档已被删掉"，下拉会一直空着，用户以为功能没做。
-        """
-        if bar is None or self._tts is None:
-            return
-        try:
-            profiles = await self._tts.list_profiles()
-        except Exception as exc:    # 读表失败只是没有音色可选，不该拖垮整页偏好
-            logger.warning("朗读语音档载入失败：%s", exc)
-            return
-        profile_id = str(await self._reading.get_reader_preference(
-            "tts_profile", "") or "")
-        if self._view is None:    # 两次 await 之间页可能已经切走
-            return
-        self._tts_profiles = list(profiles or [])
-        bar.set_voice_options(self._tts_profiles, current=profile_id)
-        self._tts_profile = self._find_profile(bar.voice)
 
     # ------------------------------------------------------------------ #
     # 快捷键（M6 补回：键位分发；规范化在 app.core.shortcuts，与设置页同一份表）
@@ -436,10 +378,6 @@ class ReaderController(BaseController):
             lines = [line for kind, payload, _ in plan if kind == "text"
                      for line, _heading in payload]
             text_length = sum(len(line) for line in lines)
-            if self._tts is not None:
-                # 顺手留一份朗读稿：正文已经在这里切成段了，朗读不必再走一遍取文
-                self._tts_text_url = chapter["url"]
-                self._tts_text = _spoken_text(lines)
             # 这一章正文里的视频块 → 播放列表条目（连读追加时列表会一直长）
             self._collect_videos(plan, chapter)
             start = 0.0
@@ -617,13 +555,9 @@ class ReaderController(BaseController):
         return None
 
     def _update_chapter_navigation(self) -> None:
-        """工具栏「序号/总数 · 章名」+ 状态栏「《书名》 · 作者 · 共 N 章」+ 上下章可用性 + 朗读可用性。"""
+        """工具栏「序号/总数 · 章名」+ 状态栏「《书名》 · 作者 · 共 N 章」+ 上下章可用性。"""
         total = len(self._readable)
         index = self._chapter_index
-        # 朗读的**可见性**现在归视图（工具栏那颗能收起），控制器只报"这会儿能不能念"：
-        # 没有朗读服务（替身装配/精简启动）或没有可念的章时，入口整颗禁用。
-        self._view.set_read_aloud_available(
-            self._tts is not None and 0 <= index < total)
         if not total or not 0 <= index < total:
             self._view.set_progress("未选择章节")
             self._view.set_status_bar("")
@@ -690,7 +624,6 @@ class ReaderController(BaseController):
 
     def open_chapter(self, chapter: dict, _=None) -> None:
         self._view.show_directory(False)
-        self._interrupt_read_aloud()
         index = self._readable_index(str(chapter.get("url") or ""))
         if index >= 0:
             self.ui_call(self._open_index(index))
@@ -703,7 +636,6 @@ class ReaderController(BaseController):
 
     def _jump_relative(self, direction: int) -> None:
         """手动翻章：整篇替换（不是追加），卷标题由 _adjacent_chapter 跳掉。"""
-        self._interrupt_read_aloud()
         target = self._adjacent_chapter(direction)
         if target is None:
             return
@@ -828,7 +760,6 @@ class ReaderController(BaseController):
     # ------------------------------------------------------------------ #
     def _set_chapters(self, chapters: list[dict]) -> None:
         """目录落位：一次换书要把派生状态一起重置（漏一项就是上一本的残留）。"""
-        self._interrupt_read_aloud()
         self._interrupt_video()
         self._chapters = list(chapters or [])
         self._readable = [c for c in self._chapters if not c["is_volume"]]
@@ -839,8 +770,6 @@ class ReaderController(BaseController):
         self._reading_loading = False
         self._restoring_scroll = False
         self._pending_document_offset = 0.0
-        self._tts_text = ""
-        self._tts_text_url = ""
         self._view.render_chapters(self._chapters)
 
     def _on_reader_scroll(self, event=None) -> None:
@@ -940,7 +869,6 @@ class ReaderController(BaseController):
 
     def jump_to_bookmark(self, mark: dict, _=None) -> None:
         self._view.show_side_panel("")
-        self._interrupt_read_aloud()
         self.ui_call(self._open_index(
             int((mark or {}).get("chapter_index", 0) or 0)))
 
@@ -974,7 +902,6 @@ class ReaderController(BaseController):
         self._view.content_search_bar.render_results(list(hits or []))
 
     def jump_to_hit(self, hit: dict, _=None) -> None:
-        self._interrupt_read_aloud()
         self.ui_call(self._jump_to_hit(hit))
 
     async def _jump_to_hit(self, hit: dict) -> None:
@@ -1000,193 +927,6 @@ class ReaderController(BaseController):
                 return
         logger.info("段级定位没等到版心尺寸，停在章首：第 %d 段", paragraph)
 
-    # ------------------------------------------------------------------ #
-    # 朗读（接 ReadAloudService，播放条见 views/reading/read_aloud_bar.py）
-    # ------------------------------------------------------------------ #
-    def toggle_read_aloud(self, _=None) -> None:
-        """播放条主按钮：停着就读当前章，读着就停。
-
-        按**章**为粒度：系统 TTS 后端不上报朗读位置（事件里 position 恒为 0），
-        所以没有句级进度，只有"这一章念完没念完"。念完之后要不要接下一章由
-        ``_tts_follow`` 决定。
-        """
-        if self._tts is None:
-            return
-        if self._tts_playing:
-            self.stop_read_aloud()
-            return
-        if self._chapter_index < 0:
-            self._show_read_aloud("idle", detail="先打开一章再朗读")
-            return
-        self._tts_playing = True
-        self._tts_generation += 1
-        self.ui_call(self._read_aloud_loop(self._tts_generation))
-
-    def stop_read_aloud(self, _=None) -> None:
-        """停止朗读：先换号让循环收工，再叫停后端掐断当前语音。"""
-        if self._tts is None:
-            return
-        was_playing = self._tts_playing
-        self._tts_playing = False
-        self._tts_generation += 1
-        if was_playing:
-            self.ui_call(self._stop_backend("已停止朗读"))
-
-    def set_read_aloud_follow(self, value) -> None:
-        self._tts_follow = bool(value)
-
-    def set_read_aloud_rate(self, rate) -> None:
-        """语速档位落库（键 ``reader.tts_rate``，与排版偏好同一命名空间）。
-
-        语速不参与重排，所以和快捷键一样是"进程级读一次"的偏好，不进排版口径。
-        """
-        self.ui_call(self._reading.save_reader_preference("tts_rate", str(rate or "")))
-
-    def set_read_aloud_voice(self, value) -> None:
-        """选音色：落库（键 ``reader.tts_profile``）+ 立刻把后端切过去。
-
-        正在念的时候不打断当前这句——opts 是**每章**算一次的，所以新音色从下一章
-        生效，这句得说给用户听，否则又是"选了没反应"。
-        """
-        from app.views.reading.read_aloud_bar import BUILTIN_VOICE
-        profile_id = ("" if str(value or "") in ("", BUILTIN_VOICE)
-                      else str(value))
-        self._tts_profile = self._find_profile(profile_id)
-        if self._tts is not None:
-            # set_voice 只切后端（engine_type 决定走哪条链），url/headers 随 opts 走
-            self._tts.set_voice(self._tts_profile or {})
-        if self._reading is not None:
-            self.ui_call(self._reading.save_reader_preference(
-                "tts_profile", profile_id))
-        name = (self._tts_profile or {}).get("name", "")
-        if self._tts_playing:
-            self._show_read_aloud("speaking", detail=f"音色「{name}」从下一章生效")
-        else:
-            self._show_read_aloud("idle", detail=(
-                f"已切换到音色「{name}」" if name else "已改用内置语音"))
-
-    def _find_profile(self, profile_id: str) -> dict | None:
-        for profile in self._tts_profiles:
-            if str(profile.get("id", "")) == str(profile_id or ""):
-                return profile
-        return None
-
-    def _read_aloud_opts(self, index: int) -> dict:
-        """一次朗读的参数：章号（事件按它过滤）+ 语速 + 选中语音档的接法。"""
-        opts: dict[str, object] = {"chapter": index}
-        bar = getattr(self._view, "read_aloud", None) if self._view is not None else None
-        rate = getattr(bar, "rate_value", None)
-        if rate:
-            opts["rate"] = int(rate)
-        profile = self._tts_profile or {}
-        engine_type = str(profile.get("engine_type") or "")
-        if engine_type:
-            opts["engine_type"] = engine_type
-        url = str(profile.get("url") or "")
-        if url:
-            opts["url"] = url
-        headers = profile.get("headers")
-        if headers:
-            opts["headers"] = headers
-        return opts
-
-    def _tts_backend_name(self) -> str:
-        """实际在用的后端名：服务自己会回退（system→edge→http），界面只能问它。"""
-        backend = getattr(self._tts, "active_backend", None) if self._tts else None
-        return str(getattr(backend, "name", "") or "")
-
-    async def _read_aloud_loop(self, generation: int) -> None:
-        """一章接一章念下去：任何一处停不下来都算 bug，所以每步都先看 generation。"""
-        while generation == self._tts_generation and self._tts_playing:
-            chapter = self._current_chapter()
-            if chapter is None:
-                break
-            name = chapter["name"] or f"第 {self._chapter_index + 1} 章"
-            if self._tts_text_url != chapter["url"]:
-                self._tts_playing = False
-                self._show_read_aloud("idle", chapter=name,
-                                      detail="本章正文还没加载好")
-                return
-            if not self._tts_text:
-                self._tts_playing = False
-                self._show_read_aloud("idle", chapter=name,
-                                      detail="本章没有可朗读的正文")
-                return
-            # 点亮要跟着循环走：一章能念十几分钟，而 ui_call 只在协程收尾时 flush
-            # 一次——不自己补这一下，连读时播放条会停在第一章。
-            self._show_read_aloud("speaking", chapter=name)
-            self.flush()
-            try:
-                await self._tts.speak(self._book_url, self._tts_text,
-                                      self._read_aloud_opts(self._chapter_index))
-            except Exception as exc:
-                logger.warning("朗读失败 %s：%s", chapter.get("url"), exc)
-                self._tts_playing = False
-                self._show_read_aloud("error", chapter=name,
-                                      detail=f"朗读失败：{exc}")
-                return
-            if generation != self._tts_generation or not self._tts_playing:
-                return    # 念这一章的路上用户已经按了停止
-            if not self._tts_follow:
-                self._tts_playing = False
-                self._show_read_aloud("idle", chapter=name, detail="本章读完")
-                return
-            following = self._adjacent_chapter(1)
-            if following is None:
-                self._tts_playing = False
-                self._show_read_aloud("idle", chapter=name,
-                                      detail="已经读到最后一章")
-                return
-            # 换章失败（正文没挂上）不在这里报：下一轮的"还没加载好"分支会说。
-            await self._open_index(self._readable_index(following["url"]))
-        self._tts_playing = False
-
-    async def _stop_backend(self, detail: str = "") -> None:
-        try:
-            await self._tts.stop_speaking()
-        except Exception as exc:
-            logger.warning("停止朗读失败：%s", exc)
-        self._show_read_aloud("idle", detail=detail)
-
-    def _show_read_aloud(self, state: str, chapter: str = "",
-                         detail: str = "") -> None:
-        if self._view is None:
-            return
-        bar = getattr(self._view, "read_aloud", None)
-        if bar is not None:
-            # 把后端名一起传过去：语速只对系统 TTS 有意义，用户得看得见是谁在念，
-            # 否则"调了语速没反应"又是一次没人解释得了的静默退化。
-            bar.set_state(state, chapter=chapter, detail=detail,
-                          backend=self._tts_backend_name())
-            # 态同时回流到工具栏那颗入口：念着的时候它要禁用收起（见视图注释）。
-            self._view.sync_read_aloud()
-
-    async def _on_read_aloud_state(self, event: ReadAloudStateEvent) -> None:
-        """服务态镜像到播放条。
-
-        只认当前书 + 当前章的事件：连读翻下一章时上一章的 idle 可能后到，
-        照单渲染会让播放条在"正在朗读"和"未开始"之间来回跳。
-        """
-        if str(getattr(event, "book_url", "") or "") != self._book_url:
-            return
-        try:
-            chapter = int(getattr(event, "chapter", None))
-        except (TypeError, ValueError):
-            return
-        if chapter != self._chapter_index:
-            return
-        state = str(getattr(event, "state", "") or "idle")
-        name = (self._current_chapter() or {}).get("name", "")
-        self._show_read_aloud(
-            state, chapter=name,
-            detail="朗读后端出错" if state == "error" else "")
-
-    def _interrupt_read_aloud(self) -> None:
-        """手动换章先停朗读：人在看别的章，还念着上一章是干扰不是陪伴。"""
-        if self._tts_playing:
-            self.stop_read_aloud()
-
-    # ------------------------------------------------------------------ #
     # 视频书（接 MediaPlayService，面板见 views/reading/video_play_bar.py）
     # ------------------------------------------------------------------ #
     def _video_bar(self):
@@ -1224,12 +964,11 @@ class ReaderController(BaseController):
     def play_video(self, url, _=None) -> None:
         """正文条目上的「在本页播放」→ 起一次播放会话。
 
-        听书和看视频不能同时出声：起播先把朗读叫停。
+        
         """
         url = str(url or "")
         if not url:
             return
-        self._interrupt_read_aloud()
         self.ui_call(self._start_video(url))
 
     async def _start_video(self, url: str, *, resume: bool | None = None) -> None:
@@ -1411,7 +1150,7 @@ class ReaderController(BaseController):
     async def _on_media_play_state(self, event: MediaPlayStateEvent) -> None:
         """服务态镜像到面板：只认当前这本书的事件。
 
-        和朗读同一处境——换书时上一条会话的 idle 可能后到，照单渲染会让面板
+        换书时上一条会话的 idle 可能后到，照单渲染会让面板
         在"正在播放"和"未开始"之间来回跳。
         """
         if str(getattr(event, "book_url", "") or "") != self._book_url:
