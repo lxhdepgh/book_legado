@@ -62,8 +62,14 @@ def _summary(result: dict) -> str:
     """从单源结果拼一句人类可读摘要（CheckFinishedEvent.summary）。"""
     state = str(result.get("check_state") or "unknown")
     name = result.get("name") or result.get("raw_url") or "(未命名)"
+    # 按优先级收集错误信息：阅读 > 通用 > 搜索 > 状态
     err = (result.get("reading_error") or result.get("error")
            or result.get("search_error") or "").strip()
+    # 如果以上都没有，尝试从 search_status 获取错误类型
+    if not err:
+        search_status = str(result.get("search_status") or "")
+        if search_status in {"js_error", "rule_error", "timeout", "blocked"}:
+            err = f"搜索阶段{search_status}"
     line = f"{name}：{state}（{err}）" if err else f"{name}：{state}"
     # "没试正文"和"试了失败"在九态里都落进列表那一级，界面上必须点出来是哪种，
     # 否则浅遍的结论看起来像源本身有毛病。

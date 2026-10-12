@@ -83,6 +83,14 @@ def _error_kind(exc: Exception) -> str:
         return "unsupported"
     if isinstance(exc, JsBridgeError):
         return "js_error"
+    # JS 运行时错误（浏览器上下文缺失、全局变量未定义等）
+    js_runtime_patterns = [
+        "cannot read property", "not a function", "is not defined",
+        "undefined is not", "expecting value", "json.parse",
+        "typeerror:", "referenceerror:"
+    ]
+    if any(pattern in message for pattern in js_runtime_patterns):
+        return "js_error"
     if "429" in message or "rate limit" in message:
         return "rate_limited"
     if isinstance(exc, (RequestConnectionError, aiohttp.ClientError, OSError)):
