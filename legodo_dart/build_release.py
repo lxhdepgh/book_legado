@@ -79,14 +79,15 @@ def build_flutter(target: str) -> Path:
     print(f"\n[2/3] Building Flutter {target} Release...", flush=True)
 
     backend_exe = DART_CLIENT / "backend" / "LegadoReader.exe"
-    backend_main = DART_CLIENT / "backend" / "main.py"
 
     cmd = ["flutter", "build", target, "--release"]
+    
+    # 注意：不设置 LEGODO_PYTHON/LEGODO_MAIN，让运行时使用相对路径查找
+    # bootstrap.dart 会从 Platform.resolvedExecutable 同级目录查找 backend/
     if backend_exe.exists():
-        cmd.extend([
-            "--dart-define", f"LEGODO_PYTHON={backend_exe}",
-            "--dart-define", f"LEGODO_MAIN={backend_main}",
-        ])
+        print(f"[INFO] Backend found, will use relative path at runtime", flush=True)
+    else:
+        print("[WARN] Backend exe not found, runtime will fail without it", flush=True)
 
     run(cmd, cwd=DART_CLIENT)
 
