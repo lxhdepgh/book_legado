@@ -94,8 +94,8 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
     """v4：M4 内容形态域（契约 §8 / §6.3）。
 
     本函数是 M4 四线并行共享的迁移点：
-    - 本线``tts_profiles`` 表 +
-      ``books.play_position`` 视频/音频书播放位置列；
+    - 
+    - ``books.play_position`` 视频/音频书播放位置列；
     - RSS 线（RssService）应在本函数内**追加** ``rss_sources``/``rss_articles``
       等表 DDL（不要整体替换本函数）；LocalBook 线无新增表（复用 books 登记）。
 
@@ -105,10 +105,6 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
       ⚠️ "复用 chapter_index"这条在界面接出播放面板后被推翻，播放索引改存
       ``books.play_chapter_index``，见 :func:`_migrate_v7`。
     """
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS tts_profiles ("
-        "  id          INTEGER PRIMARY KEY AUTOINCREMENT,"
-    if "play_position" not in cols:
         conn.execute(
             "ALTER TABLE books ADD COLUMN "
             "play_position REAL NOT NULL DEFAULT 0")
