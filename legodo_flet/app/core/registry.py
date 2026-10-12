@@ -168,12 +168,13 @@ NAV_META: dict[str, tuple] = {
     DEST_READER:         (GROUP_READING, "阅读器", True),
     DEST_MANGA_READER:   (GROUP_READING, "漫画",   True),
     # -- 配置组（M5/M6）：工具入口/外观/服务合成「配置」页的三个页签；
-    #    8 个工具子页仍是整页目的地（从「更多工具」卡片跳转）--
+    #    7 个工具子页仍是整页目的地（从「更多工具」卡片跳转）--
     DEST_TOOLS_OVERVIEW: (GROUP_CONFIG, "更多工具", False),
     DEST_SETTINGS_APPEARANCE: (GROUP_CONFIG, "外观", False),
     DEST_SETTINGS_SHORTCUTS: (GROUP_CONFIG, "快捷键", False),
     DEST_SETTINGS_DASHBOARD:  (GROUP_CONFIG, "服务", False),
-    DEST_TOOLS_BROWSER:  (GROUP_CONFIG, "浏览器",   True),
+    # [已移除] 浏览器目的地：最初用于书源检测时弹出 Cloudflare 人工确认，现不再需要
+    # DEST_TOOLS_BROWSER:  (GROUP_CONFIG, "浏览器",   True),
     # [已移除] DEST_TOOLS_DICT 词典功能在任务 #45 中被删除
     # DEST_TOOLS_DICT:     (GROUP_CONFIG, "词典",     True),
     DEST_TOOLS_REPLACE:  (GROUP_CONFIG, "替换规则", True),

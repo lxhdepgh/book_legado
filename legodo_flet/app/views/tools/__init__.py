@@ -5,9 +5,8 @@
 视图数据一律经所属 Controller 从 ``ServiceHub.get()`` 取服务后注入；
 唯一例外通道是 BrowserView 实现 BrowserInteractionCallback（core 协议，不违反依赖方向）。
 
-工具组十个目的地（注册进 ViewRegistry）：
+工具组九个目的地（注册进 ViewRegistry）：
 
-- :class:`BrowserView`        通用浏览器：地址栏 / 前进后退 / 加载态；
 - :class:`DictPopup`          划词取词弹窗；
 - :class:`ReplaceRuleView`    全局替换规则管理；
 - :class:`FontView`           字体管理（系统枚举 / 用户字体 / 选中）；
@@ -21,7 +20,7 @@
 from __future__ import annotations
 
 from app.core.hub import ServiceHub
-from app.core.registry import (DEST_TOOLS_BROWSER, DEST_TOOLS_DICT,
+from app.core.registry import (DEST_TOOLS_DICT,
                                DEST_TOOLS_EXPORT, DEST_TOOLS_FONT,
                                DEST_TOOLS_OVERVIEW, DEST_TOOLS_QR,
                                DEST_TOOLS_REPLACE, DEST_TOOLS_TTS,
@@ -29,7 +28,8 @@ from app.core.registry import (DEST_TOOLS_BROWSER, DEST_TOOLS_DICT,
                                DEST_TOOLS_WEBDAV, DEST_TOOLS_WEB_BRIDGE,
                                TOOLS_DESTINATIONS, ViewRegistry)
 
-from app.views.tools.browser_view import BrowserView
+# [已移除] 浏览器功能：最初用于书源检测时弹出 Cloudflare 人工确认，现不再需要
+# from app.views.tools.browser_view import BrowserView
 from app.views.tools.dict_popup import DictPopup
 from app.views.tools.replace_rule_view import ReplaceRuleView
 from app.views.tools.font_view import FontView
@@ -40,7 +40,8 @@ from app.views.tools.update_view import UpdateView
 from app.views.tools.web_bridge_view import WebBridgeView
 from app.views.tools.tts_view import TtsProfileView
 
-from app.controllers.tools.browser_controller import BrowserController
+# [已移除] 浏览器控制器
+# from app.controllers.tools.browser_controller import BrowserController
 from app.controllers.tools.dict_popup_controller import DictPopupController
 from app.controllers.tools.replace_rule_controller import ReplaceRuleController
 from app.controllers.tools.font_controller import FontController
@@ -52,9 +53,9 @@ from app.controllers.tools.web_bridge_controller import WebBridgeController
 from app.controllers.tools.tts_controller import TtsProfileController
 
 __all__ = [
-    "BrowserView", "DictPopup", "ReplaceRuleView", "FontView", "QrCodeView",
+    "DictPopup", "ReplaceRuleView", "FontView", "QrCodeView",
     "ExportView", "WebDavView", "UpdateView", "WebBridgeView", "TtsProfileView",
-    "BrowserController", "DictPopupController", "ReplaceRuleController",
+    "DictPopupController", "ReplaceRuleController",
     "FontController", "QrCodeController", "ExportController",
     "WebDavController", "UpdateController", "WebBridgeController",
     "TtsProfileController",
@@ -69,18 +70,21 @@ def register_destinations(registry: ViewRegistry, hub: ServiceHub) -> ViewRegist
     所需服务集按 §9.2 声明，供导航层做就绪性检查。
 
     导航精简（M7 后）：侧栏只展示「更多工具」（DEST_TOOLS_OVERVIEW）入口页，
-    八个工具子页注册为**隐藏目的地**（``hidden=True``，注册可达但不在导航栏
+    七个工具子页注册为**隐藏目的地**（``hidden=True``，注册可达但不在导航栏
     显示），由 overview 页内卡片经 ``on_open_destination`` 跳转。
+    
+    [已移除] 浏览器功能（DEST_TOOLS_BROWSER）：最初用于书源检测时弹出 Cloudflare 
+    人工确认，现不再需要。BrowserService 仍保留供 webView 弹窗使用。
     """
     # 更多工具入口页（工具组唯一展示目的地）
     registry.register(
         DEST_TOOLS_OVERVIEW,
         lambda: _build_overview(),
         required_services=())
-    # 八个工具子页：隐藏目的地（可达，不展示）
-    registry.register(
-        DEST_TOOLS_BROWSER, lambda: _build(hub, BrowserView, BrowserController),
-        required_services=("BrowserService",), hidden=True)
+    # [已移除] 浏览器目的地：不再需要内置浏览器页面
+    # registry.register(
+    #     DEST_TOOLS_BROWSER, lambda: _build(hub, BrowserView, BrowserController),
+    #     required_services=("BrowserService",), hidden=True)
     # [已移除] 词典功能在任务 #45 中被删除
     # registry.register(
     #     DEST_TOOLS_DICT, lambda: _build(hub, DictPopup, DictPopupController),

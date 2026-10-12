@@ -69,7 +69,8 @@ _ICONS: dict[str, str] = {
     "sources.check": ft.Icons.FACT_CHECK_OUTLINED,
     "sources.repair": ft.Icons.HEALING,
     "tools.overview": ft.Icons.BUILD_OUTLINED,
-    "tools.browser": ft.Icons.PUBLIC,
+    # [已移除] 浏览器图标：不再需要内置浏览器页面
+    # "tools.browser": ft.Icons.PUBLIC,
     "tools.dict": ft.Icons.LANGUAGE,
     "tools.replace": ft.Icons.FIND_REPLACE,
     "tools.font": ft.Icons.TEXT_FIELDS,
