@@ -21,6 +21,14 @@ wheelhouse/
 build/LegadoReader/
 !LegadoReader.spec
 
+# Dart subproject packaging output
+legodo_dart/backend/
+legodo_dart/build/
+legodo_dart/dist/
+*.zip
+*.exe
+
+
 # Runtime caches and probes (reproducible test artifacts)
 .cache/
 .probe/
