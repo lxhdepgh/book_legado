@@ -14,11 +14,15 @@ import sys
 from pathlib import Path
 
 # 确保项目根目录在 sys.path 中（沿用旧 main.py 方式）
-# legodo_flet/app/main.py → 项目根 = ../../ 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+# legodo_flet/app/main.py → legodo_flet 根 = ../ 
+_FLET_ROOT = Path(__file__).resolve().parent.parent
+if str(_FLET_ROOT) not in sys.path:
+    sys.path.insert(0, str(_FLET_ROOT))
+# 同时保留上级项目根（供 app.core / app.services 等跨子项目导入）
+_PROJECT_ROOT = _FLET_ROOT.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
-_ROOT = _PROJECT_ROOT
+_ROOT = _FLET_ROOT
 
 logger = logging.getLogger(__name__)
 
