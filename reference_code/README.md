@@ -4,17 +4,28 @@
 
 ## 目录结构
 
-### Legado 主项目
+### Legado 主项目（三个版本对照）
+
+#### 1. 原始基准版（`legado-3.23.110211/`）
 - **版本**：`3.23.110211`
 - **提交**：`56c3301dc441c23aaa75bac973943f7469c202be`
-- **目录**：`legado-3.23.110211/`
 - **来源**：`https://github.com/gedoor/legado` → `https://gitee.com/crwth/legado.git`
 - **获取日期**：`2026-08-10`
+- **说明**：官方 GitHub 仓库已清除历史主体源码，使用保留原发布标签的历史镜像
 
-> 官方 GitHub 仓库已清除历史主体源码，使用保留原发布标签的历史镜像。后续行为对齐以该固定提交为准。
+#### 2. MD3 Material Design 3 改版（`legado-md3/`）
+- **来源**：`https://github.com/HapeLee/legado-with-MD3`
+- **获取日期**：`2026-10-12`
+- **说明**：应用 Material Design 3 设计语言的 Legado 分支，UI 层重构参考
 
-**重点对照入口**：
+#### 3. lyc486 维护版（`legado-lyc486/`）
+- **来源**：`https://gitee.com/lyc486/legado`
+- **获取日期**：`2026-10-12`
+- **说明**：Gitee 上的活跃维护分支，包含最新规则引擎改进
+
+**重点对照入口**（所有版本通用）：
 - `app/src/main/java/io/legado/app/model/analyzeRule/AnalyzeRule.kt` - 规则解析入口
+- `app/src/main/java/io/legado/app/model/analyzeRule/AnalyzeUrl.kt` - URL 参数解析与 JS 执行
 - `app/src/main/java/io/legado/app/model/webBook/` - 网络书源处理
 - `app/src/main/java/io/legado/app/data/entities/rule/` - 规则实体定义
 - `app/src/main/java/io/legado/app/data/entities/BookSource.kt` - 书源实体
@@ -41,5 +52,6 @@
 
 1. **只读参考**：本目录所有文件仅供查阅，不参与构建或测试
 2. **语义对齐**：实现 Legado 规则引擎时，以此处源码为行为准绳
-3. **不随分支更新**：固定于特定提交，避免上游变更影响兼容性验证
+3. **多版本对照**：遇到行为分歧时，对比三个版本的实现差异
+4. **不随分支更新**：固定于特定提交，避免上游变更影响兼容性验证
 

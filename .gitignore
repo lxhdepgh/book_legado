@@ -66,3 +66,7 @@ tools/legado_diff/harness/.gradle/
 # Pre-refactor snapshot kept locally for behaviour comparison (207M, not source control)
 old_code/
 flutter_client/backend/
+
+# Reference code repositories (clone separately)
+reference_code/legado-md3/
+reference_code/legado-lyc486/
