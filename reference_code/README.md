@@ -13,10 +13,12 @@
 - **获取日期**：`2026-08-10`
 - **说明**：官方 GitHub 仓库已清除历史主体源码，使用保留原发布标签的历史镜像
 
-#### 2. MD3 Material Design 3 改版（`legado-md3/`）
+#### 2. MD3 Material Design 3 改版（`legado-md3-new/`）
 - **来源**：`https://github.com/HapeLee/legado-with-MD3`
 - **获取日期**：`2026-10-12`
 - **说明**：应用 Material Design 3 设计语言的 Legado 分支，UI 层重构参考
+- **状态**：完整克隆（151,180 个对象，82.88 MB），包含完整规则引擎代码
+- **注意**：旧的空目录 `legado-md3/` 因系统锁定未删除，请使用 `legado-md3-new/`
 
 #### 3. lyc486 维护版（`legado-lyc486/`）
 - **来源**：`https://gitee.com/lyc486/legado`
