@@ -18,15 +18,16 @@ from app.services.engine.rule_engine import (RequestConnectionError, RequestTime
 from app.services.engine.reading_engine import LegadoReadingEngine
 
 
-CHECK_CONCURRENCY = 8
-CHECK_MAX_CONCURRENCY = 16
-TAG_PAGE_CONCURRENCY = 4
+# 方案1：提高并发数（从8提升到16，适配现代多核CPU）
+CHECK_CONCURRENCY = 16
+CHECK_MAX_CONCURRENCY = 32  # 上限翻倍，允许高配机器跑得更快
+TAG_PAGE_CONCURRENCY = 8  # 分类页并发也提升
 # Explore categories are the slowest stage (one request per category, several
 # categories per source).  They get their own narrow pool so they cannot idle
 # the workers that still have a search or reading chain to run.
-TAG_SOURCE_CONCURRENCY = 4
-JS_CHECK_CONCURRENCY = 2
-SOURCE_TAG_TIMEOUT = 20
+TAG_SOURCE_CONCURRENCY = 8  # 从4提升到8
+JS_CHECK_CONCURRENCY = 4  # JS执行并发从2提升到4（现代JS引擎更快）
+SOURCE_TAG_TIMEOUT = 15  # 缩短分类超时（从20秒降到15秒）
 CHECK_TAG_CATEGORIES = 6
 # A host intercepted by local security software answers with a block page, so
 # waiting for the rule stages only burns their timeouts.  Interception is local
@@ -36,14 +37,14 @@ BLOCKED_PROBE_BUDGET = 1.5
 # A source whose home page is a slow blackhole must not keep the source open
 # after every rule stage has already finished.
 PROBE_JOIN_BUDGET = 3.0
-READING_CHAIN_TIMEOUT = 15
+READING_CHAIN_TIMEOUT = 12  # 缩短阅读链超时（从15秒降到12秒）
 READING_CHAIN_CANDIDATES = 3
 # Upper bound for the whole reading chain of one source.  Three candidates at
 # the per-stage timeout each would otherwise hold a worker for minutes.
-READING_CHAIN_BUDGET = 30
+READING_CHAIN_BUDGET = 25  # 缩短总预算（从30秒降到25秒）
 # Hard ceiling for everything one source may spend, search stage included, so a
 # single half-dead site cannot extend the tail of a long run.
-SOURCE_CHECK_BUDGET = 45
+SOURCE_CHECK_BUDGET = 35  # 缩短单源总预算（从45秒降到35秒）
 # Explore and reading hit the same host the search stage just failed to reach,
 # so a host-level search error already answers what they would ask.
 HOST_UNREACHABLE_KINDS = {"network_error", "timeout", "js_error", "rate_limited"}
@@ -438,6 +439,21 @@ def _classify_result(result: dict) -> str:
 async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
                         on_result=None, auto_disable=False,
                         depth=CHECK_DEPTH_FULL):
+    """批量检测书源（支持分段超时、连接池复用、DNS缓存）。
+    
+    方案2实现：分段超时策略
+    - 连通性探测：timeout * 0.25（默认3秒）
+    - 搜索链路：timeout * 0.5（默认6秒）  
+    - 阅读链路：timeout * 0.75（默认9秒）
+    
+    方案3实现：连接池优化
+    - limit_per_host 从3提升到6，允许同域名更多并发
+    - enable_cleanup_closed=True 自动清理关闭的连接
+    
+    方案4实现：DNS缓存增强
+    - ttl_dns_cache 从300秒提升到600秒（10分钟）
+    - 减少重复DNS查询开销
+    """
     depth = str(depth or CHECK_DEPTH_FULL).strip().lower()
     if depth not in CHECK_DEPTHS:
         raise ValueError(f"未知的检测深度：{depth!r}（可用：{sorted(CHECK_DEPTHS)}）")
@@ -447,8 +463,20 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
     engine_sem = asyncio.Semaphore(worker_limit)
     tag_sem = asyncio.Semaphore(min(worker_limit, TAG_SOURCE_CONCURRENCY))
     js_sem = asyncio.Semaphore(JS_CHECK_CONCURRENCY)
+    
+    # 方案2：计算分段超时
+    probe_timeout = max(2.0, timeout * 0.25)  # 连通性探测最少2秒
+    search_timeout = max(4.0, timeout * 0.5)  # 搜索链路最少4秒
+    reading_timeout = max(8.0, timeout * 0.75)  # 阅读链路最少8秒
+    
+    # 方案3+4：优化连接池和DNS缓存
     connector = aiohttp.TCPConnector(
-        ssl=False, limit=worker_limit, limit_per_host=3, ttl_dns_cache=300)
+        ssl=False, 
+        limit=worker_limit, 
+        limit_per_host=6,  # 从3提升到6，同域名可更多并发
+        ttl_dns_cache=600,  # 从300提升到600秒（10分钟）
+        enable_cleanup_closed=True,  # 自动清理关闭的连接
+        force_close=False)  # 保持连接复用
     headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 14) "
                              "AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"}
     results = []
@@ -459,8 +487,9 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
         browser_fetcher = available_fetcher()
 
         async def check_source(source, index):
+            # 方案2：使用分段超时
             probe_task = asyncio.create_task(
-                _probe_source(source, session, network_sem, timeout))
+                _probe_source(source, session, network_sem, probe_timeout))
             # 缺口判定要走一次 JS 模拟面清单，放线程里跑，别卡住事件循环。
             java_gaps = asyncio.create_task(
                 asyncio.to_thread(_unsupported_java_packages, source))
@@ -469,12 +498,13 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
             # 握手都省不下来（8 源 16 次 vs 16 次）；唯一省下来的形状（多条源挤同一
             # 域名）反而更慢——共享让 limit_per_host 变成跨源排队，14 次拨号降到 8 次
             # 却把墙钟从 700ms 顶到 746ms。引擎本身构造/关闭合计 ~9ms/8 源。
-            engine = LegadoReadingEngine(timeout=timeout,
+            # 方案2：使用阅读链路的分段超时
+            engine = LegadoReadingEngine(timeout=reading_timeout,
                                          webview_fetcher=browser_fetcher,
                                          background=True)
             limiter = js_sem if _source_uses_js(source) else engine_sem
             try:
-                probe = await _locally_blocked_probe(probe_task, timeout)
+                probe = await _locally_blocked_probe(probe_task, probe_timeout)
                 if probe is not None:
                     search, search_books = {
                         "search_status": "skip", "book_count": None,
@@ -493,8 +523,9 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
                         # 之后时单源墙钟 3743 ms（超出恰好等于搜索段的 1588 ms），起点
                         # 前移后 2754 ms，剩下 0.75 s 是 _remaining 的 1s 下限，不是漏。
                         deadline = time.perf_counter() + SOURCE_CHECK_BUDGET
+                        # 方案2：使用搜索链路的分段超时
                         search, search_books = await _engine_search_check(
-                            source, engine, _remaining(deadline, timeout + 3))
+                            source, engine, _remaining(deadline, search_timeout))
                         tags, tag_timeout, tag_skipped = [], False, False
                         if (getattr(source, "enabledExplore", True) and
                                 str(getattr(source, "exploreUrl", "") or "").strip()):
@@ -508,7 +539,7 @@ async def check_sources(sources, concurrency=CHECK_CONCURRENCY, timeout=12,
                                         tags = await asyncio.wait_for(
                                             check_categories(
                                                 source,
-                                                timeout=min(timeout, 10),
+                                                timeout=min(search_timeout, 10),
                                                 engine=engine,
                                                 max_categories=CHECK_TAG_CATEGORIES,
                                                 stop_after_valid=True),

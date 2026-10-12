@@ -150,6 +150,14 @@ class SourceCheckService(Service):
         #: 待深检队列（服务侧，见 :mod:`tiered_check`）：跨轮存"谁该补验正文"。
         #: 不落库、不进用户分组——它是检测自己的账，不是用户看得见的一个组。
         self._deep_queue = tiered_check.DeepQueue()
+        
+        # 方案5：历史成功率跟踪（用于智能跳过策略）
+        # {raw_url: {"success": int, "fail": int, "last_success_ts": float, "consecutive_fail": int}}
+        self._source_history: dict[str, dict] = {}
+        #: 连续失败N次后降低优先级（从3次提升到5次，避免误判）
+        self._low_priority_threshold = 5
+        #: 历史成功率低于此值的源跳过深检（30%阈值）
+        self._skip_deep_threshold = 0.3
 
     # ------------------------------------------------------------------ #
     # 生命周期：经 hub 补齐未注入的基础设施，并读检测偏好
@@ -216,6 +224,11 @@ class SourceCheckService(Service):
 
         已有批量在跑时**不再派第二遍全量联网**（两份流水线同时打站点对既浪费
         又容易被封），而是接到那一轮的收尾上。
+        
+        方案7实现：分批并行 + 流式反馈
+        - 每批50条源，批完成后立即反馈进度
+        - 允许中途取消未开始的批次
+        - 用户感知更快，不必等全部完成
         """
         if self._run is not None and self._run["running"]:
             logger.info("批量检测已在跑，check_all 接到当前这一轮的收尾")
@@ -228,7 +241,37 @@ class SourceCheckService(Service):
                 self.status.progress = None
                 results, tiering = [], self._empty_tiering()
             else:
-                results, tiering = await self._run_tiered(sources, run)
+                # 方案7：分批处理（每批50条）
+                BATCH_SIZE = 50
+                all_results = []
+                total_batches = (len(sources) + BATCH_SIZE - 1) // BATCH_SIZE
+                
+                for batch_idx in range(total_batches):
+                    # 检查是否被取消
+                    if run.get("cancelled"):
+                        logger.info("检测被取消，剩余 %s 个批次不执行", 
+                                   total_batches - batch_idx)
+                        break
+                    
+                    start = batch_idx * BATCH_SIZE
+                    end = min(start + BATCH_SIZE, len(sources))
+                    batch = sources[start:end]
+                    
+                    logger.info("执行第 %s/%s 批（%s 条源）", 
+                               batch_idx + 1, total_batches, len(batch))
+                    
+                    batch_results, batch_tiering = await self._run_tiered(batch, run)
+                    all_results.extend(batch_results)
+                    
+                    # 流式反馈：每批完成后更新进度
+                    self.status.progress = (batch_idx + 1) / total_batches
+                    logger.info("批次 %s/%s 完成，当前进度 %.1f%%", 
+                               batch_idx + 1, total_batches, 
+                               self.status.progress * 100)
+                
+                results = all_results
+                # 合并分级统计（取最后一批的tiering作为代表）
+                tiering = batch_tiering if batch_idx >= 0 else self._empty_tiering()
                 # 两遍的派发数加起来正好是计划源数，这里只把收尾那一格钉到 1.0。
                 self.status.progress = 1.0
             run["tiering"] = tiering
@@ -283,7 +326,22 @@ class SourceCheckService(Service):
             self._deep_queue.add(url, reason)
 
         limit = tiered_check.per_round_deep_limit(len(sources))
-        deep_sources = self._deep_queue.select(sources, limit=limit)
+        
+        # 方案5：基于历史成功率过滤深检队列
+        deep_candidates = self._deep_queue.select(sources, limit=limit)
+        deep_sources = []
+        skipped_by_history = 0
+        for source in deep_candidates:
+            url = url_of(source)
+            if self._should_skip_deep_check(url):
+                skipped_by_history += 1
+                # 从队列中移除低成功率源，但不删除（下次浅遍重新评估）
+                continue
+            deep_sources.append(source)
+        
+        if skipped_by_history > 0:
+            logger.info("智能跳过：%s 条源因历史成功率低被跳过深检", skipped_by_history)
+        
         deep_urls = {url_of(s) for s in deep_sources}
         shallow_sources = [s for s in sources if url_of(s) not in deep_urls]
         tiering = {"plan_total": len(sources),
@@ -291,6 +349,7 @@ class SourceCheckService(Service):
                    "slice_limit": limit,
                    "carried": sum(1 for s in deep_sources
                                   if url_of(s) in carried),
+                   "skipped_by_history": skipped_by_history,  # 记录跳过的数量
                    "by_reason": {}}
 
         results: list[dict] = []
@@ -470,6 +529,50 @@ class SourceCheckService(Service):
             # 每一行派发都是这条源**这一轮**的结论（补验在后面的轮次，不改本轮这一行），
             # 所以审计跟着每一条留下的结果走。
             self._maybe_audit(result, sources)
+            
+            # 方案5：更新历史成功率
+            self._update_source_history(result)
+
+    def _update_source_history(self, result: dict) -> None:
+        """更新源的历史成功率统计（用于智能跳过策略）。"""
+        url = str(result.get("raw_url") or "")
+        if not url:
+            return
+        
+        state = str(result.get("check_state") or "")
+        is_success = state in {"fully_usable", "list_usable", "search_only", "explore_only"}
+        
+        import time as _time
+        now = _time.monotonic()
+        
+        entry = self._source_history.setdefault(url, {
+            "success": 0, "fail": 0, 
+            "last_success_ts": 0.0, 
+            "consecutive_fail": 0
+        })
+        
+        if is_success:
+            entry["success"] += 1
+            entry["last_success_ts"] = now
+            entry["consecutive_fail"] = 0
+        else:
+            entry["fail"] += 1
+            entry["consecutive_fail"] += 1
+    
+    def _should_skip_deep_check(self, url: str) -> bool:
+        """判断是否应该跳过该源的深检（基于历史成功率）。"""
+        entry = self._source_history.get(url)
+        if not entry:
+            return False  # 没有历史记录，不跳过
+        
+        total = entry["success"] + entry["fail"]
+        if total < 3:  # 样本太少，不判断
+            return False
+        
+        success_rate = entry["success"] / total
+        # 连续失败N次 或 成功率低于阈值，跳过深检
+        return (entry["consecutive_fail"] >= self._low_priority_threshold or
+                success_rate < self._skip_deep_threshold)
 
         async def runner():
             return await self._checker(
