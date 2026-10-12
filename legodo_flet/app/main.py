@@ -6,8 +6,6 @@
     python main.py --serve                   # 无头模式：仅 GatewayService（供远程调用）
     python main.py --connect URL --token T   # 环回模式：连接外部 Python 后端
     python main.py --smoke-test              # 冻结包动态依赖冒烟
-
-注意：本项目的后端代码位于 app_backend/ 目录（与顶层 app/ 分离，避免多子项目冲突）。
 """
 import asyncio
 import logging
@@ -15,23 +13,16 @@ import os
 import sys
 from pathlib import Path
 
-# 确保 legodo_flet 根目录在 sys.path 中
+# 确保 legodo_flet 根目录在 sys.path 中（app/ 包含完整后端 + 前端）
 # legodo_flet/app/main.py → legodo_flet 根 = ../ 
 _FLET_ROOT = Path(__file__).resolve().parent.parent
-
-# 添加 app_backend/ 到 sys.path（本项目专属后端）
-_BACKEND_DIR = _FLET_ROOT / "app_backend"
-if str(_BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(_BACKEND_DIR))
-
-# 同时保留 legodo_flet 根目录（供前端视图导入，如 app.themes、app.views）
 if str(_FLET_ROOT) not in sys.path:
-    sys.path.insert(1, str(_FLET_ROOT))
+    sys.path.insert(0, str(_FLET_ROOT))
 
 # 同时保留上级项目根（供跨子项目导入，如果需要）
 _PROJECT_ROOT = _FLET_ROOT.parent
 if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(2, str(_PROJECT_ROOT))
+    sys.path.insert(1, str(_PROJECT_ROOT))
 
 _ROOT = _FLET_ROOT
 
@@ -121,6 +112,11 @@ def _build_hub():
     注意：ServiceHub 自身不注册（它是总控制器），但 status_report 会带它一行，
     仪表盘因此展示 5 个基础设施 + RuleEngineService 共 6 行。
     """
+    # 【关键修复】在任何服务初始化之前，先导入 action 表模块触发装饰器注册 BY_ACTION
+    import app.gateway.methods  # noqa: F401  导入即注册
+    import logging as _log
+    _log.getLogger(__name__).info("BY_ACTION 已加载 %d 个 action", len(app.gateway.methods.BY_ACTION))
+    
     from app.core.bus import EventBus
     from app.core.engine_worker import engine_hub
     from app.core.hub import ServiceHub
@@ -451,6 +447,11 @@ def serve(argv: list[str] | None = None) -> int:
     hub = _build_hub()
     gateway = GatewayService(port=port, idle_exit_seconds=idle, exit_event=stop_event)
     hub.register(gateway)
+    
+    # 【调试】确认 gateway.hub 被正确设置
+    import logging as _serve_log
+    _serve_log.getLogger(__name__).info("GatewayService.hub = %s", gateway.hub)
+    
     _wire_headless_webview(hub, gateway)
 
     engine = engine_hub()
@@ -496,14 +497,6 @@ def main():
 
     import flet as ft
 
-    # DEBUG: Print sys.path before MD3 theme import
-    import sys as _sys
-    print(f"DEBUG: sys.path[0:4] = {_sys.path[:4]}", flush=True)
-    print(f"DEBUG: CWD = {Path.cwd()}", flush=True)
-
-    # Apply MD3 theme before building UI
-    from app.themes.md3_theme import apply_to_page
-
     # 视图在函数里才 import（不是模块顶层）：审计跑在子进程里，Windows 的 spawn
     # 会在每个子进程里把 `__main__`（也就是本文件）重新 import 一遍，顶层那行
     # flet + 视图树会让每个 worker 白背 ~126 ms 的导入和几十 MB 常驻。
@@ -523,9 +516,6 @@ def main():
 
     try:
         def _on_page(page):
-            # Apply MD3 theme to page (light/dark/system from saved preference)
-            apply_to_page(page, theme_mode="system")
-
             if hub is not None:
                 _apply_saved_theme(page, hub)
                 _wire_browser_page(hub, page)

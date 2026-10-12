@@ -1,0 +1,6 @@
+{
+  "type": "object",
+  "description": "rss.sources 入参：无。回的是订阅源列表行（左栏那一屏），每行自带 total/unread 两格角标——那两格由服务端一次 GROUP BY 出来，客户端不许逐源去数文章列表（N 次查询会在这里长成一条看不见的慢）。",
+  "properties": {},
+  "additionalProperties": false
+}

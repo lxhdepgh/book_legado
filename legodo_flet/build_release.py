@@ -27,7 +27,7 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parent  # 项目根目录
-_APP_SOURCE = _SCRIPT_DIR / "app_backend"  # Python 后端源码（本地副本）
+_APP_SOURCE = _SCRIPT_DIR / "app"  # Python app (backend + frontend)
 _OUTPUT_DIR = _SCRIPT_DIR / "dist"
 
 
@@ -135,7 +135,7 @@ def pack_backend(python_exe: str):
         print("[ERROR] PyInstaller failed")
         sys.exit(1)
     
-    dist_dir = _PROJECT_ROOT / "dist" / "LegadoReader"
+    dist_dir = _SCRIPT_DIR / "dist" / "LegadoReader"
     if not dist_dir.exists():
         print(f"[ERROR] PyInstaller output not found: {dist_dir}")
         sys.exit(1)

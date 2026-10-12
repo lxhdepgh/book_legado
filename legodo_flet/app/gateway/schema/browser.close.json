@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "description": "关闭浏览器会话",
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "description": "浏览器会话 ID"
+    }
+  },
+  "required": ["session_id"],
+  "additionalProperties": false
+}

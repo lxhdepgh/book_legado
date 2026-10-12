@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "book_url": {
+      "type": "string"
+    },
+    "text": {
+      "type": "string"
+    },
+    "opts": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "book_url",
+    "text"
+  ],
+  "additionalProperties": false
+}

@@ -37,12 +37,6 @@ from app.core.registry import (ViewRegistry,
                                DEST_MANGA_READER, GROUP_READING,
                                DEST_SETTINGS_APPEARANCE, DEST_SETTINGS_DASHBOARD,
                                DEST_SETTINGS_SHORTCUTS)
-from app.views.common.md3_styles import (
-    RADIUS_CARD,
-    SPACE_MD,
-    NAV_RAIL_WIDTH,
-    NAV_RAIL_WIDE,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -220,30 +214,16 @@ class SectionView(ft.Column):
         #: 用户点页签时通知外壳同步 current（目的地已由外壳装配，视图不持导航）
         self.on_tab_selected = None       # (destination: str) -> None
 
-        tab_bar = ft.TabBar(
-            tabs=[
-                ft.Tab(label=title, icon=_ICONS.get(dest, ft.Icons.CIRCLE))
-                for dest, title in tabs
-            ],
-            indicator_color=ft.Colors.PRIMARY,
-            indicator_tab_size=True,
-            overlay_color=ft.Colors.PRIMARY.with_opacity(0.08),
-        )
+        tab_bar = ft.TabBar(tabs=[
+            ft.Tab(label=title, icon=_ICONS.get(dest, ft.Icons.CIRCLE))
+            for dest, title in tabs])
         self._pages = [ft.Container(expand=True) for _ in self._dests]
         self._tabs = ft.Tabs(
-            length=len(self._dests),
-            selected_index=0,
-            expand=True,
+            length=len(self._dests), selected_index=0, expand=True,
             on_change=self._on_change,
-            content=ft.Column(
-                spacing=0,
-                expand=True,
-                controls=[
-                    tab_bar,
-                    ft.TabBarView(expand=True, controls=self._pages),
-                ],
-            ),
-        )
+            content=ft.Column(spacing=0, expand=True, controls=[
+                tab_bar, ft.TabBarView(expand=True, controls=self._pages),
+            ]))
         self.controls = [self._tabs]
 
     # ------------------------------------------------------------------ #
@@ -342,33 +322,16 @@ class NavigationHost:
         self._standalone = None                   # 整页目的地当前视图（阅读器/工具子页）
 
         entries = [ft.NavigationRailDestination(
-            icon=ft.Icon(_GROUP_ICONS.get(group, _FALLBACK_ICON)),
-            label=ft.Text(group))
+            icon=_GROUP_ICONS.get(group, _FALLBACK_ICON), label=group)
             for group in self._groups]
-        # MD3-styled NavigationRail: pill indicator, comfortable spacing
         self._rail = ft.NavigationRail(
-            destinations=entries,
-            selected_index=0,
-            extended=not self._is_narrow(),
-            label_type=ft.NavigationRailLabelType.ALL,
-            use_indicator=True,
-            indicator_shape=ft.RoundedRectangleBorder(
-                radius=RADIUS_CARD,
-            ),
-            indicator_color=ft.Colors.PRIMARY_CONTAINER,
-            on_change=self._on_rail_change,
-        )
-        # MD3-styled NavigationBar: tonal surface with pill indicators
+            destinations=entries, selected_index=0, extended=True,
+            use_indicator=True, on_change=self._on_rail_change)
         self._bar = ft.NavigationBar(
             destinations=[ft.NavigationBarDestination(
-                icon=ft.Icon(_GROUP_ICONS.get(group, _FALLBACK_ICON)),
-                label=group)
+                icon=_GROUP_ICONS.get(group, _FALLBACK_ICON), label=group)
                 for group in self._groups],
-            selected_index=0,
-            height=80,
-            elevation=3,
-            on_change=self._on_bar_change,
-        )
+            selected_index=0, on_change=self._on_bar_change)
 
         self.root = self.render()
         self.show(initial_destination or self._anchor(GROUP_READING))
@@ -399,11 +362,7 @@ class NavigationHost:
         ])
 
     def _render_layout(self):
-        """按当前宽/窄窗决定根布局（Rail 行 / Bar 列）。
-
-        tight=True 防止子项在嵌套 TabBarView 时溢出（78 轮实测：expand=True
-        在某些窄窗下会塌成 0 宽，导致正文被裁切）。
-        """
+        """按当前宽/窄窗决定根布局（Rail 行 / Bar 列）。"""
         if self._is_narrow():
             return ft.Column([
                 ft.Container(self.content, expand=True),
@@ -412,16 +371,11 @@ class NavigationHost:
         return ft.Row([
             self._rail,
             ft.VerticalDivider(width=1, opacity=0.5),
-            ft.Container(self.content, expand=True, alignment=ft.Alignment.TOP_LEFT),
-        ], expand=True, spacing=0, tight=True)
+            ft.Container(self.content, expand=True),
+        ], expand=True, spacing=0)
 
     def rebuild(self):
-        """宽/窄窗切换时调用：换根布局但保留当前内容视图（不重建目的地）。
-
-        注意：此方法只在**跨过** :data:`NARROW_WIDTH_THRESHOLD` 时被调用
-        （见 _on_resize 的 last_narrow 缓存）。同档内拖窗不会触发，避免
-        920 行书源表时的 0.5-2.1s 冻结（78 轮实测：30 拍只收到 1-4 次回调）。
-        """
+        """宽/窄窗切换时调用：换根布局但保留当前内容视图（不重建目的地）。"""
         self.root = self.render()
         self._sync_selected()
         self._notify_band()
@@ -806,18 +760,19 @@ def build_app_shell(page: ft.Page, hub: ServiceHub, shelf_probe=None,
 
     # 窗口跨阈值缩放时：宽/窄窗切换重建外壳（内容视图保留，不重建）。
     #
-    # ✅ **同档不重建契约**（78 轮实测验证）：
-    # - 拖窗期间 Python 侧只收到 1-4 次 on_resize（客户端合流优化）
-    # - 每次 rebuild()+_repaint_root() 需 0.5-2.1s（917 行书源表 ≈ 9200 控件序列化）
-    # - 只在**跨过** NARROW_WIDTH_THRESHOLD (720px) 时才重建，同档内直接返回
-    # - 形状没变的那一拍重发相同树，除了冻结页面没有任何收益
+    # 只在这一拍**跨过** :data:`NARROW_WIDTH_THRESHOLD` 时才重建，同档位内直接返回。
+    # 第七十八轮实测：拖窗期间 Python 侧只收到 1–4 次 ``on_resize``（客户端合掉了），
+    # 但**每一次**处理器都要 0.5–2.1 s——因为 `rebuild()+_repaint_root()` 是把整棵根树
+    # 重新序列化后发给客户端（书源表 917 条时约 9200 个控件）。不跨阈值也照发的话，
+    # 拖窗过程中会随机冻住界面循环半秒到两秒（心跳同期落后 max 545 ms）。
+    # 形状没变的那一拍重发形状相同的树，除了冻页面什么都不换来。
     last_narrow = host._is_narrow()
 
     def _on_resize(e=None):
         nonlocal last_narrow
         now_narrow = host._is_narrow()
         if now_narrow == last_narrow:
-            return  # ✅ 同档零重建（CPU < 5%，不序列化控件树）
+            return
         last_narrow = now_narrow
         host.rebuild()
         host._repaint_root()

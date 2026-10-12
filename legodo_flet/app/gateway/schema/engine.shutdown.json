@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "description": "engine.shutdown 入参。",
+  "properties": {
+    "reason": {
+      "type": "string",
+      "description": "为什么收摊（只进日志，不参与判定）。"
+    }
+  },
+  "additionalProperties": false
+}

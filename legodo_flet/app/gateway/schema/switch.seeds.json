@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "description": "switch.seeds 入参：换源对话框打开时先读的本地种子（不联网）。",
+  "properties": {
+    "book": {
+      "type": "object",
+      "description": "要换源的那本书：书架那一行原样传回即可（服务端只读 name/author 去 search_books 里取同名书）。字段口径与 bookshelf.list 一致；这里不锁键名，因为书架行的形状由 books 表定，锁一份就是再抄一遍。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "book"
+  ]
+}

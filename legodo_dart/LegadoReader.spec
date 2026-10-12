@@ -20,13 +20,13 @@ hiddenimports = [
     "app.services.gateway.service",
     "app.gateway.methods",  # action 表注册模块（必须导入才能填充 BY_ACTION）
     "app.core.engine_worker",
-    "app.core.service_hub",
+    "app.core.hub",
     # M1: 阅读核心
     "app.services.reading.book_cache_service",
     "app.services.reading.reading_service",
     "app.services.reading.download_service",
     "app.services.reading.bookmark_service",
-    "app.services.reading.content_search_service",
+    "app.services.reading.content_search",
     "app.services.reading.image_book_service",
     # M2: 引擎层
     "app.services.engine.rule_engine_service",
@@ -71,14 +71,12 @@ excludes = [
     "cv2",                  # 112MB - QR码可用更轻量方案（如qrcode库本身就够了）
 ]
 
-# 计算项目根目录和 app 源码路径（使用环境变量或硬编码路径）
-import os
-# PyInstaller spec 执行时 __file__ 不可用，使用当前工作目录
+# 计算项目根目录和 app 源码路径（使用运行时相对路径）
 _script_dir = os.getcwd()  # legodo_dart/ 目录
-_app_source = os.path.join(_script_dir, "app_backend")  # 本地后端副本（与顶层 app/ 分离）
+_app_source = os.path.join(_script_dir, "app")  # 本地后端副本（与顶层 app/ 分离）
 
 a = Analysis(
-    [os.path.join(_app_source, "main.py")],  # 打包入口：本地 app_backend/main.py
+    [os.path.join(_app_source, "main.py")],  # 打包入口：本地 app/main.py
     pathex=[_script_dir],  # legodo_dart/ 目录作为搜索路径
     binaries=[
         # conda python 3.12 的 VC runtime + UCRT 全套 DLL（从 conda 根目录）

@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "properties": {
+    "rate_key": {
+      "type": "string",
+      "enum": [
+        "slow",
+        "normal",
+        "fast",
+        "very_fast"
+      ]
+    }
+  },
+  "required": [
+    "rate_key"
+  ],
+  "additionalProperties": false
+}

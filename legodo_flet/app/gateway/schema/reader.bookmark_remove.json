@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "description": "reader.bookmark_remove 入参：删一条书签。",
+  "properties": {
+    "book_url": {
+      "type": "string",
+      "description": "books/bookUrl：书签属于哪本书（按 id 删时也要带上书，删错书的行比删不掉更坏）。"
+    },
+    "bookmark_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "reader.bookmarks 回的那条 bookmark_id。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "bookmark_id",
+    "book_url"
+  ]
+}

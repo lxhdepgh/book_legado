@@ -37,7 +37,13 @@ from app.services.content.read_aloud import ReadAloudService
 from app.services.content.local_book_service import is_local_source_url
 from app.services.sources.rule_repair_service import RuleRepairService
 from app.services.engine.rule_engine import display_intro, html_to_text
-from app.services.tools.dict_service import DictService
+
+# [已移除] 词典服务在任务 #45 中被删除，改为条件导入
+try:
+    from app.services.tools.dict_service import DictService
+except ImportError:
+    DictService = None
+
 from app.core.shortcuts import (action_for, chord_of, default_reader_shortcuts,
                                 merge_reader_shortcuts)
 

@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "backup_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "backup_id"
+  ],
+  "additionalProperties": false
+}

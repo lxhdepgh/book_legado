@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "description": "reader.open 入参：开一个阅读会话。服务端按 source_url 取回书源对象，按 book 的 url 走书源规则；会话是进程内单例，第二次 open 会顶掉第一次（顶掉前先把上一次的进度落库）。",
+  "properties": {
+    "source_url": {
+      "type": "string",
+      "description": "bookSourceUrl。空串表示「按 book.origin 反查书源」——从书架点开的路径就是这一条。"
+    },
+    "book": {
+      "type": "object",
+      "description": "书籍的字典快照（书架记录或搜索结果那一行，字段口径由服务端 _book_item_dict 定）。服务端负责还原成 BookItem。"
+    },
+    "shelve": {
+      "type": "boolean",
+      "description": "true=进书架；false=Legado 的 notShelf 试读暂存（退出时要问「放入书架吗」，见 reader.staged）。缺省按 true。"
+    },
+    "resume": {
+      "type": "boolean",
+      "description": "true=按 books 表的存档恢复续读位置。缺省按 true；false 从第一章开始。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "book",
+    "source_url"
+  ]
+}

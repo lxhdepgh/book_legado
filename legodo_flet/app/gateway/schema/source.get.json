@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "description": "source.get 入参。",
+  "properties": {
+    "url": {
+      "type": "string",
+      "description": "bookSourceUrl。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "url"
+  ]
+}

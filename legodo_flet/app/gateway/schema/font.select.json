@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "family": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "family"
+  ],
+  "additionalProperties": false
+}

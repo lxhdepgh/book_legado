@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "description": "rss.star 入参：收藏 / 取消收藏一篇文章（Legado 的 rssStars 在这里折成 rss_articles.star_flag 一列）。回 data 是 true/false，false=这条不在了；客户端要按回包翻图标，别按「我发了什么」翻——发出去了没改成，图标就会与库不一致。",
+  "properties": {
+    "article_id": {
+      "type": "integer",
+      "description": "文章 id。"
+    },
+    "starred": {
+      "type": "boolean",
+      "description": "true=收藏，false=取消收藏。是设值不是取反：两个客户端同时点同一篇文章时，取反的那个会把另一个的操作盖回去。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "article_id",
+    "starred"
+  ]
+}

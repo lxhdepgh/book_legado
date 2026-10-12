@@ -1,0 +1,6 @@
+{
+  "type": "object",
+  "description": "engine.status 入参：无。返回全部服务的状态快照。",
+  "properties": {},
+  "additionalProperties": false
+}

@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "description": "reader.content 入参：取一章正文。chapter_url 必须是 reader.toc 回的那一条原样传回（服务端按 url 在目录里找回引擎用的那个 ChapterItem，认不出来的 url 直接报错，不静默回空章）。",
+  "properties": {
+    "source_url": {
+      "type": "string",
+      "description": "bookSourceUrl。"
+    },
+    "book_url": {
+      "type": "string",
+      "description": "books/bookUrl。"
+    },
+    "chapter_url": {
+      "type": "string",
+      "description": "目录那一行的 url（reader.toc 的 url 字段）。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "book_url",
+    "chapter_url",
+    "source_url"
+  ]
+}

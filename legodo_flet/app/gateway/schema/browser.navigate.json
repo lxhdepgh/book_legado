@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "session_id": {
+      "type": "string"
+    },
+    "url": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "url"
+  ],
+  "additionalProperties": false
+}

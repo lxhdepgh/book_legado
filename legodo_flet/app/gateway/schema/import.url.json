@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "description": "import.url 入参：按 URL 拉取再导入。",
+  "properties": {
+    "url": {
+      "type": "string",
+      "description": "在线资源地址；拉不到记一条 error 而不是抛穿。"
+    },
+    "kind": {
+      "type": "string",
+      "description": "同 import.text 的 kind。"
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "append",
+        "replace"
+      ],
+      "description": "同 import.text 的 mode。"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "url"
+  ]
+}
