@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
-"""Legodo Flet - 多平台打包脚本（使用 flet pack）。
+"""Legodo Flet - 多平台打包脚本（基于 flet pack）。
 
 用法：
     conda activate legodo_booksource_check
     cd legodo_flet
-    python build_release.py windows   # Windows 桌面版
-    python build_release.py macos     # macOS 桌面版
-    python build_release.py linux     # Linux 桌面版
+    python build_release.py windows              # Windows 单文件 exe
+    python build_release.py windows --onedir     # Windows 目录版（更快启动）
+    python build_release.py macos                # macOS .app
+    python build_release.py linux                # Linux 可执行文件
 
-功能：
-1. 使用 flet pack 打包完整应用（UI + 后端服务，单进程架构）
-2. 生成发布包（zip/tar.gz）
-
-架构说明：
-- Flet 是纯 Python 项目，UI 和后端在同一个进程（ServiceHub）
-- 使用 flet pack 命令自动处理 PyInstaller 配置和依赖收集
-- 生成的 exe 包含完整的 Python 运行时和所有依赖
+特性：
+- 使用 flet pack 自动处理 PyInstaller 配置
+- 支持 Windows/macOS/Linux 三平台
+- Windows 默认单文件 exe，可选 --onedir 目录版
+- 自动生成发布包（zip/tar.gz）
 """
+import argparse
 import os
 import platform
 import shutil
@@ -26,143 +25,119 @@ from pathlib import Path
 
 
 # --------------------------------------------------------------------------- #
-# 路径计算（全部基于运行时相对路径，避免硬编码）
+# 路径计算
 # --------------------------------------------------------------------------- #
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_PROJECT_ROOT = _SCRIPT_DIR.parent  # 项目根目录
-_APP_SOURCE = _SCRIPT_DIR / "app"  # Python app (backend + frontend)
+_APP_SOURCE = _SCRIPT_DIR / "app"
 _OUTPUT_DIR = _SCRIPT_DIR / "dist"
 
 
-def find_command(names: list[str]) -> str | None:
-    """在 PATH 中查找可用的命令。"""
-    for name in names:
-        path = shutil.which(name)
-        if path:
-            return path
-    return None
-
-
-def detect_python() -> str:
-    """检测当前 conda 环境的 Python 解释器。"""
-    # 优先使用当前运行的 Python
-    if "legodo_booksource_check" in sys.executable:
-        return sys.executable
-    
-    # 尝试常见的 conda 环境路径
+def find_flet() -> str:
+    """查找 flet 命令。"""
+    # 1. 当前 Python 环境同级目录
     candidates = [
-        Path(sys.prefix) / "python.exe",  # Windows
-        Path(sys.prefix) / "bin" / "python",  # Unix
+        Path(sys.executable).parent / "flet.exe",
+        Path(sys.executable).parent / "flet",
     ]
-    for p in candidates:
-        if p.exists():
-            return str(p)
+    for c in candidates:
+        if c.exists():
+            return str(c)
     
-    # 最后尝试 PATH 中的 python
-    py = find_command(["python"])
-    if py:
-        return py
+    # 2. PATH 中查找
+    path = shutil.which("flet")
+    if path:
+        return path
     
-    raise RuntimeError("找不到 Python 解释器，请激活 conda 环境 legodo_booksource_check")
+    raise RuntimeError(
+        "找不到 flet 命令。\n"
+        "请安装: pip install flet-cli\n"
+        "或激活 conda 环境: conda activate legodo_booksource_check"
+    )
 
 
-def run_cmd(cmd: list[str], cwd: Path | None = None, description: str = "") -> int:
-    """运行命令并返回退出码。"""
-    print(f"[INFO] {description or ' '.join(cmd)}")
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(cwd) if cwd else None,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace"
-        )
-        if result.stdout:
-            for line in result.stdout.strip().split("\n"):
-                if line.strip():
-                    print(f"  {line}")
-        if result.stderr:
-            for line in result.stderr.strip().split("\n"):
-                if line.strip():
-                    print(f"  [STDERR] {line}")
-        if result.returncode != 0:
-            print(f"[ERROR] Command failed with exit code {result.returncode}")
-        return result.returncode
-    except Exception as exc:
-        print(f"[ERROR] Command execution failed: {exc}")
-        return 1
+def run_cmd(cmd: list[str], cwd: Path | None = None) -> int:
+    """运行命令并实时输出。"""
+    print(f"$ {' '.join(str(c) for c in cmd)}", flush=True)
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    
+    for line in proc.stdout:
+        print(line.rstrip())
+    
+    proc.wait()
+    return proc.returncode
 
 
-def pack_app(python_exe: str):
-    """步骤 1：使用 flet pack 打包完整应用。"""
-    print("\n[1/2] Packing application with flet pack...")
+def build_flet_pack(flet_cmd: str, target: str, onedir: bool = False) -> Path:
+    """步骤 1：使用 flet pack 打包应用。"""
+    print(f"\n[1/2] Building with flet pack ({target})...")
     
-    # 查找 flet 命令
-    flet_cmd = None
-    flet_candidates = [
-        Path(python_exe).parent / "flet.exe",  # Windows conda
-        Path(python_exe).parent / "flet",      # Unix conda
-        "flet",                                # PATH
-    ]
-    for candidate in flet_candidates:
-        if isinstance(candidate, Path):
-            if candidate.exists():
-                flet_cmd = str(candidate)
-                break
-        else:
-            path = shutil.which(candidate)
-            if path:
-                flet_cmd = path
-                break
-    
-    if not flet_cmd:
-        print("[ERROR] flet command not found. Please install flet-cli:")
-        print("  pip install flet-cli")
-        sys.exit(1)
-    
-    print(f"[INFO] Using flet: {flet_cmd}")
-    
-    # 构建 flet pack 命令
     main_py = _APP_SOURCE / "main.py"
     if not main_py.exists():
         print(f"[ERROR] Main script not found: {main_py}")
         sys.exit(1)
     
+    # 构建基础命令
     cmd = [
         flet_cmd,
         "pack",
         str(main_py),
         "--name", "LegadoReader",
         "--distpath", str(_OUTPUT_DIR),
-        "--onedir",  # 使用 onedir 模式（避免单文件模式的 DLL 问题）
-        "-y",        # 非交互模式
+        "-y",  # 非交互模式
     ]
     
-    # 添加隐藏导入（动态加载的服务模块）
+    # Windows 可选择单文件或目录版
+    if target == "windows":
+        if onedir:
+            cmd.append("--onedir")
+            print("[INFO] Mode: onedir (faster startup, larger disk usage)")
+        else:
+            print("[INFO] Mode: single file (smaller distribution, slower startup)")
+    elif target == "macos":
+        # macOS 必须是 onedir（.app bundle）
+        pass
+    elif target == "linux":
+        # Linux 默认单文件
+        pass
+    
+    # 隐藏导入（动态加载的服务模块）
     hidden_imports = [
+        # Gateway + Engine
         "app.services.gateway.service",
         "app.gateway.methods",
         "app.core.engine_worker",
         "app.core.service_hub",
+        # M1: 阅读核心
         "app.services.reading.book_cache_service",
         "app.services.reading.reading_service",
         "app.services.reading.download_service",
         "app.services.reading.bookmark_service",
         "app.services.reading.content_search_service",
         "app.services.reading.image_book_service",
+        # M2: 引擎层
         "app.services.engine.rule_engine_service",
         "app.services.engine.legado_js",
         "app.services.engine.public_suffix",
+        # M3: 书源域
         "app.services.sources.source_service",
         "app.services.sources.source_check_service",
         "app.services.sources.rule_repair_service",
         "app.services.sources.compat_audit_service",
         "app.services.sources.online_import_service",
+        # M4: 内容形态
         "app.services.content.rss_service",
         "app.services.content.local_book_service",
         "app.services.content.media_play",
+        # M5: 工具域
         "app.services.tools.background_service",
         "app.services.tools.book_export_service",
         "app.services.tools.font_service",
@@ -173,13 +148,14 @@ def pack_app(python_exe: str):
         "app.services.tools.web_dav_service",
         "app.services.tools.web_bridge_service",
         "app.services.tools.browser_service",
+        # Core
         "app.core.storage",
     ]
     
     for imp in hidden_imports:
         cmd.extend(["--hidden-import", imp])
     
-    # 添加数据文件（schema 和资源文件）
+    # 数据文件
     schema_dir = _APP_SOURCE / "gateway" / "schema"
     if schema_dir.exists():
         cmd.extend(["--add-data", f"{schema_dir}:app/gateway/schema"])
@@ -189,102 +165,135 @@ def pack_app(python_exe: str):
     if publicsuffix_gz.exists():
         cmd.extend(["--add-data", f"{publicsuffix_gz}:app/resources"])
     
-    ret = run_cmd(cmd, cwd=_SCRIPT_DIR, description="Running flet pack")
+    ret = run_cmd(cmd, cwd=_SCRIPT_DIR)
     if ret != 0:
         print("[ERROR] flet pack failed")
         sys.exit(1)
     
-    dist_dir = _OUTPUT_DIR / "LegadoReader"
-    if not dist_dir.exists():
-        print(f"[ERROR] Pack output not found: {dist_dir}")
+    # 确定输出路径
+    app_name = "LegadoReader"
+    if target == "windows":
+        if onedir:
+            output = _OUTPUT_DIR / app_name
+        else:
+            output = _OUTPUT_DIR / f"{app_name}.exe"
+    elif target == "macos":
+        output = _OUTPUT_DIR / f"{app_name}.app"
+    elif target == "linux":
+        output = _OUTPUT_DIR / app_name
+    else:
+        output = _OUTPUT_DIR / app_name
+    
+    if not output.exists():
+        print(f"[ERROR] Build output not found: {output}")
         sys.exit(1)
     
-    print(f"[OK] Application packed to: {dist_dir}")
-    return dist_dir
+    print(f"[OK] Built: {output}")
+    return output
 
 
-def create_package(platform_name: str, app_src: Path):
+def create_archive(target: str, app_path: Path) -> Path:
     """步骤 2：生成发布包。"""
-    print(f"\n[2/2] Generating release package for {platform_name}...")
+    print(f"\n[2/2] Creating release archive...")
     
-    # 根据平台选择压缩格式
-    if platform_name == "windows":
-        archive_name = f"legodo_flet_{platform_name}.zip"
+    if target == "windows":
+        archive_name = "legodo_flet_windows.zip"
         archive_format = "zip"
-    elif platform_name in ("macos", "linux"):
-        archive_name = f"legodo_flet_{platform_name}.tar.gz"
+    elif target == "macos":
+        archive_name = "legodo_flet_macos.tar.gz"
+        archive_format = "gztar"
+    elif target == "linux":
+        archive_name = "legodo_flet_linux.tar.gz"
         archive_format = "gztar"
     else:
-        print(f"[ERROR] Unsupported platform: {platform_name}")
+        print(f"[ERROR] Unsupported target: {target}")
         sys.exit(1)
     
     archive_path = _SCRIPT_DIR / archive_name
     
-    try:
-        # 删除旧归档
-        if archive_path.exists():
-            archive_path.unlink()
-        
-        # 创建归档（直接打包 PyInstaller 输出目录）
-        shutil.make_archive(
-            str(_SCRIPT_DIR / "legodo_flet_temp"),
-            archive_format,
-            root_dir=str(app_src.parent),
-            base_dir=app_src.name
-        )
-        
-        # 重命名为最终名称
-        temp_archive = _SCRIPT_DIR / f"legodo_flet_temp.{archive_format.replace('gztar', 'tar.gz').replace('zip', 'zip')}"
-        if temp_archive.exists():
-            temp_archive.rename(archive_path)
-        
-        print(f"[OK] Package created: {archive_path}")
-        size_mb = archive_path.stat().st_size / (1024 * 1024)
-        print(f"  - Size: {size_mb:.1f} MB")
-    except Exception as exc:
-        print(f"[ERROR] Failed to create package: {exc}")
-        sys.exit(1)
+    # 删除旧归档
+    if archive_path.exists():
+        archive_path.unlink()
+    
+    # 创建归档
+    root_dir = app_path.parent
+    base_dir = app_path.name
+    
+    print(f"[INFO] Archiving: {base_dir} → {archive_name}")
+    shutil.make_archive(
+        str(_SCRIPT_DIR / "_temp_archive"),
+        archive_format,
+        root_dir=str(root_dir),
+        base_dir=base_dir,
+    )
+    
+    # 重命名临时文件
+    temp_archive = _SCRIPT_DIR / f"_temp_archive.{archive_format.replace('gztar', 'tar.gz')}"
+    if temp_archive.exists():
+        temp_archive.rename(archive_path)
+    
+    size_mb = archive_path.stat().st_size / (1024 * 1024)
+    print(f"[OK] Archive created: {archive_path} ({size_mb:.1f} MB)")
+    return archive_path
 
 
 def main():
-    """主流程。"""
+    parser = argparse.ArgumentParser(
+        description="Build Legodo Flet multi-platform release"
+    )
+    parser.add_argument(
+        "target",
+        choices=["windows", "macos", "linux"],
+        help="Target platform",
+    )
+    parser.add_argument(
+        "--onedir",
+        action="store_true",
+        help="Windows only: create one-folder bundle instead of single-file exe",
+    )
+    args = parser.parse_args()
+    
     print("=" * 60)
-    print("  Legodo BookSource Check (Flet) - Multi-Platform Build")
+    print("  Legodo Flet - Multi-Platform Build")
     print("=" * 60)
-    
-    # 解析参数
-    if len(sys.argv) < 2:
-        print(f"Usage: python {sys.argv[0]} <windows|macos|linux>")
-        sys.exit(1)
-    
-    platform_name = sys.argv[1].lower()
-    if platform_name not in ("windows", "macos", "linux"):
-        print(f"[ERROR] Unsupported platform: {platform_name}")
-        print("Supported: windows, macos, linux")
-        sys.exit(1)
-    
-    print(f"[INFO] Platform: {platform_name}")
-    print(f"[INFO] Script: {_SCRIPT_DIR}")
+    print(f"[INFO] Target: {args.target}")
+    if args.target == "windows" and args.onedir:
+        print(f"[INFO] Mode: onedir")
+    print(f"[INFO] Platform: {platform.system()} {platform.release()}")
     print()
     
-    # 检测 Python
-    python_exe = detect_python()
-    print(f"[INFO] Python: {python_exe}")
+    # 查找 flet 命令
+    flet_cmd = find_flet()
+    print(f"[INFO] Flet: {flet_cmd}")
     
-    # 执行打包流程（简化为两步：打包 + 生成归档）
-    app_src = pack_app(python_exe)
-    create_package(platform_name, app_src)
+    # 步骤 1: 打包
+    app_path = build_flet_pack(flet_cmd, args.target, args.onedir)
+    
+    # 步骤 2: 生成归档
+    archive = create_archive(args.target, app_path)
     
     print("\n" + "=" * 60)
     print("  Build Complete!")
     print("=" * 60)
-    archive_ext = "zip" if platform_name == "windows" else "tar.gz"
-    print(f"\nPackage: {_SCRIPT_DIR / f'legodo_flet_{platform_name}.{archive_ext}'}")
-    print("\nArchitecture:")
-    print("  - Single executable (UI + backend in one process)")
-    print("  - No separate backend needed")
-    print("  - Self-contained with Python runtime")
-    print("  - Built with flet pack (auto-configured PyInstaller)")
+    print(f"\nArchive: {archive}")
+    
+    if args.target == "windows":
+        print("\nNext steps:")
+        print("  - Extract the zip file")
+        if args.onedir:
+            print("  - Run: LegadoReader/LegadoReader.exe")
+        else:
+            print("  - Run: LegadoReader.exe")
+        print("  - No installation required")
+    elif args.target == "macos":
+        print("\nNext steps:")
+        print("  - Extract the tar.gz file")
+        print("  - Drag LegadoReader.app to Applications")
+    elif args.target == "linux":
+        print("\nNext steps:")
+        print("  - Extract the tar.gz file")
+        print("  - chmod +x LegadoReader")
+        print("  - Run: ./LegadoReader")
 
 
 if __name__ == "__main__":
