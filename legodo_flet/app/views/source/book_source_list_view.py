@@ -31,7 +31,8 @@ class BookSourceListView(ft.Column):
         self.on_delete = None               # (record: dict) -> None
         self.on_import_json = None          # () -> None
         self.on_export_json = None          # () -> None
-        self.on_start_check = None          # () -> None
+        # [已移除] on_start_check：检测页已隐藏，改为找书页问题反馈流程
+        # self.on_start_check = None
         self.on_start_repair = None         # () -> None
         # -- 批量选择（对齐旧 manage_view 选择模式） --
         self.on_selection_changed = None    # (url: str, checked: bool) -> None
@@ -73,9 +74,10 @@ class BookSourceListView(ft.Column):
         self._export_btn = ft.OutlinedButton(
             "导出", icon=ft.Icons.UPLOAD,
             on_click=lambda e: self._fire(self.on_export_json, e))
-        self._check_btn = ft.FilledTonalButton(
-            "检测", icon=ft.Icons.FACT_CHECK_OUTLINED,
-            on_click=lambda e: self._fire(self.on_start_check, e))
+        # [已移除] 检测按钮：检测页已隐藏，改为找书页问题反馈流程
+        # self._check_btn = ft.FilledTonalButton(
+        #     "检测", icon=ft.Icons.FACT_CHECK_OUTLINED,
+        #     on_click=lambda e: self._fire(self.on_start_check, e))
         self._repair_btn = ft.FilledTonalButton(
             "自愈", icon=ft.Icons.HEALING_OUTLINED,
             on_click=lambda e: self._fire(self.on_start_repair, e))
@@ -90,11 +92,10 @@ class BookSourceListView(ft.Column):
                     ft.Container(self._refresh_btn,
                                  col={"xs": 6, "sm": 1, "lg": 1}),
                 ], columns=12, spacing=6, run_spacing=4),
-                # 操作行：全选 / 导入 / 导出 / 检测 / 自愈（wrap 防窄窗裁剪）
+                # 操作行：全选 / 导入 / 导出 / 自愈（wrap 防窄窗裁剪）
                 ft.Row([
                     self._select_all_btn, self._import_btn,
-                    self._export_btn, self._check_btn,
-                    self._repair_btn,
+                    self._export_btn, self._repair_btn,
                 ], spacing=8, wrap=True),
             ]))
         # 批量操作栏（有选中时显示，对齐旧 manage_view._batch_bar）

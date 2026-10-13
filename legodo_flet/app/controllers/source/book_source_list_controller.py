@@ -63,7 +63,8 @@ class BookSourceListController(BaseController):
         self._view.on_delete = self.request_delete
         self._view.on_import_json = lambda e: self._fire(self.on_open_import)
         self._view.on_export_json = self.export_json
-        self._view.on_start_check = lambda e: self._fire(self.on_open_check)
+        # [已移除] 检测按钮回调：检测页已隐藏，改为找书页问题反馈流程
+        # self._view.on_start_check = lambda e: self._fire(self.on_open_check)
         self._view.on_start_repair = lambda e: self._start_repair()
         # -- 批量选择（对齐旧 manage_view） --
         self._view.on_selection_changed = self._on_selection_changed
