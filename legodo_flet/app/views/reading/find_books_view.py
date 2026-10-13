@@ -206,7 +206,7 @@ class FindBooksView(ft.Column):
             host.controls.append(ft.Text("暂无结果", color=ft.Colors.GREY_500))
 
     def _book_row(self, book: dict) -> ft.Control:
-        """单行结果：书名 / 作者 / 来源 + trailing 操作按钮（试读 + 标记问题）。"""
+        """单行结果：书名 / 作者 / 来源 + trailing 操作按钮（标记问题）。"""
         return ft.ListTile(
             leading=ft.Icon(ft.Icons.BOOK_OUTLINED, size=20),
             title=ft.Text(book.get("name", ""), max_lines=1,
@@ -216,16 +216,9 @@ class FindBooksView(ft.Column):
                                        book.get("origin_name", "")) if p),
                 size=11, color=ft.Colors.GREY_500, max_lines=1,
                 overflow=ft.TextOverflow.ELLIPSIS, expand=True),
-            trailing=ft.Row([
-                # 试读按钮
-                ft.IconButton(
-                    ft.Icons.READ_MORE, tooltip="试读", icon_size=18,
-                    on_click=lambda e, b=book: self._fire(self.on_read_book, b)),
-                # 标记问题按钮
-                ft.IconButton(
-                    ft.Icons.FLAG_OUTLINED, tooltip="书源有问题", icon_size=18,
-                    on_click=lambda e, b=book: self._fire(self.on_report_issue, b)),
-            ], spacing=2, tight=True),
+            trailing=ft.IconButton(
+                ft.Icons.FLAG_OUTLINED, tooltip="书源有问题", icon_size=18,
+                on_click=lambda e, b=book: self._fire(self.on_report_issue, b)),
             on_click=lambda e, b=book: self._fire(self.on_show_detail, b),
             on_long_press=lambda e, b=book: self._fire(self.on_read_book, b),
         )
