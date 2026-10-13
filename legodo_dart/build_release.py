@@ -128,13 +128,15 @@ def ensure_flutter() -> Path:
             [str(flutter), "--version"],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=10,
+            encoding="utf-8",
+            errors="replace"
         )
         if result.returncode == 0:
             version_line = result.stdout.strip().split("\n")[0]
             print(f"[OK] Found Flutter: {version_line}", flush=True)
         else:
-            print(f"[WARN] Flutter version check failed: {result.stderr[:200]}", flush=True)
+            print(f"[WARN] Flutter version check failed", flush=True)
     except Exception as e:
         print(f"[WARN] Could not verify Flutter version: {e}", flush=True)
     
@@ -189,14 +191,27 @@ def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = No
             cmd,
             cwd=cwd or SCRIPT_DIR,
             env=merged_env,
-            check=True
+            check=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT
         )
+        # 实时输出
+        if result.stdout:
+            for line in result.stdout.splitlines():
+                if line.strip():
+                    print(f"  {line}")
     except FileNotFoundError as e:
         print(f"[ERROR] Command not found: {cmd[0]}", file=sys.stderr)
         print(f"[INFO] Please ensure '{cmd[0]}' is installed and in your PATH", file=sys.stderr)
         sys.exit(1)
     except subprocess.CalledProcessError as e:
         print(f"[ERROR] Command failed with exit code {e.returncode}", file=sys.stderr)
+        if e.stdout:
+            for line in str(e.stdout).splitlines():
+                if line.strip():
+                    print(f"  {line}")
         sys.exit(e.returncode)
 
 
