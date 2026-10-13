@@ -30,6 +30,7 @@ class FindBooksView(ft.Column):
         self.on_category_changed = None   # (index: int) -> None
         self.on_read_book = None          # (book: dict) -> None
         self.on_show_detail = None        # (book: dict) -> None
+        self.on_report_issue = None       # (book: dict) -> None  # 新增：标记问题
 
         # ------------------------------------------------------------------ #
         # 书源列表页
@@ -205,7 +206,7 @@ class FindBooksView(ft.Column):
             host.controls.append(ft.Text("暂无结果", color=ft.Colors.GREY_500))
 
     def _book_row(self, book: dict) -> ft.Control:
-        """单行结果：书名 / 作者 / 来源（纯展示，点击交 Controller）。"""
+        """单行结果：书名 / 作者 / 来源 + trailing 操作按钮（试读 + 标记问题）。"""
         return ft.ListTile(
             leading=ft.Icon(ft.Icons.BOOK_OUTLINED),
             title=ft.Text(book.get("name", ""), max_lines=1,
@@ -215,6 +216,16 @@ class FindBooksView(ft.Column):
                                        book.get("origin_name", "")) if p),
                 size=11, color=ft.Colors.GREY_500, max_lines=1,
                 overflow=ft.TextOverflow.ELLIPSIS),
+            trailing=ft.Row([
+                # 试读按钮
+                ft.IconButton(
+                    ft.Icons.READ_MORE, tooltip="试读", icon_size=20,
+                    on_click=lambda e, b=book: self._fire(self.on_read_book, b)),
+                # 标记问题按钮
+                ft.IconButton(
+                    ft.Icons.FLAG_OUTLINED, tooltip="书源有问题", icon_size=20,
+                    on_click=lambda e, b=book: self._fire(self.on_report_issue, b)),
+            ], spacing=4),
             on_click=lambda e, b=book: self._fire(self.on_show_detail, b),
             on_long_press=lambda e, b=book: self._fire(self.on_read_book, b),
         )
@@ -256,4 +267,126 @@ class FindBooksView(ft.Column):
                         max_lines=8, selectable=True),
             ], tight=True, width=420),
             actions=actions,
+        )
+
+    # 问题反馈对话框（模态，由 Controller 在 page 上 show_dialog） ---------------- #
+    def build_issue_dialog(self, book: dict, on_try_repair=None,
+                           on_remove_source=None, on_cancel=None) -> ft.AlertDialog:
+        """构造书源问题反馈对话框。
+        
+        Args:
+            book: 书籍信息字典（含 origin_url / origin_name）
+            on_try_repair: 尝试自愈回调 (book: dict) -> None
+            on_remove_source: 移除书源回调 (book: dict) -> None
+            on_cancel: 取消回调 () -> None
+        """
+        source_name = book.get("origin_name", "未知书源")
+        book_name = book.get("name", "未知书籍")
+        
+        return ft.AlertDialog(
+            modal=True,
+            title=ft.Text("报告书源问题", size=18, weight=ft.FontWeight.BOLD),
+            content=ft.Column([
+                ft.Text(f"书源：{source_name}", size=14, weight=ft.FontWeight.W_500),
+                ft.Text(f"书籍：{book_name}", size=13, color=ft.Colors.GREY_700),
+                ft.Container(height=12),
+                ft.Text("请选择处理方式：", size=13, color=ft.Colors.GREY_600),
+                ft.Container(height=8),
+                ft.Text("• 尝试自愈：自动分析并修复正文规则", size=12),
+                ft.Text("• 移除此源：禁用该搜索书源", size=12),
+            ], tight=True, width=420),
+            actions=[
+                ft.TextButton("取消", on_click=lambda e: self._fire(on_cancel)),
+                ft.TextButton(
+                    "移除此源", icon=ft.Icons.DELETE_OUTLINE,
+                    style=ft.ButtonStyle(color=ft.Colors.ERROR),
+                    on_click=lambda e, b=book: self._fire(on_remove_source, b)),
+                ft.Button(
+                    "尝试自愈", icon=ft.Icons.AUTO_FIX_HIGH,
+                    on_click=lambda e, b=book: self._fire(on_try_repair, b)),
+            ],
+        )
+
+    # 进度提示对话框（自愈过程中显示） ---------------------------------------- #
+    def build_progress_dialog(self, message: str) -> ft.AlertDialog:
+        """构造进度提示对话框（不可关闭，等任务完成）。"""
+        return ft.AlertDialog(
+            modal=True,
+            content=ft.Column([
+                ft.ProgressRing(width=32, height=32),
+                ft.Container(height=12),
+                ft.Text(message, text_align=ft.TextAlign.CENTER),
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+        )
+
+    # 自愈结果对话框 ---------------------------------------------------------- #
+    def build_repair_result_dialog(self, report: dict, on_apply=None,
+                                    on_remove=None, on_cancel=None) -> ft.AlertDialog:
+        """构造自愈结果对话框。
+        
+        Args:
+            report: 自愈报告字典（含 has_fix / old_value / new_value / samples / reason）
+            on_apply: 应用修复回调 (report: dict) -> None
+            on_remove: 移除书源回调 (report: dict) -> None
+            on_cancel: 取消回调 () -> None
+        """
+        has_fix = report.get("has_fix", False)
+        
+        if not has_fix:
+            # 自愈失败：只显示原因 + 移除选项
+            reason = report.get("reason", "无法生成修复方案")
+            return ft.AlertDialog(
+                modal=True,
+                title=ft.Text("自愈失败", size=18, weight=ft.FontWeight.BOLD),
+                content=ft.Column([
+                    ft.Icon(ft.Icons.ERROR_OUTLINE, size=48, color=ft.Colors.ERROR),
+                    ft.Container(height=12),
+                    ft.Text(reason, max_lines=6, selectable=True),
+                    ft.Container(height=8),
+                    ft.Text("建议移除此书源或手动调整规则", size=12,
+                            color=ft.Colors.GREY_600),
+                ], tight=True, width=420,
+                   horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                actions=[
+                    ft.TextButton("取消", on_click=lambda e: self._fire(on_cancel)),
+                    ft.TextButton(
+                        "移除此源", icon=ft.Icons.DELETE_OUTLINE,
+                        style=ft.ButtonStyle(color=ft.Colors.ERROR),
+                        on_click=lambda e, r=report: self._fire(on_remove, r)),
+                ],
+            )
+        
+        # 自愈成功：显示原规则 vs 新规则 + 抽样复核
+        old_value = report.get("old_value", "")
+        new_value = report.get("new_value", "")
+        samples = report.get("samples", [])
+        sample_text = ""
+        if samples:
+            parts = [f"{s.get('chapter', '')} ({s.get('chars', 0)}字)" for s in samples[:3]]
+            sample_text = "抽样复核：" + "、".join(parts)
+        
+        return ft.AlertDialog(
+            modal=True,
+            title=ft.Text("自愈成功", size=18, weight=ft.FontWeight.BOLD),
+            content=ft.Column([
+                ft.Icon(ft.Icons.CHECK_CIRCLE_OUTLINE, size=48, color=ft.Colors.GREEN),
+                ft.Container(height=12),
+                ft.Text(sample_text, size=12, color=ft.Colors.GREY_700),
+                ft.Container(height=8),
+                ft.Text("原规则", size=11, color=ft.Colors.GREY_500),
+                ft.Text(old_value or "(空)", size=11, max_lines=3, selectable=True),
+                ft.Container(height=8),
+                ft.Text("新规则（已优化）", size=11, color=ft.Colors.BLUE),
+                ft.Text(new_value or "(空)", size=11, max_lines=3, selectable=True),
+            ], tight=True, width=420),
+            actions=[
+                ft.TextButton("取消", on_click=lambda e: self._fire(on_cancel)),
+                ft.TextButton(
+                    "移除此源", icon=ft.Icons.DELETE_OUTLINE,
+                    style=ft.ButtonStyle(color=ft.Colors.ERROR),
+                    on_click=lambda e, r=report: self._fire(on_remove, r)),
+                ft.Button(
+                    "应用并重试", icon=ft.Icons.PLAY_ARROW,
+                    on_click=lambda e, r=report: self._fire(on_apply, r)),
+            ],
         )

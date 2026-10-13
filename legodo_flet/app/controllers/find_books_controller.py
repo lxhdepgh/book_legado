@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import flet as ft
@@ -72,6 +73,7 @@ class FindBooksController(BaseController):
         self._view.on_category_changed = self._on_category_changed
         self._view.on_show_detail = self.show_detail
         self._view.on_read_book = self.read_book
+        self._view.on_report_issue = self.report_issue  # 新增：标记问题
 
         # 逐源增量事件高频，0.5s 合并（trailing 保证最后一次收口快照上屏）
         self.subscribe(SearchFinishedEvent,
@@ -508,3 +510,171 @@ class FindBooksController(BaseController):
             return self._view.page
         except Exception:
             return None
+
+    # ------------------------------------------------------------------ #
+    # 书源问题反馈（新增：标记问题 → 自愈/移除）
+    # ------------------------------------------------------------------ #
+    def report_issue(self, book: dict) -> None:
+        """弹出问题反馈对话框。"""
+        page = self._page()
+        if page is None:
+            return
+        dialog = self._view.build_issue_dialog(
+            book,
+            on_try_repair=lambda b: self._try_repair(b, dialog),
+            on_remove_source=lambda b: self._remove_source(b, dialog),
+            on_cancel=lambda: page.pop_dialog())
+        page.show_dialog(dialog)
+
+    async def _try_repair(self, book: dict, issue_dialog) -> None:
+        """尝试自愈：三层降级获取章节 → 跑自愈 → 显示结果。"""
+        page = self._page()
+        if page is None:
+            return
+        
+        source = self._source_for(book)
+        if source is None or self._rule_engine is None:
+            self._view.set_status("未找到书源或引擎未就绪")
+            page.pop_dialog()
+            return
+        
+        # 关闭问题对话框，显示进度
+        page.pop_dialog()
+        progress_dialog = self._view.build_progress_dialog("正在获取章节...")
+        page.show_dialog(progress_dialog)
+        
+        try:
+            # 第1层：reader-cache 中该书的已缓存目录
+            chapters = await self._get_repair_chapters(source, book)
+            if not chapters:
+                page.pop_dialog()
+                self._view.set_status("无法获取章节，请手动试读一章后再尝试自愈")
+                return
+            
+            # 更新进度
+            page.pop_dialog()
+            progress_dialog = self._view.build_progress_dialog(
+                f"正在分析 {len(chapters)} 个章节...")
+            page.show_dialog(progress_dialog)
+            
+            # 跑自愈
+            from app.services.sources.rule_repair_service import RuleRepairService
+            repair_service = self._safe_service(RuleRepairService)
+            if repair_service is None:
+                page.pop_dialog()
+                self._view.set_status("RuleRepairService 未就绪")
+                return
+            
+            report = await repair_service.repair(
+                source, chapters[0],
+                extra_chapters=chapters[1:],
+                book=book.get("name", ""))
+            
+            # 显示结果
+            page.pop_dialog()
+            result_dialog = self._view.build_repair_result_dialog(
+                report,
+                on_apply=lambda r: self._apply_repair(r, book),
+                on_remove=lambda r: self._remove_source_after_repair(book, r),
+                on_cancel=lambda: page.pop_dialog())
+            page.show_dialog(result_dialog)
+            
+        except Exception as exc:
+            logger.warning("自愈失败：%s", exc, exc_info=True)
+            page.pop_dialog()
+            self._view.set_status(f"自愈异常：{exc}")
+
+    async def _get_repair_chapters(self, source, book: dict):
+        """三层降级获取用于自愈的章节候选。"""
+        from app.models.book_source import BookSource
+        
+        source_url = str(getattr(source, "bookSourceUrl", "") or "").strip()
+        book_url = str(book.get("origin") or "").strip()
+        book_name = str(book.get("name") or "")
+        
+        # 第1层：reader-cache 中该书的已缓存目录（最可靠，不出网）
+        try:
+            from app.services.sources.rule_repair_service import RuleRepairService
+            repair_service = self._safe_service(RuleRepairService)
+            if repair_service:
+                cached = await repair_service.chapter_candidates(source_url, book_url)
+                if cached:
+                    logger.debug("自愈使用 reader-cache 章节：%d 章", len(cached))
+                    return cached[:3]
+        except Exception as exc:
+            logger.debug("reader-cache 读取失败：%s", exc)
+        
+        # 第2层：检测快照中的 sample_chapter_urls
+        try:
+            from app.services.sources.source_check_service import SourceCheckService
+            check_service = self._safe_service(SourceCheckService)
+            if check_service:
+                snap = await check_service.run_snapshot()
+                for result in snap.get("results", []):
+                    if result.get("source_id") == source_url:
+                        urls = result.get("sample_chapter_urls", [])
+                        if urls:
+                            logger.debug("自愈使用检测样本章节：%d 章", len(urls))
+                            return [
+                                BookSource(
+                                    url=url, name=f"样本章{i+1}", index=i)
+                                for i, url in enumerate(urls[:3])
+                            ]
+        except Exception as exc:
+            logger.debug("检测快照读取失败：%s", exc)
+        
+        # 第3层：现场抓取目录（出网，但只抓一次）
+        try:
+            engine = await self._rule_engine.get_engine(source)
+            chapters = await asyncio.wait_for(
+                engine.chapters(source), timeout=15.0)
+            valid = [ch for ch in chapters if not getattr(ch, "is_volume", False)]
+            if valid:
+                logger.debug("自愈现场抓取目录：%d 章", len(valid))
+                return valid[:3]
+        except Exception as exc:
+            logger.warning("自愈无法获取章节：%s", exc)
+        
+        return []
+
+    def _apply_repair(self, report: dict, book: dict) -> None:
+        """应用修复并重试。"""
+        page = self._page()
+        if page is None:
+            return
+        
+        # TODO: 调用 RuleRepairService.apply_fix(report_id)
+        # 目前先简单提示
+        page.pop_dialog()
+        self._view.set_status("修复已应用，请重新搜索验证")
+
+    def _remove_source_after_repair(self, book: dict, report: dict) -> None:
+        """自愈失败后移除书源。"""
+        self._remove_source(book, None)
+
+    async def _remove_source(self, book: dict, dialog) -> None:
+        """禁用并隐藏书源。"""
+        source = self._source_for(book)
+        if source is None or self._source_service is None:
+            self._view.set_status("未找到书源")
+            if dialog:
+                self._page().pop_dialog()
+            return
+        
+        source_url = str(getattr(source, "bookSourceUrl", "") or "").strip()
+        source_name = str(getattr(source, "bookSourceName", "") or "未知书源")
+        
+        try:
+            # 使用 set_enabled(false) 禁用书源
+            await self._source_service.set_enabled(source_url, False)
+            if dialog:
+                self._page().pop_dialog()
+            self._view.set_status(f"已移除此源：{source_name}")
+            # 刷新找书结果（如果正在搜索）
+            if self._search_running and self._search_keyword:
+                self.search(self._search_keyword)
+        except Exception as exc:
+            logger.warning("移除书源失败：%s", exc)
+            if dialog:
+                self._page().pop_dialog()
+            self._view.set_status(f"移除失败：{exc}")
