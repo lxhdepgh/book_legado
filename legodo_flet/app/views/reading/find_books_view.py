@@ -208,24 +208,24 @@ class FindBooksView(ft.Column):
     def _book_row(self, book: dict) -> ft.Control:
         """单行结果：书名 / 作者 / 来源 + trailing 操作按钮（试读 + 标记问题）。"""
         return ft.ListTile(
-            leading=ft.Icon(ft.Icons.BOOK_OUTLINED),
+            leading=ft.Icon(ft.Icons.BOOK_OUTLINED, size=20),
             title=ft.Text(book.get("name", ""), max_lines=1,
-                          overflow=ft.TextOverflow.ELLIPSIS),
+                          overflow=ft.TextOverflow.ELLIPSIS, expand=True),
             subtitle=ft.Text(
                 " · ".join(p for p in (book.get("author", ""),
                                        book.get("origin_name", "")) if p),
                 size=11, color=ft.Colors.GREY_500, max_lines=1,
-                overflow=ft.TextOverflow.ELLIPSIS),
+                overflow=ft.TextOverflow.ELLIPSIS, expand=True),
             trailing=ft.Row([
                 # 试读按钮
                 ft.IconButton(
-                    ft.Icons.READ_MORE, tooltip="试读", icon_size=20,
+                    ft.Icons.READ_MORE, tooltip="试读", icon_size=18,
                     on_click=lambda e, b=book: self._fire(self.on_read_book, b)),
                 # 标记问题按钮
                 ft.IconButton(
-                    ft.Icons.FLAG_OUTLINED, tooltip="书源有问题", icon_size=20,
+                    ft.Icons.FLAG_OUTLINED, tooltip="书源有问题", icon_size=18,
                     on_click=lambda e, b=book: self._fire(self.on_report_issue, b)),
-            ], spacing=4),
+            ], spacing=2, tight=True),
             on_click=lambda e, b=book: self._fire(self.on_show_detail, b),
             on_long_press=lambda e, b=book: self._fire(self.on_read_book, b),
         )
@@ -292,7 +292,7 @@ class FindBooksView(ft.Column):
                 ft.Container(height=12),
                 ft.Text("请选择处理方式：", size=13, color=ft.Colors.GREY_600),
                 ft.Container(height=8),
-                ft.Text("• 尝试自愈：自动分析并修复正文规则", size=12),
+                ft.Text("• 尝试自愈：自动分析并修复该书源的正文规则", size=12),
                 ft.Text("• 移除此源：禁用该搜索书源", size=12),
             ], tight=True, width=420),
             actions=[

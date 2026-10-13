@@ -154,7 +154,8 @@ NAV_META: dict[str, tuple] = {
     # -- 书源组（M3）：五个目的地合成「书源」一页的五个页签 --
     DEST_SOURCE_LIST:    (GROUP_SOURCE, "管理",   False),
     DEST_SOURCE_IMPORT:  (GROUP_SOURCE, "导入",   False),
-    DEST_SOURCE_CHECK:   (GROUP_SOURCE, "检测",   False),
+    # [已移除] 检测页：改为找书页问题反馈流程，不再作为独立页签
+    # DEST_SOURCE_CHECK:   (GROUP_SOURCE, "检测",   False),
     DEST_SOURCE_EDITOR:  (GROUP_SOURCE, "规则",   False),
     DEST_SOURCE_REPAIR:  (GROUP_SOURCE, "自愈",   False),
     # -- 阅读组（M2/M4）：找书 + 书架合成「阅读」页的两个页签；
