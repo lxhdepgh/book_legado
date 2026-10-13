@@ -287,8 +287,13 @@ def build_backend(target: str = "windows") -> None:
     print(f"[OK] Backend packed to: {backend_dir}", flush=True)
 
 
-def build_flutter(target: str) -> Path:
-    """构建 Flutter 应用并返回输出目录。"""
+def build_flutter(target: str, single_file: bool = False) -> Path:
+    """构建 Flutter 应用并返回输出目录。
+    
+    Args:
+        target: 目标平台 (windows/linux/macos/apk/ipa)
+        single_file: Windows 专用，是否打包为单文件 exe（需要 Enigma Virtual Box）
+    """
     print(f"\n[2/4] Building Flutter {target} Release...", flush=True)
     
     # 确保 flutter 可用
@@ -322,7 +327,133 @@ def build_flutter(target: str) -> Path:
         sys.exit(1)
     
     print(f"[OK] Build output: {output_dir}", flush=True)
+    
+    # Windows 单文件打包（可选）
+    if target == "windows" and single_file:
+        output_dir = pack_single_file_windows(output_dir)
+    
     return output_dir
+
+
+def find_enigma_virtual_box() -> Path | None:
+    """查找 Enigma Virtual Box 可执行文件。"""
+    candidates = [
+        Path("C:/Program Files/Enigma Virtual Box/enigmavbconsole.exe"),
+        Path("C:/Program Files (x86)/Enigma Virtual Box/enigmavbconsole.exe"),
+        Path(os.environ.get("PROGRAMFILES", "")) / "Enigma Virtual Box/enigmavbconsole.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Enigma Virtual Box/enigmavbconsole.exe",
+    ]
+    
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    
+    # 尝试 PATH
+    if path := shutil.which("enigmavbconsole.exe"):
+        return Path(path)
+    
+    return None
+
+
+def pack_single_file_windows(release_dir: Path) -> Path:
+    """使用 Enigma Virtual Box 将 Windows 发布目录打包为单文件 exe。
+    
+    Args:
+        release_dir: Flutter build windows 输出的 Release 目录
+    
+    Returns:
+        单文件 exe 的路径
+    """
+    print("\n[Packing] Creating single-file executable with Enigma Virtual Box...")
+    
+    enigma_exe = find_enigma_virtual_box()
+    if not enigma_exe:
+        print("[WARN] Enigma Virtual Box not found. Skipping single-file packaging.")
+        print("[INFO] Install from: https://enigmaprotector.com/en/products/virtualbox.html")
+        print("[INFO] Or set ENIGMA_VB_PATH environment variable")
+        return release_dir
+    
+    print(f"[INFO] Using Enigma Virtual Box: {enigma_exe}")
+    
+    # 主 exe 文件
+    main_exe = release_dir / "legodo_client.exe"
+    if not main_exe.exists():
+        print(f"[WARN] Main exe not found: {main_exe}")
+        return release_dir
+    
+    # 输出单文件 exe
+    output_exe = DART_CLIENT / "dist" / "legodo_client_single.exe"
+    output_exe.parent.mkdir(parents=True, exist_ok=True)
+    
+    # 创建 Enigma Virtual Box 配置文件
+    config_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<enigmavb>
+    <input>{main_exe}</input>
+    <output>{output_exe}</output>
+    <options>
+        <compress>true</compress>
+        <upx>false</upx>
+        <protect_import_table>false</protect_import_table>
+    </options>
+    <files>
+"""
+    
+    # 添加所有 DLL 文件
+    for dll in release_dir.glob("*.dll"):
+        rel_path = dll.relative_to(release_dir)
+        config_content += f'        <file source="{dll}" dest="{rel_path}" />\n'
+    
+    # 添加 data 目录
+    data_dir = release_dir / "data"
+    if data_dir.exists():
+        config_content += f'        <folder source="{data_dir}" dest="data" />\n'
+    
+    # 添加 backend 目录
+    backend_dir = release_dir / "backend"
+    if backend_dir.exists():
+        config_content += f'        <folder source="{backend_dir}" dest="backend" />\n'
+    
+    config_content += """    </files>
+</enigmavb>
+"""
+    
+    config_file = DART_CLIENT / "dist" / "enigma_config.xml"
+    config_file.write_text(config_content, encoding="utf-8")
+    
+    # 运行 Enigma Virtual Box
+    cmd = [str(enigma_exe), str(config_file)]
+    print(f"$ {' '.join(str(c) for c in cmd)}", flush=True)
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 分钟超时
+            encoding="utf-8",
+            errors="replace"
+        )
+        
+        if result.returncode != 0:
+            print(f"[ERROR] Enigma Virtual Box failed:")
+            if result.stderr:
+                print(result.stderr)
+            return release_dir
+        
+        if output_exe.exists():
+            size_mb = output_exe.stat().st_size / (1024 * 1024)
+            print(f"[OK] Single-file exe created: {output_exe} ({size_mb:.1f} MB)")
+            return output_exe.parent
+        else:
+            print("[ERROR] Output exe not created")
+            return release_dir
+            
+    except subprocess.TimeoutExpired:
+        print("[ERROR] Enigma Virtual Box timed out (5 minutes)")
+        return release_dir
+    except Exception as e:
+        print(f"[ERROR] Enigma Virtual Box failed: {e}")
+        return release_dir
 
 
 def copy_backend(output_dir: Path) -> None:
@@ -381,6 +512,11 @@ def main() -> None:
         choices=["windows", "linux", "macos", "apk", "ipa"],
         help="Target platform",
     )
+    parser.add_argument(
+        "--single-file",
+        action="store_true",
+        help="Windows only: pack into single-file exe using Enigma Virtual Box",
+    )
     args = parser.parse_args()
     
     print("=" * 60)
@@ -390,6 +526,8 @@ def main() -> None:
     print(f"[INFO] Platform: {platform.system()} {platform.release()}")
     print(f"[INFO] Python: {sys.executable}")
     print(f"[INFO] Script: {SCRIPT_DIR}")
+    if args.target == "windows" and args.single_file:
+        print(f"[INFO] Mode: single-file exe (requires Enigma Virtual Box)")
     print()
     
     # Step 1: Pack Python backend from source
@@ -397,10 +535,10 @@ def main() -> None:
         build_backend(args.target)
     
     # Step 2: Build Flutter
-    output_dir = build_flutter(args.target)
+    output_dir = build_flutter(args.target, single_file=args.single_file)
     
-    # Step 3: Copy backend to output
-    if args.target in ("windows", "linux", "macos", "android"):
+    # Step 3: Copy backend to output（单文件模式跳过，因为已经打包进去了）
+    if args.target in ("windows", "linux", "macos", "android") and not args.single_file:
         copy_backend(output_dir)
     
     # Step 4: Create release package
@@ -415,6 +553,8 @@ def main() -> None:
         print("  - WebView browser (platform-native WebView)")
         print("  - TTS text-to-speech (system TTS)")
         print("  - Python backend for core engine services")
+        if args.target == "windows" and args.single_file:
+            print("  - Single-file executable (no installation required)")
     print()
 
 
