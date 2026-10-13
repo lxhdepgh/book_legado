@@ -10,14 +10,24 @@
 
 ```bash
 cd legodo_flet
-python build_release.py windows   # Windows 桌面版
-python build_release.py linux     # Linux 桌面版
-python build_release.py macos     # macOS 桌面版
+
+# Windows 单文件 exe（默认，体积小适合分发）
+python build_release.py windows
+
+# Windows 目录版（启动快，适合开发测试）
+python build_release.py windows --onedir
+
+# macOS / Linux
+python build_release.py macos
+python build_release.py linux
 ```
 
-产物位置：`legodo_flet/legodo_flet_windows.zip`
+产物位置：
+- Windows: `legodo_flet/legodo_flet_windows.zip`
+- macOS: `legodo_flet/legodo_flet_macos.tar.gz`
+- Linux: `legodo_flet/legodo_flet_linux.tar.gz`
 
-**架构说明**：Flet 是纯 Python 项目，UI 和后端在同一个进程（ServiceHub），直接打包 `main.py` 为独立可执行文件，不需要分离后端。
+**架构说明**：Flet 是纯 Python 项目，UI 和后端在同一个进程（ServiceHub），使用 `flet pack` 命令自动打包为独立可执行文件，不需要分离后端。
 
 详见 `legodo_flet/BUILD.md`。
 
@@ -50,8 +60,8 @@ python build_release.py ios       # iOS IPA（需 macOS + Xcode）
 |------|------|--------------|
 | 前端语言 | Python | Dart |
 | 后端集成 | 同进程 ServiceHub | 子进程 RPC |
-| 打包方式 | PyInstaller（含 Android APK） | Flutter build + PyInstaller |
-| 适用平台 | 桌面端 + Android | 仅桌面端（Windows/Linux/macOS） |
+| 打包方式 | flet pack（自动处理 PyInstaller） | Flutter build + PyInstaller |
+| 适用平台 | 桌面端（Windows/macOS/Linux）+ Android | 仅桌面端（Windows/Linux/macOS） |
 
 **关键区别**：由于后端是 Python，Dart/Flutter 版本无法直接打包为移动端（需要将 Python 运行时嵌入 APK，目前无成熟方案）。Flet 版本基于 Python，可通过 Chaquopy 或 Pydroid3 打包为 Android APK。
 
