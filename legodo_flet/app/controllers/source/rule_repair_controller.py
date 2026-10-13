@@ -69,6 +69,7 @@ class RuleRepairController(BaseController):
         # 空串表示"这页没起过诊断"，此时来的报告一律照画（阅读器那一趟）。
         self._diagnosing = False
         self._expect_source_id = ""
+        self._auto_diagnose_source = ""  # 从列表页跳过来时标记自动诊断的源
         self._candidate_groups: list[dict] = []
         #: 候选面的普查（在架几本 / 读过几本 / 摊了几本）：提示行靠它说"还有谁没摊到"，
         #: 不这么说，摊不到的那几本就是静默消失的。
@@ -216,6 +217,8 @@ class RuleRepairController(BaseController):
 
         载荷只有三键（``_PAYLOAD_KEYS``）——章节不许由列表页传：它手上也没有，
         而且检测内部结构一旦外溢，这里就得跟着猜键名。
+        
+        增强：如果该源在 reader-cache 中有缓存章节，自动选第一章并直接开始诊断。
         """
         if self._view is None:
             return
@@ -224,6 +227,8 @@ class RuleRepairController(BaseController):
         if not url:
             return
         self._view.add_source_option(url, str(payload.get("source_name") or url))
+        # 标记这是从列表页跳过来的（用于后续自动诊断）
+        self._auto_diagnose_source = url
         self.load_chapter_options(url)
 
     # ------------------------------------------------------------------ #
@@ -265,6 +270,16 @@ class RuleRepairController(BaseController):
         # 零样本必须让粘贴框接手：这时候"挑不出一章"不是错误，是本地确实没样本。
         self._view.set_manual_visible(not options)
         self._view.set_chapter_hint(self._candidate_hint(url, options))
+        
+        # 增强：如果从列表页跳过来且有缓存章节，自动选第一章并直接开始诊断
+        auto_source = getattr(self, "_auto_diagnose_source", "")
+        if auto_source == url and options:
+            # 自动选中第一章
+            first_key = options[0][0]
+            self._view.set_chapter_selection(first_key)
+            # 延迟一点再开始诊断（等 UI 更新完）
+            import asyncio
+            asyncio.create_task(self._auto_start_diagnosis(url, first_key))
 
     async def _check_sample_group(self, url: str) -> dict | None:
         """上一轮检测给这一源抽到的样本章（检过、但没读过的源只有这一路）。"""
@@ -312,6 +327,27 @@ class RuleRepairController(BaseController):
                     + "；诊断会真抓 1-3 页，只有你点确认才写回书源")
         return ("这个源本地没有可读目录，也没有检测样本：粘贴一个正文页地址，"
                 "或先读一章 / 跑一轮检测")
+
+    async def _auto_start_diagnosis(self, url: str, chapter_key: str) -> None:
+        """从列表页跳过来且有缓存章节时，自动开始诊断。"""
+        # 等待 UI 更新完成
+        import asyncio
+        await asyncio.sleep(0.3)
+        
+        if self._view is None:
+            return
+        
+        # 检查是否还在等待自动诊断的源
+        auto_source = getattr(self, "_auto_diagnose_source", "")
+        if auto_source != url:
+            return
+        
+        # 清除标记（避免重复触发）
+        self._auto_diagnose_source = ""
+        
+        # 自动开始诊断
+        self._view.set_status("检测到缓存章节，正在自动开始诊断...")
+        self.start_diagnosis()
 
     def _on_chapter_picked(self, chapter_key: str = "") -> None:
         """选了哪一章，顺带说清这一趟还会带上谁做复核。"""
