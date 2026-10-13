@@ -48,7 +48,46 @@ class EngineHandle {
       // 已经连不上就别再喊：这时候进程多半自己没了（idle 兜底在 `--idle-seconds` 那边）。
     }
     client.dispose();
-    started.process.kill(ProcessSignal.sigterm);
+    
+    // Windows 上 SIGTERM 可能无法彻底杀死 Python 进程（尤其当进程在等待 I/O 或有未完成的异步任务时）
+    // 需要强制等待进程退出，必要时使用平台特定的强制杀死命令
+    await _forceKillProcess(started.process);
+  }
+  
+  /// 强制杀死子进程并等待其真正退出
+  Future<void> _forceKillProcess(Process process) async {
+    if (process.exitCode != null) return; // 已经退出
+    
+    // 先尝试温和终止
+    process.kill(ProcessSignal.sigterm);
+    
+    // 给进程 2 秒时间优雅退出
+    try {
+      await process.exitCode.timeout(const Duration(seconds: 2));
+      return; // 已成功退出
+    } on TimeoutException {
+      // 超时未退出，需要强制杀死
+    }
+    
+    // Windows 上使用 taskkill 强制杀死进程树
+    if (Platform.isWindows) {
+      try {
+        final pid = process.pid;
+        await Process.run('taskkill', ['/F', '/T', '/PID', '$pid']);
+        // 再次等待确认退出
+        await process.exitCode.timeout(const Duration(seconds: 1));
+      } on Object {
+        // taskkill 失败或进程已不存在，忽略
+      }
+    } else {
+      // Unix 系统使用 SIGKILL
+      process.kill(ProcessSignal.sigkill);
+      try {
+        await process.exitCode.timeout(const Duration(seconds: 1));
+      } on TimeoutException {
+        // 极端情况：SIGKILL 也无法杀死，记录但不再重试
+      }
+    }
   }
 }
 

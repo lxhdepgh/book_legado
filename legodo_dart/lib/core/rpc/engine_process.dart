@@ -112,8 +112,45 @@ class EngineProcess {
       });
       return StartedEngine(process: process, endpoint: endpoint, stderrTail: stderrTail);
     } catch (_) {
-      process.kill(ProcessSignal.sigterm);
+      // 握手失败/超时，需要强制杀死子进程并等待其真正退出
+      await _forceKillProcess(process);
       rethrow;
+    }
+  }
+  
+  /// 强制杀死子进程并等待其真正退出（与 bootstrap.dart 共用同一套逻辑）
+  static Future<void> _forceKillProcess(Process process) async {
+    if (process.exitCode != null) return; // 已经退出
+    
+    // 先尝试温和终止
+    process.kill(ProcessSignal.sigterm);
+    
+    // 给进程 2 秒时间优雅退出
+    try {
+      await process.exitCode.timeout(const Duration(seconds: 2));
+      return; // 已成功退出
+    } on TimeoutException {
+      // 超时未退出，需要强制杀死
+    }
+    
+    // Windows 上使用 taskkill 强制杀死进程树
+    if (Platform.isWindows) {
+      try {
+        final pid = process.pid;
+        await Process.run('taskkill', ['/F', '/T', '/PID', '$pid']);
+        // 再次等待确认退出
+        await process.exitCode.timeout(const Duration(seconds: 1));
+      } on Object {
+        // taskkill 失败或进程已不存在，忽略
+      }
+    } else {
+      // Unix 系统使用 SIGKILL
+      process.kill(ProcessSignal.sigkill);
+      try {
+        await process.exitCode.timeout(const Duration(seconds: 1));
+      } on TimeoutException {
+        // 极端情况：SIGKILL 也无法杀死，记录但不再重试
+      }
     }
   }
 }
