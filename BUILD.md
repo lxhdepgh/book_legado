@@ -48,11 +48,8 @@ python build_release.py aab
 ```bash
 cd legodo_dart
 
-# Windows 标准版（目录，包含 exe + DLLs）
+# Windows 标准版（目录，包含 exe + DLLs + backend/）
 python build_release.py windows
-
-# Windows 单文件版（需要 Enigma Virtual Box）
-python build_release.py windows --single-file
 
 # macOS / Linux
 python build_release.py macos
@@ -63,11 +60,10 @@ python build_release.py apk
 ```
 
 产物位置：
-- 桌面版（标准）：`legodo_dart/build/windows/x64/runner/Release/`
-- 桌面版（单文件）：`legodo_dart/dist/legodo_client_single.exe`
+- 桌面版：`legodo_dart/build/windows/x64/runner/Release/`
 - Android：`legodo_dart/build/app/outputs/flutter-apk/app-release.apk`
 
-**架构说明**：Dart 前端通过 RPC 调用 Python 后端。Windows 可使用 `--single-file` 参数将前端和后端打包为单个 exe（需要安装 [Enigma Virtual Box](https://enigmaprotector.com/en/products/virtualbox.html)）。
+**架构说明**：Dart 前端通过 RPC 调用 Python 后端。Windows 打包为标准目录版（包含 exe、DLLs 和 backend/ 目录）。如需制作安装包，可使用 Inno Setup 或 NSIS（后续实现）。
 
 详见 `legodo_dart/DEPLOYMENT.md`。
 
