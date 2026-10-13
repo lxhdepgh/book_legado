@@ -59,7 +59,7 @@ def register_destinations(registry: ViewRegistry, hub: ServiceHub) -> ViewRegist
         required_services=("SourceService", "CompatAuditService"))
     registry.register(
         DEST_SOURCE_CHECK, lambda: _build(hub, CheckView, CheckController),
-        required_services=("SourceCheckService",))
+        required_services=("SourceCheckService",), hidden=True)
     registry.register(
         DEST_SOURCE_REPAIR, lambda: _build(hub, RuleRepairView, RuleRepairController),
         required_services=("RuleRepairService",))
