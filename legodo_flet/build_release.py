@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Legodo Flet - 多平台打包脚本（Python 后端 + Flet UI）。
+"""Legodo Flet - 多平台打包脚本（使用 flet pack）。
 
 用法：
     conda activate legodo_booksource_check
@@ -9,12 +9,12 @@
     python build_release.py linux     # Linux 桌面版
 
 功能：
-1. PyInstaller 打包完整应用（含 UI + 后端服务，单进程架构）
+1. 使用 flet pack 打包完整应用（UI + 后端服务，单进程架构）
 2. 生成发布包（zip/tar.gz）
 
 架构说明：
 - Flet 是纯 Python 项目，UI 和后端在同一个进程（ServiceHub）
-- 不需要分离打包，直接打包 main.py 为独立可执行文件
+- 使用 flet pack 命令自动处理 PyInstaller 配置和依赖收集
 - 生成的 exe 包含完整的 Python 运行时和所有依赖
 """
 import os
@@ -22,7 +22,6 @@ import platform
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 
@@ -84,12 +83,12 @@ def run_cmd(cmd: list[str], cwd: Path | None = None, description: str = "") -> i
             for line in result.stdout.strip().split("\n"):
                 if line.strip():
                     print(f"  {line}")
+        if result.stderr:
+            for line in result.stderr.strip().split("\n"):
+                if line.strip():
+                    print(f"  [STDERR] {line}")
         if result.returncode != 0:
             print(f"[ERROR] Command failed with exit code {result.returncode}")
-            if result.stderr:
-                for line in result.stderr.strip().split("\n"):
-                    if line.strip():
-                        print(f"  {line}")
         return result.returncode
     except Exception as exc:
         print(f"[ERROR] Command execution failed: {exc}")
@@ -97,26 +96,107 @@ def run_cmd(cmd: list[str], cwd: Path | None = None, description: str = "") -> i
 
 
 def pack_app(python_exe: str):
-    """步骤 1：用 PyInstaller 打包完整应用（UI + 后端，单进程）。"""
-    print("\n[1/2] Packing complete application (UI + backend in one process)...")
+    """步骤 1：使用 flet pack 打包完整应用。"""
+    print("\n[1/2] Packing application with flet pack...")
     
-    spec_file = _SCRIPT_DIR / "LegadoReader.spec"
-    if not spec_file.exists():
-        print(f"[ERROR] Spec file not found: {spec_file}")
+    # 查找 flet 命令
+    flet_cmd = None
+    flet_candidates = [
+        Path(python_exe).parent / "flet.exe",  # Windows conda
+        Path(python_exe).parent / "flet",      # Unix conda
+        "flet",                                # PATH
+    ]
+    for candidate in flet_candidates:
+        if isinstance(candidate, Path):
+            if candidate.exists():
+                flet_cmd = str(candidate)
+                break
+        else:
+            path = shutil.which(candidate)
+            if path:
+                flet_cmd = path
+                break
+    
+    if not flet_cmd:
+        print("[ERROR] flet command not found. Please install flet-cli:")
+        print("  pip install flet-cli")
         sys.exit(1)
     
-    ret = run_cmd(
-        [python_exe, "-m", "PyInstaller", "--clean", "--noconfirm", str(spec_file)],
-        cwd=_SCRIPT_DIR,
-        description="Running PyInstaller"
-    )
+    print(f"[INFO] Using flet: {flet_cmd}")
+    
+    # 构建 flet pack 命令
+    main_py = _APP_SOURCE / "main.py"
+    if not main_py.exists():
+        print(f"[ERROR] Main script not found: {main_py}")
+        sys.exit(1)
+    
+    cmd = [
+        flet_cmd,
+        "pack",
+        str(main_py),
+        "--name", "LegadoReader",
+        "--distpath", str(_OUTPUT_DIR),
+        "--onedir",  # 使用 onedir 模式（避免单文件模式的 DLL 问题）
+        "-y",        # 非交互模式
+    ]
+    
+    # 添加隐藏导入（动态加载的服务模块）
+    hidden_imports = [
+        "app.services.gateway.service",
+        "app.gateway.methods",
+        "app.core.engine_worker",
+        "app.core.service_hub",
+        "app.services.reading.book_cache_service",
+        "app.services.reading.reading_service",
+        "app.services.reading.download_service",
+        "app.services.reading.bookmark_service",
+        "app.services.reading.content_search_service",
+        "app.services.reading.image_book_service",
+        "app.services.engine.rule_engine_service",
+        "app.services.engine.legado_js",
+        "app.services.engine.public_suffix",
+        "app.services.sources.source_service",
+        "app.services.sources.source_check_service",
+        "app.services.sources.rule_repair_service",
+        "app.services.sources.compat_audit_service",
+        "app.services.sources.online_import_service",
+        "app.services.content.rss_service",
+        "app.services.content.local_book_service",
+        "app.services.content.media_play",
+        "app.services.tools.background_service",
+        "app.services.tools.book_export_service",
+        "app.services.tools.font_service",
+        "app.services.tools.qr_code_service",
+        "app.services.tools.replace_rule_service",
+        "app.services.tools.theme_service",
+        "app.services.tools.update_service",
+        "app.services.tools.web_dav_service",
+        "app.services.tools.web_bridge_service",
+        "app.services.tools.browser_service",
+        "app.core.storage",
+    ]
+    
+    for imp in hidden_imports:
+        cmd.extend(["--hidden-import", imp])
+    
+    # 添加数据文件（schema 和资源文件）
+    schema_dir = _APP_SOURCE / "gateway" / "schema"
+    if schema_dir.exists():
+        cmd.extend(["--add-data", f"{schema_dir}:app/gateway/schema"])
+    
+    resources_dir = _APP_SOURCE / "resources"
+    publicsuffix_gz = resources_dir / "publicsuffixes.gz"
+    if publicsuffix_gz.exists():
+        cmd.extend(["--add-data", f"{publicsuffix_gz}:app/resources"])
+    
+    ret = run_cmd(cmd, cwd=_SCRIPT_DIR, description="Running flet pack")
     if ret != 0:
-        print("[ERROR] PyInstaller failed")
+        print("[ERROR] flet pack failed")
         sys.exit(1)
     
-    dist_dir = _SCRIPT_DIR / "dist" / "LegadoReader"
+    dist_dir = _OUTPUT_DIR / "LegadoReader"
     if not dist_dir.exists():
-        print(f"[ERROR] PyInstaller output not found: {dist_dir}")
+        print(f"[ERROR] Pack output not found: {dist_dir}")
         sys.exit(1)
     
     print(f"[OK] Application packed to: {dist_dir}")
@@ -204,6 +284,7 @@ def main():
     print("  - Single executable (UI + backend in one process)")
     print("  - No separate backend needed")
     print("  - Self-contained with Python runtime")
+    print("  - Built with flet pack (auto-configured PyInstaller)")
 
 
 if __name__ == "__main__":
