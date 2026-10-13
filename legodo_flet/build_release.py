@@ -9,9 +9,13 @@
     python build_release.py linux     # Linux 桌面版
 
 功能：
-1. PyInstaller 打包 Python 后端（含完整服务层）
-2. 复制后端到输出目录
-3. 生成发布包（zip/tar.gz）
+1. PyInstaller 打包完整应用（含 UI + 后端服务，单进程架构）
+2. 生成发布包（zip/tar.gz）
+
+架构说明：
+- Flet 是纯 Python 项目，UI 和后端在同一个进程（ServiceHub）
+- 不需要分离打包，直接打包 main.py 为独立可执行文件
+- 生成的 exe 包含完整的 Python 运行时和所有依赖
 """
 import os
 import platform
@@ -92,34 +96,9 @@ def run_cmd(cmd: list[str], cwd: Path | None = None, description: str = "") -> i
         return 1
 
 
-def remove_old_backend():
-    """清理旧的 backend 目录（带重试逻辑）。"""
-    backend_dir = _OUTPUT_DIR / "backend"
-    if not backend_dir.exists():
-        return
-    
-    print(f"[INFO] Removing old backend directory: {backend_dir}")
-    
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            shutil.rmtree(backend_dir)
-            print("[OK] Old backend removed")
-            return
-        except PermissionError as exc:
-            if attempt < max_retries:
-                print(f"[WARN] Attempt {attempt} failed, retrying...")
-                import time
-                time.sleep(1)
-            else:
-                print(f"[WARN] Cannot remove old backend (file locked): {exc}")
-                print("[INFO] Please manually delete the backend directory and retry")
-                sys.exit(1)
-
-
-def pack_backend(python_exe: str):
-    """步骤 1：用 PyInstaller 打包 Python 后端。"""
-    print("\n[1/3] Packing Python backend...")
+def pack_app(python_exe: str):
+    """步骤 1：用 PyInstaller 打包完整应用（UI + 后端，单进程）。"""
+    print("\n[1/2] Packing complete application (UI + backend in one process)...")
     
     spec_file = _SCRIPT_DIR / "LegadoReader.spec"
     if not spec_file.exists():
@@ -140,49 +119,20 @@ def pack_backend(python_exe: str):
         print(f"[ERROR] PyInstaller output not found: {dist_dir}")
         sys.exit(1)
     
-    print(f"[OK] Backend packed to: {dist_dir}")
+    print(f"[OK] Application packed to: {dist_dir}")
     return dist_dir
 
 
-def copy_backend_to_output(backend_src: Path):
-    """步骤 2：复制后端到输出目录。"""
-    print("\n[2/3] Copying backend to output directory...")
-    
-    remove_old_backend()
-    
-    backend_dest = _OUTPUT_DIR / "backend"
-    try:
-        shutil.copytree(str(backend_src), str(backend_dest))
-        print(f"[OK] Backend copied to: {backend_dest}")
-    except Exception as exc:
-        print(f"[ERROR] Failed to copy backend: {exc}")
-        sys.exit(1)
-    
-    # 验证关键文件
-    exe_path = backend_dest / "LegadoReader.exe"
-    if not exe_path.exists():
-        print(f"[ERROR] LegadoReader.exe missing in: {backend_dest}")
-        sys.exit(1)
-    
-    print(f"[OK] Backend exe ready: {exe_path}")
-    size_mb = exe_path.stat().st_size / (1024 * 1024)
-    print(f"  - Size: {size_mb:.1f} MB")
-
-
-def create_package(platform_name: str):
-    """步骤 3：生成发布包。"""
-    print(f"\n[3/3] Generating release package for {platform_name}...")
-    
-    if not _OUTPUT_DIR.exists():
-        print(f"[ERROR] Output directory not found: {_OUTPUT_DIR}")
-        sys.exit(1)
+def create_package(platform_name: str, app_src: Path):
+    """步骤 2：生成发布包。"""
+    print(f"\n[2/2] Generating release package for {platform_name}...")
     
     # 根据平台选择压缩格式
     if platform_name == "windows":
-        archive_name = "legodo_client_windows.zip"
+        archive_name = f"legodo_flet_{platform_name}.zip"
         archive_format = "zip"
     elif platform_name in ("macos", "linux"):
-        archive_name = f"legodo_client_{platform_name}.tar.gz"
+        archive_name = f"legodo_flet_{platform_name}.tar.gz"
         archive_format = "gztar"
     else:
         print(f"[ERROR] Unsupported platform: {platform_name}")
@@ -195,16 +145,16 @@ def create_package(platform_name: str):
         if archive_path.exists():
             archive_path.unlink()
         
-        # 创建归档
+        # 创建归档（直接打包 PyInstaller 输出目录）
         shutil.make_archive(
-            str(_SCRIPT_DIR / "legodo_client_temp"),
+            str(_SCRIPT_DIR / "legodo_flet_temp"),
             archive_format,
-            root_dir=str(_OUTPUT_DIR),
-            base_dir="."
+            root_dir=str(app_src.parent),
+            base_dir=app_src.name
         )
         
         # 重命名为最终名称
-        temp_archive = _SCRIPT_DIR / f"legodo_client_temp.{archive_format.replace('gztar', 'tar.gz').replace('zip', 'zip')}"
+        temp_archive = _SCRIPT_DIR / f"legodo_flet_temp.{archive_format.replace('gztar', 'tar.gz').replace('zip', 'zip')}"
         if temp_archive.exists():
             temp_archive.rename(archive_path)
         
@@ -241,19 +191,19 @@ def main():
     python_exe = detect_python()
     print(f"[INFO] Python: {python_exe}")
     
-    # 执行打包流程
-    backend_src = pack_backend(python_exe)
-    copy_backend_to_output(backend_src)
-    create_package(platform_name)
+    # 执行打包流程（简化为两步：打包 + 生成归档）
+    app_src = pack_app(python_exe)
+    create_package(platform_name, app_src)
     
     print("\n" + "=" * 60)
     print("  Build Complete!")
     print("=" * 60)
-    print(f"\nPackage: {_SCRIPT_DIR / f'legodo_client_{platform_name}'}.{('zip' if platform_name == 'windows' else 'tar.gz')}")
-    print("\nFeatures:")
-    print("  - Full Python backend with all services")
-    print("  - Flet desktop UI")
-    print("  - Self-contained executable")
+    archive_ext = "zip" if platform_name == "windows" else "tar.gz"
+    print(f"\nPackage: {_SCRIPT_DIR / f'legodo_flet_{platform_name}.{archive_ext}'}")
+    print("\nArchitecture:")
+    print("  - Single executable (UI + backend in one process)")
+    print("  - No separate backend needed")
+    print("  - Self-contained with Python runtime")
 
 
 if __name__ == "__main__":

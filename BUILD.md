@@ -15,7 +15,9 @@ python build_release.py linux     # Linux 桌面版
 python build_release.py macos     # macOS 桌面版
 ```
 
-产物位置：`legodo_flet/dist/legodo_client_windows.zip`
+产物位置：`legodo_flet/legodo_flet_windows.zip`
+
+**架构说明**：Flet 是纯 Python 项目，UI 和后端在同一个进程（ServiceHub），直接打包 `main.py` 为独立可执行文件，不需要分离后端。
 
 详见 `legodo_flet/BUILD.md`。
 
