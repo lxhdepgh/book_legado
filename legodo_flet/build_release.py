@@ -192,6 +192,58 @@ def build_flet_pack(flet_cmd: str, target: str, onedir: bool = False) -> Path:
     return output
 
 
+def build_android(flet_cmd: str, target: str = "apk") -> Path:
+    """使用 flet build 打包 Android APK/AAB。"""
+    print(f"\n[1/2] Building Android {target.upper()} with flet build...")
+    
+    main_py = _APP_SOURCE / "main.py"
+    if not main_py.exists():
+        print(f"[ERROR] Main script not found: {main_py}")
+        sys.exit(1)
+    
+    cmd = [
+        flet_cmd,
+        "build",
+        target,  # apk 或 aab
+        str(main_py),
+        "--output-dir", str(_OUTPUT_DIR),
+        "--yes",  # 非交互模式
+    ]
+    
+    # Android 权限（根据应用需求添加）
+    cmd.extend([
+        "--android-permissions",
+        "INTERNET,ACCESS_NETWORK_STATE,WRITE_EXTERNAL_STORAGE,READ_EXTERNAL_STORAGE",
+    ])
+    
+    # 可选：签名配置（如果有 keystore）
+    # cmd.extend([
+    #     "--android-signing-key-store", "path/to/keystore.jks",
+    #     "--android-signing-key-store-password", "password",
+    #     "--android-signing-key-alias", "alias",
+    #     "--android-signing-key-password", "password",
+    # ])
+    
+    ret = run_cmd(cmd, cwd=_SCRIPT_DIR)
+    if ret != 0:
+        print("[ERROR] flet build failed")
+        sys.exit(1)
+    
+    # 确定输出路径
+    if target == "apk":
+        output = _OUTPUT_DIR / "app.apk"
+    else:  # aab
+        output = _OUTPUT_DIR / "app.aab"
+    
+    if not output.exists():
+        print(f"[ERROR] Build output not found: {output}")
+        print("[INFO] Check flet build logs for details")
+        sys.exit(1)
+    
+    print(f"[OK] Built: {output}")
+    return output
+
+
 def create_archive(target: str, app_path: Path) -> Path:
     """步骤 2：生成发布包。"""
     print(f"\n[2/2] Creating release archive...")
@@ -205,6 +257,9 @@ def create_archive(target: str, app_path: Path) -> Path:
     elif target == "linux":
         archive_name = "legodo_flet_linux.tar.gz"
         archive_format = "gztar"
+    elif target in ("apk", "aab"):
+        # Android 不需要压缩，直接返回原文件
+        return app_path
     else:
         print(f"[ERROR] Unsupported target: {target}")
         sys.exit(1)
@@ -243,8 +298,8 @@ def main():
     )
     parser.add_argument(
         "target",
-        choices=["windows", "macos", "linux"],
-        help="Target platform",
+        choices=["windows", "macos", "linux", "apk", "aab"],
+        help="Target platform (apk/aab for Android)",
     )
     parser.add_argument(
         "--onedir",
@@ -266,8 +321,11 @@ def main():
     flet_cmd = find_flet()
     print(f"[INFO] Flet: {flet_cmd}")
     
-    # 步骤 1: 打包
-    app_path = build_flet_pack(flet_cmd, args.target, args.onedir)
+    # 步骤 1: 打包（Android 用 flet build，其他用 flet pack）
+    if args.target in ("apk", "aab"):
+        app_path = build_android(flet_cmd, args.target)
+    else:
+        app_path = build_flet_pack(flet_cmd, args.target, args.onedir)
     
     # 步骤 2: 生成归档
     archive = create_archive(args.target, app_path)
@@ -275,7 +333,7 @@ def main():
     print("\n" + "=" * 60)
     print("  Build Complete!")
     print("=" * 60)
-    print(f"\nArchive: {archive}")
+    print(f"\nArtifact: {archive}")
     
     if args.target == "windows":
         print("\nNext steps:")
@@ -294,6 +352,15 @@ def main():
         print("  - Extract the tar.gz file")
         print("  - chmod +x LegadoReader")
         print("  - Run: ./LegadoReader")
+    elif args.target == "apk":
+        print("\nNext steps:")
+        print("  - Transfer app.apk to your Android device")
+        print("  - Install: adb install app.apk")
+        print("  - Or scan QR code to download")
+    elif args.target == "aab":
+        print("\nNext steps:")
+        print("  - Upload app.aab to Google Play Console")
+        print("  - Google Play will generate APKs for different devices")
 
 
 if __name__ == "__main__":
