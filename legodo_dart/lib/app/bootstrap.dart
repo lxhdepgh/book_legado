@@ -126,86 +126,11 @@ Future<BootstrapResult> bootstrapEngine() async {
     return BootstrapResult(repository: FakeEngineRepository());
   }
 
-  // 尝试自动启动 Python 子进程（开发模式）
+  // 尝试拉起引擎（嵌入式 Go / 独立 Go / Python 子进程，由 EngineProcess.start 自动选择）
   StartedEngine? started;
   try {
     started = await EngineProcess.start();
   } on EngineFailure catch (e) {
-    // 如果无法启动子进程（release 模式无 LEGODO_PYTHON/LEGODO_MAIN），
-    // 回退到启动打包的 Python 后端 exe
-    if (e.kind == EngineFailureKind.unavailable) {
-      // 从 Flutter exe 同级目录查找 backend/LegadoReader.exe
-      final flutterExePath = Platform.resolvedExecutable;
-      final flutterDir = File(flutterExePath).parent.path;
-      final backendExe = '$flutterDir\\backend\\LegadoReader.exe';
-      
-      if (!File(backendExe).existsSync()) {
-        throw EngineFailure(
-          EngineFailureKind.unavailable,
-          '未找到内置 Python 后端：$backendExe\n'
-          '请确保使用 build_release.bat 构建完整版本。',
-        );
-      }
-      
-      // 启动打包的 Python 后端 exe（它会自动打印握手行）
-      final process = await Process.start(
-        backendExe,
-        ['--serve', '--port', '0', '--idle-seconds', '15'],
-        workingDirectory: '$flutterDir\\backend',
-      );
-      
-      final handshake = Completer<EngineEndpoint>();
-      final stderrTail = <String>[];
-      const handshakePrefix = 'LEGODO_GATEWAY ';
-      
-      process.stdout.transform(const Utf8Decoder(allowMalformed: true)).listen((chunk) {
-        for (final line in const LineSplitter().convert(chunk)) {
-          if (!line.startsWith(handshakePrefix) || handshake.isCompleted) continue;
-          try {
-            final json = jsonDecode(line.substring(handshakePrefix.length));
-            if (json is Map<String, Object?>) {
-              handshake.complete(EngineEndpoint.fromHandshake(json));
-            }
-          } on FormatException catch (exc) {
-            handshake.completeError(EngineFailure(EngineFailureKind.transport,
-                '握手行不是合法 JSON：${exc.message}'));
-          }
-        }
-      });
-      process.stderr.transform(const Utf8Decoder(allowMalformed: true)).listen((chunk) {
-        for (final line in const LineSplitter().convert(chunk)) {
-          stderrTail.add(line);
-          if (stderrTail.length > 40) stderrTail.removeAt(0);
-        }
-      });
-      
-      try {
-        final endpoint = await handshake.future.timeout(
-          const Duration(seconds: 60),
-          onTimeout: () {
-            throw EngineFailure(
-              EngineFailureKind.timeout,
-              '60s 没等到握手行（后端 stderr：${stderrTail.join(' | ')}）',
-            );
-          },
-        );
-        
-        final client = RpcClient(endpoint);
-        final repository = RpcEngineRepository(client);
-        
-        return BootstrapResult(
-          repository: repository,
-          handle: EngineHandle(
-            StartedEngine(process: process, endpoint: endpoint, stderrTail: stderrTail),
-            client,
-            repository,
-          ),
-        );
-      } catch (_) {
-        process.kill(ProcessSignal.sigterm);
-        rethrow;
-      }
-    }
     rethrow;
   }
 

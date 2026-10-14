@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
-"""一键打包 Flutter + Go 后端 Release。
+"""一键打包 Flutter + Go 后端 Release（单文件分发）。
 
 架构：Flutter (Dart UI) + Go 独立进程 (WebSocket RPC)
-支持平台：windows / linux / macos / android
-
-环境自动检测与修复：
-- 自动查找 flutter/go 命令
-- 跨平台路径兼容（Windows/Linux/macOS）
-- 自动定位 Go 后端源码
+分发包：单文件 .exe（Go 二进制嵌入 Flutter 可执行文件中）
 
 用法:
-    python build_release.py windows          # Windows 多文件分发
-    python build_release.py windows --skip-go  # 跳过 Go 编译（使用已有二进制）
-    python build_release.py linux              # Linux AppImage 风格
-    python build_release.py macos              # macOS .app bundle
-    python build_release.py android            # Android APK
+    python build_release.py windows       # Windows 单文件 EXE
+    python build_release.py linux         # Linux
+    python build_release.py macos         # macOS
+    python build_release.py android       # Android APK
+    python build_release.py windows --skip-go  # 跳过 Go 编译
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import platform
 import shutil
@@ -27,20 +23,15 @@ import sys
 from pathlib import Path
 
 
-# ============================================================================
-# 项目结构
-# ============================================================================
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent  # legodo_booksource_check/
-DART_CLIENT = SCRIPT_DIR          # legodo_dart/
-GO_BACKEND = SCRIPT_DIR / "backend_go"  # legodo_dart/backend_go/
+PROJECT_ROOT = SCRIPT_DIR.parent
+DART_CLIENT = SCRIPT_DIR
+GO_BACKEND = SCRIPT_DIR / "backend_go"
 
 
-def find_command(cmd_name: str, extra_paths: list[Path] | None = None) -> Path | None:
-    """在 PATH 和额外路径中查找可执行文件。"""
+def find_command(cmd_name: str) -> Path | None:
     if path := shutil.which(cmd_name):
         return Path(path)
-
     search_paths = []
     if platform.system() == "Windows":
         search_paths.extend([
@@ -60,36 +51,20 @@ def find_command(cmd_name: str, extra_paths: list[Path] | None = None) -> Path |
                 Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Go" / "bin" / "go.exe",
             ])
     elif platform.system() == "Linux":
-        search_paths.extend([
-            Path("/usr/local/bin") / cmd_name,
-            Path("/usr/bin") / cmd_name,
-            Path.home() / ".local" / "bin" / cmd_name,
-        ])
+        search_paths.extend([Path("/usr/local/bin") / cmd_name, Path("/usr/bin") / cmd_name])
     elif platform.system() == "Darwin":
-        search_paths.extend([
-            Path("/usr/local/bin") / cmd_name,
-            Path("/opt/homebrew/bin") / cmd_name,
-        ])
-
-    if extra_paths:
-        search_paths.extend(extra_paths)
-
+        search_paths.extend([Path("/usr/local/bin") / cmd_name, Path("/opt/homebrew/bin") / cmd_name])
     for candidate in search_paths:
         if candidate.exists():
             return candidate
-
     return None
 
 
 def ensure_flutter() -> Path:
-    """确保 flutter 命令可用。"""
     flutter = find_command("flutter")
     if not flutter:
         print("[ERROR] Flutter command not found in PATH", file=sys.stderr)
-        print("\nPlease install Flutter and add it to your PATH.", file=sys.stderr)
-        print("Download: https://docs.flutter.dev/get-started/install", file=sys.stderr)
         sys.exit(1)
-
     try:
         result = subprocess.run(
             [str(flutter), "--version"], capture_output=True, text=True, timeout=10, encoding="utf-8", errors="replace"
@@ -99,19 +74,14 @@ def ensure_flutter() -> Path:
             print(f"[OK] Found Flutter: {version_line}", flush=True)
     except Exception as e:
         print(f"[WARN] Could not verify Flutter version: {e}", flush=True)
-
     return flutter
 
 
 def ensure_go() -> Path:
-    """确保 go 命令可用。"""
     go = find_command("go")
     if not go:
         print("[ERROR] Go command not found in PATH", file=sys.stderr)
-        print("\nPlease install Go and add it to your PATH.", file=sys.stderr)
-        print("Download: https://go.dev/dl/", file=sys.stderr)
         sys.exit(1)
-
     try:
         result = subprocess.run(
             [str(go), "version"], capture_output=True, text=True, timeout=5
@@ -120,18 +90,14 @@ def ensure_go() -> Path:
             print(f"[OK] Found Go: {result.stdout.strip()}", flush=True)
     except Exception as e:
         print(f"[WARN] Could not verify Go version: {e}", flush=True)
-
     return go
 
 
 def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
-    """执行命令并在失败时退出。"""
     print(f"$ {' '.join(str(c) for c in cmd)}", flush=True)
-
     merged_env = os.environ.copy()
     if env:
         merged_env.update(env)
-
     try:
         result = subprocess.run(
             cmd, cwd=cwd or SCRIPT_DIR, env=merged_env, check=True,
@@ -146,33 +112,24 @@ def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = No
         sys.exit(1)
     except subprocess.CalledProcessError as e:
         print(f"[ERROR] Command failed with exit code {e.returncode}", file=sys.stderr)
-        if e.stdout:
-            for line in str(e.stdout).splitlines():
-                if line.strip():
-                    print(f"  {line}")
         sys.exit(e.returncode)
 
 
-def build_go_backend(target_platform: str) -> Path | None:
-    """编译 Go 后端为独立可执行文件。Android 返回 None。"""
+def build_go_backend(target_platform: str) -> tuple[Path, str]:
+    """编译 Go 后端并返回 (输出路径, exe 名)。Android 不编译 Go。"""
     if target_platform == "android":
-        return None
+        return (Path(), "")
 
-    print(f"\n[1/3] Building Go backend for {target_platform}...", flush=True)
-
+    print(f"\n[1/4] Building Go backend for {target_platform}...", flush=True)
     if not GO_BACKEND.exists():
         print(f"[ERROR] Go backend directory not found at: {GO_BACKEND}", file=sys.stderr)
         sys.exit(1)
 
     go = ensure_go()
-
-    # 交叉编译环境变量
     goos_map = {"windows": "windows", "linux": "linux", "macos": "darwin"}
     goarch_map = {"windows": "amd64", "linux": "amd64", "macos": "arm64"}
-
     goos = goos_map.get(target_platform)
     goarch = goarch_map.get(target_platform)
-
     if not goos or not goarch:
         print(f"[ERROR] Unsupported target platform for Go: {target_platform}", file=sys.stderr)
         sys.exit(1)
@@ -180,13 +137,10 @@ def build_go_backend(target_platform: str) -> Path | None:
     env = os.environ.copy()
     env["GOOS"] = goos
     env["GOARCH"] = goarch
-    # Android 不需要 CGO
-    if target_platform not in ("linux", "macos"):
-        env["CGO_ENABLED"] = "0"
+    env["CGO_ENABLED"] = "0"
 
     exe_name = "legodo_server.exe" if target_platform == "windows" else "legodo_server"
     output_path = GO_BACKEND / exe_name
-
     build_cmd = [str(go), "build", "-ldflags=-s -w", "-o", str(output_path), "./cmd/server/"]
     run(build_cmd, cwd=GO_BACKEND, env=env)
 
@@ -195,13 +149,24 @@ def build_go_backend(target_platform: str) -> Path | None:
         sys.exit(1)
 
     print(f"[OK] Go backend: {output_path} ({output_path.stat().st_size // 1024} KB)", flush=True)
-    return output_path
+    return (output_path, exe_name)
 
 
-def build_flutter(target: str) -> Path:
-    """构建 Flutter 应用并返回输出目录。"""
-    print(f"\n[2/3] Building Flutter {target} Release...", flush=True)
+def embed_go_as_define(go_bin_path: Path, exe_name: str, dart_dir: Path) -> str:
+    """读取 Go 二进制文件，转 base64，通过环境变量传入 Flutter 构建。
 
+    返回 --dart-define 参数值（GO_BACKEND_BASE64=<base64>），空串表示无嵌入式数据。
+    """
+    raw = go_bin_path.read_bytes()
+    b64 = base64.b64encode(raw).decode("ascii")
+    define_value = f"GO_BACKEND_BASE64={b64}"
+    print(f"[OK] Embedded Go binary: {raw / (1024*1024):.2f} MB → base64", flush=True)
+    return define_value
+
+
+def build_flutter_with_embed(target: str, go_b64_define: str) -> Path:
+    """构建 Flutter 应用，传入 Go 二进制作为编译期常量。"""
+    print(f"\n[2/4] Building Flutter {target} Release...", flush=True)
     flutter = ensure_flutter()
 
     env = os.environ.copy()
@@ -219,13 +184,14 @@ def build_flutter(target: str) -> Path:
                 break
 
     cmd = [str(flutter), "build", target, "--release"]
+    if go_b64_define:
+        cmd.append(f"--dart-define={go_b64_define}")
 
     try:
-        run(cmd, cwd=DART_CLIENT, env=env)
+        run(cmd, cwd=dart_dir, env=env)
     except SystemExit as e:
-        # Windows 下 INSTALL 阶段可能因权限失败，但 exe 已生成
         if platform.system() == "Windows" and target == "windows":
-            output_test = DART_CLIENT / "build" / "windows" / "x64" / "runner" / "Release" / "legodo_client.exe"
+            output_test = dart_dir / "build" / "windows" / "x64" / "runner" / "Release" / "legodo_client.exe"
             if output_test.exists():
                 print("[WARN] Flutter build reported error but executable was created, continuing...", flush=True)
             else:
@@ -234,9 +200,9 @@ def build_flutter(target: str) -> Path:
             raise
 
     output_map = {
-        "windows": DART_CLIENT / "build" / "windows" / "x64" / "runner" / "Release",
-        "linux": DART_CLIENT / "build" / "linux" / "x64" / "release" / "bundle",
-        "macos": DART_CLIENT / "build" / "macos" / "Build" / "Products" / "Release" / "legodo_client.app",
+        "windows": dart_dir / "build" / "windows" / "x64" / "runner" / "Release",
+        "linux": dart_dir / "build" / "linux" / "x64" / "release" / "bundle",
+        "macos": dart_dir / "build" / "macos" / "Build" / "Products" / "Release" / "legodo_client.app",
     }
     output_dir = output_map.get(target)
     if not output_dir or not output_dir.exists():
@@ -248,9 +214,8 @@ def build_flutter(target: str) -> Path:
 
 
 def build_android_apk() -> Path:
-    """构建 Android APK。"""
-    print(f"\n[2/3] Building Android APK...", flush=True)
-
+    """构建 Android APK（纯 Dart/Flutter，不含 Go 后端）。"""
+    print(f"\n[2/4] Building Android APK...", flush=True)
     flutter = ensure_flutter()
 
     java_home = os.environ.get("JAVA_HOME", "")
@@ -280,7 +245,7 @@ def build_android_apk() -> Path:
     cmd = [str(flutter), "build", "apk", "--release"]
     try:
         run(cmd, cwd=DART_CLIENT)
-    except SystemExit as e:
+    except SystemExit:
         print("[ERROR] Flutter APK build failed", file=sys.stderr)
         raise
 
@@ -295,125 +260,82 @@ def build_android_apk() -> Path:
         sys.exit(1)
 
     latest_apk = max(apks, key=lambda p: p.stat().st_mtime)
-
     dist_dir = SCRIPT_DIR / "dist"
     dist_dir.mkdir(exist_ok=True)
     dest_apk = dist_dir / latest_apk.name
     shutil.copy2(latest_apk, dest_apk)
     print(f"[OK] APK copied to: {dest_apk} ({latest_apk.stat().st_size / (1024*1024):.1f} MB)", flush=True)
-
     return dest_apk
 
 
-def copy_flutter_artifacts(flutter_output: Path, dist_dir: Path, target: str) -> None:
-    """复制 Flutter 构建产物到分发包目录。"""
-    print(f"[INFO] Copying Flutter build from: {flutter_output}", flush=True)
+def create_distribution_windows(target_platform: str, flutter_output: Path) -> Path:
+    """创建 Windows 分发包（复制产物 + README）。"""
+    print(f"\n[3/4] Creating distribution package for {target_platform}...", flush=True)
+
+    dist_dir = SCRIPT_DIR / "dist" / f"legodo_{target_platform}"
+    if dist_dir.exists():
+        shutil.rmtree(dist_dir)
+    dist_dir.mkdir(parents=True)
+
+    # 复制 Flutter 产物
     for item in flutter_output.iterdir():
         if item.is_dir():
             shutil.copytree(item, dist_dir / item.name)
         else:
             shutil.copy2(item, dist_dir / item.name)
 
-    # Windows: 复制 AOT data 和运行时依赖
-    if target == "windows":
-        data_dir = flutter_output / "data"
-        app_so = flutter_output.parent.parent.parent / "app.so"
+    # 复制 AOT data 和运行时依赖
+    data_dir = flutter_output / "data"
+    app_so = flutter_output.parent.parent.parent / "app.so"
+    if not data_dir.exists() and app_so.exists():
+        data_dir = dist_dir / "data"
+        data_dir.mkdir(exist_ok=True)
+        shutil.copy2(app_so, data_dir / "app.so")
+        print(f"[OK] Copied app.so ({app_so.stat().st_size // (1024*1024)} MB)", flush=True)
+    elif data_dir.exists():
+        shutil.copytree(data_dir, dist_dir / "data", dirs_exist_ok=True)
+        print("[OK] Copied data/ directory", flush=True)
 
-        if not data_dir.exists() and app_so.exists():
-            data_dir = dist_dir / "data"
-            data_dir.mkdir(exist_ok=True)
-            shutil.copy2(app_so, data_dir / "app.so")
-            print(f"[OK] Copied app.so ({app_so.stat().st_size // (1024*1024)} MB)", flush=True)
-        elif data_dir.exists():
-            shutil.copytree(data_dir, dist_dir / "data", dirs_exist_ok=True)
-            print("[OK] Copied data/ directory", flush=True)
+    flutter_dll = DART_CLIENT / "windows" / "flutter" / "ephemeral" / "flutter_windows.dll"
+    if flutter_dll.exists():
+        shutil.copy2(flutter_dll, dist_dir / "flutter_windows.dll")
+        print("[OK] Copied flutter_windows.dll", flush=True)
 
-        # flutter_windows.dll
-        flutter_dll = DART_CLIENT / "windows" / "flutter" / "ephemeral" / "flutter_windows.dll"
-        if flutter_dll.exists():
-            shutil.copy2(flutter_dll, dist_dir / "flutter_windows.dll")
-            print(f"[OK] Copied flutter_windows.dll", flush=True)
+    plugins_build_dir = DART_CLIENT / "build" / "windows" / "x64" / "plugins"
+    if plugins_build_dir.exists():
+        for plugin_dir in plugins_build_dir.iterdir():
+            release_dir = plugin_dir / "Release"
+            if release_dir.exists():
+                for dll_file in release_dir.glob("*.dll"):
+                    shutil.copy2(dll_file, dist_dir / dll_file.name)
+                    print(f"[OK] Copied plugin: {dll_file.name}", flush=True)
 
-        # 插件 DLL
-        plugins_build_dir = DART_CLIENT / "build" / "windows" / "x64" / "plugins"
-        if plugins_build_dir.exists():
-            for plugin_dir in plugins_build_dir.iterdir():
-                release_dir = plugin_dir / "Release"
-                if release_dir.exists():
-                    for dll_file in release_dir.glob("*.dll"):
-                        shutil.copy2(dll_file, dist_dir / dll_file.name)
-                        print(f"[OK] Copied plugin: {dll_file.name}", flush=True)
+    # 注意：Go 二进制已嵌入 legodo_client.exe，不需要单独复制！
 
+    # start.bat 仅用于说明（实际上一键双击即可）
+    start_script = dist_dir / "start.bat"
+    start_script.write_text(
+        "@echo off\n"
+        "echo Starting Legodo BookSource Check...\n"
+        "start \"\" \"legodo_client.exe\"\n",
+        encoding="gbk"
+    )
 
-def create_distribution(target_platform: str, go_bin: Path | None, single_exe: bool = False) -> Path:
-    """创建分发包（Flutter + Go 后端）。"""
-    print(f"\n[3/3] Creating distribution package for {target_platform}...", flush=True)
-
-    if target_platform == "android":
-        return build_android_apk()
-
-    flutter_output = build_flutter(target_platform)
-
-    # 临时分发目录
-    dist_dir = SCRIPT_DIR / "dist" / f"legodo_{target_platform}"
-    if dist_dir.exists():
-        shutil.rmtree(dist_dir)
-    dist_dir.mkdir(parents=True)
-
-    copy_flutter_artifacts(flutter_output, dist_dir, target_platform)
-
-    # 复制 Go 二进制
-    if go_bin is not None:
-        lib_name = go_bin.name
-        shutil.copy2(go_bin, dist_dir / lib_name)
-        print(f"[OK] Go server copied: {lib_name}", flush=True)
-
-    # 生成启动脚本
-    suffix = ".exe" if target_platform == "windows" else ""
-    client_suffix = ".exe" if target_platform == "windows" else ""
-
-    if target_platform == "windows":
-        start_script = dist_dir / "start.bat"
-        start_script.write_text(
-            "@echo off\n"
-            "echo Starting Legodo BookSource Check...\n"
-            "start \"\" \"" + f"legodo_server{suffix}" + "\"\n"
-            "timeout /t 2 /nobreak >nul\n"
-            "start \"\" \"" + f"legodo_client{client_suffix}" + "\"\n",
-            encoding="gbk"
-        )
-    else:
-        start_script = dist_dir / "start.sh"
-        start_script.write_text(
-            "#!/bin/bash\n"
-            "echo 'Starting Legodo BookSource Check...'\n"
-            "chmod +x ./legodo_server\n"
-            "./legodo_server &\n"
-            "sleep 2\n"
-            "chmod +x ./legodo_client\n"
-            "./legodo_client &\n",
-            encoding="utf-8"
-        )
-        start_script.chmod(0o755)
-
-    # README
     readme = dist_dir / "README.txt"
     readme.write_text(
-        f"Legodo BookSource Check - {target_platform.upper()}\n"
+        "Legodo BookSource Check - Windows Release\n"
         "=" * 60 + "\n\n"
         "启动方法:\n"
-        f"  {target_platform.title()}: 双击 start.bat 或运行 ./start.sh\n\n"
-        "手动启动:\n"
-        f"  1. 先启动后端: ./legodo_server{suffix}\n"
-        f"  2. 再启动前端: ./legodo_client{client_suffix}\n\n"
+        "  直接双击 legodo_client.exe\n\n"
         "架构:\n"
-        "  - 前端: Flutter (Dart UI)\n"
-        "  - 后端: Go (规则引擎、HTML 解析、JS 执行)\n"
-        "  - 通信: WebSocket RPC (:8080)\n\n"
+        "  - Flutter (Dart UI) + Go 后端（嵌入单一 EXE）\n"
+        "  - Go 后端在首次运行时自动提取到同目录\n"
+        "  - 通信: WebSocket RPC (:8080)\n"
+        "  - 退出时自动清理生成的文件\n\n"
         "功能:\n"
         "  - webview_flutter: 网页浏览/试读\n"
         "  - flutter_tts: 系统 TTS 朗读\n"
-        "  - Go FFI 替代方案: 独立进程 + RPC\n"
+        "  - Go 规则引擎、HTML 解析、JS 执行\n"
         "  - 性能: 并发扫描 100+ 源/秒\n",
         encoding="utf-8"
     )
@@ -422,7 +344,6 @@ def create_distribution(target_platform: str, go_bin: Path | None, single_exe: b
     zip_path = SCRIPT_DIR / f"legodo_{target_platform}.zip"
     if zip_path.exists():
         zip_path.unlink()
-
     print("[INFO] Creating zip archive...", flush=True)
     shutil.make_archive(str(zip_path.with_suffix("")), "zip", dist_dir.parent, dist_dir.name)
 
@@ -431,23 +352,13 @@ def create_distribution(target_platform: str, go_bin: Path | None, single_exe: b
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build Flutter + Go backend release")
-    parser.add_argument(
-        "target",
-        choices=["windows", "linux", "macos", "android"],
-        help="Target platform",
-    )
+    parser = argparse.ArgumentParser(description="Build Flutter + Go backend release (single-file EXE)")
+    parser.add_argument("target", choices=["windows", "linux", "macos", "android"], help="Target platform")
     parser.add_argument("--skip-go", action="store_true", help="Skip Go backend compilation")
     parser.add_argument("--skip-flutter", action="store_true", help="Skip Flutter build")
     args = parser.parse_args()
 
-    platform_desc = {
-        "windows": "Portable (EXE)",
-        "linux": "AppDir",
-        "macos": ".app Bundle",
-        "android": "APK",
-    }
-
+    platform_desc = {"windows": "Single-File EXE", "linux": "Portable", "macos": ".app Bundle", "android": "APK"}
     print("=" * 60)
     print("  Legodo BookSource Check - Multi-Platform Build")
     print(f"  Target: {platform_desc[args.target]}")
@@ -456,37 +367,45 @@ def main() -> None:
     print(f"[INFO] Python: {sys.executable}")
     print()
 
-    # Step 1: Build Go backend
-    go_bin = None
+    go_exe_path: Path | None = None
+    exe_name = ""
+    go_b64_define = ""
+
+    # Step 1: Build Go backend (if needed for embedding)
     if args.target != "android" and not args.skip_go:
-        go_bin = build_go_backend(args.target)
-    elif args.skip_go:
+        go_out, exe_name = build_go_backend(args.target)
+        go_exe_path = go_out
+        # Embed as compile-time constant for Flutter build
+        go_b64_define = embed_go_as_define(go_out, exe_name, DART_CLIENT)
+    elif args.skip_go and args.target != "android":
         print("[INFO] Skipping Go backend compilation (--skip-go)", flush=True)
-        exe_name = "legodo_server.exe" if args.target == "windows" else "legodo_server"
-        go_bin = GO_BACKEND / exe_name
-        if not go_bin.exists():
-            print(f"[ERROR] Go binary not found: {go_bin}", file=sys.stderr)
-            sys.exit(1)
-        print(f"[OK] Using existing: {go_bin}", flush=True)
     else:
         print("[INFO] Android: skipping Go backend (pure Dart/Flutter)", flush=True)
 
-    # Step 2-3: Create distribution
+    # Step 2 & 3: Build Flutter + Create distribution
+    package: Path | None = None
     if not args.skip_flutter:
-        package = create_distribution(args.target, go_bin)
+        if args.target == "android":
+            package = build_android_apk()
+        else:
+            flutter_output = build_flutter_with_embed(args.target, go_b64_define)
+            if args.target == "windows":
+                package = create_distribution_windows(args.target, flutter_output)
+            else:
+                print(f"[INFO] Package creation for {args.target} needs adaptation", flush=True)
+                package = flutter_output
     else:
         print("[INFO] Skipping Flutter build (--skip-flutter)", flush=True)
-        package = None
 
     print("\n" + "=" * 60)
     print("  Build Complete!")
     print("=" * 60)
     if package:
-        print(f"\nPackage: {package}")
+        print(f"\nOutput: {package}")
     print("\nFeatures:")
     print("  - WebView browser (native WebView)")
     print("  - TTS text-to-speech (system TTS)")
-    print("  - Go backend via WebSocket RPC")
+    print("  - Go backend embedded in single EXE (auto-extract on startup)")
     print("  - Cross-platform (Windows/Linux/macOS/Android)")
     print()
 
