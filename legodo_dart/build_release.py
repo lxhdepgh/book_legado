@@ -160,7 +160,7 @@ def embed_go_as_define(go_bin_path: Path, exe_name: str, dart_dir: Path) -> str:
     raw = go_bin_path.read_bytes()
     b64 = base64.b64encode(raw).decode("ascii")
     define_value = f"GO_BACKEND_BASE64={b64}"
-    print(f"[OK] Embedded Go binary: {raw / (1024*1024):.2f} MB → base64", flush=True)
+    print(f"[OK] Embedded Go binary: {len(raw) / (1024*1024):.2f} MB → base64", flush=True)
     return define_value
 
 
