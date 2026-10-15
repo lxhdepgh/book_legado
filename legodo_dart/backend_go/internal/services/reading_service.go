@@ -164,6 +164,20 @@ func (s *ReadingService) GetPosition() (int, float64) {
 	return chapIdx, offset
 }
 
+// OpenSession starts a new reading session directly (used by FFI engine).
+func (s *ReadingService) OpenSession(sess *ReadingSession) {
+	s.mu.Lock()
+	s.session = sess
+	s.mu.Unlock()
+}
+
+// GetSession returns the current reading session (nil if none open).
+func (s *ReadingService) GetSession() *ReadingSession {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.session
+}
+
 // PrefetchChapters loads upcoming chapters into the content cache.
 func (s *ReadingService) PrefetchChapters(ctx context.Context, fromChapter int, count int) {
 	s.mu.RLock()

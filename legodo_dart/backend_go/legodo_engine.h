@@ -21,7 +21,7 @@ extern const char *_GoStringPtr(_GoString_ s);
 /* Start of preamble from import "C" comments.  */
 
 
-#line 3 "engine.go"
+#line 13 "engine.go"
 
 #include <stdlib.h>
 
@@ -89,13 +89,9 @@ extern "C" {
 
 extern void FreeString(char* s);
 extern void Initialize(void);
-extern char* SearchBooks(char* sourceJSON, char* keyword);
-extern char* GetBookInfo(char* sourceJSON, char* bookURL);
-extern char* GetChapters(char* sourceJSON, char* bookURL);
-extern char* GetContent(char* sourceJSON, char* chapterJSON);
-extern char* CheckSource(char* sourceJSON);
-extern char* ExecuteJS(char* jsCode, char* contextJSON);
 extern void Cleanup(void);
+extern char* Call(char* actionRaw, char* paramsRaw);
+extern char* StatusReport(void);
 
 #ifdef __cplusplus
 }

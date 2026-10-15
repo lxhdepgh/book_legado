@@ -2,12 +2,13 @@ package models
 
 // Chapter represents a single chapter in a book's table of contents.
 type Chapter struct {
-	Index   int    `json:"index"`
-	Title   string `json:"title"`
-	URL     string `json:"url"`
-	BookURL string `json:"bookUrl"` // parent book URL
-	IsVip   bool   `json:"isVip"`
-	IsPay   bool   `json:"isPay"`
+	Index     int    `json:"index"`
+	Title     string `json:"title"`
+	URL       string `json:"url"`
+	BookURL   string `json:"bookUrl"` // parent book URL
+	IsVip     bool   `json:"isVip"`
+	IsPay     bool   `json:"isPay"`
+	WordCount int    `json:"wordCount"`
 }
 
 // ChapterContent represents the rendered content of a single chapter.

@@ -103,3 +103,23 @@ func (s *ContentSearchService) Search(query string, bookURL string, limit int) (
 	}
 	return results, rows.Err()
 }
+
+// IndexedChapters returns the number of chapters indexed for a book.
+func (s *ContentSearchService) IndexedChapters(bookURL string) int {
+	row := s.storage.QueryRow("SELECT COUNT(DISTINCT chapter_title) FROM content_search WHERE book_url = ?", bookURL)
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return 0
+	}
+	return count
+}
+
+// FTSAvailable returns whether the FTS index table exists.
+func (s *ContentSearchService) FTSAvailable() bool {
+	row := s.storage.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='content_search'")
+	var c int
+	if err := row.Scan(&c); err != nil {
+		return false
+	}
+	return c > 0
+}

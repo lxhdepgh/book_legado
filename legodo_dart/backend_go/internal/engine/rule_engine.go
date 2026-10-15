@@ -308,6 +308,81 @@ func (re *RuleEngine) GetChapters(ctx context.Context, source *models.BookSource
 	return chapters, nil
 }
 
+// BrowseBooks 浏览发现书籍（对齐 Legado Explore）
+func (re *RuleEngine) BrowseBooks(ctx context.Context, source *models.BookSource, searchURL string, category string) ([]*models.BookItem, error) {
+	rule := source.RuleExplore
+	if rule == nil || rule.BookList == nil {
+		return nil, fmt.Errorf("书源 %s 缺少发现规则", source.BookSourceURL)
+	}
+
+	urlToFetch := searchURL
+	if urlToFetch == "" {
+		// Try to use ExploreURL from source as base
+		if source.ExploreURL != nil {
+			urlToFetch = strings.ReplaceAll(*source.ExploreURL, "{{page}}", "1")
+		} else {
+			return nil, fmt.Errorf("未配置发现 URL")
+		}
+	}
+
+	resp, err := re.httpClient.Get(ctx, urlToFetch, nil)
+	if err != nil {
+		return nil, fmt.Errorf("浏览请求失败: %w", err)
+	}
+
+	html := resp.BodyString()
+	doc, err := ruleparser.ParseHTML(html)
+	if err != nil {
+		return nil, fmt.Errorf("解析 HTML 失败: %w", err)
+	}
+
+	nodes := doc.Select(*rule.BookList)
+	var books []*models.BookItem
+	for _, node := range nodes {
+		book := &models.BookItem{
+			Origin:     source.BookSourceURL,
+			OriginName: source.BookSourceName,
+		}
+
+		// Extract using ExploreRule fields (same structure as SearchRule)
+		if rule.Name != nil {
+			nameNodes := node.Select(*rule.Name)
+			if len(nameNodes) > 0 {
+				book.Name = nameNodes[0].Text()
+			}
+		}
+		if rule.Author != nil {
+			authorNodes := node.Select(*rule.Author)
+			if len(authorNodes) > 0 {
+				book.Author = re.formatAuthor(authorNodes[0].Text())
+			}
+		}
+		if rule.Intro != nil {
+			introNodes := node.Select(*rule.Intro)
+			if len(introNodes) > 0 {
+				book.Intro = re.formatIntro(introNodes[0].Text())
+			}
+		}
+		if rule.CoverURL != nil {
+			coverNodes := node.Select(*rule.CoverURL)
+			if len(coverNodes) > 0 {
+				book.CoverURL = coverNodes[0].Attr("src")
+			}
+		}
+		if rule.BookURL != nil {
+			urlNodes := node.Select(*rule.BookURL)
+			if len(urlNodes) > 0 {
+				book.URL = urlNodes[0].Attr("href")
+			}
+		}
+		if book.Name != "" {
+			books = append(books, book)
+		}
+	}
+
+	return books, nil
+}
+
 // GetContent 获取章节内容（对齐 Legado WebBook.getContent）
 func (re *RuleEngine) GetContent(ctx context.Context, source *models.BookSource, chapter *models.Chapter) (*models.ChapterContent, error) {
 	rule := source.GetContentRule()
