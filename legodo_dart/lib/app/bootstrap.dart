@@ -1,15 +1,14 @@
 /// 启动装配：**先连引擎，再决定给不给用户看界面**（§4.6 那条握手规矩的落点）。
 ///
-/// 顺序是有原因的：握不上就是连不上，那一屏要写清"连的是哪个地址、哪一步没通"，
+/// 顺序是有原因的：握不上就是连不上，那一屏要写清"连的是哪个库、哪一步没通"，
 /// 而不是先立一个空壳窗口、转圈转到用户以为程序卡了。
 ///
-/// 仓库和句柄都从这里注入（`engineRepositoryProvider` 的默认体是
+/// FFI 单进程：Go 引擎以 `legodo_engine.dll` 装进本进程（无子进程、无端口）。
+/// 仓库从这里注入（`engineRepositoryProvider` 的默认体是
 /// `UnwiredEngineRepository`），于是 widget 测试只要换一个 override 就能跑同一屏。
 library;
 
-import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
+import 'dart:io' as io;
 import 'dart:ui' show AppExitResponse;
 
 import 'package:flutter/material.dart';
@@ -17,85 +16,20 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../core/di/providers.dart';
-import '../core/rpc/engine_endpoint.dart';
-import '../core/rpc/engine_process.dart';
+import '../core/ffi/engine_ffi.dart';
 import '../core/rpc/engine_repository.dart';
 import '../core/rpc/envelope.dart';
+import '../core/rpc/ffi_engine_adapter.dart';
 import '../core/rpc/fake_engine_repository.dart';
-import '../core/rpc/rpc_client.dart';
-import '../core/rpc/rpc_engine_repository.dart';
 import '../features/settings/data/app_theme.dart';
 import '../features/settings/data/theme_preferences.dart';
 import '../features/settings/domain/appearance_notifier.dart';
 import 'router.dart';
 
-/// 已经拉起来的那个引擎子进程：跟着 App 活，退出时负责发 `engine.shutdown`。
-class EngineHandle {
-  EngineHandle(this.started, this.client, this.repository);
-
-  final StartedEngine started;
-  final RpcClient client;
-  final RpcEngineRepository repository;
-
-  bool _done = false;
-
-  Future<void> dispose() async {
-    if (_done) return;
-    _done = true;
-    try {
-      await repository.shutdown(reason: 'flutter window closed');
-    } on Object {
-      // 已经连不上就别再喊：这时候进程多半自己没了（idle 兜底在 `--idle-seconds` 那边）。
-    }
-    client.dispose();
-    
-    // Windows 上 SIGTERM 可能无法彻底杀死 Python 进程（尤其当进程在等待 I/O 或有未完成的异步任务时）
-    // 需要强制等待进程退出，必要时使用平台特定的强制杀死命令
-    await _forceKillProcess(started.process);
-  }
-  
-  /// 强制杀死子进程并等待其真正退出
-  Future<void> _forceKillProcess(Process process) async {
-    if (process.exitCode != null) return; // 已经退出
-    
-    // 先尝试温和终止
-    process.kill(ProcessSignal.sigterm);
-    
-    // 给进程 2 秒时间优雅退出
-    try {
-      await process.exitCode.timeout(const Duration(seconds: 2));
-      return; // 已成功退出
-    } on TimeoutException {
-      // 超时未退出，需要强制杀死
-    }
-    
-    // Windows 上使用 taskkill 强制杀死进程树
-    if (Platform.isWindows) {
-      try {
-        final pid = process.pid;
-        await Process.run('taskkill', ['/F', '/T', '/PID', '$pid']);
-        // 再次等待确认退出
-        await process.exitCode.timeout(const Duration(seconds: 1));
-      } on Object {
-        // taskkill 失败或进程已不存在，忽略
-      }
-    } else {
-      // Unix 系统使用 SIGKILL
-      process.kill(ProcessSignal.sigkill);
-      try {
-        await process.exitCode.timeout(const Duration(seconds: 1));
-      } on TimeoutException {
-        // 极端情况：SIGKILL 也无法杀死，记录但不再重试
-      }
-    }
-  }
-}
-
 class BootstrapResult {
-  const BootstrapResult({required this.repository, this.handle});
+  const BootstrapResult({required this.repository});
 
   final EngineRepository repository;
-  final EngineHandle? handle;
 
   /// 把仓库注进 [ProviderScope]。
   ///
@@ -104,19 +38,10 @@ class BootstrapResult {
   Widget scope(Widget child) => ProviderScope(
         overrides: [
           engineRepositoryProvider.overrideWithValue(repository),
-          engineHandleProvider.overrideWithValue(handle),
-          // 二进制那条路（§4.4 `GET /media/{key}`）要的是地址，不是动作：
-          // 真起过进程才有端口与令牌，替身那一程是 null（图片退回 url 那一格）。
-          engineEndpointProvider.overrideWithValue(handle?.started.endpoint),
         ],
         child: child,
       );
 }
-
-/// 拉起的那一发句柄。widget 测试里它是 `null`（没有子进程可收），
-/// 所以 [LegodoApp] 收摊那一手必须能处理"没有句柄"。
-final Provider<EngineHandle?> engineHandleProvider =
-    Provider<EngineHandle?>((ref) => null);
 
 /// `--dart-define=LEGODO_FAKE_ENGINE=1` 时用替身起界面（CI 里没引擎也要能跑 widget 测试）。
 const bool _useFakeEngine = bool.fromEnvironment('LEGODO_FAKE_ENGINE');
@@ -126,34 +51,50 @@ Future<BootstrapResult> bootstrapEngine() async {
     return BootstrapResult(repository: FakeEngineRepository());
   }
 
-  // 尝试拉起引擎（嵌入式 Go / 独立 Go / Python 子进程，由 EngineProcess.start 自动选择）
-  StartedEngine? started;
+  // Go FFI 动态库（legodo_engine.dll）— 单进程架构，零网络延迟
+  Object? ffiError;
   try {
-    started = await EngineProcess.start();
-  } on EngineFailure catch (e) {
-    rethrow;
+    final ffiAdapter = FFIEngineAdapter();
+    await ffiAdapter.connect();
+    if (ffiAdapter.isConnected) {
+      // 书架探针（冷启动落哪一屏用）：连上后顺手问一次，问不出来按"没书"走。
+      bool shelfHasBooks = false;
+      try {
+        shelfHasBooks = (await ffiAdapter.listBookshelf()).isNotEmpty;
+      } catch (_) {}
+      setShelfProbe(() => shelfHasBooks);
+
+      return BootstrapResult(repository: ffiAdapter);
+    }
+    ffiError = 'FFI 连接成功但 isConnected 为 false';
+  } on Object catch (e) {
+    ffiError = e;
+    // 诊断：输出 FFI 失败原因到 stderr（发布版保留，方便排查）
+    _logEngineFailure('FFI 路径', e);
   }
 
-  final client = RpcClient(started.endpoint);
-  // 句柄与界面共用这一个仓库实例：各 new 一个的话 `engine.shutdown` 发两遍，
-  // 第二遍打在已经退场的进程上，表现是退出时多一条没来由的 transport 错。
-  final repository = RpcEngineRepository(client);
-
-  // G4-E0：注入书架探测（阅读组落地优先级第二档：架上有书先落书架）
-  // 缓存启动时的结果（shelf 状态变化频率低，不必每次切分组都查）。
-  bool shelfHasBooks = false;
-  try {
-    final items = await repository.listBookshelf();
-    shelfHasBooks = items.isNotEmpty;
-  } catch (_) {
-    // 探不到就按空架处理
-  }
-  setShelfProbe(() => shelfHasBooks);
-
-  return BootstrapResult(
-    repository: repository,
-    handle: EngineHandle(started, client, repository),
+  // 加载失败 — 拼接 FFI 诊断信息，让用户知道具体哪一步断了
+  final ffiDetail = '\nFFI 加载失败：$ffiError';
+  // 添加 DLL 路径诊断
+  final dllPath = GoFFIClient.instance.libraryPath;
+  final dllExists = io.File(dllPath).existsSync();
+  final exePath = io.File(io.Platform.resolvedExecutable).path;
+  final detail = '$ffiDetail\nDLL 路径：$dllPath\nDLL 存在：$dllExists\n'
+      'EXE 路径：$exePath\n工作目录：${io.Directory.current.path}';
+  throw EngineFailure(
+    EngineFailureKind.unavailable,
+    '当前环境不支持拉起引擎：Go 引擎动态库（legodo_engine.dll）加载失败。$detail\n'
+    '使用 build_release.py 构建完整版本。',
   );
+}
+
+/// 将引擎连接失败写入 stderr，发布版也保留（方便远程排查）。
+void _logEngineFailure(String path, Object error) {
+  try {
+    io.stderr.writeln('[LEGODO_ENGINE] $path 失败：$error');
+  } catch (_) {
+    // stderr 不可写时静默忽略
+  }
 }
 
 /// 连不上那一屏用的根：仍然要有 `ProviderScope`（widget 测试与错误屏 itself 都读 provider）。
@@ -208,25 +149,30 @@ class LegodoApp extends ConsumerStatefulWidget {
 }
 
 class _LegodoAppState extends ConsumerState<LegodoApp> {
-  /// 句柄从 [engineHandleProvider] 读、不从构造参数走：`boot.scope()` 已经是
-  /// 唯一的注入口，再开第二条线就等于同一件事在两个地方各写一遍。
-  late final AppLifecycleListener _lifecycle;
-
   /// 路由表**只建一次**：主题现在会让这一发重建（下面 watch 了外观偏好），
   /// 而每次 build 新 GoRouter 会把导航状态冲掉——用户换个皮肤就跳回首页。
   late final GoRouter _router = buildRouter();
 
+  /// 关窗收摊的监听器。**字段不是在 dispose 里才 late 初始化的**：`late final`
+  /// 的初始化体是第一次读时才跑，而构造必须发生在 [initState]——否则"退出收摊"
+  /// 那一发永远不会被注册，关窗直接放行（bootstrap_test 第一条就是它）。
+  late final AppLifecycleListener _lifecycle;
+
   @override
   void initState() {
     super.initState();
-    // 必须在这里就构造：`late final` 的初始化体是**第一次读**时才跑的，
-    // 而这条唯一的读发生在 [dispose]——于是"退出收摊"那一发永远不会被注册，
-    // 关窗直接放行，python 子进程留在后台占端口（bootstrap_test 第一条就是它）。
     _lifecycle = AppLifecycleListener(
-      // 关窗要主动收引擎：`--idle-seconds` 那条兜底等的是 15s，而用户期待的是"关了就走"。
+      // 关窗要主动收引擎：FFI 单进程下这是给 Go 侧发 engine_shutdown（
+      // 停服务、关存储）的最后窗口；机器上的 idle 兜底不为它作保。
       // 回 `exit` 才是放行这一次退出；回 `cancel` 会把关窗按回去。
       onExitRequested: () async {
-        await ref.read(engineHandleProvider)?.dispose();
+        try {
+          await ref
+              .read(engineRepositoryProvider)
+              .shutdown(reason: 'flutter window closed');
+        } on Object {
+          // 已经连不上就别再喊：这一手只是尽力而为，不该把关窗卡住。
+        }
         return AppExitResponse.exit;
       },
     );

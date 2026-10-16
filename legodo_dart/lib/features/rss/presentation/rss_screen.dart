@@ -594,12 +594,56 @@ class _RssScreenState extends ConsumerState<RssScreen> {
   ///
   /// 说明那一句是**功能边界**，不是装饰：带规则的订阅源要在源文件里填规则字段，
   /// 这一页只抓取标准 RSS/Atom。不写，用户就会以为在这里改了能生效。
+  ///
+  /// 两个输入框的控制器由 [_AddSourceDialog] 自己持有并释放（理由在那个类头上）：
+  /// 这一发只拿回框里的两个字串。
   Future<void> _openAddDialog(RssNotifier notifier) async {
-    final name = TextEditingController();
-    final url = TextEditingController();
-    final submitted = await showDialog<bool>(
+    final values = await showDialog<(String, String)>(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (context) => const _AddSourceDialog(),
+    );
+    if (values == null || !mounted) return;
+    // 两个字段**空着也照样提交**：flet 那边 `submit` 不看空，名称留空由服务端
+    // 拿 url 顶名，地址留空服务端会抛"RSS 源 url 不能为空"——那一句走状态槽。
+    // 在这里加一道"没填不许提交"就是界面自己发明了一条服务端没有的规矩。
+    await notifier.addSource(name: values.$1, url: values.$2);
+  }
+
+  /// 菜单标题那 40 个字：flet 是 `str(name or sid)[:40]`（超长源名会把这个小对话框
+  /// 顶成整屏，而标题这一格本来只是"你在操作哪一条"）。
+  String _clipped(String value) =>
+      value.length <= 40 ? value : value.substring(0, 40);
+}
+
+enum _SourceMenuAction { refresh, remove }
+
+/// 添加框的内容（两个输入框自己的 `TextEditingController` 住在 [State] 里）。
+///
+/// 控制器**必须**由这里持有：写在外层 `_openAddDialog` 里、`showDialog` 的 future
+/// 一回来就 `dispose()` 会撞上退出动画——路由 pop 只让那个 future 完成，框本身还在
+/// 树上重建一拍，那两个 `TextField` 会用到已经释放的控制器
+/// （`A TextEditingController was used after being disposed`）。提交时把两个字串
+/// 经 `Navigator.pop` 带出框，框外的代码再也碰不到控制器。
+class _AddSourceDialog extends StatefulWidget {
+  const _AddSourceDialog();
+
+  @override
+  State<_AddSourceDialog> createState() => _AddSourceDialogState();
+}
+
+class _AddSourceDialogState extends State<_AddSourceDialog> {
+  final TextEditingController _name = TextEditingController();
+  final TextEditingController _url = TextEditingController();
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _url.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
         key: const Key('rss.add.dialog'),
         title: const Text(kRssAddDialogTitle),
         content: SizedBox(
@@ -610,13 +654,13 @@ class _RssScreenState extends ConsumerState<RssScreen> {
             children: <Widget>[
               TextField(
                 key: const Key('rss.add.name'),
-                controller: name,
+                controller: _name,
                 decoration: const InputDecoration(
                     labelText: kRssFieldName, hintText: kRssFieldNameHint),
               ),
               TextField(
                 key: const Key('rss.add.url'),
-                controller: url,
+                controller: _url,
                 decoration: const InputDecoration(
                     labelText: kRssFieldUrl, hintText: kRssFieldUrlHint),
               ),
@@ -628,31 +672,14 @@ class _RssScreenState extends ConsumerState<RssScreen> {
         actions: <Widget>[
           TextButton(
             key: const Key('rss.add.cancel'),
-            onPressed: () => Navigator.of(context).pop(false),
+            onPressed: () => Navigator.of(context).pop(null),
             child: const Text(kRssCancel),
           ),
           TextButton(
             key: const Key('rss.add.submit'),
-            onPressed: () => Navigator.of(context).pop(true),
+            onPressed: () => Navigator.of(context).pop((_name.text, _url.text)),
             child: const Text(kRssAdd),
           ),
         ],
-      ),
-    );
-    final values = (name: name.text, url: url.text);
-    name.dispose();
-    url.dispose();
-    if (submitted != true || !mounted) return;
-    // 两个字段**空着也照样提交**：flet 那边 `submit` 不看空，名称留空由服务端
-    // 拿 url 顶名，地址留空服务端会抛"RSS 源 url 不能为空"——那一句走状态槽。
-    // 在这里加一道"没填不许提交"就是界面自己发明了一条服务端没有的规矩。
-    await notifier.addSource(name: values.name, url: values.url);
-  }
-
-  /// 菜单标题那 40 个字：flet 是 `str(name or sid)[:40]`（超长源名会把这个小对话框
-  /// 顶成整屏，而标题这一格本来只是"你在操作哪一条"）。
-  String _clipped(String value) =>
-      value.length <= 40 ? value : value.substring(0, 40);
+      );
 }
-
-enum _SourceMenuAction { refresh, remove }

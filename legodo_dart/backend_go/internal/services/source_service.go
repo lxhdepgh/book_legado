@@ -83,11 +83,15 @@ func (s *SourceService) List() []models.BookSource {
 	return result
 }
 
-// Get retrieves a single source by URL.
+// Get retrieves a single source by URL. 查无此源回 (nil, false)——缓存里的
+// nil 值与缺席同义，不能拿去解引用（换源写回按 url 找源，找不到是常态）。
 func (s *SourceService) Get(url string) (*models.BookSource, bool) {
 	src, ok := s.cache[url]
+	if !ok || src == nil {
+		return nil, false
+	}
 	copy := *src
-	return &copy, ok
+	return &copy, true
 }
 
 // Save persists a book source to DB and updates the cache.
@@ -112,7 +116,7 @@ func (s *SourceService) Save(src *models.BookSource) error {
 	}
 
 	s.cache[src.BookSourceURL] = src
-	s.bus.Publish(&core.SourceChangedEvent{ChangeType: "save", SourceURL: src.BookSourceURL})
+	s.bus.Publish(&core.SourceChangedEvent{ChangeType: "save", SourceID: src.BookSourceURL, Timestamp: core.NowSeconds()})
 	return nil
 }
 
@@ -123,7 +127,7 @@ func (s *SourceService) Delete(url string) error {
 		return fmt.Errorf("delete source: %w", err)
 	}
 	delete(s.cache, url)
-	s.bus.Publish(&core.SourceChangedEvent{ChangeType: "delete", SourceURL: url})
+	s.bus.Publish(&core.SourceChangedEvent{ChangeType: "delete", SourceID: url, Timestamp: core.NowSeconds()})
 	return nil
 }
 
@@ -136,7 +140,7 @@ func (s *SourceService) Enable(url string, enabled bool) error {
 	if src, ok := s.cache[url]; ok {
 		src.Enabled = enabled
 	}
-	s.bus.Publish(&core.SourceChangedEvent{ChangeType: "enable", SourceURL: url})
+	s.bus.Publish(&core.SourceChangedEvent{ChangeType: "enable", SourceID: url, Timestamp: core.NowSeconds()})
 	return nil
 }
 

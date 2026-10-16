@@ -70,8 +70,8 @@ class GatewayInfo {
 /// `mode="job"` 那四发（`check.start` / `search.start` / `switch.scan` /
 /// `rss.refresh_all`）的受理凭据（`{"started":true,"action":…}`）。
 ///
-/// **它不是结果**。`mode="job"` 的动作回这个就收摊，真结果一根不落在 RPC 上，
-/// 只走 `/ws` 的事件流（`search.start` → `SearchFinishedEvent`，
+/// **它不是结果**。`mode="job"` 的动作回这个就收摊，真结果一根不落在受理回包上，
+/// 只走事件流（`engine_poll` 轮询那一路）（`search.start` → `SearchFinishedEvent`，
 /// `check.start` → `CheckFinishedEvent`，`switch.scan` → 那两条 `SourceSwitch*`，
 /// `rss.refresh_all` → `RssRefreshProgressEvent` + `RssRefreshedEvent`）。
 /// 拿它当"任务成功了"是这一发最容易读错的地方：
@@ -110,7 +110,7 @@ class WebviewDelivery {
 
 /// 规矩：**失败以 Future 的错误交付，不同步抛**。
 ///
-/// 这条不是风格问题。`RpcEngineRepository` 的失败一定在 Future 上（网络那一发本来就异步），
+/// 这条不是风格问题。FFI 适配器的失败一定在 Future 上（引擎那一发本来就异步），
 /// 而默认体若是 `=> throw`，调用方就会在同一句上分别撞上"同步炸"和"异步炸"两种形状——
 /// `AsyncNotifier.build()` 只接得住后一种，前者会打穿界面（表现为整屏红屏而不是错误页）。
 abstract class EngineRepository {
@@ -169,7 +169,7 @@ abstract class EngineRepository {
   /// 同步抛会打穿 `build()`（本文件头部那条规矩对 Stream 同样成立，只是交付形状不同）。
   Stream<EngineEvent> events() => Stream<EngineEvent>.error(EngineFailure(
         EngineFailureKind.unavailable,
-        '当前环境没有事件流：这根 /ws 没接上，界面上"结果不再往上涨"分不清是没结果还是没声音',
+        '当前环境没有事件流：轮询那一路没接上，界面上"结果不再往上涨"分不清是没结果还是没声音',
       ));
 
   // ------------------------------------------------------------------ #

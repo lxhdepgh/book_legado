@@ -104,9 +104,9 @@ pyinstaller --clean ../LegadoReader.spec
 
 ### 通信协议
 
-- **前端 → 后端**：HTTP POST `/rpc`，JSON-RPC 风格信封
-- **后端 → 前端**：事件流（WebSocket 或 SSE，用于进度推送）
-- **认证**：Bearer Token（启动时动态生成）
+- **前端 → 后端**：FFI 调用（`legodo_engine.dll` 的 `Call(action, params)`，单进程）
+- **后端 → 前端**：事件环轮询（`engine_poll` 按游标取进度/完成事件）
+- **认证**：无（单进程内存直连，不再有回环端口与令牌）
 
 ## 功能模块
 

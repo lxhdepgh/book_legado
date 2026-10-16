@@ -57,6 +57,92 @@ func (n *Node) Select(selector string) []*Node {
 	return nodes
 }
 
+// SplitFieldRule 把 Legado 的 `选择器@属性` 字段规则拆成两段。
+//
+// 判据：最后一个 @ 之后是**纯属性名**才算属性段。真源里
+// `a[href*="@qq.com"]` 这种 @ 写在属性选择器里的规则不能被误拆成
+// 选择器 `a[href*="` + 属性 `qq.com"]`——所以属性段含 CSS 结构字符
+// （方括号、引号、等号、括号、斜杠、点、井号、空格、通配/组合符）时整串仍是选择器。
+func SplitFieldRule(rule string) (selector, attr string) {
+	rule = strings.TrimSpace(rule)
+	idx := strings.LastIndex(rule, "@")
+	if idx < 0 {
+		return rule, ""
+	}
+	attr = strings.TrimSpace(rule[idx+1:])
+	if attr == "" || strings.ContainsAny(attr, `[]"=()#./*^$~| ,`) {
+		return rule, ""
+	}
+	return strings.TrimSpace(rule[:idx]), attr
+}
+
+// Field 按「选择器@属性」字段规则取一个值（Legado AnalyzeRule 的核心子集）。
+//
+// 支持：`selector@text` / `selector@html` / `selector@ownText` / `selector@属性名`，
+// 以及不带 @ 的裸选择器（属性用 defAttr：文本类字段传 "text"、url 类传 "href"/"src"）。
+// `@text`（选择器段为空）取当前节点本身；取不到时回 ""。
+// `##` 正则后缀、`!` 排除、`&&/||` 组合不在这个子集里——语料与 E2E 用到哪种再补哪种。
+func (n *Node) Field(rule, defAttr string) string {
+	selector, attr := SplitFieldRule(rule)
+	if attr == "" {
+		attr = defAttr
+	}
+	target := n
+	if selector != "" {
+		found := n.Select(selector)
+		if len(found) == 0 {
+			return ""
+		}
+		target = found[0]
+	}
+	return target.pick(attr)
+}
+
+// Field 与 Node.Field 同语义；选择器段为空（纯 `@text`）在文档级没有"当前节点"，
+// 回 ""（文档级规则形如 `.list@html`，选择器段不会为空）。
+func (d *Document) Field(rule, defAttr string) string {
+	selector, attr := SplitFieldRule(rule)
+	if attr == "" {
+		attr = defAttr
+	}
+	if selector == "" {
+		return ""
+	}
+	found := d.Select(selector)
+	if len(found) == 0 {
+		return ""
+	}
+	return found[0].pick(attr)
+}
+
+func (n *Node) pick(attr string) string {
+	switch attr {
+	case "", "text":
+		return n.Text()
+	case "html":
+		html, _ := n.Html()
+		return html
+	case "ownText":
+		return n.ownText()
+	default:
+		return n.Attr(attr)
+	}
+}
+
+// ownText 取节点的**直接文本子节点**（不递归子元素），对齐 jsoup ownText()。
+func (n *Node) ownText() string {
+	if len(n.sel.Nodes) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for child := n.sel.Nodes[0].FirstChild; child != nil; child = child.NextSibling {
+		if child.Type == html.TextNode {
+			b.WriteString(child.Data)
+		}
+	}
+	return b.String()
+}
+
 // Attr 获取属性
 func (n *Node) Attr(name string) string {
 	val, _ := n.sel.Attr(name)

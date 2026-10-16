@@ -1,9 +1,11 @@
 /// 试读暂存的那条书架记录：`reader.staged` 的载荷，也是 `reader.close` 里那一格。
 ///
-/// **它和 `bookshelf.list` 的行不是同一套键**（实测：多一格 `in_bookshelf`，
-/// 少三格 `reading`/`updateError`/`cacheUpdatedAt`）。少的那三格里最要紧的是
-/// `reading`——暂存记录**不带进度子对象**，"读到第几章"只能从 `durChapterTitle`
-/// 那几格看（`bookshelf_item.dart` 那套归一在这里没有输入）。
+/// **它和 `bookshelf.list` 的行不是同一套键**：少三格
+/// `reading`/`updateError`/`cacheUpdatedAt`（暂存这一支从不可能带）。少的那三格里
+/// 最要紧的是 `reading`——暂存记录**不带进度子对象**，"读到第几章"只能从
+/// `durChapterTitle` 那几格看（`bookshelf_item.dart` 那套归一在这里没有输入）。
+/// `in_bookshelf` 则是这一侧**必带**（[inBookshelf] 就读它），而书架行带不带取决于
+/// 它的 payload 里有没有——那是透传，不是书架行的结构性键（实测 8 行里 1 行带）。
 ///
 /// 键名两套拼法并存是服务端 `find_bookshelf_item` 的历史形状（BookItem 的蛇形字段 +
 /// 数据库行的驼形字段），不是这里挑的：`golden_contract_test.dart` 拿真样本逐键核。

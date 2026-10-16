@@ -1,20 +1,21 @@
 package services
 
 import (
-	"encoding/json"
 	"time"
 
 	"github.com/legodo-booksource/legodo_go/core"
 )
 
-// Bookmark represents a reader bookmark.
+// Bookmark represents a reader bookmark row. Keys align with the Python
+// gateway contract (app/services/reading/bookmark_service.py list_bookmarks)
+// and Dart's BookmarkRow.fromJson: snake_case, created_at in epoch seconds.
 type Bookmark struct {
-	ID         int64     `json:"id"`
-	BookURL    string    `json:"bookUrl"`
-	ChapterIdx int       `json:"chapterIndex"`
-	Offset     float64   `json:"offset"`
-	Summary    string    `json:"summary"`
-	CreatedAt  int64     `json:"createdAt"`
+	ID         int64   `json:"bookmark_id"`
+	BookURL    string  `json:"book_url"`
+	ChapterIdx int     `json:"chapter_index"`
+	Offset     float64 `json:"offset"`
+	Summary    string  `json:"summary"`
+	CreatedAt  float64 `json:"created_at"`
 }
 
 // ReaderService manages bookmarks for books being read.
@@ -33,26 +34,10 @@ func NewReaderService(storage *core.StorageService, bus *core.EventBus) *ReaderS
 	}
 }
 
-// Start initializes bookmarks table.
-func (s *ReaderService) Start() error {
-	s.base.SetOnStart(func() error {
-		_, err := s.storage.Execute(`
-		CREATE TABLE IF NOT EXISTS reading_bookmarks (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			book_url TEXT NOT NULL,
-			chapter_index INTEGER NOT NULL,
-			offset REAL DEFAULT 0,
-			summary TEXT,
-			created_at INTEGER DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
-			UNIQUE(book_url, chapter_index, offset)
-		);
-		CREATE INDEX IF NOT EXISTS idx_reading_bm_book ON reading_bookmarks(book_url);
-		`)
-		return err
-	})
-	return s.base.Start()
-}
-func (s *ReaderService) Stop() error { return s.base.Stop() }
+// Start brings the reader service up. The canonical bookmarks table is
+// created by StorageService's schema; no service-local table here.
+func (s *ReaderService) Start() error { return s.base.Start() }
+func (s *ReaderService) Stop() error  { return s.base.Stop() }
 
 // AddBookmark creates a bookmark for a book at current position.
 func (s *ReaderService) AddBookmark(bookURL string, chapterIdx int, offset float64, summary string) (*Bookmark, error) {
@@ -61,10 +46,10 @@ func (s *ReaderService) AddBookmark(bookURL string, chapterIdx int, offset float
 		ChapterIdx: chapterIdx,
 		Offset:     offset,
 		Summary:    summary,
-		CreatedAt:  time.Now().UnixMilli(),
+		CreatedAt:  float64(time.Now().UnixNano()) / 1e9,
 	}
 	result, err := s.storage.Execute(
-		`INSERT INTO reading_bookmarks (book_url, chapter_index, offset, summary, created_at) VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO bookmarks (book_url, chapter_index, offset, summary, created_at) VALUES (?, ?, ?, ?, ?)`,
 		bm.BookURL, bm.ChapterIdx, bm.Offset, bm.Summary, bm.CreatedAt,
 	)
 	if err != nil {
@@ -75,15 +60,23 @@ func (s *ReaderService) AddBookmark(bookURL string, chapterIdx int, offset float
 	return bm, nil
 }
 
-// RemoveBookmark deletes a specific bookmark.
-func (s *ReaderService) RemoveBookmark(bookURL string, chapterIdx int, offset float64) error {
-	_, err := s.storage.Execute("DELETE FROM reading_bookmarks WHERE book_url = ? AND chapter_index = ? AND offset = ?", bookURL, chapterIdx, offset)
-	return err
+// RemoveBookmark deletes a bookmark by id, reporting whether a row was hit
+// (the row may already be gone, removed from another view).
+func (s *ReaderService) RemoveBookmark(bookURL string, bookmarkID int64) (bool, error) {
+	result, err := s.storage.Execute("DELETE FROM bookmarks WHERE book_url = ? AND id = ?", bookURL, bookmarkID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
 }
 
-// ListBookmarks returns all bookmarks for a book.
+// ListBookmarks returns all bookmarks for a book, oldest first.
 func (s *ReaderService) ListBookmarks(bookURL string) ([]Bookmark, error) {
-	rows, err := s.storage.Query("SELECT id, book_url, chapter_index, offset, summary, created_at FROM reading_bookmarks WHERE book_url = ? ORDER BY chapter_index, offset", bookURL)
+	rows, err := s.storage.Query("SELECT id, book_url, chapter_index, offset, summary, created_at FROM bookmarks WHERE book_url = ? ORDER BY created_at ASC, id ASC", bookURL)
 	if err != nil {
 		return nil, err
 	}
@@ -102,26 +95,6 @@ func (s *ReaderService) ListBookmarks(bookURL string) ([]Bookmark, error) {
 
 // DeleteAllBookmarks removes all bookmarks for a book.
 func (s *ReaderService) DeleteAllBookmarks(bookURL string) error {
-	_, err := s.storage.Execute("DELETE FROM reading_bookmarks WHERE book_url = ?", bookURL)
+	_, err := s.storage.Execute("DELETE FROM bookmarks WHERE book_url = ?", bookURL)
 	return err
-}
-
-// SavePosition marshals position data and stores via SettingsService pattern.
-func (s *ReaderService) SavePosition(key string, position interface{}) error {
-	data, err := json.Marshal(position)
-	if err != nil {
-		return err
-	}
-	_, err = s.storage.Execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, CAST(strftime('%s','now') AS INTEGER) * 1000)", key, string(data))
-	return err
-}
-
-// ReadPosition retrieves stored position JSON from settings.
-func (s *ReaderService) ReadPosition(key string) (string, bool) {
-	row := s.storage.QueryRow("SELECT value FROM settings WHERE key = ?", key)
-	var val string
-	if err := row.Scan(&val); err != nil {
-		return "", false
-	}
-	return val, true
 }

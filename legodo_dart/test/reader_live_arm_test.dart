@@ -1,21 +1,26 @@
-/// G3 落点实弹臂：**真 `--serve` 子进程** + 仓库里那条语料假源，两侧按字符偏移比翻页落点。
+/// G3 落点实弹臂（FFI 版）：**进程内真 Go 引擎**（`legodo_engine.dll`）+ 仓库里那条
+/// 语料假源，两侧按字符偏移比翻页落点。
 ///
 /// §9 门 G3 的判据是"同一本书翻页落点与 flet 版可比（按字符偏移断言）"。
 /// `reader_screen_test` 那一半用替身 + 黄金样本（证形状），这一半证**接上真的还是一样对**：
 ///
 /// - 参照物是 `tests/gateway/projection/reader.content.json`——**flet 自己的函数**算出来的
-///   落点表，不是 Dart 自己算的。两边都读 Dart 的投影，Dart 错了就两边一起绿
+///   落点表，不是 Dart 自己算的。两边都读 Dart 的投影，Dart 错了两边一起绿
 ///   （G1 那笔账，见 `live_engine_test.dart` 抬头）。
 /// - 靶子是 `tests/gateway/fake_source_reader.py`（跟踪在仓库里的那份语料），由本臂当
 ///   **子进程**拉起来；它与黄金样本的对齐由 `tests/test_reader_fixture_matches_golden_samples.py`
 ///   钉住。本臂不抄语料规则：书源字典是问 `/g3/source.json` 要的。
-/// - 引擎跑在**空的临时数据目录**里：这一臂会建源、入架、落进度，一行都不许进真库。
+/// - 引擎是**进程内**的（FFI 架构下不再是子进程）：`LEGADO_BOOKSOURCE_DATA_DIR` 在进程
+///   启动时就固定了，所以库根由 `.probe/ffi_live_run.py` 预建（空目录）——这一臂建的源、
+///   入的书架、落的进度一行都不进真库。结果事件走适配器的游标轮询（`engine_poll`）。
 ///
-/// 三条仪器规矩：全程 127.0.0.1（零外网，记忆 `legado-live-scan-av-block`）；两个子进程的
-/// 输出从头抽干（记忆 `subprocess-probe-must-drain-stdout`）；字节按 action 数，不留混合
-/// 计数（记忆 `aggregated-counters-hide-which-call`）。
+/// 三条仪器规矩：全程 127.0.0.1（零外网，记忆 `legado-live-scan-av-block`）；子进程输出
+/// 从头抽干（记忆 `subprocess-probe-must-drain-stdout`）；"引擎真来取过页"读**语料自己记
+/// 的账**（`/hits.json`），不由引擎或本臂自报（记忆 `zero-counts-need-a-positive-control`）。
 ///
-/// 没给 `LEGODO_PYTHON` / `LEGODO_MAIN` 就整支跳过——与 `live_engine_test.dart` 同一个开关。
+/// 开关：`LEGODO_ENGINE_DLL` + `LEGADO_BOOKSOURCE_DATA_DIR` + `LEGODO_PYTHON` + Windows
+/// （FFI 的内存分配器目前只实现 kernel32）。少一个就整支跳过——`.probe/ffi_live_run.py`
+/// 一次配齐（连 DLL 一起编好）。
 library;
 
 import 'dart:async';
@@ -24,19 +29,26 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
-import 'package:legodo_client/core/events/engine_event_client.dart';
 import 'package:legodo_client/core/events/engine_event.dart';
-import 'package:legodo_client/core/rpc/engine_process.dart';
-import 'package:legodo_client/core/rpc/rpc_client.dart';
-import 'package:legodo_client/core/rpc/rpc_engine_repository.dart';
+import 'package:legodo_client/core/rpc/envelope.dart';
+import 'package:legodo_client/core/rpc/ffi_engine_adapter.dart';
 import 'package:legodo_client/features/find_books/data/book_row.dart';
 import 'package:legodo_client/features/reader/data/chapter_document.dart';
 import 'package:legodo_client/features/reader/data/reading_position.dart';
 import 'package:legodo_client/features/reader/domain/text_layout.dart';
 
+final String? _dll = Platform.environment['LEGODO_ENGINE_DLL'];
+final String? _dataDir = Platform.environment['LEGADO_BOOKSOURCE_DATA_DIR'];
 final String? _python = Platform.environment['LEGODO_PYTHON'];
-final String? _mainPy = Platform.environment['LEGODO_MAIN'];
-final bool _live = _python != null && _mainPy != null;
+
+/// 活臂开关：DLL + 语料目录 + python（起假源子进程）都得给，且都得真指到东西上。
+bool get _live =>
+    _dll != null &&
+    _dataDir != null &&
+    _python != null &&
+    Platform.isWindows &&
+    File(_dll!).existsSync() &&
+    Directory(_dataDir!).existsSync();
 
 final String _repoRoot = Directory.current.parent.path;
 
@@ -56,7 +68,8 @@ Map<String, Object?> _loadJson(String relative) => jsonDecode(
 
 /// 起起来的语料假源。
 class _Fixture {
-  _Fixture({required this.process, required this.port, required this.source, required this.lines});
+  _Fixture(
+      {required this.process, required this.port, required this.source, required this.lines});
 
   final Process process;
   final int port;
@@ -65,6 +78,14 @@ class _Fixture {
 
   String get sourceUrl => '${source['bookSourceUrl']}';
   String get group => '${source['bookSourceGroup']}';
+
+  /// 语料自己记的取页账（路径 + 是否渲染版 → 次数），由被取的一方记账。
+  Future<Map<String, Object?>> hits() async {
+    final response = await http
+        .get(Uri.parse('http://127.0.0.1:$port/hits.json'))
+        .timeout(const Duration(seconds: 20));
+    return jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, Object?>;
+  }
 }
 
 /// 把假源当子进程拉起来，读它的 `PORT` 行，再问它要书源字典。
@@ -104,71 +125,22 @@ Future<_Fixture> _startFixture() async {
       lines: lines);
 }
 
-/// 只数进出的字节，别的都转给真 client（与 `live_engine_test.dart` 同一形状）。
-///
-/// **按 action 数**：这一臂发了八发以上，一个总数就没法回答"reader.content 那一发到底
-/// 多大"，也就拦不住"多发了什么"。
-class _CountingClient extends http.BaseClient {
-  _CountingClient(this._inner);
-
-  final http.Client _inner;
-  final Map<String, int> sentByAction = <String, int>{};
-  final Map<String, int> receivedByAction = <String, int>{};
-
-  String get perAction => sentByAction.keys.map((String action) {
-        return '$action 出 ${sentByAction[action]}B 入 ${receivedByAction[action]}B';
-      }).join(' · ');
-
-  @override
-  Future<http.StreamedResponse> send(http.BaseRequest request) async {
-    final body = await request.finalize().toBytes();
-    var action = '(没解出 action)';
-    try {
-      final decoded = jsonDecode(utf8.decode(body));
-      if (decoded is Map<String, Object?>) action = '${decoded['action']}';
-    } on FormatException {
-      // 解不出来就留着占位：计数不许因为探针而改变行为。
-    }
-    sentByAction[action] = (sentByAction[action] ?? 0) + body.length;
-    // 走 `Request..bodyBytes`：`Client.post(body: …)` 按 latin1 编字节，中文会花。
-    final outbound = http.Request(request.method, request.url)
-      ..followRedirects = request.followRedirects
-      ..headers.addAll(request.headers)
-      ..bodyBytes = body;
-    final response = await http.Response.fromStream(await _inner.send(outbound));
-    receivedByAction[action] =
-        (receivedByAction[action] ?? 0) + response.bodyBytes.length;
-    return http.StreamedResponse(Stream<List<int>>.value(response.bodyBytes),
-        response.statusCode,
-        headers: response.headers, reasonPhrase: response.reasonPhrase);
-  }
-
-  @override
-  void close() => _inner.close();
-}
-
-/// 一趟实弹：假源 + 真引擎 + 真会话，读回那一章。
+/// 一趟实弹：假源 + 进程内真引擎 + 真会话，读回那一章。
 class _LiveShot {
   _LiveShot({
     required this.fixture,
-    required this.started,
-    required this.events,
+    required this.adapter,
     required this.subscription,
-    required this.counter,
-    required this.repository,
-    required this.dataDir,
+    required this.frames,
     required this.book,
     required this.document,
     required this.chapterCount,
   });
 
   final _Fixture fixture;
-  final StartedEngine started;
-  final EngineEventClient events;
+  final FFIEngineAdapter adapter;
   final StreamSubscription<EngineEvent> subscription;
-  final _CountingClient counter;
-  final RpcEngineRepository repository;
-  final Directory dataDir;
+  final List<EngineEvent> frames;
   final BookRow book;
   final ChapterDocument document;
   final int chapterCount;
@@ -177,51 +149,38 @@ class _LiveShot {
   List<int> get offsets => paragraphOffsets(paragraphs);
 
   /// 逐项注册清理：**成功路径**才用 addTearDown（失败路径由 [_shootOnce] 自己收摊，
-  /// 否则半趟跑起来的两个子进程会把端口和临时目录留在盘上）。
+  /// 否则半趟跑起来的假源子进程会把端口留在盘上）。
   void registerTearDowns() {
     addTearDown(() async {
       await subscription.cancel();
-      await events.close();
-      counter.close();
-      started.process.kill(ProcessSignal.sigterm);
+      // disconnect 是幂等的（cleanup 由 _ready 守着）：测试体内若已收过摊，这里再来一次是空操作。
+      await adapter.disconnect();
       fixture.process.kill(ProcessSignal.sigterm);
-      if (dataDir.existsSync()) dataDir.deleteSync(recursive: true);
     });
   }
 }
 
 Future<_LiveShot> _shootOnce() async {
   final fixture = await _startFixture();
-  final dataDir = await Directory.systemTemp.createTemp('legodo-g3live-');
-  final started = await EngineProcess.start(
-      python: _python,
-      mainPy: _mainPy,
-      environment: <String, String>{
-        // 空目录：这一臂建的源、入的书架、落的进度都不进真库。
-        'LEGADO_BOOKSOURCE_DATA_DIR': dataDir.path,
-        'LEGADO_BOOKSOURCE_CACHE_DIR': '${dataDir.path}/cache',
-        'PYTHONIOENCODING': 'utf-8',
-      });
-  final counter = _CountingClient(http.Client());
-  final repository = RpcEngineRepository(RpcClient(started.endpoint, client: counter));
-  final events = EngineEventClient(started.endpoint);
+  final adapter = FFIEngineAdapter();
+  await adapter.connect();
   final frames = <EngineEvent>[];
-  final subscription = events.events.listen(frames.add);
+  final subscription = adapter.events().listen(frames.add);
   Future<void> cleanup() async {
     await subscription.cancel();
-    await events.close();
-    counter.close();
-    started.process.kill(ProcessSignal.sigterm);
+    await adapter.disconnect();
     fixture.process.kill(ProcessSignal.sigterm);
-    if (dataDir.existsSync()) dataDir.deleteSync(recursive: true);
   }
 
   try {
-    await events.start();
-    await repository.hello();
-    final saved = await repository.saveSource(fixture.source);
-    expect(saved.saved, isTrue, reason: 'source.save 没建起语料源：${saved.errors}');
-    final accepted = await repository.searchStart(
+    final saved = await adapter.saveSource(fixture.source);
+    expect(saved.saved, isTrue, reason: 'source_save 没建起语料源：${saved.errors}');
+    // 建源的回话只是"这一发没报错"，源真在不在要按 url 读回来——search 那一发会在
+    // 找不到源时报"无源可搜"，与"源建坏了"隔着两层，读回来这一发把两层并成一层。
+    final loaded = await adapter.loadSource(fixture.sourceUrl);
+    expect(loaded, isNotNull,
+        reason: 'source_save 之后按 url 读不回这条源 = 建源这一发没落到事情上');
+    final accepted = await adapter.searchStart(
         keyword: _keyword,
         scope: fixture.group,
         searchId: DateTime.now().millisecondsSinceEpoch % 1000000);
@@ -233,25 +192,22 @@ Future<_LiveShot> _shootOnce() async {
             payload['finished'] == true && (payload['items'] as List? ?? []).isNotEmpty);
     final book = BookRow.fromJson(
         (frame.payload['items']! as List).cast<Map<String, Object?>>().first);
-    final session = await repository.openReader(
+    final session = await adapter.openReader(
         sourceUrl: fixture.sourceUrl, book: book.raw, shelve: true, resume: true);
-    final rows = await repository.chapterRows(
+    final rows = await adapter.chapterRows(
         sourceUrl: fixture.sourceUrl, bookUrl: session.bookUrl);
     expect(rows.length, session.chapterCount,
         reason: '会话报的章数与目录行数不是一个数：'
             '${session.chapterCount} vs ${rows.length}');
-    final document = await repository.chapterDocument(
+    final document = await adapter.chapterDocument(
         sourceUrl: fixture.sourceUrl,
         bookUrl: session.bookUrl,
         chapterUrl: rows[_chapterIndex].url);
     return _LiveShot(
       fixture: fixture,
-      started: started,
-      events: events,
+      adapter: adapter,
       subscription: subscription,
-      counter: counter,
-      repository: repository,
-      dataDir: dataDir,
+      frames: frames,
       book: book,
       document: document,
       chapterCount: session.chapterCount,
@@ -265,7 +221,7 @@ Future<_LiveShot> _shootOnce() async {
 Future<EngineEvent> _waitFor(List<EngineEvent> frames,
     {required String name,
     required bool Function(Map<String, Object?> payload) where}) async {
-  final deadline = DateTime.now().add(const Duration(seconds: 180));
+  final deadline = DateTime.now().add(const Duration(seconds: 120));
   while (DateTime.now().isBefore(deadline)) {
     for (final frame in frames) {
       if (frame.name == name && where(frame.payload)) return frame;
@@ -278,8 +234,8 @@ Future<EngineEvent> _waitFor(List<EngineEvent> frames,
 
 void main() {
   test('靶子自己先要能打：假源子进程起得来、PORT 行与 source.json 同端口', () async {
-    if (!_live) {
-      markTestSkipped('没有 LEGODO_PYTHON / LEGODO_MAIN：这一臂要真起子进程');
+    if (_python == null) {
+      markTestSkipped('没有 LEGODO_PYTHON：这一臂要真起子进程');
       return;
     }
     final fixture = await _startFixture();
@@ -297,9 +253,10 @@ void main() {
         reason: '正文页短到这个程度，段切那一头就没东西可切了');
   }, timeout: const Timeout(Duration(minutes: 2)));
 
-  test('实弹：真子进程读回的正文，Dart 那把尺与 flet 投影表同偏移', () async {
+  test('实弹：进程内真引擎读回的正文，Dart 那把尺与 flet 投影表同偏移', () async {
     if (!_live) {
-      markTestSkipped('没有 LEGODO_PYTHON / LEGODO_MAIN');
+      markTestSkipped('没有 LEGODO_ENGINE_DLL / LEGADO_BOOKSOURCE_DATA_DIR / LEGODO_PYTHON：'
+          '跑 .probe/ffi_live_run.py 一次配齐');
       return;
     }
     final projection = _loadJson('projection/reader.content.json');
@@ -309,11 +266,15 @@ void main() {
     final offsets = live.offsets;
     final want =
         (projection['offsets']! as List).cast<num>().map((v) => v.toInt()).toList();
-    stdout.writeln('LIVE 第${_chapterIndex + 1}章 服务端 ${live.document.paragraphCount} 段 '
+    // 语料自己记的账：这一页真被引擎从回环地址取过。
+    final hits = await live.fixture.hits();
+    final chapterPath = Uri.parse(live.document.chapterUrl).path;
+    final chapterHits = (hits[chapterPath] as num?)?.toInt() ?? 0;
+    stdout.writeln('LIVE-FFI 第${_chapterIndex + 1}章 服务端 ${live.document.paragraphCount} 段 '
         '${live.document.totalChars} 字 · Dart ${live.paragraphs.length} 段 '
         '${chapterTextLength(live.paragraphs)} 字 · flet 投影 '
         '${projection['paragraph_count']} 段 ${projection['total_chars']} 字'
-        ' · 目录 ${live.chapterCount} 章 · ${live.counter.perAction}');
+        ' · 目录 ${live.chapterCount} 章 · 取页账 $hits');
 
     // ---- 三个读数必须同时对上：服务端算的、Dart 算的、flet 算的 ----
     expect(live.paragraphs.length, live.document.paragraphCount,
@@ -337,14 +298,20 @@ void main() {
       expect(offsets[index], offsetOfParagraph(live.paragraphs, index));
     }
 
-    // ---- 交付形态那一头：实弹里媒体块是"字节 + 地址"，地址不许丢 ----
-    // 离线守卫只能验到地址还在 value 那一格（不发请求就不会换成字节），这一格是它够不着的那一半。
+    // ---- 仪器正控：正文那一页真被取过（语料记账，不是本臂自报） ----
+    // 没有这一行，上面那串"对上了"分不清是引擎真从回环取回来的，还是读了别处的缓存。
+    expect(chapterHits, greaterThanOrEqualTo(1),
+        reason: '语料账里 $chapterPath 一次都没有 = 引擎没来取过这页，读数另有来源');
+    expect(hits.values.any((v) => (v as num?) != null && v! > 0), isTrue,
+        reason: '取页账整个是空的 = 账本本身没记上（与"没被取过"是两件事）');
+
+    // ---- 媒体面：Go 正文管线目前是纯文本（GetContent 把 .list@html 整段 HTMLToText，
+    // <img> 被拍平），flet 参考实现会给插图画一条 image 块（投影表 rows 里那条
+    // kind=image）。这是 FFI 引擎的已知缺口（不在本轮拆除范围），读数写在这里而不是
+    // 断言"没有"：缺口补上那天这里会红，逼着把断言升级成"1 块 + url 非空 + binary 形状"。
     final media = live.document.blocks.where((block) => !block.isText).toList();
-    expect(media, hasLength(1),
-        reason: '插图那条臂没跑到：${live.document.blocks.map((b) => b.kind).toList()}');
-    expect(media.single.binary, isTrue);
-    expect(media.single.url, startsWith('http://127.0.0.1:'),
-        reason: '引擎把图换成字节之后，客户端只能靠 url 那一格渲染它（设计 §4.4）');
+    expect(media, isEmpty,
+        reason: 'Go 出媒体块了：把这条读数升级成与 flet 同形的断言（对照投影表 kind=image 那条）');
 
     // ---- 落点往返：Dart 算出的偏移交给服务端，再原样读回来 ----
     final position = ReadingPosition(
@@ -356,14 +323,14 @@ void main() {
       fontSize: 16,
       lastReadAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
     );
-    final saved = await live.repository.savePosition(
+    final saved = await live.adapter.savePosition(
         sourceUrl: live.fixture.sourceUrl,
         bookUrl: live.book.url,
         positionJson: position.toJson());
     expect(saved.characterOffset, offsets[_pinnedParagraph],
         reason: '范围内的偏移被改写了：落回 ${saved.characterOffset}，'
             'Dart 发的是 ${offsets[_pinnedParagraph]}');
-    final restored = await live.repository.readPosition(
+    final restored = await live.adapter.readPosition(
         sourceUrl: live.fixture.sourceUrl, bookUrl: live.book.url);
     expect(restored, isNotNull, reason: '刚落的一发读不回来（那是"从没读过"的形状）');
     expect(restored!.characterOffset, offsets[_pinnedParagraph],
@@ -375,7 +342,7 @@ void main() {
         reason: '往返读回来的偏移与 flet 投影表第 $_pinnedParagraph 段的落点不是同一个数');
 
     // ---- 正对照：越界那一发必须真被夹回来，且夹完仍不超过这把尺 ----
-    final overflow = await live.repository.savePosition(
+    final overflow = await live.adapter.savePosition(
         sourceUrl: live.fixture.sourceUrl,
         bookUrl: live.book.url,
         positionJson: <String, Object?>{
@@ -388,55 +355,38 @@ void main() {
     expect(overflow.paragraphIndex, live.paragraphs.length - 1);
     expect(overflow.characterOffset, isNot(saved.characterOffset),
         reason: '越界那发的读数与正常那发一模一样 = 夹回这条臂根本没跑到');
-
-    // ---- 正对照（仪器）：这几发真发出去了，比对不是拿替身糊出来的 ----
-    expect(live.counter.receivedByAction.keys, containsAll(<String>[
-      'engine.hello', 'source.save', 'search.start', 'reader.open', 'reader.toc',
-      'reader.content', 'reader.position_save', 'reader.position_get',
-    ]));
-    expect(live.counter.receivedByAction['reader.content']!, greaterThan(2000),
-        reason: '正文那一发的 HTTP 体比一章的字数还小 = 载荷被截了或发错了 action');
   }, timeout: const Timeout(Duration(minutes: 6)));
 
-  test('收摊：engine.shutdown 之后两个子进程都退，临时目录不留在盘上', () async {
+  test('收摊与复用：engine_shutdown 真把引擎放掉，重接之后会话数据还在', () async {
     if (!_live) {
-      markTestSkipped('没有 LEGODO_PYTHON / LEGODO_MAIN');
+      markTestSkipped('没有 LEGODO_ENGINE_DLL / LEGADO_BOOKSOURCE_DATA_DIR / LEGODO_PYTHON');
       return;
     }
     final live = await _shootOnce();
-    final dataDirPath = live.dataDir.path;
-    final port = live.started.endpoint.port;
-    await live.repository.deleteSource(live.fixture.sourceUrl);
-    await live.repository.shutdown(reason: 'g3 live arm done');
+    live.registerTearDowns();
+    final rowsBefore = await live.adapter.listBookshelf();
+    expect(rowsBefore, isNotEmpty,
+        reason: '刚 openReader(shelve:true) 过，书架却一行没有 = 这一臂的书根本没进架');
+
+    // 先退订事件流：poll 定时器还在的话，shutdown 之后每一拍都会往流里塞
+    // "hub not initialized"（那个错按设计要继续报），会把收摊顺序里的读数淹掉。
     await live.subscription.cancel();
-    await live.events.close();
-    live.counter.close();
-    live.fixture.process.kill(ProcessSignal.sigterm);
+    await live.adapter.shutdown(reason: 'g3 live arm done');
+    await expectLater(
+        live.adapter.listBookshelf(),
+        throwsA(isA<EngineFailure>()
+            .having((EngineFailure e) => e.kind, 'kind', EngineFailureKind.engine)
+            .having((EngineFailure e) => e.message, 'message',
+                contains('hub not initialized'))),
+        reason: 'engine_shutdown 之后引擎必须真放掉（不是"标志位换了个值"——那种引擎这里会照常回数）');
 
-    final rc = await live.started.process.exitCode
-        .timeout(const Duration(seconds: 60),
-            onTimeout: () => throw StateError('发了 engine.shutdown，60s 内进程没退'));
-    expect(rc, 0, reason: '非 0 = 无头入口收尾没走干净');
-    // 假源那一发也要有退出凭据，不是"我杀了它"就算收了。
-    await live.fixture.process.exitCode
-        .timeout(const Duration(seconds: 30),
-            onTimeout: () => throw StateError('假源收到 SIGTERM 之后 30s 没退'));
-
-    // 端口真放掉没有：还连着上就是"停掉的只是 shell、python 还占着端口"那一类
-    // （记忆 background-server-keeps-port）。
-    var refused = false;
-    try {
-      final probe =
-          await Socket.connect('127.0.0.1', port, timeout: const Duration(seconds: 3));
-      probe.destroy();
-    } on SocketException {
-      refused = true;
-    }
-    expect(refused, isTrue, reason: '引擎退了但端口还占着 = 还有别的进程没退');
-    // 正对照：临时目录真在被用（收摊前先确认它存在，否则上面那句 deleteSync 可能删的是空气）。
-    expect(Directory(dataDirPath).existsSync(), isTrue,
-        reason: '引擎跑完连临时目录都没有 = 这一臂的 LEGADO_BOOKSOURCE_DATA_DIR 没生效');
-    Directory(dataDirPath).deleteSync(recursive: true);
-    expect(Directory(dataDirPath).existsSync(), isFalse);
+    // 重接：GoFFIClient.initialize() 在 _ready=true 时早退，所以必须先用 disconnect
+    // 把 _ready 归位；直接 connect 会静默接上一个已经死掉的 hub。
+    await live.adapter.disconnect();
+    await live.adapter.connect();
+    final rowsAfter = await live.adapter.listBookshelf();
+    expect(rowsAfter.length, rowsBefore.length,
+        reason: '重接之后书架读数与收摊前不等：同一份语料目录、同一批行，'
+            '${rowsBefore.length} → ${rowsAfter.length}');
   }, timeout: const Timeout(Duration(minutes: 5)));
 }

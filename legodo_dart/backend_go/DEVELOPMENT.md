@@ -4,8 +4,6 @@
 
 ```
 legodo_go/
-├── cmd/server/              # 主入口
-│   └── main.go              # 服务启动/停止逻辑
 ├── internal/                # 内部实现（不对外暴露）
 │   ├── engine/              # 规则引擎核心
 │   │   ├── rule_engine.go   # 规则执行器
@@ -20,8 +18,6 @@ legodo_go/
 │   │   ├── hub.go           # ServiceHub 生命周期
 │   │   ├── register.go      # 服务注册
 │   │   └── ...              # 28 个服务
-│   ├── gateway/             # RPC 网关
-│   │   └── gateway.go       # WebSocket + HTTP
 │   └── storage/             # 存储层
 │       ├── sqlite.go        # SQLite 连接
 │       └── cache.go         # 文件缓存
@@ -62,11 +58,11 @@ go test ./... -v
 ### 3. 构建
 
 ```bash
-# Windows
-go build -o legodo_server.exe ./cmd/server/
+# FFI 动态库（Windows 出 .dll，Linux/macOS 出 .so）
+go build -buildmode=c-shared -o legodo_engine.dll ./pkg/ffi/
 
-# Linux/macOS
-go build -o legodo_server ./cmd/server/
+# 完整出包（含 Flutter 端与打包 zip）
+python ../build_release.py windows
 
 # Android (AAR)
 gomobile bind -target=android -o legodo_engine.aar ./pkg/jsruntime
@@ -74,11 +70,9 @@ gomobile bind -target=android -o legodo_engine.aar ./pkg/jsruntime
 
 ### 4. 运行
 
-```bash
-./legodo_server.exe
-# 或
-go run ./cmd/server/
-```
+FFI 单进程：动态库由 Flutter 客户端进程加载（`lib/app/bootstrap.dart` 的 FFI
+路径），没有独立服务进程可跑。完整出包用 `python ../build_release.py windows`，
+产物是 `legodo_client.exe`（DLL 随包分发）。
 
 ## 核心模块实现进度
 

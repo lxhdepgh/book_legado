@@ -193,7 +193,8 @@ class RssNotifier extends AsyncNotifier<RssState> {
       added = await ref.read(engineRepositoryProvider).refreshRssSource(sourceId);
     } on EngineFailure catch (exc) {
       // 抓取失败在服务端是**错误信封**，不是静默 0（`rss.refresh` 的 summary 明写）。
-      _failures.add(exc);
+      // 只写状态槽、**不**推 [failures]：这句和横幅的框字（`刷新失败：…`）是同一句话，
+      // 两处一起上屏就是同一事实两个持有者（flet `_refresh_one` 也只写 `_status`）。
       _emitStatus(kRssRefreshFailed(exc.message));
       return;
     }

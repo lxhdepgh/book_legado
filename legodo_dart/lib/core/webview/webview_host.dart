@@ -3,8 +3,9 @@
 /// 链条是这样的：引擎读到 `<useweb>` 或 `url,{"webView":true}` 那一族源，先在自己这边
 /// 试无头内核（`BrowserService._silent_render`）；那一页**看着像要人**（登录墙、验证码、
 /// `block_pages.looks_like_gate` 那几条）时，内核那一版就不交了，改问远端宿主
-/// ——`GatewayService.request_web_content` 从 `/ws` 推一条 `request` 帧，等 20s。
-/// 宿主的答案走 `/rpc engine.webContentReady` 回去。
+/// ——引擎发一条 `request` 帧，等 20s。宿主的答案走 `engine.webContentReady`
+/// 回去。（P7 拆掉网关后这条通道两侧都没有落点，见
+/// `test/webview_reverse_channel_live_arm_test.dart` 钉的边界。）
 ///
 /// **这一轮产品侧接的不是可见 WebView，是接缝**：G4 要挑 Windows 的 WebView 插件
 /// （`flutter_inappwebview` 无 Windows 桌面、`webview_windows` 已停更，见开发日志那份
@@ -110,7 +111,7 @@ class ScriptedWebviewHost implements WebviewHost {
 ///    而每一发各等自己的 20s；在监听回调里 await 会把后面那些帧压着
 ///    （[ScriptedWebviewHost] 那 `delay` 一大就演得出这个形状）。
 /// 2. **宿主炸了不许带走这根流**。渲染抛错折成 `error` 交回去，交回本身抛错只出声
-///    （[onError]）——事件流与这条口在同一条 `/ws` 上，订阅一断，界面上"结果不再往上涨"
+///    （[onError]）——事件流与这条口同在一个引擎上，订阅一断，界面上"结果不再往上涨"
 ///    就再也分不清是没结果还是没声音。
 /// 3. **`delivered:false` 不是失败**（引擎已经走人了），所以它只走 [onError] 那条
 ///    说明，不折成异常。

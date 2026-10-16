@@ -156,7 +156,12 @@ FakeEngineRepository _contFake({Map<String, ChapterDocument>? byUrl}) {
 Future<GoRouter> _open(WidgetTester tester, FakeEngineRepository fake) async {
   // 视口收小：正文要**真的滚得动**才接得出下一章（默认 800×600 下第 1 章 12 短段
   // 几乎一屏装下，`maxScrollExtent` 接近 0，追加判据根本走不到）。
-  await tester.binding.setSurfaceSize(const Size(360, 300));
+  //
+  // 360×**400** 而不是 360×300：300 高时根路由上首屏那一页（阅读分组的初始页签）
+  // 自己会 RenderFlex 溢出 18px——那是另一屏在极小高度下的排版，与这一屏无关，
+  // 而 flutter_test 把任何一次渲染异常都记成"这一条失败"，八条用例全被它带红。
+  // 400 高时正文照样滚得动（第 1 章 maxScrollExtent ≈ 549），前提一个不少。
+  await tester.binding.setSurfaceSize(const Size(360, 400));
   addTearDown(() => tester.binding.setSurfaceSize(null));
   final router = buildRouter();
   await tester.pumpWidget(ProviderScope(
@@ -195,16 +200,36 @@ double _viewportTop(WidgetTester tester) =>
 Finder _row(int documentParagraph) =>
     find.byKey(ValueKey('reader.text.$documentParagraph'));
 
+/// 树上已建出来的正文行段号（升序）。`ListView.builder` 只建视口附近那几行，
+/// `_revealRow` 要往哪边揭、跳过几屏都靠它当眼睛（段号是离散的，能直接从键上读）。
+List<int> _builtRange(WidgetTester tester) {
+  final values = <int>[];
+  for (final text in tester.widgetList<Text>(find.byWidgetPredicate((widget) =>
+      widget is Text &&
+      widget.key is ValueKey<String> &&
+      (widget.key! as ValueKey<String>).value.startsWith('reader.text.')))) {
+    final key = (text.key! as ValueKey<String>).value;
+    values.add(int.parse(key.substring('reader.text.'.length)));
+  }
+  return values..sort();
+}
+
 /// 让下一发滚动通知落在**距底不足 180px** 那一格：一屏一屏跳到底。
 ///
 /// 为什么跳好几次而不是 `jumpTo(maxScrollExtent)` 一发到位：`ListView.builder` 的
 /// `maxScrollExtent` 是按**已建出来的**那些行的均值估的，跳到"估出来的底"之后布局又建出
 /// 新的一截，真正的底还在下面——一次到位时通知里的 distance 可能是几百像素，
 /// 追加就不会触发（仪器自己的错，不是屏的错）。
-Future<void> _driveToBottom(WidgetTester tester) async {
+///
+/// 返回最后一发 `jumpTo` 之后**当场**读到的像素：追加那一臂的原则是"视口一像素不动"，
+/// 判据要拿触发那一发的停靠值比，不能拿"接完之后"的读数比（接完再读，等于让屏自己
+/// 给自己当证词）。
+Future<double> _driveToBottom(WidgetTester tester) async {
+  var docked = _list(tester).position.pixels;
   for (var step = 0; step < 8; step++) {
     final controller = _list(tester);
     controller.jumpTo(controller.position.maxScrollExtent);
+    docked = controller.position.pixels;
     await tester.pump();
     if (controller.position.pixels >=
         controller.position.maxScrollExtent - _triggerBand()) {
@@ -215,25 +240,29 @@ Future<void> _driveToBottom(WidgetTester tester) async {
   // 再补两泵才看得见接上来的行。
   await tester.pump();
   await tester.pump();
+  return docked;
 }
 
 /// 与 `ReaderNotifier._appendTriggerPx` 同一个数——**不 import 那个私有常量**：
 /// 判据读被测对象的常量的话，把 180 改成 18000 也照样全绿（记忆那一条"不许读被测常量"）。
 double _triggerBand() => 180;
 
-/// 把整篇第 [paragraph] 段的段顶对齐到视口顶（屏外就先一屏一屏揭出来）。
+/// 把整篇第 [paragraph] 段的段顶对齐到视口顶（屏外就往那一侧一屏一屏揭）。
+///
+/// 方向按**已建出来的段号区间**判：目标比最小已建段号还小就往上看，否则往下看。
+/// 不能一律往下跳：接缝那一臂要先往上看（从第二章退回第一章那一段），
+/// 只会向下揭的话那一问永远够不着。
 ///
 /// 这里用的是**外部**量到的行顶（`getTopLeft`），不是屏自己记的那一套：两边各量各的
 /// 才叫对照。
 Future<void> _revealRow(WidgetTester tester, int paragraph) async {
   for (var step = 0; step < 60 && _row(paragraph).evaluate().isEmpty; step++) {
     final controller = _list(tester);
-    final toward = controller.position.pixels +
-            controller.position.viewportDimension * 0.8 >
-        controller.position.maxScrollExtent
-        ? controller.position.maxScrollExtent
-        : controller.position.pixels +
-            controller.position.viewportDimension * 0.8;
+    final built = _builtRange(tester);
+    final upward = built.isNotEmpty && paragraph < built.first;
+    final span = controller.position.viewportDimension * 0.8;
+    final toward = (controller.position.pixels + (upward ? -span : span))
+        .clamp(0.0, controller.position.maxScrollExtent);
     if (toward == controller.position.pixels) break;
     controller.jumpTo(toward);
     await tester.pump();
@@ -269,14 +298,17 @@ void main() {
           reason: '第 $index 章的段首偏移两侧不同数：Dart 造的语料不是 flet 那支假源的语料');
       expect(_paragraphsOf(index).length, _int(row['paragraph_count']));
     }
-    // flet 的 `text_length` 是 `sum(len(段))`，不含段间那个换行；Dart 的尺含（`+1` 每段间）。
-    // 差的就是 n−1 格——留着这一句是为了下一轮把它当**已知的口径差**而不是"突然对不上"。
+    // flet 的 `text_length` 数的是**显示行**（`novel_paragraphs` 缩进之后）：
+    // `sum(len(段)) + 2 × 非标题段数`（缩进 `　　` 两个字符、标题不缩、段间格不进）。
+    // Dart 尺上那一格（`chapterTextLength`，`MountedChapter.toMount` 用的）是**没缩进**的
+    // 原文 + 段间换行——两个量本来就不同。这里拿 Dart 的**显示口径**（`contentPlan` 的
+    // `display` 列）与 flet 抓下的数对，比的是"同一章渲染完之后两边字符流同长"。
     for (var i = 0; i < tableChapters.length; i++) {
-      final paragraphs = _paragraphsOf(i + 1);
-      expect(
-          _int(tableChapters[i]['text_length']),
-          chapterTextLength(paragraphs) - (paragraphs.length - 1),
-          reason: '第 ${i + 1} 章的 text_length 差的不止段间格，两边串的已经不是同一串字');
+      final displaySum = contentPlan(_documentOf(i + 1), indent: true)
+          .where((line) => line.isText)
+          .fold<int>(0, (sum, line) => sum + line.display.length);
+      expect(_int(tableChapters[i]['text_length']), displaySum,
+          reason: '第 ${i + 1} 章的显示行总长两侧不同数：切段或缩进口径有一边改了');
     }
   });
 
@@ -296,9 +328,8 @@ void main() {
       (tester) async {
     final fake = _contFake();
     await _open(tester, fake);
-    final before = _list(tester).position.pixels;
     final loadSeq = _page(tester).loadSeq;
-    await _driveToBottom(tester);
+    final atBottom = await _driveToBottom(tester);
 
     final page = _page(tester);
     expect(page.mounts.length, 2, reason: '没接上下一章：追加那一臂整条断了');
@@ -313,12 +344,16 @@ void main() {
     expect(page.documentLines.length, 18,
         reason: '12 段 + 分隔线 + 章名 + 3 段 + 1 张插图：占行的比产段的多三行');
     expect(page.loadSeq, loadSeq, reason: '追加动了 loadSeq = 屏会为"新一拍"重跑落位，把人弹回去');
-    expect(_list(tester).position.pixels, before,
+    expect(_list(tester).position.pixels, atBottom,
         reason: '接一章就把视口挪了一格，用户看到的是书自己跳');
     // 追加进来的那一章在屏上真有行：撞名的话这里会指着第一章那第 0 段。
-    expect(_row(12), findsOneWidget);
+    await _revealRow(tester, 12);
+    expect(tester.widget<Text>(_row(12)).data, startsWith('　　连续第2章第1段'),
+        reason: '整篇第 12 段不是第二章第 0 段 = 键表没按整篇段号编');
+    // 往上看：整篇第 0 段还是第一章那一句（往上揭那一臂由 `_revealRow` 自己判方向）。
+    _list(tester).jumpTo(0);
+    await tester.pump();
     expect(_row(0), findsOneWidget);
-    expect(tester.widget<Text>(_row(12)).data, startsWith('连续第2章第1段'));
     expect(tester.widget<Text>(_row(0)).data, startsWith('　　连续第1章第1段'),
         reason: '整篇第 0 段还是第一章那一句：键表按整篇段号编，没有撞名');
   });
@@ -341,10 +376,21 @@ void main() {
     expect(saved, isNotNull, reason: '合流窗口推过了还没落库：落点整条没写出去');
     expect(_int(saved!['chapter_index']), 1);
     expect(_int(saved['chapter_paragraph']), 0);
-    expect(_int(saved['chapter_pos']), 0, reason: '第二章第 0 段的章内偏移必须是 0');
+    // 章内偏移**不钉 0**：探头表上那一格是 0，是因为那张表的像素是折算模型自己算的
+    // （模型像素 8336 < document_start 9000，比例夹到 0）；真屏上"第 12 段在视口顶"
+    // 对应的像素必然 > document_start（视口 + 分隔线 + 章名那几行），比例 > 0，
+    // 估出来的偏移就落在第 0 段**里面**。要钉的是"它是本章口径的段内量"：
+    // 落在第 0 段的 [起点, 下一段起点) 里；钉 0 就把屏上正确的估算判成错。
+    final chapter2Offsets = <int>[
+      for (final value in (tableChapters[1]['offsets']! as List)) _int(value)
+    ];
+    expect(_int(saved['chapter_pos']),
+        allOf(greaterThanOrEqualTo(chapter2Offsets[0]),
+            lessThan(chapter2Offsets[1])),
+        reason: '章内偏移越出第 0 段的字符范围 = 整篇口径漏进了落库那一格');
     expect(saved['chapter_url'], _chapterUrl(2));
 
-    // 反向对照：同一篇文档往上滚，回到第一章最后一段（整篇第 11 段）时章号要退回来。
+    // 反向对照：同一篇文档往上滚，回到第一章里面（整篇第 5 段）时章号要退回来。
     await _revealRow(tester, 5);
     final back = _page(tester);
     expect(back.chapterIndex, 0);
@@ -424,7 +470,9 @@ void main() {
         <int>[for (final row in tableChapters) _int(row['paragraph_start'])],
         reason: '三章的段起点两侧不同数（flet 表里钉的是 0/12/15）');
     expect(fake.callsFor('reader.content'), 3);
-    expect(_row(15), findsOneWidget, reason: '第三章第 0 段该是整篇第 15 段');
+    // 第三章的正文是在视口**下方**接上来的：当前像素还停在两章时的底，新行没进过
+    // 视口就还没建出来——先揭到那一行再断言（这一发量的仍是"挂载账对"）。
+    await _revealRow(tester, 15);
     expect(tester.widget<Text>(_row(15)).data, contains('第3章 收梢'));
   });
 
@@ -462,8 +510,12 @@ void main() {
 
     // 归零之后的行表在屏上就是第一章那 12 段：整篇第 0 段又指回第一章那一句。
     // 这一发读的是**树**，不是状态——行表换了而屏还挂着旧行，用户看到的才是事故。
-    await tester.pump();
-    expect(_row(0), findsOneWidget);
+    //
+    // 落位不是一帧的事：整篇替换之后屏要按第 0 段重跑落位（从旧像素一截一截贴回去），
+    // 单泵一帧时树里只有落位途中的那几行。给一个有界的泵循环，等目标行真被建出来。
+    for (var step = 0; step < 40 && _row(0).evaluate().isEmpty; step++) {
+      await tester.pump();
+    }
     expect(tester.widget<Text>(_row(0)).data, startsWith('　　连续第1章第1段'));
     expect(find.byKey(const ValueKey('reader.title.1.第2章 连续章')), findsNothing,
         reason: '接上来的那一章的章名行还在树上：itemCount 与行表不是同一份');

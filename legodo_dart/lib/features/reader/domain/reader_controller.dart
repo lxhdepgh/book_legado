@@ -247,8 +247,9 @@ class MountedChapter {
       );
 
   /// 交给折算层的那一格。`textLength` 用的是**带段间换行**的字符流长度
-  /// （`chapterTextLength`），与 `offsets` 同一把尺；flet 那边是 `sum(len(line))`，
-  /// 少了 n−1 个段间格。那一格只在"段表不可信、退回像素插值"时才乘比例，
+  /// （`chapterTextLength`），与 `offsets` 同一把尺；flet 那边存的是显示行的
+  /// `sum(len(line))`——缩进（`　　`）进了、段间格没进，两个数本来就不同。
+  /// 那一格只在"段表不可信、退回像素插值"时才乘比例，
   /// 而这一屏每一章都算得出段表，走不到那一条。
   ChapterMount toMount() => ChapterMount(
         chapterUrl: chapterUrl,

@@ -165,31 +165,39 @@ CREATE TABLE IF NOT EXISTS cookies (
 );
 
 -- v2: books (book metadata + continuous scroll progress), bookmarks
+-- 结构化列对齐 Python schema（_migrate_v2/v4/v7/v8 的最终形状）：进度是
+-- chapter_index/scroll_offset/scroll_ratio/chapter_pos/chapter_paragraph/font_size；
+-- 早先这里自造的 reading/vars/payload 三列在真库里并不存在，对真库执行会直接报错。
 CREATE TABLE IF NOT EXISTS books (
 	book_url TEXT PRIMARY KEY,
-	name TEXT NOT NULL,
-	author TEXT,
-	kind TEXT,
-	cover_url TEXT,
-	source_url TEXT,
-	in_bookshelf INTEGER DEFAULT 0,
-	reading TEXT DEFAULT '{}',
-	vars TEXT DEFAULT '{}',
-	payload TEXT DEFAULT '{}',
-	updated_at INTEGER DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
-	play_position REAL DEFAULT 0,
-	play_chapter_index INTEGER DEFAULT -1
+	source_url TEXT NOT NULL DEFAULT '',
+	name TEXT NOT NULL DEFAULT '',
+	author TEXT NOT NULL DEFAULT '',
+	kind TEXT NOT NULL DEFAULT '',
+	cover_url TEXT NOT NULL DEFAULT '',
+	chapter_index INTEGER NOT NULL DEFAULT 0,
+	scroll_offset REAL NOT NULL DEFAULT 0,
+	scroll_ratio REAL NOT NULL DEFAULT 0,
+	chapter_pos INTEGER NOT NULL DEFAULT 0,
+	font_size INTEGER NOT NULL DEFAULT 16,
+	in_bookshelf INTEGER NOT NULL DEFAULT 1,
+	shelf_group TEXT NOT NULL DEFAULT '',
+	updated_at REAL NOT NULL DEFAULT 0,
+	play_position REAL NOT NULL DEFAULT 0,
+	play_chapter_index INTEGER NOT NULL DEFAULT 0,
+	chapter_paragraph INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS bookmarks (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	book_url TEXT NOT NULL,
-	chapter_index INTEGER NOT NULL,
-	offset REAL DEFAULT 0,
-	summary TEXT,
-	created_at INTEGER DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
-	UNIQUE(book_url, chapter_index, offset)
+	chapter_index INTEGER NOT NULL DEFAULT 0,
+	offset REAL NOT NULL DEFAULT 0,
+	summary TEXT NOT NULL DEFAULT '',
+	created_at REAL NOT NULL DEFAULT 0
 );
+
+CREATE INDEX IF NOT EXISTS idx_bookmarks_book ON bookmarks(book_url);
 
 -- v3: audit_log (static source audit results)
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -208,31 +216,36 @@ CREATE TABLE IF NOT EXISTS tts_profiles (
 	engine_type TEXT DEFAULT 'builtin'
 );
 
+-- Python 形状（app/core/storage.py _migrate_v4）：源 id 即 feed 地址（TEXT 主键），
+-- wire 上 rss.* 那一族全按这个身份（golden rss.sources 的 id 就是 url）。
 CREATE TABLE IF NOT EXISTS rss_sources (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	name TEXT NOT NULL,
-	url TEXT NOT NULL UNIQUE,
-	"group" TEXT,
-	enabled INTEGER DEFAULT 1,
-	rss_type INTEGER DEFAULT 0,
-	last_update_time INTEGER DEFAULT 0,
-	custom_order INTEGER DEFAULT 0
+	id               TEXT PRIMARY KEY,
+	name             TEXT NOT NULL DEFAULT '',
+	url              TEXT NOT NULL DEFAULT '',
+	enabled          INTEGER NOT NULL DEFAULT 1,
+	source_group     TEXT NOT NULL DEFAULT '',
+	custom_order     INTEGER NOT NULL DEFAULT 0,
+	type             INTEGER NOT NULL DEFAULT 0,
+	last_update_time REAL   NOT NULL DEFAULT 0,
+	rule_articles    TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS rss_articles (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	source_id INTEGER NOT NULL,
-	title TEXT NOT NULL,
-	url TEXT,
-	author TEXT,
-	pub_date TEXT,
-	image TEXT,
-	read INTEGER DEFAULT 0,
-	starred INTEGER DEFAULT 0,
-	text TEXT,
-	created_at INTEGER DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	source_id   TEXT NOT NULL,
+	title       TEXT NOT NULL DEFAULT '',
+	url         TEXT NOT NULL DEFAULT '',
+	author      TEXT NOT NULL DEFAULT '',
+	pub_date    TEXT NOT NULL DEFAULT '',
+	content     TEXT NOT NULL DEFAULT '',
+	image       TEXT NOT NULL DEFAULT '',
+	read_flag   INTEGER NOT NULL DEFAULT 0,
+	star_flag   INTEGER NOT NULL DEFAULT 0,
+	updated_at  REAL   NOT NULL DEFAULT 0,
 	UNIQUE(source_id, url)
 );
+-- 注：rss 的两个索引不放在这里——旧形状的库还没迁到 star_flag 列，
+-- 建索引会先于 migrateRssTables 炸掉 ensureSchema，见 ensureSchema 尾部。
 
 -- v5: replace_rules, dict_rules, fonts, download_tasks
 CREATE TABLE IF NOT EXISTS replace_rules (
@@ -298,28 +311,221 @@ CREATE TABLE IF NOT EXISTS bookshelf (
 	updated_at INTEGER DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
 );
 
+-- One row per book_url (INSERT OR REPLACE semantics), alignment with
+-- Python schema v6: search_books(book_url PK, source_group, saved_at ms).
 CREATE TABLE IF NOT EXISTS search_books (
-	book_url TEXT NOT NULL,
-	name TEXT NOT NULL,
-	author TEXT,
-	kind TEXT,
-	origin TEXT,
-	origin_group TEXT,
-	origin_order INTEGER DEFAULT 0,
-	saved_at INTEGER,
-	payload TEXT,
-	updated_at INTEGER,
-	PRIMARY KEY(book_url, origin, saved_at)
+	book_url TEXT PRIMARY KEY,
+	name TEXT NOT NULL DEFAULT '',
+	author TEXT NOT NULL DEFAULT '',
+	kind TEXT NOT NULL DEFAULT '',
+	origin TEXT NOT NULL DEFAULT '',
+	source_group TEXT NOT NULL DEFAULT '',
+	origin_order INTEGER NOT NULL DEFAULT 0,
+	saved_at INTEGER NOT NULL DEFAULT 0,
+	payload TEXT NOT NULL DEFAULT '{}',
+	updated_at REAL NOT NULL DEFAULT 0
 );
+
+CREATE INDEX IF NOT EXISTS idx_search_books_name_author
+	ON search_books(name, author, origin_order);
+
+CREATE INDEX IF NOT EXISTS idx_search_books_origin
+	ON search_books(origin);
 
 -- v7: books.play_chapter_index (separate from reading progress)
 -- Already included in v2 schema above as play_chapter_index
 
 -- Runtime FTS5 virtual table for content search (Created dynamically by ContentSearchService)
-`;
+`
 
 	_, err := s.db.Exec(schema)
+	if err != nil {
+		return err
+	}
+	if err := s.migrateSearchBooks(); err != nil {
+		return err
+	}
+	if err := s.migrateRssTables(); err != nil {
+		return err
+	}
+	// 索引等迁移之后建：旧形状的 rss_articles 还没有 star_flag 列。
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_rss_articles_source
+		ON rss_articles(source_id);
+	CREATE INDEX IF NOT EXISTS idx_rss_articles_star
+		ON rss_articles(star_flag)`)
 	return err
+}
+
+// migrateSearchBooks rebuilds a pre-FFI search_books table (PK included
+// origin+saved_at and carried an origin_group column) into the one-row-per-
+// book_url shape. The old shape was never written by any Go code path, but
+// INSERT OR REPLACE against it would silently pile up duplicate rows per
+// book_url, so an existing DB gets rebuilt instead of patched.
+func (s *StorageService) migrateSearchBooks() error {
+	rows, err := s.db.Query(`PRAGMA table_info(search_books)`)
+	if err != nil {
+		return err
+	}
+	hasOriginGroup := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt interface{}
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "origin_group" {
+			hasOriginGroup = true
+		}
+	}
+	rows.Close()
+	if !hasOriginGroup {
+		return nil
+	}
+
+	return s.Transaction(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`CREATE TABLE search_books_v2 (
+			book_url TEXT PRIMARY KEY,
+			name TEXT NOT NULL DEFAULT '',
+			author TEXT NOT NULL DEFAULT '',
+			kind TEXT NOT NULL DEFAULT '',
+			origin TEXT NOT NULL DEFAULT '',
+			source_group TEXT NOT NULL DEFAULT '',
+			origin_order INTEGER NOT NULL DEFAULT 0,
+			saved_at INTEGER NOT NULL DEFAULT 0,
+			payload TEXT NOT NULL DEFAULT '{}',
+			updated_at REAL NOT NULL DEFAULT 0
+		)`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO search_books_v2
+			(book_url, name, author, kind, origin, source_group, origin_order,
+			 saved_at, payload, updated_at)
+			SELECT book_url, name, author, COALESCE(kind,''),
+			       COALESCE(origin,''), COALESCE(origin_group,''),
+			       COALESCE(origin_order,0), COALESCE(saved_at,0),
+			       COALESCE(payload,'{}'), COALESCE(updated_at,0)
+			FROM search_books ORDER BY saved_at`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DROP TABLE search_books`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`ALTER TABLE search_books_v2 RENAME TO search_books`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_search_books_name_author
+			ON search_books(name, author, origin_order)`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_search_books_origin
+			ON search_books(origin)`)
+		return err
+	})
+}
+
+// migrateRssTables rebuilds a pre-FFI rss_sources / rss_articles pair into the
+// Python shape: source id = feed url (TEXT), source_group / type /
+// read_flag / star_flag column names, content instead of text. The old shape
+// was only ever written by the stub Go rss service; the wire contract
+// (golden rss.sources.json / rss.articles.json) keys off the Python shape, so
+// an existing DB is rebuilt with data carried over instead of patched.
+// Orphan articles (their source row was already gone) are dropped — the
+// delete path is cascading, so they carry no meaning.
+func (s *StorageService) migrateRssTables() error {
+	rows, err := s.db.Query(`PRAGMA table_info(rss_sources)`)
+	if err != nil {
+		return err
+	}
+	oldShape := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt interface{}
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "rss_type" {
+			oldShape = true
+		}
+	}
+	rows.Close()
+	if !oldShape {
+		return nil
+	}
+
+	return s.Transaction(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`CREATE TABLE rss_articles_v2 (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			source_id   TEXT NOT NULL,
+			title       TEXT NOT NULL DEFAULT '',
+			url         TEXT NOT NULL DEFAULT '',
+			author      TEXT NOT NULL DEFAULT '',
+			pub_date    TEXT NOT NULL DEFAULT '',
+			content     TEXT NOT NULL DEFAULT '',
+			image       TEXT NOT NULL DEFAULT '',
+			read_flag   INTEGER NOT NULL DEFAULT 0,
+			star_flag   INTEGER NOT NULL DEFAULT 0,
+			updated_at  REAL   NOT NULL DEFAULT 0,
+			UNIQUE(source_id, url)
+		)`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO rss_articles_v2
+			(id, source_id, title, url, author, pub_date, content, image,
+			 read_flag, star_flag, updated_at)
+			SELECT a.id, src.url, COALESCE(a.title,''), COALESCE(a.url,''),
+			       COALESCE(a.author,''), COALESCE(a.pub_date,''),
+			       COALESCE(a.text,''), COALESCE(a.image,''),
+			       COALESCE(a.read,0), COALESCE(a.starred,0),
+			       COALESCE(a.created_at,0) / 1000.0
+			FROM rss_articles a JOIN rss_sources src ON src.id = a.source_id`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DROP TABLE rss_articles`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`ALTER TABLE rss_articles_v2 RENAME TO rss_articles`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_rss_articles_source
+			ON rss_articles(source_id)`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_rss_articles_star
+			ON rss_articles(star_flag)`); err != nil {
+			return err
+		}
+
+		if _, err := tx.Exec(`CREATE TABLE rss_sources_v2 (
+			id               TEXT PRIMARY KEY,
+			name             TEXT NOT NULL DEFAULT '',
+			url              TEXT NOT NULL DEFAULT '',
+			enabled          INTEGER NOT NULL DEFAULT 1,
+			source_group     TEXT NOT NULL DEFAULT '',
+			custom_order     INTEGER NOT NULL DEFAULT 0,
+			type             INTEGER NOT NULL DEFAULT 0,
+			last_update_time REAL   NOT NULL DEFAULT 0,
+			rule_articles    TEXT NOT NULL DEFAULT ''
+		)`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO rss_sources_v2
+			(id, name, url, enabled, source_group, custom_order, type, last_update_time)
+			SELECT url, COALESCE(name,''), url, COALESCE(enabled,1),
+			       COALESCE("group",''), COALESCE(custom_order,0),
+			       COALESCE(rss_type,0), COALESCE(last_update_time,0)
+			FROM rss_sources WHERE url IS NOT NULL AND url <> ''`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DROP TABLE rss_sources`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`ALTER TABLE rss_sources_v2 RENAME TO rss_sources`)
+		return err
+	})
 }
 
 // SchemaVersion returns the current database schema version.

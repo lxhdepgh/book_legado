@@ -201,7 +201,10 @@ class FakeEngineRepository implements EngineRepository {
     _order.add(action);
     final thrown = failure;
     if (thrown != null) {
-      await Future<void>.delayed(delay);
+      // 与成功路径同一条守卫：`delay == 0` 不许排定时器。
+      // 拍定时器要靠 pump 推假时钟，而"测试体正 await 着这一发"时没人 pump——
+      // 那个 0 时长定时器永远不响，测试卡到 10 分钟超时（bootstrap_test 收摊臂栽过）。
+      if (delay > Duration.zero) await Future<void>.delayed(delay);
       throw EngineFailure(thrown.kind, thrown.message, action: action);
     }
     final value = body();
@@ -209,12 +212,12 @@ class FakeEngineRepository implements EngineRepository {
     return value;
   }
 
-  /// 测试往里推一条事件（真引擎那一侧是 /ws 推的）。
+  /// 测试往里推一条事件（真引擎那一侧是 `engine_poll` 轮询取回的）。
   void emit(EngineEvent event) => _events.add(event);
 
   /// 让所有在听的那一屏同时收到一条"流断了"（断线文案那一臂的仪器）。
   void emitStreamError(String message) => _events
-      .addError(EngineFailure(EngineFailureKind.transport, message, action: 'ws'));
+      .addError(EngineFailure(EngineFailureKind.transport, message, action: 'events'));
 
   @override
   Stream<EngineEvent> events() => _events.stream;

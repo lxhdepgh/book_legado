@@ -70,6 +70,17 @@ Map<String, Object?> _finishedPayload() => Map<String, Object?>.from(
     Map<String, Object?>.from(_sample('switch.scan')['event_sample']! as Map)['payload']!
         as Map);
 
+/// 收尾那一发的**本轮**版本：守门（`_isCurrentRound`）按 `switch_id` 认轮，
+/// 样本里那一格是采集时的轮次号，原样发整条会被丢掉（收尾三种一句都上不了屏）。
+/// 身份现读替身记下的 `switch.scan`——就是点「开始换源」那一拍自己攥的那个 int。
+EngineEvent _finished(FakeEngineRepository fake,
+        [Map<String, Object?> overrides = const <String, Object?>{}]) =>
+    EngineEvent(EngineEventNames.sourceSwitchFinished,
+        _with(_finishedPayload(), <String, Object?>{
+          'switch_id': '${fake.payloadFor('switch.scan')!['switch_id']}',
+          ...overrides,
+        }));
+
 /// 从样本改一格的替身载荷：形状还是真那一份，只翻被测的那一值。
 Map<String, Object?> _with(Map<String, Object?> source, Map<String, Object?> overrides) =>
     Map<String, Object?>.from(source)..addAll(overrides);
@@ -227,10 +238,11 @@ void main() {
     expect(_start, findsNothing, reason: '开始与停止是换 visible，不是灰着一个');
 
     // 事件按快照那一份身份来认（`_adoptRound`）：本轮身份在服务端折成了字符串。
-    expect(fake.switchRun.switchId, '6379028');
+    // '15035127' 是这版样本里那一轮的号——样本换了这里先红，重测之后再改字面。
+    expect(fake.switchRun.switchId, '15035127');
     fake.emit(EngineEvent(EngineEventNames.sourceSwitchProgress,
         _with(_progressFrame(), <String, Object?>{
-          'switch_id': '6379028',
+          'switch_id': '15035127',
           'done': 2,
           'failures': 1,
           'starved': 2
@@ -303,7 +315,7 @@ void main() {
     final finished = _finishedPayload();
     expect(finished.containsKey('done'), isFalse,
         reason: '计数只在进度帧里发；这里读成 0 就会把跑完的一轮写成"扫了 0 个源"');
-    fake.emit(EngineEvent(EngineEventNames.sourceSwitchFinished, finished));
+    fake.emit(_finished(fake));
     await tester.pumpAndSettle();
 
     expect(find.text('扫描完成，3 个候选'), findsOneWidget);
@@ -319,8 +331,7 @@ void main() {
   testWidgets('被叫停那一帧：句子是已停止，转圈跟着停', (tester) async {
     final fake = _fake();
     await _started(tester, fake);
-    fake.emit(EngineEvent(EngineEventNames.sourceSwitchFinished,
-        _with(_finishedPayload(), <String, Object?>{'cancelled': true})));
+    fake.emit(_finished(fake, <String, Object?>{'cancelled': true}));
     await tester.pumpAndSettle();
 
     expect(find.text(kSwitchStoppedStatus), findsOneWidget);
@@ -333,11 +344,10 @@ void main() {
     final fake = _fake();
     await _started(tester, fake);
     // 出错 + 候选为空是这一屏最容易混的一格：`error` 非空与"扫完了没同名书"是两种形状。
-    fake.emit(EngineEvent(EngineEventNames.sourceSwitchFinished,
-        _with(_finishedPayload(), <String, Object?>{
-          'error': '取不到那条书源',
-          'candidates': <Object?>[],
-        })));
+    fake.emit(_finished(fake, <String, Object?>{
+      'error': '取不到那条书源',
+      'candidates': <Object?>[],
+    }));
     await tester.pumpAndSettle();
 
     expect(find.text('换源失败：取不到那条书源'), findsOneWidget);

@@ -125,7 +125,7 @@ func (s *SettingsService) ReadKeys(keys []string) (map[string]string, error) {
 func (s *SettingsService) Subscribe(keys []string, handler func(event *SettingsChangedEvent)) func() {
 	unsubKeyHandlers := make([]func(), len(keys))
 	for _, key := range keys {
-		u := s.bus.Subscribe("settings_changed", func(event AppEvent) {
+		u := s.bus.Subscribe("SettingsChangedEvent", func(event AppEvent) {
 			if evt, ok := event.(*SettingsChangedEvent); ok && (key == evt.Key || len(keys) == 0) {
 				handler(evt)
 			}

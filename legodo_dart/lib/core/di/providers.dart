@@ -24,12 +24,12 @@ final Provider<EngineRepository> engineRepositoryProvider =
 final Provider<EngineEndpoint?> engineEndpointProvider =
     Provider<EngineEndpoint?>((ref) => null);
 
-/// 事件流（§4.3）：一根流供所有屏听，别每屏各连一次 `/ws`。
+/// 事件流（§4.3）：一根流供所有屏听，别每屏各自开一条。
 ///
 /// `retry: null` 与书架那条同源（记忆 `riverpod-provider-default-retry`）：
-/// 默认策略会把"这一条流断了"变成背靠背重连 11 次，而**重连本来是 [EngineRepository.events]
-/// 那一侧的活**（`EngineEventClient` 自带退避，上界压在服务端空闲自杀之下）。
-/// 两层都重试 = 两层互相踩，表现是断线后一阵狂连。
+/// 默认策略会把"这一条流断了"变成背靠背重连 11 次，而**重连本来是
+/// `EngineRepository.events` 那一侧的活**（FFI 路径是 `engine_poll` 游标轮询，
+/// 断线语义只剩"库没了"）；两层都重试 = 两层互相踩。
 final StreamProvider<EngineEvent> engineEventsProvider =
     StreamProvider<EngineEvent>(
   (ref) => ref.watch(engineRepositoryProvider).events(),

@@ -1,36 +1,26 @@
-/// 反向 WebView 通道在 Dart 这一侧的管道（§8 R1 / G3-D1）。
+/// 反向 WebView 通道在 Dart 这一侧的三块：帧解码、答复的键面、宿主接线。
 ///
-/// 这一档不起进程：它钉的是**形状与归属**——帧怎么解、答案八格怎么落、
-/// 不作答/渲染失败/答晚了各是什么读数。真往返在
-/// `webview_reverse_channel_live_arm_test.dart` 那一臂。
+/// FFI 面上这条通道**没有落点**（Go 那侧 `doWebContentReady` 恒回
+/// `{"delivered":false}`，`engine_poll` 也只驮事件不驮 request 帧），
+/// 所以这一档钉的是接缝本身：帧怎么解、答案八格怎么发、宿主答/不答/答晚了各是什么读数。
+/// 真边界在 `webview_reverse_channel_live_arm_test.dart` 那一臂。
 ///
 /// 三条最容易悄悄写错的地方都在这里有名字：
-/// - `js_result` 缺键与空串不是一件事（宿主没跑脚本 ≠ 脚本返回了空）；
-/// - `engine.webContentReady` 不许走单飞顶替（并发渲染的两条答案会被顶掉一条，
-///   而服务端那一侧其实已经收到正文了）；
-/// - 一次渲染不许压着下一次（预取连着求时，每条各等自己的 20s）。
+/// - `js_result` 的 null 与空串不是一件事（宿主没跑脚本 ≠ 脚本返回了空）；
+/// - 答复是**并发**的两发：第二条不许被第一条顶掉；
+/// - 一次渲染不许压着下一次（预取连着求时，每条各走自己的活）。
 library;
 
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:http/http.dart' as http;
-import 'package:http/testing.dart';
-import 'package:legodo_client/core/events/engine_event_client.dart';
 import 'package:legodo_client/core/events/webview_request.dart';
-import 'package:legodo_client/core/rpc/engine_endpoint.dart';
+import 'package:legodo_client/core/ffi/engine_ffi.dart';
 import 'package:legodo_client/core/rpc/engine_repository.dart';
 import 'package:legodo_client/core/rpc/envelope.dart';
 import 'package:legodo_client/core/rpc/fake_engine_repository.dart';
-import 'package:legodo_client/core/rpc/rpc_client.dart';
-import 'package:legodo_client/core/rpc/rpc_engine_repository.dart';
+import 'package:legodo_client/core/rpc/ffi_engine_adapter.dart';
 import 'package:legodo_client/core/webview/webview_host.dart';
-
-const EngineEndpoint _endpoint = EngineEndpoint(
-  host: '127.0.0.1', port: 1, token: 't',
-  protocolVersion: 1, build: 'test', pid: 1,
-);
 
 /// `service.py` 里 `request_web_content` 那一发请求帧的形状（键名以服务端为准）。
 Map<String, Object?> _requestFrame(String requestId,
@@ -53,26 +43,36 @@ WebviewRequest _request(String id, {String url = 'http://h/ch/1.html'}) =>
         sourceUrl: 'http://h',
         options: const <String, Object?>{'webView': true});
 
-/// 一个只认 `engine.webContentReady` 的回话器：`data` 那格按 [delivered] 给形状。
-RpcEngineRepository _repository(List<Map<String, Object?>> sent,
-    {int delayMs = 0, Object? delivered = true}) {
-  return RpcEngineRepository(RpcClient(_endpoint,
-      client: MockClient((request) async {
-        final body = jsonDecode(utf8.decode(request.bodyBytes))
-            as Map<String, Object?>;
-        sent.add(body);
-        if (delayMs > 0) {
-          await Future<void>.delayed(Duration(milliseconds: delayMs));
-        }
-        return http.Response(
-            jsonEncode(<String, Object?>{
-              'v': 1, 'id': body['id'], 'ok': true, 'code': null, 'error': null,
-              'data': <String, Object?>{'delivered': delivered},
-            }),
-            200,
-            headers: <String, String>{'content-type': 'application/json'});
-      })));
+/// 记录每一发的 action + params；回话由 [handler] 按发给，不给就回 `data: null`。
+class _RecordingFFI implements GoFFIClient {
+  final List<({String action, Map<String, dynamic> params})> calls = [];
+  Map<String, dynamic> Function(String action, Map<String, dynamic> params)? handler;
+
+  @override
+  bool get loaded => true;
+
+  @override
+  String get libraryPath => r'Z:\fake\legodo_engine.dll';
+
+  @override
+  void load() {}
+
+  @override
+  void initialize() {}
+
+  @override
+  void cleanup() {}
+
+  @override
+  Map<String, dynamic> call(String action, Map<String, dynamic> params) {
+    calls.add((action: action, params: params));
+    final handler = this.handler;
+    if (handler != null) return handler(action, params);
+    return <String, dynamic>{'ok': true, 'data': null};
+  }
 }
+
+FFIEngineAdapter _repo(_RecordingFFI ffi) => FFIEngineAdapter(client: ffi);
 
 /// 只继承、一个方法都不覆写：拿基类的 throw 默认体。
 class _ScaffoldRepository extends EngineRepository {
@@ -142,94 +142,49 @@ void main() {
               .having((EngineFailure e) => e.message, 'message',
                   contains('options'))));
     });
-
-    test('事件解码器不接 request 帧：一帧两个出口迟早飘', () {
-      expect(() => decodeFrame(_requestFrame('w1')),
-          throwsA(isA<EngineFailure>()
-              .having((EngineFailure e) => e.kind, 'kind',
-                  EngineFailureKind.transport)
-              .having((EngineFailure e) => e.message, 'message',
-                  contains('webviewRequests'))));
-      // 正对照：同一支解码器认事件帧，否则上面那条"响"可能只是"全都不认"。
-      expect(decodeFrame(<String, Object?>{
-        'type': 'event', 'name': 'SearchFinishedEvent', 'payload': <String, Object?>{}
-      }).single.name, 'SearchFinishedEvent');
-    });
   });
 
   group('engine.webContentReady 仓库面', () {
     test('八格落到 payload 上，键名与服务端签名一致', () async {
-      final sent = <Map<String, Object?>>[];
-      final delivery = await _repository(sent)
-          .webContentReady(
-              requestId: 'w3', body: '<html>正文</html>',
-              url: 'http://h/ch/1.html', cookie: 'a=1', jsResult: '标题');
-      expect(delivery.delivered, isTrue);
-      expect(sent.single['action'], 'engine.webContentReady');
-      expect(sent.single['payload'], <String, Object?>{
-        'request_id': 'w3', 'body': '<html>正文</html>', 'status': 200,
-        'url': 'http://h/ch/1.html', 'cookie': 'a=1', 'error': '',
-        'js_result': '标题',
+      final ffi = _RecordingFFI();
+      final delivery = await _repo(ffi).webContentReady(
+          requestId: 'w3', body: '<html>正文</html>',
+          url: 'http://h/ch/1.html', cookie: 'a=1', jsResult: '标题');
+      expect(delivery.delivered, isFalse,
+          reason: 'FFI 面 Go 恒回 delivered:false：引擎那侧没有在等的请求可满足');
+      expect(ffi.calls.single.action, 'engine_web_content_ready');
+      expect(ffi.calls.single.params, <String, Object?>{
+        'request_id': 'w3', 'body': '<html>正文</html>', 'headers': null,
+        'status': 200, 'url': 'http://h/ch/1.html', 'cookie': 'a=1',
+        'error': '', 'js_result': '标题',
       });
     });
 
-    test('没跑脚本就不发 js_result 这个键；发了空串是另一件事', () async {
-      final sent = <Map<String, Object?>>[];
-      await _repository(sent).webContentReady(requestId: 'w1', body: 'x');
-      expect((sent.single['payload']! as Map).containsKey('js_result'), isFalse,
-          reason: '服务端读"有没有这个键"才分得开没跑与跑了回空；折成空串就混了');
-      expect((sent.single['payload']! as Map).containsKey('headers'), isFalse,
-          reason: 'schema 那里 additionalProperties:false，多塞一个 null 键是 schema 错');
+    test('没跑脚本那一格是 null：与"跑了返回空串"是两件事', () async {
+      final ffi = _RecordingFFI();
+      await _repo(ffi).webContentReady(requestId: 'w1', body: 'x');
+      final payload = ffi.calls.single.params;
+      expect(payload.containsKey('js_result'), isTrue);
+      expect(payload['js_result'], isNull,
+          reason: 'null=宿主没跑脚本，空串=跑了返回空——折成同一个值就混了');
 
-      await _repository(sent)
-          .webContentReady(requestId: 'w2', body: 'x', jsResult: '');
-      expect(sent.last['payload'], containsPair('js_result', ''),
-          reason: '正对照：脚本真返回了空时这一格必须发得出去');
+      await _repo(ffi).webContentReady(requestId: 'w2', body: 'x', jsResult: '');
+      expect(ffi.calls.last.params['js_result'], '',
+          reason: '正对照：脚本真返回了空时这一格是空串');
     });
 
-    test('并发两发都不许被顶掉：顶替会把已经送达的答案读成没答上', () async {
-      // 单飞顶替对"同一动作的新值盖旧值"是对的，但这里两条是**不同 request_id 的答案**：
-      // 服务端收到第一条时就已经把正文交回引擎了，客户端抛 cancelled 只会让宿主再答一遍。
-      final sent = <Map<String, Object?>>[];
-      final client = RpcClient(_endpoint,
-          client: MockClient((request) async {
-            final body = jsonDecode(utf8.decode(request.bodyBytes))
-                as Map<String, Object?>;
-            sent.add(body);
-            await Future<void>.delayed(const Duration(milliseconds: 30));
-            return http.Response(
-                jsonEncode(<String, Object?>{
-                  'v': 1, 'id': body['id'], 'ok': true, 'code': null, 'error': null,
-                  'data': <String, Object?>{'delivered': true},
-                }),
-                200,
-                headers: <String, String>{'content-type': 'application/json'});
-          }));
-      final repository = RpcEngineRepository(client);
-      final deliveries = await Future.wait(<Future<WebviewDelivery>>[
-        repository.webContentReady(requestId: 'w1', body: 'a'),
-        repository.webContentReady(requestId: 'w2', body: 'b'),
-      ]);
-      expect(deliveries.map((d) => d.delivered), <bool>[true, true]);
-      expect(sent.map((e) => (e['payload']! as Map)['request_id']), <String>['w1', 'w2']);
-      // 仪器自己的对照：这一发压根没进在飞表——走了单飞的话这里挂着的就是它，
-      // 而上面那两条 delivered 会变成一条 cancelled。
-      expect(client.inFlight, isEmpty);
-    });
-
-    test('回话里 delivered 不是布尔：那是形状变了，读成"答晚了"就是假绿灯', () async {
-      for (final delivered in <Object?>[null, 'true', 1]) {
-        final sent = <Map<String, Object?>>[];
-        await expectLater(
-            _repository(sent, delivered: delivered)
-                .webContentReady(requestId: 'w1', body: 'a'),
-            throwsA(isA<EngineFailure>()
-                .having((EngineFailure e) => e.kind, 'kind',
-                    EngineFailureKind.transport)
-                .having((EngineFailure e) => e.action, 'action',
-                    'engine.webContentReady')),
-            reason: 'delivered=$delivered');
-      }
+    test('delivered 按 data 那一格读；非布尔是形状漂了，折成 false', () async {
+      final ffi = _RecordingFFI()
+        ..handler = (action, params) =>
+            <String, dynamic>{'ok': true, 'data': <String, Object?>{'delivered': true}};
+      expect((await _repo(ffi).webContentReady(requestId: 'w1', body: 'x')).delivered,
+          isTrue);
+      ffi.handler = (action, params) => <String, dynamic>{
+            'ok': true, 'data': <String, Object?>{'delivered': 'true'},
+          };
+      expect((await _repo(ffi).webContentReady(requestId: 'w1', body: 'x')).delivered,
+          isFalse,
+          reason: 'Go 恒回布尔；非布尔就是形状漂了（读成"答上了"是假绿灯）');
     });
 
     test('契约面的默认体仍然抛 unavailable（这一发没接上时必须有声音）', () async {

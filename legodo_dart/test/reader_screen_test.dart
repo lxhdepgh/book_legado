@@ -165,11 +165,13 @@ double _viewportTop(WidgetTester tester) =>
 ///
 /// 为什么需要它：`_row(n)` 那些"落在上面第几段"的对照要求那一行**还在树上**，
 /// 而 ListView 只建视口附近那一截——用"滚过没滚过"当正对照不依赖任何一行建没建。
-double _pixels(WidgetTester tester) => tester
+double _pixels(WidgetTester tester) => _listPosition(tester).pixels;
+
+/// 那一格滚动位的两栏（像素 + 总高）：段内估算的期望值要现读这两栏自己算。
+ScrollPosition _listPosition(WidgetTester tester) => tester
     .widget<ListView>(find.byKey(const Key('reader.body')))
     .controller!
-    .position
-    .pixels;
+    .position;
 
 /// 视口顶那一行是哪一段：把 8 段的行顶与列表顶比，取"已经过顶"里最靠下的那段。
 ///
@@ -341,8 +343,24 @@ void main() {
       final saved = _savedPayload(fake);
       expect(saved, isNotNull, reason: '滚过了却没落库：合流那一臂断了');
       expect(_int(saved!['chapter_paragraph']), expected);
-      expect(_int(saved['chapter_pos']), _offsets()[expected!],
-          reason: '落库的字符偏移不是 flet 那把尺上第 $expected 段的段首');
+      // 字符偏移是**段内估算**：段首 + 段内那一截按像素比例插——flet `track` 的
+      // 同一份算术（投影表 `reader.continuous.json` 里第 5 段那一发读回的就是 141，
+      // 而它的段首是 135；段内那一格本来就是估算，不是事实）。所以这里不钉
+      // `offsets[n]`（那是"没滚过"才该存的值）；要钉的是载荷真按同一份算术算：
+      // 把屏此刻的像素/总高现读出来，在**测试侧**独立算一遍。
+      final offsets = _offsets();
+      final paragraph = expected!;
+      final position = _listPosition(tester);
+      final ratio = position.pixels / position.maxScrollExtent;
+      expect(ratio, greaterThan(0.02),
+          reason: '这一臂的前提没了：滚动位置贴在段首上，下面两式同值，断言空转');
+      final span = offsets[paragraph + 1] - offsets[paragraph] - 1;
+      expect(_int(saved['chapter_pos']), offsets[paragraph] + (span * ratio).toInt(),
+          reason: '落库的字符偏移不是"段首 + 段内那一截"：这一发没走 flet `track` 的算术');
+      expect(_int(saved['chapter_pos']), greaterThanOrEqualTo(offsets[paragraph]),
+          reason: '偏移落到了第 $paragraph 段之前：段口径整体漂了');
+      expect(_int(saved['chapter_pos']), lessThan(offsets[paragraph + 1]),
+          reason: '偏移越过了第 $paragraph 段的段尾：段内那一截没夹在段区间里');
       expect(saved['chapter_index'], 0);
       expect(saved['chapter_url'], _golden('reader.content')['chapterUrl'],
           reason: '章节定位要用**回话里**那一条，不是请求里传的那一条');
@@ -601,7 +619,10 @@ void main() {
 
     testWidgets('命中那一发：摘录剥掉 <mark>，句子里报的是命中处数', (tester) async {
       final sample = ContentSearchResult.fromJson(_golden('reader.search_content'));
-      expect(sample.hits.length, 4, reason: '样本当场数过：4 处命中');
+      // 样本当场数过：3 处命中（`indexedChapters: 3`——只搜了已索引的那三章，
+      // 第 2/3/4 章各一处。语料里六章都带"第3段"，命中数是被索引窗口定的，
+      // 不是语料定的；这一格跟着样本走）。
+      expect(sample.hits.length, 3, reason: '样本当场数过：3 处命中');
       expect(sample.hits.first.snippet, contains('<mark>'),
           reason: '服务端不剥标记，剥是界面那一侧的事');
       final fake = _readerFake(contentSearch: sample);
@@ -612,7 +633,7 @@ void main() {
       await tester.tap(find.byKey(const Key('reader.search.submit')));
       await tester.pumpAndSettle();
 
-      expect(find.text('「第3段」命中 4 处'), findsOneWidget);
+      expect(find.text('「第3段」命中 3 处'), findsOneWidget);
       expect(find.text('第2章第3段字句读纸张看灯下山风月夜…'), findsOneWidget,
           reason: '标记没剥或整条摘录丢了：屏上要的是纯文本');
       expect(find.textContaining('<mark>'), findsNothing);
@@ -928,6 +949,12 @@ void main() {
         overrides: [engineRepositoryProvider.overrideWithValue(fake)],
         child: MaterialApp.router(routerConfig: buildRouter()),
       ));
+      await tester.pumpAndSettle();
+      // 阅读组的落地页签是有状态的三档（`initialTabOf`：记住的页签 > 书架探测 >
+      // 组内第一个），而"记住的页签"（`_lastTab`）是**模块级**的：上一条用例点过
+      // 「书架」，同一进程里这一条再进组就落在「书架」——找书那一屏压根没建，
+      // openSearch 当然找不到。显式点回「找书」，别把上一条的停留当这一条的前提。
+      await tester.tap(find.byKey(const ValueKey('tab-$readingGroupRoute-找书')));
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('findbooks.openSearch')));
       await tester.pumpAndSettle();

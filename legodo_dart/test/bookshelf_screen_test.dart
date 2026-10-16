@@ -20,7 +20,7 @@ import 'package:legodo_client/core/rpc/fake_engine_repository.dart';
 import 'package:legodo_client/features/bookshelf/data/bookshelf_item.dart';
 import 'package:legodo_client/features/bookshelf/presentation/bookshelf_screen.dart';
 
-/// 黄金样本里的 7 行——不是手搓样例：手搓只会证明我自己写得对。
+/// 黄金样本里的 8 行——不是手搓样例：手搓只会证明我自己写得对。
 List<BookshelfItem> _goldenRows() {
   final sample = _loadSample('golden/bookshelf.list.json');
   final envelope = Map<String, Object?>.from(sample['response']! as Map);
@@ -64,7 +64,7 @@ void main() {
     expect(find.text('书架加载失败'), findsOneWidget);
   });
 
-  testWidgets('黄金样本的 7 行全落在树上，文本与 flet 那屏同源', (tester) async {
+  testWidgets('黄金样本的 8 行全落在树上，文本与 flet 那屏同源', (tester) async {
     final rows = _goldenRows();
     final fake = FakeEngineRepository(bookshelf: rows);
     await tester.binding.setSurfaceSize(const Size(1200, 1600));
@@ -108,7 +108,7 @@ void main() {
     fake.bookshelf = _goldenRows();
     await tester.tap(find.byKey(const Key('bookshelf.retry')));
     await tester.pumpAndSettle();
-    expect(find.text('书架共 7 本'), findsOneWidget);
+    expect(find.text('书架共 8 本'), findsOneWidget);
   });
 
   testWidgets('不可重试的失败（schema）不把重试按钮递到用户手里', (tester) async {
@@ -155,7 +155,7 @@ void main() {
         find.byKey(const Key('bookshelf.refresh')));
     expect(button.onPressed, isNull, reason: '在飞的时候再点一发 = 自己顶自己');
     await tester.pumpAndSettle();
-    expect(find.byType(ListTile), findsNWidgets(7));
+    expect(find.byType(ListTile), findsNWidgets(8));
   });
 
   testWidgets('失败之后退避窗口内一发都不许多发（Riverpod 默认会自己重 10 次）',
@@ -191,8 +191,8 @@ void main() {
       // 少这一跳，两条断言量的是找书页，"宽屏整屏空白"那条护栏就静默失效了。
       await tester.tap(find.byKey(const ValueKey('tab-$readingGroupRoute-书架')));
       await tester.pumpAndSettle();
-      expect(find.text('书架共 7 本'), findsOneWidget, reason: '$size 那一档');
-      expect(find.byType(ListTile), findsNWidgets(7), reason: '$size 那一档');
+      expect(find.text('书架共 8 本'), findsOneWidget, reason: '$size 那一档');
+      expect(find.byType(ListTile), findsNWidgets(8), reason: '$size 那一档');
     }
   });
 
@@ -206,7 +206,7 @@ void main() {
     final projection = _loadSample('projection/bookshelf.list.json');
     final expected =
         (projection['rows']! as List).cast<Map<String, Object?>>();
-    expect(expected, hasLength(7), reason: '投影表与黄金样本同一批行，7 本');
+    expect(expected, hasLength(8), reason: '投影表与黄金样本同一批行，8 本');
 
     await tester.binding.setSurfaceSize(const Size(1200, 1600));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -226,7 +226,7 @@ void main() {
 
   testWidgets('连不上引擎那一屏：文案里必须带上是哪一步没通', (tester) async {
     await tester.pumpWidget(bootFailureScope(
-        const EngineFailure(EngineFailureKind.timeout, '60s 没等到 LEGODO_GATEWAY')));
+        const EngineFailure(EngineFailureKind.timeout, '60s 没等到引擎就绪')));
     await tester.pumpAndSettle();
     expect(find.textContaining('连不上引擎（unavailable）'), findsNothing);
     expect(find.textContaining('连不上引擎（timeout）'), findsOneWidget);

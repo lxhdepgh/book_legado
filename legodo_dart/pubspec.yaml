@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.0+1
+version: 1.0.1+2
 
 environment:
   sdk: ^3.13.2
@@ -42,6 +42,9 @@ dependencies:
   # [Android 裁剪] WebView + TTS 纯 Dart 实现（替代 Python Playwright/pyttsx3）
   webview_flutter: ^4.8.0
   flutter_tts: ^4.0.2
+  
+  # FFI 支持（对接 Go 动态库 - 单进程模式）
+  ffi: ^2.1.0
 
 dev_dependencies:
   flutter_test:

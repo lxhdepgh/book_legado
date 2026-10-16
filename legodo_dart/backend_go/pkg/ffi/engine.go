@@ -25,8 +25,8 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/legodo-booksource/legodo_go/core"
 	internalmodels "github.com/legodo-booksource/legodo_go/internal/models"
-	"github.com/legodo-booksource/legodo_go/models"
 	"github.com/legodo-booksource/legodo_go/internal/services"
 )
 
@@ -36,11 +36,16 @@ import (
 
 var hub atomic.Pointer[services.ServiceHub]
 
+// evtRing records every published event for Dart-side polling (engine_poll).
+// FFI 没有推送出口：Dart 以游标来问，这里只负责按发布序留一份最近的。
+var evtRing atomic.Pointer[core.EventRing]
+
 func getHub() *services.ServiceHub { return hub.Load() }
-func toCString(s string) *C.char    { return C.CString(s) }
-func toJSON(v any) string           { b, _ := json.Marshal(v); return string(b) }
+func toCString(s string) *C.char   { return C.CString(s) }
+func toJSON(v any) string          { b, _ := json.Marshal(v); return string(b) }
 
 // FreeString releases a C string returned by Call/Cleanup/etc.
+//
 //export FreeString
 func FreeString(s *C.char) { C.free(unsafe.Pointer(s)) }
 
@@ -52,6 +57,7 @@ func main() {}
 // ---------------------------------------------------------------------------
 
 // Initialize boots the ServiceHub. Idempotent. Must be called before Call().
+//
 //export Initialize
 func Initialize() {
 	if h := getHub(); h != nil {
@@ -64,6 +70,17 @@ func Initialize() {
 	if err := getHub().RegisterBusinessServices(); err != nil {
 		log.Printf("[Initialize] business services registration failed: %v", err)
 	}
+	// 先挂事件环再启服务：服务启动期发的事件（ServiceStateChangedEvent）
+	// 也要进环，否则界面在初始化后拿到的第一帧是残缺的。
+	ring := core.NewEventRing(4096)
+	evtRing.Store(ring)
+	if bus := getHub().EventBus(); bus != nil {
+		bus.SubscribeAll(func(event core.AppEvent) {
+			ring.Record(event)
+		})
+	} else {
+		log.Println("[Initialize] event bus missing: engine_poll will stay empty")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := getHub().StartAll(ctx); err != nil {
@@ -73,6 +90,7 @@ func Initialize() {
 }
 
 // Cleanup stops all services. After this, call Initialize() again to reuse.
+//
 //export Cleanup
 func Cleanup() {
 	if h := getHub(); h != nil {
@@ -102,6 +120,7 @@ func failResult(msg, id string) ResultEnvelope {
 }
 
 // Call is the SINGLE data-entry-point FFI function.
+//
 //export Call
 func Call(actionRaw *C.char, paramsRaw *C.char) *C.char {
 	actionStr := C.GoString(actionRaw)
@@ -122,6 +141,7 @@ func Call(actionRaw *C.char, paramsRaw *C.char) *C.char {
 }
 
 // StatusReport reads-only view used by flutter to verify readiness.
+//
 //export StatusReport
 func StatusReport() *C.char {
 	h := getHub()
@@ -140,10 +160,33 @@ func StatusReport() *C.char {
 // Helpers
 // ---------------------------------------------------------------------------
 
-func gs(p map[string]interface{}, k string) string          { v, _ := p[k].(string); return v }
-func gb(p map[string]interface{}, k string) bool             { b, _ := p[k].(bool); return b }
-func gi(p map[string]interface{}, k string) int              { n, _ := p[k].(float64); return int(n) }
-func gl(p map[string]interface{}, k string) float64          { v, _ := p[k].(float64); return v }
+func gs(p map[string]interface{}, k string) string  { v, _ := p[k].(string); return v }
+func gb(p map[string]interface{}, k string) bool    { b, _ := p[k].(bool); return b }
+func gi(p map[string]interface{}, k string) int     { n, _ := p[k].(float64); return int(n) }
+func gl(p map[string]interface{}, k string) float64 { v, _ := p[k].(float64); return v }
+
+// gbDefault 缺省按 def：shelve/resume/save_progress 的缺省都是 true，
+// 用 gb 会把"没传"读成 false（对协议默认值来说是个静默翻转）。
+func gbDefault(p map[string]interface{}, k string, def bool) bool {
+	if v, ok := p[k].(bool); ok {
+		return v
+	}
+	return def
+}
+
+func stringSlice(raw interface{}) []string {
+	arr, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, item := range arr {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
 
 // ---------------------------------------------------------------------------
 // Convention-based router: <service>_<action> → Service.Method()
@@ -170,9 +213,11 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 			}
 		}
 		return okResult(map[string]interface{}{"total": total, "running": running}, "")
-	case "engine.shutdown":
+	case "engine_shutdown", "engine.shutdown":
 		Cleanup()
 		return okResult(true, "")
+	case "engine_poll", "engine.poll":
+		return doEnginePoll(p)
 
 	// --- source ---
 	case "source_list", "source.list":
@@ -198,7 +243,7 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 
 	// --- bookshelf ---
 	case "bookshelf_list", "bookshelf.list":
-		return doBookshelfList(h)
+		return doBookshelfList(h, p)
 	case "bookshelf_add", "bookshelf.add":
 		return doBookshelfAdd(h, p)
 	case "bookshelf_update", "bookshelf.update":
@@ -210,7 +255,7 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 
 	// --- check ---
 	case "check_start", "check.start":
-		return doCheckStart(h)
+		return doCheckStart(h, p)
 	case "check_snapshot", "check.snapshot":
 		return doCheckSnapshot(h)
 	case "check_cancel", "check.cancel":
@@ -222,6 +267,9 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 	case "search_start", "search.start":
 		return doSearchStart(h, p)
 	case "search_stop", "search.stop":
+		if svc := h.ReadingService(); svc != nil {
+			svc.StopSearch()
+		}
 		return okResult(true, "")
 	case "search_scopes", "search.scopes":
 		return doSearchScopes(h)
@@ -230,27 +278,21 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 	case "switch_seeds", "switch.seeds":
 		return doSwitchSeeds(h, p)
 	case "switch_scan", "switch.scan":
-		return doSwitchScan(h)
+		return doSwitchScan(h, p)
 	case "switch_snapshot", "switch.snapshot":
 		return doSwitchSnapshot(h)
 	case "switch_cancel", "switch.cancel":
-		if svc := h.CheckService(); svc != nil {
-			svc.Cancel()
-		}
-		return okResult(map[string]interface{}{"cancelled": true}, "")
+		return doSwitchCancel(h)
 	case "switch_apply", "switch.apply":
-		return okResult(map[string]interface{}{"applied": 0, "added": 0, "kept": 0}, "")
+		return doSwitchApply(h, p)
 
-	// --- reader (partial — bookmarks + position only) ---
+	// --- reader ---
 	case "reader_open", "reader.open":
 		return doReaderOpen(h, p)
 	case "reader_close", "reader.close":
-		if svc := h.ReadingService(); svc != nil {
-			svc.Close()
-		}
-		return okResult(true, "")
+		return doReaderClose(h, p)
 	case "reader_toc", "reader.toc":
-		return doReaderToc(h)
+		return doReaderToc(h, p)
 	case "reader_content", "reader.content":
 		return doReaderContent(h, p)
 	case "reader_position_get", "reader.position_get":
@@ -258,11 +300,11 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 	case "reader_position_save", "reader.position_save":
 		return doReaderPosSave(h, p)
 	case "reader_staged", "reader.staged":
-		return okResult([]interface{}{}, "")
+		return doReaderStaged(h)
 	case "reader_staged_promote", "reader.staged_promote":
-		return okResult(true, "")
+		return doReaderStagedPromote(h)
 	case "reader_staged_discard", "reader.staged_discard":
-		return okResult(true, "")
+		return doReaderStagedDiscard(h)
 	case "reader_bookmarks", "reader.bookmarks":
 		return doReaderBookmarks(h, p)
 	case "reader_bookmark_add", "reader.bookmark_add":
@@ -284,29 +326,45 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 	case "rss_remove_source", "rss.remove_source":
 		return doRssRemoveSource(h, p)
 	case "rss_refresh", "rss.refresh":
-		go func() {
-			if svc := h.RSSService(); svc != nil {
-				_, _ = svc.Refresh(context.Background(), 0)
-			}
-		}()
-		return okResult(map[string]interface{}{"refreshed": true}, "")
+		// call 语义（对齐 Python：这一发真的发网络请求，60s 预算）；回本次**新增**数。
+		// 抓取失败是**错误信封**不是静默 0——「0 新增」与「没抓着」是两件事。
+		svc := h.RSSService()
+		if svc == nil {
+			return failResult("rss service unavailable", "")
+		}
+		count, err := svc.Refresh(context.Background(), gs(p, "source_id"))
+		if err != nil {
+			return failResult(err.Error(), "")
+		}
+		return okResult(count, "")
 	case "rss_refresh_all", "rss.refresh_all":
+		// job 语义：受理回包只有 {started, action}，真交付全在事件流上
+		// （RssRefreshProgressEvent 逐帧 + RssRefreshedEvent 每源一条）。
+		refreshID := int64(gi(p, "refresh_id"))
 		go func() {
 			if svc := h.RSSService(); svc != nil {
-				svc.RefreshAll(context.Background())
+				svc.RefreshAll(context.Background(), refreshID)
 			}
 		}()
-		return okResult(map[string]interface{}{"refreshed_all": true}, "")
+		return okResult(map[string]interface{}{"started": true, "action": "rss.refresh_all"}, "")
 	case "rss_mark_read", "rss.mark_read":
 		if svc := h.RSSService(); svc != nil {
-			svc.MarkRead([]string{gs(p, "url")})
+			changed, err := svc.MarkRead(int64(gi(p, "article_id")))
+			if err != nil {
+				return failResult(err.Error(), "")
+			}
+			return okResult(changed, "")
 		}
-		return okResult(true, "")
+		return failResult("rss service unavailable", "")
 	case "rss_star", "rss.star":
 		if svc := h.RSSService(); svc != nil {
-			svc.Star(gs(p, "url"), gb(p, "starred"))
+			changed, err := svc.Star(int64(gi(p, "article_id")), gb(p, "starred"))
+			if err != nil {
+				return failResult(err.Error(), "")
+			}
+			return okResult(changed, "")
 		}
-		return okResult(gb(p, "starred"), "")
+		return failResult("rss service unavailable", "")
 
 	// --- browser ---
 	case "browser_open_page", "browser.open_page":
@@ -322,8 +380,8 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 		return okResult(true, "")
 	case "webbridge_status", "webbridge.status":
 		return okResult(map[string]interface{}{"active": false}, "")
-	case "engine.webContentReady":
-		return okResult(map[string]interface{}{"ready": true}, "")
+	case "engine_web_content_ready", "engine.webContentReady":
+		return doWebContentReady(h, p)
 
 	// --- qr ---
 	case "qr_generate", "qr.generate":
@@ -355,7 +413,7 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 
 	// --- font ---
 	case "font_scan_system", "font.scan_system":
-		return okResult(map[string]interface{}{"fonts": []interface{}{}}, "")
+		return okResult([]interface{}{}, "")
 	case "font_add_user", "font.add_user":
 		return okResult(true, "")
 	case "font_remove", "font.remove":
@@ -576,9 +634,9 @@ func doSourceAudit(h *services.ServiceHub) ResultEnvelope {
 // Bookshelf handlers
 // ---------------------------------------------------------------------------
 
-func doBookshelfList(h *services.ServiceHub) ResultEnvelope {
+func doBookshelfList(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
 	if svc := h.BookshelfService(); svc != nil {
-		items, err := svc.List()
+		items, err := svc.List(gb(p, "include_staged"))
 		if err != nil {
 			return failResult(err.Error(), "")
 		}
@@ -587,25 +645,35 @@ func doBookshelfList(h *services.ServiceHub) ResultEnvelope {
 	return failResult("bookshelf service unavailable", "")
 }
 
+// doBookshelfAdd 对齐 Python shelve_by_url → shelve_book：源按 url 取回（取不到
+// 当场报"书源不存在"），`shelved=false` 即 notShelf 试读暂存；同键已存在不覆盖，
+// 但 shelved=true 时补一次转正（试读过的书再点"加入书架"不能"点了没反应"）。
 func doBookshelfAdd(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
-	if svc := h.BookshelfService(); svc != nil {
-		bookRaw, _ := json.Marshal(p["book"])
-		internalBook := parseBookItem(bookRaw)
-		modelBook := &models.BookItem{
-			BookURL:  internalBook.URL,
-			Name:     internalBook.Name,
-			Author:   internalBook.Author,
-			CoverURL: internalBook.CoverURL,
-			Intro:    internalBook.Intro,
-			Kind:     internalBook.Kind,
-			Origin:   internalBook.Origin,
-		}
-		if err := svc.Add(modelBook); err != nil {
-			return failResult(err.Error(), "")
-		}
-		return okResult(true, "")
+	svc := h.BookshelfService()
+	if svc == nil {
+		return failResult("bookshelf service unavailable", "")
 	}
-	return failResult("bookshelf service unavailable", "")
+	sourceURL := gs(p, "source_url")
+	var sourceName string
+	if srcSvc := h.SourceService(); srcSvc != nil {
+		if source, ok := srcSvc.Get(sourceURL); ok && source != nil {
+			sourceName = source.BookSourceName
+		}
+	}
+	if sourceName == "" {
+		return failResult(fmt.Sprintf("书源不存在：%s", sourceURL), "")
+	}
+	bookRaw, _ := json.Marshal(p["book"])
+	book := parseBookItem(bookRaw)
+	if book.URL == "" {
+		return failResult("missing book url", "")
+	}
+	shelved := gbDefault(p, "shelved", true)
+	added := svc.CreateShelfRecord(sourceURL, sourceName, book, shelved)
+	if shelved && !added {
+		added = svc.PromoteShelfRecord(sourceURL, book.URL)
+	}
+	return okResult(added, "")
 }
 
 func doBookshelfUpdate(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
@@ -643,115 +711,122 @@ func doBookshelfDelete(h *services.ServiceHub, p map[string]interface{}) ResultE
 // Check handlers
 // ---------------------------------------------------------------------------
 
-func doCheckStart(h *services.ServiceHub) ResultEnvelope {
-	if svc := h.CheckService(); svc != nil {
-		go func() {
-			svc.RunAll(nil)
-		}()
-		return okResult(map[string]interface{}{"started": true}, "")
+func doCheckStart(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.CheckService()
+	if svc == nil {
+		return failResult("check service unavailable", "")
 	}
-	return failResult("check service unavailable", "")
+	groups := stringSlice(p["groups"])
+	go func() {
+		if _, err := svc.RunAll(groups); err != nil {
+			log.Printf("[FFI] check.start failed: %v", err)
+		}
+	}()
+	return okResult(map[string]interface{}{"started": true, "action": "check.start"}, "")
 }
 
 func doCheckSnapshot(h *services.ServiceHub) ResultEnvelope {
-	if svc := h.CheckService(); svc != nil {
-		snap := svc.Snapshot()
-		results := make([]interface{}, len(snap.Results))
-		for i, r := range snap.Results {
-			results[i] = map[string]interface{}{
-				"sourceUrl": r.SourceURL,
-				"state":     string(r.State),
-				"duration":  r.Duration.Milliseconds(),
-				"error":     r.Error,
-			}
-		}
-		return okResult(map[string]interface{}{
-			"total":     snap.Total,
-			"done":      snap.Done,
-			"results":   results,
-			"updatedAt": snap.UpdatedAt.Format(time.RFC3339),
-		}, "")
+	svc := h.CheckService()
+	if svc == nil {
+		return failResult("check service unavailable", "")
 	}
-	return failResult("check service unavailable", "")
+	return okResult(svc.Snapshot(), "")
 }
 
 func doCheckCancel(h *services.ServiceHub) ResultEnvelope {
 	if svc := h.CheckService(); svc != nil {
 		svc.Cancel()
 	}
-	return okResult(true, "")
+	return okResult(nil, "")
 }
 
 func doCheckSource(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
-	if svc := h.CheckService(); svc != nil {
-		url := gs(p, "url")
-		srcs := svc.GetSourceService().List()
-		for _, src := range srcs {
-			if src.BookSourceURL == url && src.Enabled {
-				src.RespondTime = 0
-				svc.GetSourceService().Save(&src)
-				return okResult(map[string]interface{}{
-					"url":     url,
-					"state":   "available",
-					"respond": src.RespondTime,
-				}, "")
-			}
-		}
-		return okResult(map[string]interface{}{"url": url, "state": "not_found"}, "")
+	svc := h.CheckService()
+	if svc == nil {
+		return failResult("check service unavailable", "")
 	}
-	return failResult("check service unavailable", "")
+	sourceJSON, _ := p["source_json"].(map[string]interface{})
+	if sourceJSON == nil {
+		return failResult("missing source_json", "")
+	}
+	report, err := svc.CheckSingle(sourceJSON, gs(p, "depth"))
+	if err != nil {
+		return failResult(err.Error(), "")
+	}
+	return okResult(report, "")
 }
 
 // ---------------------------------------------------------------------------
-// Reader handlers (partial — bookmarks + position only)
+// Reader handlers
 // ---------------------------------------------------------------------------
 
+// doReaderPosGet 回**存档形状**（books 表没有 chapter_url/name 两列，那两格恒空、
+// 续读那一章由 chapter_index 在目录里定位）；没有记录就是 null，不是"位置为 0"。
 func doReaderPosGet(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
-	if svc := h.ReaderService(); svc != nil {
-		key := gs(p, "url")
-		val, ok := svc.ReadPosition(key)
-		if !ok {
-			return okResult(map[string]interface{}{}, "")
-		}
-		var pos map[string]interface{}
-		json.Unmarshal([]byte(val), &pos)
-		return okResult(pos, "")
+	svc := h.ReadingService()
+	if svc == nil {
+		return okResult(nil, "")
 	}
-	return okResult(map[string]interface{}{}, "")
+	data, ok := svc.ReadPositionByURL(gs(p, "source_url"), gs(p, "book_url"))
+	if !ok {
+		return okResult(nil, "")
+	}
+	return okResult(data, "")
 }
 
 func doReaderPosSave(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
-	if svc := h.ReaderService(); svc != nil {
-		key := gs(p, "url")
-		position := map[string]interface{}{
-			"chapterIndex": gi(p, "index"),
-			"title":        gs(p, "title"),
-		}
-		data, _ := json.Marshal(position)
-		svc.SavePosition(key, string(data))
-		return okResult(true, "")
+	svc := h.ReadingService()
+	if svc == nil {
+		return failResult("reading service unavailable", "")
 	}
-	return okResult(true, "")
+	position, _ := p["position_json"].(map[string]interface{})
+	data, err := svc.SavePositionByURL(gs(p, "source_url"), gs(p, "book_url"), position)
+	if err != nil {
+		return failResult(err.Error(), "")
+	}
+	return okResult(data, "")
+}
+
+// doReaderStaged 当前书若是试读暂存（notShelf）给出那条书架记录；在架的书、
+// 没记录、没会话都是 null——在架的书退出时不该被问一遍。
+func doReaderStaged(h *services.ServiceHub) ResultEnvelope {
+	svc := h.ReadingService()
+	if svc == nil {
+		return okResult(nil, "")
+	}
+	record, ok := svc.StagedRecordBySession()
+	if !ok {
+		return okResult(nil, "")
+	}
+	return okResult(record, "")
+}
+
+func doReaderStagedPromote(h *services.ServiceHub) ResultEnvelope {
+	svc := h.ReadingService()
+	if svc == nil {
+		return okResult(false, "")
+	}
+	return okResult(svc.PromoteStaged(), "")
+}
+
+func doReaderStagedDiscard(h *services.ServiceHub) ResultEnvelope {
+	svc := h.ReadingService()
+	if svc == nil {
+		return okResult(false, "")
+	}
+	return okResult(svc.DiscardStaged(), "")
 }
 
 func doReaderBookmarks(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
 	if svc := h.ReaderService(); svc != nil {
-		bookURL := gs(p, "url")
-		bms, err := svc.ListBookmarks(bookURL)
+		bms, err := svc.ListBookmarks(gs(p, "book_url"))
 		if err != nil {
 			return failResult(err.Error(), "")
 		}
-		data := make([]interface{}, len(bms))
-		for i, bm := range bms {
-			data[i] = map[string]interface{}{
-				"id":         bm.ID,
-				"bookUrl":    bm.BookURL,
-				"chapterIdx": bm.ChapterIdx,
-				"offset":     bm.Offset,
-				"summary":    bm.Summary,
-			}
+		if bms == nil {
+			bms = []services.Bookmark{}
 		}
-		return okResult(data, "")
+		return okResult(bms, "")
 	}
 	return failResult("reader service unavailable", "")
 }
@@ -759,32 +834,28 @@ func doReaderBookmarks(h *services.ServiceHub, p map[string]interface{}) ResultE
 func doReaderBookmarkAdd(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
 	if svc := h.ReaderService(); svc != nil {
 		bm, err := svc.AddBookmark(
-			gs(p, "url"),
-			gi(p, "chapterIndex"),
+			gs(p, "book_url"),
+			gi(p, "chapter_index"),
 			gl(p, "offset"),
 			gs(p, "summary"),
 		)
 		if err != nil {
 			return failResult(err.Error(), "")
 		}
-		return okResult(map[string]interface{}{
-			"id":         bm.ID,
-			"chapterIdx": bm.ChapterIdx,
-		}, "")
+		return okResult(bm.ID, "")
 	}
-	return okResult(true, "")
+	return failResult("reader service unavailable", "")
 }
 
 func doReaderBookmarkRemove(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
 	if svc := h.ReaderService(); svc != nil {
-		svc.RemoveBookmark(
-			gs(p, "url"),
-			gi(p, "chapterIndex"),
-			gl(p, "offset"),
-		)
-		return okResult(true, "")
+		removed, err := svc.RemoveBookmark(gs(p, "book_url"), int64(gi(p, "bookmark_id")))
+		if err != nil {
+			return failResult(err.Error(), "")
+		}
+		return okResult(removed, "")
 	}
-	return okResult(true, "")
+	return failResult("reader service unavailable", "")
 }
 
 // ---------------------------------------------------------------------------
@@ -793,72 +864,36 @@ func doReaderBookmarkRemove(h *services.ServiceHub, p map[string]interface{}) Re
 
 func doRssSources(h *services.ServiceHub) ResultEnvelope {
 	if svc := h.RSSService(); svc != nil {
-		sources := svc.ListSources()
-		data := make([]interface{}, len(sources))
-		for i, s := range sources {
-			data[i] = map[string]interface{}{
-				"id":    s.ID,
-				"name":  s.Name,
-				"url":   s.URL,
-				"group": s.Group,
-			}
-		}
-		return okResult(data, "")
+		return okResult(svc.SourceRows(), "")
 	}
 	return okResult([]interface{}{}, "")
 }
 
 func doRssArticles(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
 	if svc := h.RSSService(); svc != nil {
-		sourceIDRaw, _ := p["sourceId"].(float64)
-		sourceID := int64(sourceIDRaw)
-		page := gi(p, "page")
-		limit := 20
-		offset := page * limit
-		articles, err := svc.GetArticles(sourceID, offset, limit)
-		if err != nil {
-			return failResult(err.Error(), "")
-		}
-		data := make([]interface{}, len(articles))
-		for i, a := range articles {
-			desc := truncate(a.Text, 200)
-			data[i] = map[string]interface{}{
-				"id":        a.ID,
-				"title":     a.Title,
-				"url":       a.URL,
-				"author":    a.Author,
-				"pubDate":   a.PubDate,
-				"description": desc,
-				"read":      a.Read,
-				"starred":   a.Starred,
-			}
-		}
-		return okResult(data, "")
+		return okResult(svc.ArticleRows(gs(p, "source_id"), gb(p, "unread_only")), "")
 	}
 	return okResult([]interface{}{}, "")
 }
 
 func doRssAddSource(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
 	if svc := h.RSSService(); svc != nil {
-		name := gs(p, "name")
-		url := gs(p, "url")
-		if name == "" || url == "" {
-			return failResult("name and url required", "")
-		}
-		src := &services.RSSSource{Name: name, URL: url, Enabled: true, RSSType: 1}
-		if err := svc.AddSource(src); err != nil {
+		id, err := svc.AddSource(gs(p, "name"), gs(p, "url"), gs(p, "source_group"))
+		if err != nil {
 			return failResult(err.Error(), "")
 		}
-		return okResult(map[string]interface{}{"id": src.ID}, "")
+		return okResult(id, "")
 	}
 	return failResult("rss service unavailable", "")
 }
 
 func doRssRemoveSource(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
 	if svc := h.RSSService(); svc != nil {
-		idRaw, _ := p["id"].(float64)
-		svc.RemoveSource(int64(idRaw))
-		return okResult(true, "")
+		changed, err := svc.RemoveSource(gs(p, "source_id"))
+		if err != nil {
+			return failResult(err.Error(), "")
+		}
+		return okResult(changed, "")
 	}
 	return failResult("rss service unavailable", "")
 }
@@ -976,43 +1011,44 @@ func bookToMap(b *internalmodels.BookItem) map[string]interface{} {
 
 func defaultThemePrefs() map[string]interface{} {
 	return map[string]interface{}{
-		"theme_mode":   "system",
-		"background":   "#ffffff",
-		"text_color":   "#000000",
-		"font_family":  "",
-		"font_size":    16.0,
-		"line_spacing": 1.5,
-		"paragraph_sp": 1.0,
-		"margin_px":    20,
+		"theme_mode":    "system",
+		"background":    "#ffffff",
+		"text_color":    "#000000",
+		"font_family":   "",
+		"font_size":     16.0,
+		"line_spacing":  1.5,
+		"paragraph_sp":  1.0,
+		"margin_px":     20,
 		"show_cover_bg": false,
-		"scroll_mode":  false,
+		"scroll_mode":   false,
 	}
 }
 
 // parseBookItem converts raw bytes into a BookItem (handles snake_case Dart keys).
 func parseBookItem(raw []byte) *internalmodels.BookItem {
-	item := &internalmodels.BookItem{}
-	// Try direct unmarshal first (some Dart keys may match Go field names via json tags)
-	if err := json.Unmarshal(raw, item); err != nil {
-		// Fall back to manual extraction from map
-		var m map[string]interface{}
-		if err2 := json.Unmarshal(raw, &m); err2 == nil {
-			item.URL = gs(m, "bookUrl")
-			item.Name = gs(m, "name")
-			item.Author = gs(m, "author")
-			item.Kind = fmt.Sprintf("%v", m["kind"])
-			item.Origin = gs(m, "origin")
-			item.CoverURL = gs(m, "coverUrl")
-		}
+	var m map[string]interface{}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return &internalmodels.BookItem{}
 	}
-	return item
-}
-
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
+	// 主口径是 35 键 snake_case 快照（事件/搜索行原样回传的那份，见 BookSnapshot）；
+	// 旧 camelCase 行的键在快照里没有对应时逐个兜底。
+	book := services.BookFromSnapshot(m)
+	if book.URL == "" {
+		book.URL = gs(m, "bookUrl")
 	}
-	return s[:maxLen]
+	if book.CoverURL == "" {
+		book.CoverURL = gs(m, "coverUrl")
+	}
+	if book.OriginName == "" {
+		book.OriginName = gs(m, "originName")
+	}
+	if book.TocURL == "" {
+		book.TocURL = gs(m, "tocUrl")
+	}
+	if book.LastChapter == "" {
+		book.LastChapter = gs(m, "lastChapter")
+	}
+	return book
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,69 +1085,54 @@ func bookToMapFull(b *internalmodels.BookItem) map[string]interface{} {
 }
 
 // ---------------------------------------------------------------------------
-// Reader handlers — toc + content (now real implementations)
+// Reader handlers — open / close / toc / content
 // ---------------------------------------------------------------------------
 
+// doReaderOpen 开会话（对齐 Python open_by_url）：回会话快照 + 位置，目录不在
+// 这一发里（几千章另走 reader.toc）。缺省 shelve=true / resume=true。
 func doReaderOpen(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.ReadingService()
+	if svc == nil {
+		return failResult("reading service unavailable", "")
+	}
 	bookRaw, _ := json.Marshal(p["book"])
 	book := parseBookItem(bookRaw)
 	if book.URL == "" {
 		return failResult("missing book url", "")
 	}
-
-	sourceSvc := h.SourceService()
-	src, ok := sourceSvc.Get(book.Origin)
-	if !ok {
-		return failResult("source not found", "")
-	}
-
-	ruleEngine := h.RuleEngine()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	bookInfo, err := ruleEngine.GetBookInfo(ctx, src, book.URL)
+	data, err := svc.OpenByURL(gs(p, "source_url"), book,
+		gbDefault(p, "shelve", true), gbDefault(p, "resume", true))
 	if err != nil {
-		return failResult(fmt.Sprintf("get book info: %v", err), "")
+		return failResult(err.Error(), "")
 	}
-
-	chapters, err := ruleEngine.GetChapters(ctx, src, bookInfo.TocURL)
-	if err != nil {
-		log.Printf("[reader.open] get chapters failed: %v", err)
-		chapters = []*internalmodels.Chapter{}
-	}
-
-	// Store session in hub
-	if svc := h.ReadingService(); svc != nil {
-		svc.OpenSession(&services.ReadingSession{
-			BookURL:     book.URL,
-			Name:        book.Name,
-			Author:      book.Author,
-			TocURL:      bookInfo.TocURL,
-			LastChapter: 0,
-			CachedChaps: chapters,
-		})
-	}
-
-	return okResult(map[string]interface{}{
-		"book":          bookToMapFull(bookInfo),
-		"chaptersCount": len(chapters),
-		"started":       true,
-	}, "")
+	return okResult(data, "")
 }
 
-func doReaderToc(h *services.ServiceHub) ResultEnvelope {
-	if svc := h.ReadingService(); svc != nil {
-		sess := svc.GetSession()
-		if sess == nil {
-			return failResult("no reading session open", "")
-		}
-		data := make([]interface{}, len(sess.CachedChaps))
-		for i, ch := range sess.CachedChaps {
-			data[i] = chapterRow(ch)
-		}
-		return okResult(data, "")
+// doReaderClose 结束会话（对齐 Python close_by_url）：url 对不上回
+// {closed:false, staged:null} 什么都不关。缺省 save_progress=true。
+func doReaderClose(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.ReadingService()
+	if svc == nil {
+		return failResult("reading service unavailable", "")
 	}
-	return failResult("reading service unavailable", "")
+	return okResult(svc.CloseByURL(gs(p, "source_url"), gs(p, "book_url"),
+		gbDefault(p, "save_progress", true)), "")
+}
+
+func doReaderToc(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.ReadingService()
+	if svc == nil {
+		return failResult("reading service unavailable", "")
+	}
+	chapters, err := svc.TocByURL(gs(p, "source_url"), gs(p, "book_url"), gb(p, "refresh"))
+	if err != nil {
+		return failResult(err.Error(), "")
+	}
+	data := make([]interface{}, len(chapters))
+	for i, ch := range chapters {
+		data[i] = chapterRow(ch)
+	}
+	return okResult(data, "")
 }
 
 func doReaderContent(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
@@ -1121,60 +1142,18 @@ func doReaderContent(h *services.ServiceHub, p map[string]interface{}) ResultEnv
 	sourceURL := gs(p, "source_url")
 	bookURL := gs(p, "book_url")
 	chapterURL := gs(p, "chapter_url")
-
 	if sourceURL == "" || bookURL == "" || chapterURL == "" {
 		return failResult("missing required params", "")
 	}
-
-	sourceSvc := h.SourceService()
-	src, ok := sourceSvc.Get(sourceURL)
-	if !ok {
-		return failResult("source not found", "")
+	svc := h.ReadingService()
+	if svc == nil {
+		return failResult("reading service unavailable", "")
 	}
-
-	ruleEngine := h.RuleEngine()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-
-	// Find chapter in session or reconstruct Chapter object
-	var chapter *internalmodels.Chapter
-	if svc := h.ReadingService(); svc != nil {
-		sess := svc.GetSession()
-		if sess != nil && sess.BookURL == bookURL {
-			for _, c := range sess.CachedChaps {
-				if c.URL == chapterURL {
-					chapter = c
-					break
-				}
-			}
-		}
-	}
-	if chapter == nil {
-		chapter = &internalmodels.Chapter{URL: chapterURL, BookURL: bookURL}
-	}
-
-	content, err := ruleEngine.GetContent(ctx, src, chapter)
+	data, err := svc.ChapterDocument(sourceURL, bookURL, chapterURL)
 	if err != nil {
-		return failResult(fmt.Sprintf("get content: %v", err), "")
+		return failResult(err.Error(), "")
 	}
-
-	result := map[string]interface{}{
-		"chapterUrl":    content.ChapterURL,
-		"title":         content.Title,
-		"paragraphCount": 0,
-		"totalChars":   len(content.Content),
-	}
-
-	// Split content into blocks (simple text split by newline groups)
-	blocks := []interface{}{
-		map[string]interface{}{"kind": "text", "value": content.Content, "headers": map[string]interface{}{}},
-	}
-	if content.SubContent != nil && *content.SubContent != "" {
-		blocks = append(blocks, map[string]interface{}{"kind": "text", "value": *content.SubContent, "headers": map[string]interface{}{}})
-	}
-	result["blocks"] = blocks
-
-	return okResult(result, "")
+	return okResult(data, "")
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,195 +1223,172 @@ func doBrowseBooks(h *services.ServiceHub, p map[string]interface{}) ResultEnvel
 	for i, b := range books {
 		data[i] = bookToMapFull(b)
 	}
+	return okResult(data, "")
+}
+
+// ---------------------------------------------------------------------------
+// Event polling
+// ---------------------------------------------------------------------------
+
+// doEnginePoll serves the Dart-side cursor poll: {"since": N} →
+// {"events":[{"seq","name","payload"}], "last_seq": N, "lost": bool}.
+func doEnginePoll(p map[string]interface{}) ResultEnvelope {
+	ring := evtRing.Load()
+	if ring == nil {
+		return okResult(map[string]interface{}{"events": []interface{}{}, "last_seq": 0, "lost": false}, "")
+	}
+	since := int64(gi(p, "since"))
+	entries, lastSeq, lost := ring.Since(since)
 	return okResult(map[string]interface{}{
-		"books": data,
-		"page":  pageNum,
-		"count": len(books),
+		"events":   entries,
+		"last_seq": lastSeq,
+		"lost":     lost,
 	}, "")
+}
+
+// ---------------------------------------------------------------------------
+// Webview bridge
+// ---------------------------------------------------------------------------
+
+// doWebContentReady acknowledges a webview render delivery from Dart.
+// Contract (Dart WebviewDelivery): {"delivered": bool}. Under FFI the engine
+// does not issue reverse webview requests, so there is never a pending one to
+// satisfy; answering delivered=false is the honest shape (matches what the
+// Dart parser produced from the old "ready" key anyway).
+func doWebContentReady(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	return okResult(map[string]interface{}{"delivered": false}, "")
 }
 
 // ---------------------------------------------------------------------------
 // Search handlers
 // ---------------------------------------------------------------------------
 
+// doSearchStart 起一轮多源找书（mode="job"）：受理回包只有 {started, action}，
+// 逐源结果与收口走 SearchFinishedEvent 事件流（search_id 认本轮，同一 id 再调即翻页）。
 func doSearchStart(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
 	keyword := gs(p, "keyword")
 	if keyword == "" {
 		return failResult("empty keyword", "")
 	}
-
-	sources := h.SourceService().List()
-	total := 0
-	allBooks := make([]*internalmodels.BookItem, 0)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	ruleEngine := h.RuleEngine()
-
-	for _, src := range sources {
-		if !src.Enabled {
-			continue
-		}
-		if total >= 200 { // limit results
-			break
-		}
-		result, err := ruleEngine.SearchBook(ctx, &src, keyword)
-		if err != nil {
-			continue
-		}
-		total += len(result)
-		allBooks = append(allBooks, result...)
+	scope := gs(p, "scope")
+	searchID := int64(gl(p, "search_id"))
+	if searchID == 0 {
+		// 缺 search_id 的调用没有关联依据：事件回带 "0" 而界面认不到，等于结果作废。
+		return failResult("missing search_id", "")
 	}
 
-	data := make([]interface{}, len(allBooks))
-	for i, b := range allBooks {
-		data[i] = bookToMapFull(b)
+	readingSvc := h.ReadingService()
+	if readingSvc == nil {
+		return failResult("reading service unavailable", "")
 	}
-	searchID := fmt.Sprintf("%v", p["search_id"])
+	go readingSvc.SearchInScope(context.Background(), keyword, scope, searchID)
+
 	return okResult(map[string]interface{}{
-		"books":    data,
-		"total":    total,
-		"searchId": searchID,
+		"started": true,
+		"action":  "search.start",
 	}, "")
 }
 
 func doSearchScopes(h *services.ServiceHub) ResultEnvelope {
-	allSources := h.SourceService().List()
-	sources := make([]interface{}, 0, len(allSources))
-	for _, src := range allSources {
-		sources = append(sources, map[string]interface{}{
-			"value":      src.BookSourceURL,
-			"name":       src.BookSourceName,
-			"group":      "",
-			"enabled":    src.Enabled,
-			"enabledExplore": src.EnabledExplore,
-		})
+	readingSvc := h.ReadingService()
+	if readingSvc == nil {
+		return okResult([]interface{}{}, "")
 	}
-	return okResult(map[string]interface{}{
-		"sources": sources,
-		"all":     len(allSources),
-	}, "")
+	// [{scope, count}]：范围有哪些、各带几条可搜源，只有服务端一份算法。
+	return okResult(readingSvc.SearchScopes(), "")
 }
 
 // ---------------------------------------------------------------------------
 // Switch/Seeds handlers
 // ---------------------------------------------------------------------------
 
+// doSwitchSeeds 本地种子库查同名书（不联网）。入参 book 是书架行原样，
+// 只读 name/author；没有服务时回空数组而不是报错——对话框空空比弹红字好。
 func doSwitchSeeds(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	readingSvc := h.ReadingService()
+	if readingSvc == nil {
+		return okResult([]interface{}{}, "")
+	}
 	bookRaw, _ := json.Marshal(p["book"])
-	targetBook := parseBookItem(bookRaw)
-	if targetBook.Name == "" {
-		return okResult([]interface{}{}, "")
-	}
-
-	// Query bookshelf for books with matching name
-	bookshelfSvc := h.BookshelfService()
-	if bookshelfSvc == nil {
-		return okResult([]interface{}{}, "")
-	}
-
-	items, err := bookshelfSvc.List()
-	if err != nil {
-		return okResult([]interface{}{}, "")
-	}
-
-	seeds := make([]interface{}, 0)
-	lowerTarget := strings.ToLower(targetBook.Name)
-	for _, item := range items {
-		name, _ := item["name"].(string)
-		if name == "" {
-			name, _ = item["bookName"].(string)
-		}
-		if strings.Contains(strings.ToLower(name), lowerTarget) {
-			modelBook := &models.BookItem{
-				Name:     name,
-				Author:   gs(item, "author"),
-				CoverURL: gs(item, "coverUrl"),
-				Origin:   gs(item, "origin"),
-			}
-			seeds = append(seeds, bookToMapFull(&internalmodels.BookItem{
-				URL:      gs(item, "bookUrl"),
-				Name:     name,
-				Author:   modelBook.Author,
-				CoverURL: modelBook.CoverURL,
-				Origin:   modelBook.Origin,
-			}))
-		}
-	}
-	return okResult(seeds, "")
+	return okResult(readingSvc.SwitchSeeds(parseBookItem(bookRaw)), "")
 }
 
-func doSwitchScan(h *services.ServiceHub) ResultEnvelope {
-	return okResult(map[string]interface{}{
-		"started": true,
-		"action":  "switch.scan",
-	}, "")
+// doSwitchScan 起一轮换源扫描。这是个异步动作：回包只表示"受理了"，
+// 逐源进度与最终候选都走 SourceSwitch* 事件。switch_id 缺席按 0
+// （对齐 Python `str(switch_id or 0)`），不拒收。
+func doSwitchScan(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	readingSvc := h.ReadingService()
+	if readingSvc == nil {
+		return failResult("reading service unavailable", "")
+	}
+	record, _ := p["book"].(map[string]interface{})
+	switchID := int64(gl(p, "switch_id"))
+	go readingSvc.SwitchScan(context.Background(), record, switchID, gs(p, "keyword"), gs(p, "group"))
+	return okResult(map[string]interface{}{"started": true, "action": "switch.scan"}, "")
 }
 
+// doSwitchSnapshot 本轮（或最近一轮）扫描的回放快照；没跑过回 9 键空轮。
 func doSwitchSnapshot(h *services.ServiceHub) ResultEnvelope {
-	return okResult(map[string]interface{}{
-		"total":   0,
-		"done":    0,
-		"results": []interface{}{},
-	}, "")
+	if svc := h.ReadingService(); svc != nil {
+		return okResult(svc.SwitchSnapshot(), "")
+	}
+	return okResult(services.IdleSwitchRun(), "")
+}
+
+// doSwitchCancel 合作式叫停在跑的扫描；没有可停的就回 cancelled=false。
+func doSwitchCancel(h *services.ServiceHub) ResultEnvelope {
+	if svc := h.ReadingService(); svc != nil {
+		return okResult(svc.SwitchCancel(), "")
+	}
+	return okResult(map[string]interface{}{"cancelled": false}, "")
+}
+
+// doSwitchApply 换源写回。源按 source_url 取回；取不到**报错**而不是回
+// applied=false——那三种失败成因（源没了 / 记录没了 / 冲突）得让界面分得开。
+func doSwitchApply(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	readingSvc := h.ReadingService()
+	if readingSvc == nil {
+		return failResult("reading service unavailable", "")
+	}
+	record, _ := p["record"].(map[string]interface{})
+	bookRaw, _ := json.Marshal(p["book"])
+	result, err := readingSvc.ApplySwitch(record, gs(p, "source_url"), parseBookItem(bookRaw))
+	if err != nil {
+		return failResult(err.Error(), "")
+	}
+	return okResult(result, "")
 }
 
 // ---------------------------------------------------------------------------
 // RSS article detail handler
 // ---------------------------------------------------------------------------
 
+// doRssArticle 打开一篇文章（10 键 = 列表 9 格 + 去标签的 text）。没这篇回
+// data=null——Dart `openRssArticle` 把 null（"没有"）与空正文分得开。
 func doRssArticle(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
-	articleID := gi(p, "article_id")
 	if h == nil || h.RSSService() == nil {
-		return okResult(map[string]interface{}{}, "")
+		return failResult("rss service unavailable", "")
 	}
-	// Placeholder: RSS articles stored in SQLite
-	return okResult(map[string]interface{}{
-		"row": map[string]interface{}{
-			"id":         articleID,
-			"title":      "(未实现)",
-			"url":        "",
-			"author":     "",
-			"pubDate":    "",
-			"read":       false,
-			"starred":    false,
-		},
-		"text": "",
-	}, "")
+	detail := h.RSSService().ArticleDetail(int64(gi(p, "article_id")))
+	return okResult(detail, "")
 }
 
 // ---------------------------------------------------------------------------
 // Reader full-text search handler
 // ---------------------------------------------------------------------------
 
+// doReaderSearchContent 书内全文检索（对齐 Python search_ensured）：服务侧先按需
+// 补索引再查，回 hits + written(int) + indexedChapters + ftsAvailable——
+// 0 命中要分得清"没缓存"与"真没有"。
 func doReaderSearchContent(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
-	bookURL := gs(p, "book_url")
-	keyword := gs(p, "keyword")
-
-	searchSvc := h.ContentSearchService()
-	if searchSvc == nil || bookURL == "" || keyword == "" {
+	svc := h.ReadingService()
+	if svc == nil {
 		return okResult(map[string]interface{}{
 			"hits":            []interface{}{},
-			"written":         false,
+			"written":         0,
 			"indexedChapters": 0,
 			"ftsAvailable":    false,
 		}, "")
 	}
-
-	hits, _ := searchSvc.Search(keyword, bookURL, 50)
-	results := make([]interface{}, len(hits))
-	for i, hit := range hits {
-		results[i] = map[string]interface{}{
-			"bookUrl":      hit.BookURL,
-			"chapterTitle": hit.ChapterTitle,
-			"snippet":      hit.Snippet,
-		}
-	}
-	return okResult(map[string]interface{}{
-		"hits":            results,
-		"written":         true,
-		"indexedChapters": searchSvc.IndexedChapters(bookURL),
-		"ftsAvailable":    searchSvc.FTSAvailable(),
-	}, "")
+	return okResult(svc.SearchContentByURL(gs(p, "book_url"), gs(p, "keyword"), gs(p, "source_url")), "")
 }

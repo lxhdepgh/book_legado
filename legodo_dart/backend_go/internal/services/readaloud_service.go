@@ -22,6 +22,20 @@ const (
 	StatePaused
 )
 
+// String maps the enum to the wire strings documented on core.ReadAloudStateEvent
+// ("idle", "speaking", "paused"). A plain string(s) conversion would emit a single
+// rune (e.g. "\x00") instead, silently breaking every consumer of the event.
+func (s ReadAloudState) String() string {
+	switch s {
+	case StatePlaying:
+		return "speaking"
+	case StatePaused:
+		return "paused"
+	default:
+		return "idle"
+	}
+}
+
 // ReadAloudService manages TTS read-aloud profiles and playback state.
 type ReadAloudService struct {
 	base    *core.BaseService
@@ -45,28 +59,28 @@ func NewReadAloudService(storage *core.StorageService, bus *core.EventBus) *Read
 func (s *ReadAloudService) Start() error { return s.base.Start() }
 func (s *ReadAloudService) BaseStop() error {
 	s.state = StateStopped
-	s.bus.Publish(&core.ReadAloudStateEvent{State: string(StateStopped)})
+	s.bus.Publish(&core.ReadAloudStateEvent{State: s.state.String()})
 	return s.base.Stop()
 }
 
 // Speak starts TTS speaking for text.
 func (s *ReadAloudService) Speak(text string) error {
 	s.state = StatePlaying
-	s.bus.Publish(&core.ReadAloudStateEvent{State: string(StatePlaying)})
+	s.bus.Publish(&core.ReadAloudStateEvent{State: s.state.String()})
 	return nil
 }
 
 // Pause pauses playback.
 func (s *ReadAloudService) Pause() error {
 	s.state = StatePaused
-	s.bus.Publish(&core.ReadAloudStateEvent{State: string(StatePaused)})
+	s.bus.Publish(&core.ReadAloudStateEvent{State: s.state.String()})
 	return nil
 }
 
 // Resume resumes paused playback.
 func (s *ReadAloudService) Resume() error {
 	s.state = StatePlaying
-	s.bus.Publish(&core.ReadAloudStateEvent{State: string(StatePlaying)})
+	s.bus.Publish(&core.ReadAloudStateEvent{State: s.state.String()})
 	return nil
 }
 

@@ -1,6 +1,6 @@
 {
-  "row_count": 7,
-  "status_line": "书架共 7 本",
+  "row_count": 8,
+  "status_line": "书架共 8 本",
   "rows": [
     {
       "name": "我的功法无限提升",
@@ -63,6 +63,15 @@
       "subtitle": "茄仔向前冲 · 读到 第1章 落月镇的小财神",
       "local": false,
       "url": "https://m.lvsexs.com/xs/206743.html",
+      "source_url": "https://m.lvsexs.com"
+    },
+    {
+      "name": "游戏入侵：开局矿奴，我加点成神",
+      "author": "无相飘云",
+      "chapter_name": "",
+      "subtitle": "无相飘云",
+      "local": false,
+      "url": "https://m.lvsexs.com/xs/454135.html",
       "source_url": "https://m.lvsexs.com"
     }
   ]

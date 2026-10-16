@@ -300,14 +300,21 @@ void main() {
       // 「文章」级，下面那一发才谈得上"退回来"；没跳成时"退回订阅源"是原地的假读数。
       expect(_levelIndexShown(tester), 1);
 
-      await tester.tap(_menuButton(_feedSource().id));
+      // 源没了这一格**程序化注入**（与 flet 探针同形：它那一发也是直接喂空表
+      // `render_sources([], {}, "")`，不是点删除）：窄窗停在文章级时源栏整栏 Offstage，
+      // 「⋮→删除」那颗按钮本来就点不到——能点的路径走不到这一格。重读走的仍是真实
+      // 那一路：事件到了之后 notifier 按 0.5s 窗口合流出一次 `rss.sources`。
+      fake.rssSources = const <RssSourceRow>[];
+      fake.emit(EngineEvent(EngineEventNames.rssRefreshed, <String, Object?>{
+        'source_id': _feedSource().id,
+        'new_count': 0,
+        'timestamp': 0,
+      }));
+      await tester.pump(const Duration(milliseconds: 600)); // 角标重读的合流窗口
       await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const Key('rss.menu.remove')));
-      await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const Key('rss.confirm.delete')));
-      await tester.pumpAndSettle();
-      expect(fake.callsFor('rss.remove_source'), 1);
-      expect(fake.rssSources, isEmpty);
+      expect(fake.callsFor('rss.sources'), greaterThanOrEqualTo(2),
+          reason: '正对照：左栏真的被重读过（起手一次 + 事件合流那一次）；'
+              '重读没发生时的"退回订阅源"是原地的假读数');
       _expectShape(tester, expected);
     });
 
@@ -401,7 +408,10 @@ void main() {
           detail: _articleDetail());
       expect(find.textContaining('${withUnread.unread} 未读'), findsOneWidget,
           reason: '正对照：起手角标是真从行里读出来的那一个数');
-      await tester.tap(_articleTile(articles.first.id));
+      // 点的是**详情样本那一篇**：替身的 `openRssArticle` 按 id 认行（id 不配回 null，
+      // 与"没这篇文章"走同一支早退，已读那一发就打不出去），而 `rss.articles` 的行序
+      // 是 [id=2, id=1]——点 `articles.first` 恰好是详情样本里没有的那一篇。
+      await tester.tap(_articleTile(_articleDetail().row.id));
       await tester.pumpAndSettle();
 
       expect(fake.callsFor('rss.sources'), 1,
@@ -471,7 +481,9 @@ void main() {
       await tester.pumpAndSettle();
       final button =
           tester.widget<IconButton>(find.byKey(const Key('rss.detail.star')));
-      expect(button.icon, const Icon(Icons.star).icon, reason: '图标跟着旗标走');
+      // `button.icon` 那一格是 `Widget`，`Icon.icon` 才是 `IconData`——两边比的得是
+      // **同一个口**（`(icon! as Icon).icon`），拿 Widget 比 IconData 恒红。
+      expect((button.icon! as Icon).icon, Icons.star, reason: '图标跟着旗标走');
       expect(button.tooltip, kRssStarTooltip,
           reason: 'flet 的 `show_article` 只给 `_detail_star.icon` 赋值（rss_view.py:355），'
               'tooltip 停在 `:117` 那句「收藏」。这一格钉的是"照搬"：要修它得单独一轮');

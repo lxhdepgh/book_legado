@@ -860,11 +860,14 @@ void main() {
       expect(outcome.staged!.inBookshelf, isFalse,
           reason: '在架的书那一发根本回 null；这里为 true 是异常形状，界面不许省掉询问');
 
-      // 它和 bookshelf.list 的行**不是同一套键**（staged_record.dart 文件头的主张）。
+      // 它和 bookshelf.list 的行**不是同一套键**（staged_record.dart 文件头的主张）：
+      // 结构性差别是**少的那三格**（暂存那一支从不可能带）。`in_bookshelf` 在书架
+      // 那一侧只是 payload 透传——本批 8 行里只有 1 行的 payload 带它——所以那侧
+      // 不钉"必有/必无"；暂存这一侧才必带（StagedRecord.inBookshelf 的读取源）。
       final shelf = _fieldNamesOf(_load('bookshelf.list'));
       final stagedFields = _fieldNamesOf(_load('reader.staged'));
-      expect(stagedFields, contains('in_bookshelf'));
-      expect(shelf, isNot(contains('in_bookshelf')));
+      expect(stagedFields, contains('in_bookshelf'),
+          reason: '暂存必带 in_bookshelf——StagedRecord.inBookshelf 就读它');
       for (final key in <String>['reading', 'updateError', 'cacheUpdatedAt']) {
         expect(shelf, contains(key), reason: '$key：bookshelf 那侧的形状变了，这条比对要重看');
         expect(stagedFields, isNot(contains(key)),
@@ -919,9 +922,14 @@ void main() {
 
     test('switch.snapshot：九键快照，候选三行里同站两本都在', () {
       final run = SwitchRun.fromJson(data('switch.snapshot'));
-      // 本轮身份：服务端 `sid = str(switch_id or 0)` 折成**字符串**回带，样本里就是 `"6379028"`。
+      // 本轮身份：服务端 `sid = str(switch_id or 0)` 折成**字符串**回带。
       // 模型这一格必须是 String——按数字读会永远读到 0，"只认当前那一轮"那半边守卫整个失效。
-      expect(run.switchId, '6379028');
+      // 期望值**现读同一份样本的 wire 原值**，不写死字面量：这一格是捕捉时刻的
+      // ms-of-day，每次重抓都换一个数（G4-B 重抓语料后，写死的旧值连着红了两轮）。
+      final snapshotId = '${data('switch.snapshot')['switch_id']}';
+      expect(snapshotId, isNotEmpty,
+          reason: '样本里没有 switch_id：下面那条比对会对着空串自证');
+      expect(run.switchId, snapshotId);
       expect(run.running, isFalse);
       expect(run.cancelled, isFalse);
       expect(run.done, 3);
@@ -963,7 +971,8 @@ void main() {
       expect(finished.containsKey('done'), isFalse);
       expect(finished.containsKey('total'), isFalse);
       final run = SwitchRun.fromFinishedEvent(finished);
-      expect(run.switchId, '6379028', reason: '收尾与快照带的是同一个本轮身份');
+      expect(run.switchId, '${data('switch.snapshot')['switch_id']}',
+          reason: '收尾与快照带的是同一个本轮身份（值现读，见上一条注释）');
       expect(run.candidates, hasLength(3));
       expect(run.running, isFalse, reason: '收尾事件之后没有"还在跑"这一说');
       expect(run.cancelled, isFalse);
@@ -973,8 +982,11 @@ void main() {
       final frames = (progressSample['frames']! as List)
           .cast<Map<String, Object?>>();
       expect(frames, isNotEmpty, reason: '正对照：没有进度帧，下面读的全是空表');
-      final progress = SwitchProgress.fromMap(frames.first);
-      expect(progress.switchId, '6379028');
+      // 帧的外面还包着一层 `{payload: {...}}`（与 rss.refresh_all 那边同形状）：
+      // 直接喂外圈进去，`map['switch_id']` 读到的永远是 null → 空串。
+      final progress = SwitchProgress.fromMap(
+          Map<String, Object?>.from(frames.first['payload']! as Map));
+      expect(progress.switchId, '${data('switch.snapshot')['switch_id']}');
       expect(progress.done, 3);
       expect(progress.total, 3);
       expect(progress.failures, 0);
@@ -1169,9 +1181,13 @@ void main() {
       expect(progress.first.current, isEmpty,
           reason: '语料里第一帧开始就带名字了：界面那句「未知源」的分支要重新找靶子');
       expect(progress.first.status, contains('未知源'));
-      // `done + 1` 而不是 `done`：进度条读分数、状态行读"正在刷第几条"，两者不同值是**有意的**。
-      expect(progress[1].status, '正在刷新 2/${progress[1].total}：'
-          '${progress[1].current}', reason: '状态行与进度条同一格数字才是真的对齐');
+      // 帧[1] 是 done=0 的**首个工作帧**（先发帧再抓源），状态行显示 1/3；
+      // 要看见 `done + 1` 与进度条 `done` 是两个数，得看帧[2]：done=1、正在刷第 2 个源
+      // ——状态行读 "2/3" 而进度条读 1/3，两边数字不同是**有意的**（flet `rss_controller.py:315` 同一句）。
+      expect(progress[1].status, '正在刷新 1/3：${progress[1].current}',
+          reason: 'done=0 的工作帧：+1 之后才是"正在刷第几条"');
+      expect(progress[2].status, '正在刷新 2/3：${progress[2].current}',
+          reason: '状态行与进度条同读 done 那一格；这里 done=1，两个数是 2 与 1');
 
       final event = Map<String, Object?>.from(
           (sample['event_sample']! as Map)['payload']! as Map);

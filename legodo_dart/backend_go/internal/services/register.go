@@ -4,12 +4,22 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 
 	"github.com/legodo-booksource/legodo_go/core"
 	"github.com/legodo-booksource/legodo_go/internal/engine"
 	"github.com/legodo-booksource/legodo_go/internal/httpclient"
 	"github.com/legodo-booksource/legodo_go/pkg/jsruntime"
 )
+
+// envOr reads an environment variable with a fallback for unset/empty.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
 // RegisterInfrastructure registers core infrastructure services.
 func (h *ServiceHub) RegisterInfrastructure() error {
@@ -25,7 +35,10 @@ func (h *ServiceHub) RegisterInfrastructure() error {
 		return err
 	}
 
-	storageDir := "./data"
+	// LEGADO_BOOKSOURCE_DATA_DIR 是 Python app_paths.py 的既有契约：打包与语料
+	// 探针都靠它换库根（见 .probe/r4_service_baseline.py 的 boot()），Go 侧对齐
+	// 这一格；没设时保持 ./data 的历史行为。
+	storageDir := envOr("LEGADO_BOOKSOURCE_DATA_DIR", "./data")
 	storageSvc, err := core.NewStorageService(storageDir)
 	if err != nil {
 		return fmt.Errorf("create storage: %w", err)
@@ -85,7 +98,7 @@ func (h *ServiceHub) RegisterBusinessServices() error {
 	}
 
 	// CheckService
-	checkSvc := NewCheckService(sourceSvc, h.settingsSvc, h.eventBus)
+	checkSvc := NewCheckService(h)
 	h.checkSvc = checkSvc
 	if err := h.registerNamed("SourceCheckService", &bizSvc{
 		base:   core.NewBaseService("SourceCheckService", "SourceService", "SettingsService"),
@@ -155,7 +168,7 @@ func (h *ServiceHub) RegisterBusinessServices() error {
 	}
 
 	// FontService
-	fontSvc := NewFontService(h.storageSvc, h.eventBus, "./data/user-fonts")
+	fontSvc := NewFontService(h.storageSvc, h.eventBus, filepath.Join(h.storageSvc.DataDir(), "user-fonts"))
 	h.fontSvc = fontSvc
 	if err := h.registerNamed("FontService", &bizSvc{
 		base:   core.NewBaseService("FontService", "StorageService"),
@@ -205,7 +218,7 @@ func (h *ServiceHub) RegisterBusinessServices() error {
 	}
 
 	// ExportService
-	exportSvc := NewExportService("./data/export", h.eventBus)
+	exportSvc := NewExportService(filepath.Join(h.storageSvc.DataDir(), "export"), h.eventBus)
 	h.exportSvc = exportSvc
 	if err := h.registerNamed("ExportService", &bizSvc{
 		base:   core.NewBaseService("ExportService"),
@@ -216,7 +229,7 @@ func (h *ServiceHub) RegisterBusinessServices() error {
 
 	// WebDAVService
 	webdavCfg := WebDAVConfig{}
-	webdavSvc := NewWebDAVService(&http.Client{}, webdavCfg, "./data", h.eventBus)
+	webdavSvc := NewWebDAVService(&http.Client{}, webdavCfg, h.storageSvc.DataDir(), h.eventBus)
 	h.webdavSvc = webdavSvc
 	if err := h.registerNamed("WebDAVService", &bizSvc{
 		base:   core.NewBaseService("WebDAVService"),

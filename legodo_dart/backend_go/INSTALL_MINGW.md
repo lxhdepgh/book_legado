@@ -117,18 +117,6 @@ $ go build -buildmode=c-shared -ldflags=-s -w -o legodo_engine.dll ./pkg/ffi/
 
 ---
 
-## 如果不想安装 GCC
-
-使用独立进程模式（无需 CGO）：
-
-```bash
-python build_release.py windows --standalone
-```
-
-这会编译为独立的可执行文件，通过 WebSocket 通信，不需要 C 编译器。
-
----
-
 ## 常见问题
 
 ### Q: 安装后仍然提示 gcc not found

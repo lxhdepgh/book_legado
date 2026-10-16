@@ -2,8 +2,6 @@ module github.com/legodo-booksource/legodo_go
 
 go 1.26.0
 
-require github.com/gorilla/websocket v1.5.3
-
 require (
 	github.com/PuerkitoBio/goquery v1.13.0
 	github.com/antchfx/htmlquery v1.3.7

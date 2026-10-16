@@ -156,6 +156,10 @@ void main() {
         bookshelf: <BookshelfItem>[_row('我的功法无限提升')],
         sources: <SourceRecord>[_source('一条书源')]);
     for (final width in <double>[500, 1200]) {
+      // 每一档都要是一次**起手**：`_lastTab`（记住这一组停过的页签）是模块级的，
+      // 上一档在末尾点过「书架」，这一档再进组就落在「书架」——不再是"起手落哪一屏"
+      // 那一问，而是上一档自己的脚印。先把记忆归回「找书」再起手。
+      rememberTab(readingGroupRoute, '找书');
       await tester.binding.setSurfaceSize(Size(width, 1200));
       addTearDown(() => tester.binding.setSurfaceSize(null));
       await tester.pumpWidget(_routed(fake));

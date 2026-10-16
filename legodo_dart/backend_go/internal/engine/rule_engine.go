@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,15 +29,40 @@ func NewRuleEngine(client *httpclient.ClientSession, js *jsruntime.Runtime) *Rul
 	}
 }
 
-// SearchBook 搜索书籍（对齐 Legado WebBook.search）
-func (re *RuleEngine) SearchBook(ctx context.Context, source *models.BookSource, keyword string) ([]*models.BookItem, error) {
+// resolvePageURL 把页面上抽到的地址按**当页 URL** 解析成绝对地址（对齐 Legado
+// AnalyzeUrl.getAbsoluteURL / Python extract_value 里那一步 urljoin）。
+//
+// 为什么非他不可：语料与真源的 href 全是相对路径（`/g3/ch/2.html`），不解析的话
+// 下一跳取页拿的是相对地址，http 层直接报 `unsupported protocol scheme ""`——
+// 整条「搜索→详情→目录→正文」链在第一个相对 href 上就断了。
+// 判据是 `IsAbs`（有 scheme 才原样保留：http/https 之外 data:/javascript: 这类
+// 也不能拼），空值不回拼。
+func resolvePageURL(baseURL, value string) string {
+	raw := strings.TrimSpace(value)
+	if raw == "" || baseURL == "" {
+		return raw
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return raw
+	}
+	ref, err := url.Parse(raw)
+	if err != nil || ref.IsAbs() {
+		return raw
+	}
+	return base.ResolveReference(ref).String()
+}
+
+// SearchBook 搜索书籍（对齐 Legado WebBook.search）；
+// page 从 1 起，同一次搜索翻页时由 SearchModel 递增后传入。
+func (re *RuleEngine) SearchBook(ctx context.Context, source *models.BookSource, keyword string, page int) ([]*models.BookItem, error) {
 	rule := source.GetSearchRule()
 	if rule.BookList == nil {
 		return nil, fmt.Errorf("书源 %s 缺少搜索规则", source.BookSourceURL)
 	}
 
 	// 构建搜索 URL
-	searchURL, err := re.buildSearchURL(source, keyword)
+	searchURL, err := re.buildSearchURL(source, keyword, page)
 	if err != nil {
 		return nil, fmt.Errorf("构建搜索 URL 失败: %w", err)
 	}
@@ -58,7 +85,7 @@ func (re *RuleEngine) SearchBook(ctx context.Context, source *models.BookSource,
 	nodes := doc.Select(*rule.BookList)
 	var books []*models.BookItem
 	for _, node := range nodes {
-		book := re.extractBookInfo(node, rule, source)
+		book := re.extractBookInfo(node, rule, source, searchURL)
 		if book != nil {
 			books = append(books, book)
 		}
@@ -67,29 +94,132 @@ func (re *RuleEngine) SearchBook(ctx context.Context, source *models.BookSource,
 	return books, nil
 }
 
-// buildSearchURL 构建搜索 URL（对齐 Legado AnalyzeUrl）
-func (re *RuleEngine) buildSearchURL(source *models.BookSource, keyword string) (string, error) {
+// buildSearchURL 构建搜索 URL（对齐 Legado AnalyzeUrl / Python resolve_search_url）。
+// 模板替换顺序与 Python 一致：关键词 → 页码 → baseUrl → <第一页,后续页> 备选。
+func (re *RuleEngine) buildSearchURL(source *models.BookSource, keyword string, page int) (string, error) {
 	searchURL := ""
 	if source.SearchURL != nil {
 		searchURL = *source.SearchURL
 	} else {
 		return "", fmt.Errorf("未配置搜索 URL")
 	}
-
-	// 替换关键词占位符
-	searchURL = strings.ReplaceAll(searchURL, "{{key}}", url.QueryEscape(keyword))
-	searchURL = strings.ReplaceAll(searchURL, "searchKey", url.QueryEscape(keyword))
-
-	// 执行 JS（如果有）
-	if source.LoginCheckJS != nil && strings.Contains(searchURL, "@js:") {
-		// TODO: 执行 URL 中的 JS 表达式
+	if page < 1 {
+		page = 1
 	}
 
-	return searchURL, nil
+	// 替换关键词占位符（先原样替换，最后整体编码非 ASCII —— 与 Python 相同）
+	for _, variable := range []string{"{{key}}", "{{searchKey}}", "{{keyword}}", "{{keys}}"} {
+		searchURL = strings.ReplaceAll(searchURL, variable, keyword)
+	}
+	searchURL = strings.ReplaceAll(searchURL, "{{page+1}}", strconv.Itoa(page+1))
+	searchURL = strings.ReplaceAll(searchURL, "{{page-1}}", strconv.Itoa(max(page-1, 0)))
+	searchURL = strings.ReplaceAll(searchURL, "{{page}}", strconv.Itoa(page))
+	searchURL = strings.ReplaceAll(searchURL, "{{pg}}", strconv.Itoa(page))
+	searchURL = strings.ReplaceAll(searchURL, "{{baseUrl}}", strings.TrimRight(source.BookSourceURL, "/")+"/")
+
+	// Legado 页码备选：<first-page,second-page,later-pages>，超出列表后复用最后一格。
+	searchURL = pageAlternation.ReplaceAllStringFunc(searchURL, func(match string) string {
+		inner := match[1 : len(match)-1]
+		choices := strings.Split(inner, ",")
+		if len(choices) == 0 {
+			return ""
+		}
+		idx := page - 1
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= len(choices) {
+			idx = len(choices) - 1
+		}
+		return strings.TrimSpace(choices[idx])
+	})
+
+	// 还有未替换的模板（复杂表达式）无法处理
+	if strings.Contains(searchURL, "{{") && strings.Contains(searchURL, "}}") {
+		if strings.Contains(searchURL, "{{source.key}}") || strings.Contains(searchURL, "{{sourceKey}}") {
+			searchURL = strings.ReplaceAll(searchURL, "{{source.key}}", source.BookSourceURL)
+			searchURL = strings.ReplaceAll(searchURL, "{{sourceKey}}", source.BookSourceURL)
+		}
+		if strings.Contains(searchURL, "{{") && strings.Contains(searchURL, "}}") {
+			return "", fmt.Errorf("搜索地址格式暂时无法解析")
+		}
+	}
+
+	// data: URL 是 Legado 内部传输编码，原样保留
+	if strings.HasPrefix(searchURL, "data:") {
+		return searchURL, nil
+	}
+
+	// 相对路径拼 base_url
+	if !strings.HasPrefix(searchURL, "http://") && !strings.HasPrefix(searchURL, "https://") {
+		base, err := url.Parse(strings.TrimRight(source.BookSourceURL, "/") + "/")
+		if err != nil {
+			return "", fmt.Errorf("书源 URL 无效: %w", err)
+		}
+		ref, err := url.Parse(searchURL)
+		if err != nil {
+			return "", fmt.Errorf("搜索地址无法解析: %w", err)
+		}
+		searchURL = base.ResolveReference(ref).String()
+	}
+
+	if !strings.HasPrefix(searchURL, "http://") && !strings.HasPrefix(searchURL, "https://") {
+		return "", fmt.Errorf("搜索地址不是 http/https")
+	}
+
+	return encodeNonASCIIURL(searchURL), nil
 }
 
-// extractBookInfo 从 DOM 节点提取书籍信息
-func (re *RuleEngine) extractBookInfo(node *ruleparser.Node, rule *models.SearchRule, source *models.BookSource) *models.BookItem {
+var pageAlternation = regexp.MustCompile(`<([^<>]*)>`)
+
+// encodeNonASCIIURL 把 URL 中的非 ASCII 字符编成百分号形式（对齐 Python encode_url）。
+// 全是 ASCII 时原样返回，避免对已有编码做二次转义。
+func encodeNonASCIIURL(raw string) string {
+	asciiOnly := true
+	for i := 0; i < len(raw); i++ {
+		if raw[i] >= 0x80 {
+			asciiOnly = false
+			break
+		}
+	}
+	if asciiOnly {
+		return raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" {
+		return escapeNonASCII(raw, ":/?#[]@!$&'()*+,;=-._~%")
+	}
+	parsed.Path = escapeNonASCII(parsed.Path, "/%")
+	parsed.RawPath = ""
+	parsed.RawQuery = escapeNonASCII(parsed.RawQuery, "=&%")
+	parsed.Fragment = escapeNonASCII(parsed.Fragment, "")
+	return parsed.String()
+}
+
+// escapeNonASCII 保留 ASCII 中安全集合内的字符，其余（含空格与非 ASCII 字节）逐字节百分号编码。
+func escapeNonASCII(value, safe string) string {
+	var b strings.Builder
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c < 0x80 && (isURLSafeByte(c) || strings.IndexByte(safe, c) >= 0) {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteString(fmt.Sprintf("%%%02X", c))
+	}
+	return b.String()
+}
+
+func isURLSafeByte(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	}
+	return strings.IndexByte("_.-~", c) >= 0
+}
+
+// extractBookInfo 从 DOM 节点提取书籍信息；baseURL 是这一页的地址，相对 href 按它解析。
+func (re *RuleEngine) extractBookInfo(node *ruleparser.Node, rule *models.SearchRule, source *models.BookSource, baseURL string) *models.BookItem {
 	book := &models.BookItem{
 		Origin:     source.BookSourceURL,
 		OriginName: source.BookSourceName,
@@ -97,50 +227,32 @@ func (re *RuleEngine) extractBookInfo(node *ruleparser.Node, rule *models.Search
 
 	// 书名
 	if rule.Name != nil {
-		nameNodes := node.Select(*rule.Name)
-		if len(nameNodes) > 0 {
-			book.Name = nameNodes[0].Text()
-		}
+		book.Name = node.Field(*rule.Name, "text")
 	}
 
 	// 作者
 	if rule.Author != nil {
-		authorNodes := node.Select(*rule.Author)
-		if len(authorNodes) > 0 {
-			book.Author = re.formatAuthor(authorNodes[0].Text())
-		}
+		book.Author = re.formatAuthor(node.Field(*rule.Author, "text"))
 	}
 
 	// 简介
 	if rule.Intro != nil {
-		introNodes := node.Select(*rule.Intro)
-		if len(introNodes) > 0 {
-			book.Intro = re.formatIntro(introNodes[0].Text())
-		}
+		book.Intro = re.formatIntro(node.Field(*rule.Intro, "text"))
 	}
 
 	// 封面
 	if rule.CoverURL != nil {
-		coverNodes := node.Select(*rule.CoverURL)
-		if len(coverNodes) > 0 {
-			book.CoverURL = coverNodes[0].Attr("src")
-		}
+		book.CoverURL = resolvePageURL(baseURL, node.Field(*rule.CoverURL, "src"))
 	}
 
 	// 书籍 URL
 	if rule.BookURL != nil {
-		urlNodes := node.Select(*rule.BookURL)
-		if len(urlNodes) > 0 {
-			book.URL = urlNodes[0].Attr("href")
-		}
+		book.URL = resolvePageURL(baseURL, node.Field(*rule.BookURL, "href"))
 	}
 
 	// 最新章节
 	if rule.LastChapter != nil {
-		chapterNodes := node.Select(*rule.LastChapter)
-		if len(chapterNodes) > 0 {
-			book.LastChapter = chapterNodes[0].Text()
-		}
+		book.LastChapter = node.Field(*rule.LastChapter, "text")
 	}
 
 	return book
@@ -208,43 +320,27 @@ func (re *RuleEngine) GetBookInfo(ctx context.Context, source *models.BookSource
 
 	// 提取书名
 	if rule.Name != nil {
-		nodes := doc.Select(*rule.Name)
-		if len(nodes) > 0 {
-			book.Name = nodes[0].Text()
-		}
+		book.Name = doc.Field(*rule.Name, "text")
 	}
 
 	// 提取作者
 	if rule.Author != nil {
-		nodes := doc.Select(*rule.Author)
-		if len(nodes) > 0 {
-			book.Author = re.formatAuthor(nodes[0].Text())
-		}
+		book.Author = re.formatAuthor(doc.Field(*rule.Author, "text"))
 	}
 
 	// 提取简介
 	if rule.Intro != nil {
-		nodes := doc.Select(*rule.Intro)
-		if len(nodes) > 0 {
-			htmlContent, _ := nodes[0].Html()
-			book.Intro = re.formatIntro(htmlContent)
-		}
+		book.Intro = re.formatIntro(doc.Field(*rule.Intro, "html"))
 	}
 
 	// 提取封面
 	if rule.CoverURL != nil {
-		nodes := doc.Select(*rule.CoverURL)
-		if len(nodes) > 0 {
-			book.CoverURL = nodes[0].Attr("src")
-		}
+		book.CoverURL = resolvePageURL(bookURL, doc.Field(*rule.CoverURL, "src"))
 	}
 
 	// 提取目录 URL
 	if rule.TocURL != nil {
-		nodes := doc.Select(*rule.TocURL)
-		if len(nodes) > 0 {
-			book.TocURL = nodes[0].Attr("href")
-		}
+		book.TocURL = resolvePageURL(bookURL, doc.Field(*rule.TocURL, "href"))
 	}
 
 	return book, nil
@@ -282,24 +378,18 @@ func (re *RuleEngine) GetChapters(ctx context.Context, source *models.BookSource
 
 		// 章节名
 		if rule.ChapterName != nil {
-			nameNodes := node.Select(*rule.ChapterName)
-			if len(nameNodes) > 0 {
-				chapter.Title = strings.TrimSpace(nameNodes[0].Text())
-			}
+			chapter.Title = strings.TrimSpace(node.Field(*rule.ChapterName, "text"))
 		}
 
 		// 章节 URL
 		if rule.ChapterURL != nil {
-			urlNodes := node.Select(*rule.ChapterURL)
-			if len(urlNodes) > 0 {
-				chapter.URL = urlNodes[0].Attr("href")
-			}
+			chapter.URL = resolvePageURL(tocURL, node.Field(*rule.ChapterURL, "href"))
 		}
 
 		// VIP 标识
 		if rule.IsVip != nil {
-			vipNodes := node.Select(*rule.IsVip)
-			chapter.IsVip = len(vipNodes) > 0
+			selector, _ := ruleparser.SplitFieldRule(*rule.IsVip)
+			chapter.IsVip = len(node.Select(selector)) > 0
 		}
 
 		chapters = append(chapters, chapter)
@@ -346,34 +436,19 @@ func (re *RuleEngine) BrowseBooks(ctx context.Context, source *models.BookSource
 
 		// Extract using ExploreRule fields (same structure as SearchRule)
 		if rule.Name != nil {
-			nameNodes := node.Select(*rule.Name)
-			if len(nameNodes) > 0 {
-				book.Name = nameNodes[0].Text()
-			}
+			book.Name = node.Field(*rule.Name, "text")
 		}
 		if rule.Author != nil {
-			authorNodes := node.Select(*rule.Author)
-			if len(authorNodes) > 0 {
-				book.Author = re.formatAuthor(authorNodes[0].Text())
-			}
+			book.Author = re.formatAuthor(node.Field(*rule.Author, "text"))
 		}
 		if rule.Intro != nil {
-			introNodes := node.Select(*rule.Intro)
-			if len(introNodes) > 0 {
-				book.Intro = re.formatIntro(introNodes[0].Text())
-			}
+			book.Intro = re.formatIntro(node.Field(*rule.Intro, "text"))
 		}
 		if rule.CoverURL != nil {
-			coverNodes := node.Select(*rule.CoverURL)
-			if len(coverNodes) > 0 {
-				book.CoverURL = coverNodes[0].Attr("src")
-			}
+			book.CoverURL = resolvePageURL(urlToFetch, node.Field(*rule.CoverURL, "src"))
 		}
 		if rule.BookURL != nil {
-			urlNodes := node.Select(*rule.BookURL)
-			if len(urlNodes) > 0 {
-				book.URL = urlNodes[0].Attr("href")
-			}
+			book.URL = resolvePageURL(urlToFetch, node.Field(*rule.BookURL, "href"))
 		}
 		if book.Name != "" {
 			books = append(books, book)
@@ -412,26 +487,18 @@ func (re *RuleEngine) GetContent(ctx context.Context, source *models.BookSource,
 
 	// 提取标题
 	if rule.Title != nil {
-		nodes := doc.Select(*rule.Title)
-		if len(nodes) > 0 {
-			content.Title = strings.TrimSpace(nodes[0].Text())
+		if title := strings.TrimSpace(doc.Field(*rule.Title, "text")); title != "" {
+			content.Title = title
 		}
 	}
 
 	// 提取正文
-	nodes := doc.Select(*rule.Content)
-	if len(nodes) > 0 {
-		htmlContent, _ := nodes[0].Html()
-		content.Content = ruleparser.HTMLToText(htmlContent)
-	}
+	content.Content = ruleparser.HTMLToText(doc.Field(*rule.Content, "html"))
 
 	// 处理分页（subContent）
 	if rule.SubContent != nil {
-		nodes := doc.Select(*rule.SubContent)
-		if len(nodes) > 0 {
-			htmlContent, _ := nodes[0].Html()
-			subContent := ruleparser.HTMLToText(htmlContent)
-			content.SubContent = &subContent
+		if sub := ruleparser.HTMLToText(doc.Field(*rule.SubContent, "html")); sub != "" {
+			content.SubContent = &sub
 		}
 	}
 
