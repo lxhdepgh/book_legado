@@ -513,12 +513,15 @@ def create_distribution_windows(lib_path: Path | None, lib_name: str, flutter_ou
         sys.exit(1)
 
     # === 3. flutter_assets/ — required at runtime (shaders, fonts, packages) ===
+    # Windows runner 的 DartProject(L"data") 只认 <exe>/data/flutter_assets；
+    # 拷到 dist 根目录时应用照常起（AOT 在 data/app.so），但字体/资产全丢——
+    # 表现是界面文字正常、所有图标变方框（MaterialIcons 找不到，无 fallback）。
     assets_src = DART_CLIENT / "build" / "flutter_assets"
     if assets_src.exists():
-        assets_dst = dist_dir / "flutter_assets"
+        assets_dst = dist_dir / "data" / "flutter_assets"
         shutil.copytree(str(assets_src), str(assets_dst))
         asset_count = sum(1 for _ in assets_dst.rglob("*"))
-        print(f"[OK] Copied flutter_assets/ ({asset_count} files)", flush=True)
+        print(f"[OK] Copied flutter_assets/ -> data/ ({asset_count} files)", flush=True)
     else:
         print(f"[WARN] Missing flutter_assets/: {assets_src}", flush=True)
 
@@ -570,7 +573,16 @@ def create_distribution_windows(lib_path: Path | None, lib_name: str, flutter_ou
         print("[WARN] Go FFI library NOT included — application cannot load engine!", file=sys.stderr)
 
     # === 6. Verify critical files ===
-    critical = ["legodo_client.exe", "flutter_windows.dll"]
+    # data/flutter_assets 与 data/app.so/icudtl.dat 是 Windows 运行时的硬依赖：
+    # 缺 assets 时应用能起、文字正常、图标全方框——冒烟只看"窗口立起来"照不出来。
+    critical = [
+        "legodo_client.exe",
+        "flutter_windows.dll",
+        "data/app.so",
+        "data/icudtl.dat",
+        "data/flutter_assets/FontManifest.json",
+        "data/flutter_assets/fonts/MaterialIcons-Regular.otf",
+    ]
     if lib_path and lib_path.exists():
         critical.append(lib_name)
 

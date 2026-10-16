@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/legodo-booksource/legodo_go/core"
 	"github.com/legodo-booksource/legodo_go/internal/engine"
@@ -19,6 +20,31 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+const appDirName = "LegadoBookSourceCheck"
+
+// defaultDataDir mirrors Python app_paths.py default_app_paths() data 分支。
+// 打包版双击运行时若回退 ./data，会在 exe 旁边生一个空库——用户书架/书源全空。
+func defaultDataDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "./data"
+	}
+	switch runtime.GOOS {
+	case "windows":
+		if local := os.Getenv("LOCALAPPDATA"); local != "" {
+			return filepath.Join(local, appDirName)
+		}
+		return filepath.Join(home, "AppData", "Local", appDirName)
+	case "darwin":
+		return filepath.Join(home, "Library", "Application Support", appDirName)
+	default:
+		if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
+			return filepath.Join(xdg, appDirName)
+		}
+		return filepath.Join(home, ".local", "share", appDirName)
+	}
 }
 
 // RegisterInfrastructure registers core infrastructure services.
@@ -37,8 +63,9 @@ func (h *ServiceHub) RegisterInfrastructure() error {
 
 	// LEGADO_BOOKSOURCE_DATA_DIR 是 Python app_paths.py 的既有契约：打包与语料
 	// 探针都靠它换库根（见 .probe/r4_service_baseline.py 的 boot()），Go 侧对齐
-	// 这一格；没设时保持 ./data 的历史行为。
-	storageDir := envOr("LEGADO_BOOKSOURCE_DATA_DIR", "./data")
+	// 这一格；没设时与 Python 同走系统标准位置（Windows 是
+	// %LOCALAPPDATA%/LegadoBookSourceCheck，即用户真库所在），不再回退 ./data。
+	storageDir := envOr("LEGADO_BOOKSOURCE_DATA_DIR", defaultDataDir())
 	storageSvc, err := core.NewStorageService(storageDir)
 	if err != nil {
 		return fmt.Errorf("create storage: %w", err)
