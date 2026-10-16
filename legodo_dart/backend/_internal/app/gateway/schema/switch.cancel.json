@@ -1,6 +1,0 @@
-{
-  "type": "object",
-  "description": "switch.cancel 入参：无。回的是「这一发有没有真叫停下什么」——没有轮次在跑时 cancelled=False，界面别写「已停止」。",
-  "properties": {},
-  "additionalProperties": false
-}

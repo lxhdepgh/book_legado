@@ -1,6 +1,0 @@
-{
-  "type": "object",
-  "description": "switch.snapshot 入参：无。",
-  "properties": {},
-  "additionalProperties": false
-}

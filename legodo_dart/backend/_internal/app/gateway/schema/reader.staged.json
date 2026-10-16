@@ -1,6 +1,0 @@
-{
-  "type": "object",
-  "description": "reader.staged 入参：无。问「当前会话这本书是不是 notShelf 试读暂存」——是就回那条书架记录（原样 dict），在架的书回 null。",
-  "properties": {},
-  "additionalProperties": false
-}

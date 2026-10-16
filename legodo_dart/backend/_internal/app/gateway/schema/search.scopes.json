@@ -1,6 +1,0 @@
-{
-  "type": "object",
-  "description": "search.scopes 入参：无。返回 [{scope, count}]，顺序即下拉顺序（全部 / 未分组 / 各分组名排序去重）。",
-  "properties": {},
-  "additionalProperties": false
-}

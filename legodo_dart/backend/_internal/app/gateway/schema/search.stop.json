@@ -1,6 +1,0 @@
-{
-  "type": "object",
-  "description": "search.stop 入参：无。",
-  "properties": {},
-  "additionalProperties": false
-}

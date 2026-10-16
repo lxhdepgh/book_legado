@@ -1,6 +1,0 @@
-{
-  "type": "object",
-  "description": "theme.preferences 入参：无。",
-  "properties": {},
-  "additionalProperties": false
-}
