@@ -14,6 +14,7 @@ import 'package:legodo_client/core/ffi/engine_ffi.dart';
 import 'package:legodo_client/core/rpc/engine_repository.dart';
 import 'package:legodo_client/core/rpc/envelope.dart';
 import 'package:legodo_client/core/rpc/ffi_engine_adapter.dart';
+import 'package:legodo_client/features/settings/data/theme_preferences.dart';
 
 /// 记录每一发的 action + params；回话由 [handler] 按发给，不给就回 `data: null`。
 class _RecordingFFI implements GoFFIClient {
@@ -497,6 +498,180 @@ void main() {
           book: const <String, Object?>{});
       expect(missing.applied, isFalse,
           reason: 'FFI 面 applied 缺键折成 false（Go 那侧恒回这一键，缺了就是形状漂了）');
+    });
+  });
+
+  // 这三族原本是 FFI 桩：theme.save 回 true、update.check 回一句写死的"没有更新"、
+  // qr.generate 回显入参。服务侧现在接真了，这里钉的是**适配器读回来的那几格键名**——
+  // 上一轮就是栽在"服务端回 snake_case、适配器读 camelCase"上：编译与 analyze 全绿。
+  group('theme.* / update.* / qr.* 仓库面', () {
+    test('theme_preferences 读的是服务端那三格（skin_id 不是 skinId）', () async {
+      final ffi = _RecordingFFI()
+        ..handler = (action, params) => <String, dynamic>{
+              'ok': true,
+              'data': <String, Object?>{
+                'skin_id': 'warm_amber', 'mode': 'light', 'eink': true,
+              },
+            };
+      final prefs = await _repo(ffi).themePreferences();
+      expect(prefs.skinId, 'warm_amber',
+          reason: "适配器原先读 'skinId'：服务端从不回这个键，于是存好的皮肤每次重开都折回默认档");
+      expect(prefs.mode, ThemeModeKind.light);
+      expect(prefs.eink, isTrue);
+      expect(ffi.calls.single.action, 'theme_preferences');
+    });
+
+    test('theme_save：没动的格发 null，回的是归一后的那一套三格', () async {
+      final ffi = _RecordingFFI()
+        ..handler = (action, params) => <String, dynamic>{
+              'ok': true,
+              'data': <String, Object?>{
+                'skin_id': 'ink_gray', 'mode': 'dark', 'eink': false,
+              },
+            };
+      final saved = await _repo(ffi).saveTheme(skinId: 'ink_gray');
+      expect(ffi.calls.single.params, <String, Object?>{
+        'skin_id': 'ink_gray', 'mode': null, 'eink': null,
+      }, reason: '缺省发 null（服务端"这一格保持原值"），发空串会被折回默认档');
+      expect(saved, const ThemePreferences(
+          skinId: 'ink_gray', mode: ThemeModeKind.dark, eink: false),
+          reason: '界面把这一份当"已保存态"；回 true 会解不开而退回默认档');
+    });
+
+    test('theme 读不回时是声音，不是静默的默认档', () async {
+      final ffi = _RecordingFFI()
+        ..handler = (action, params) =>
+            <String, dynamic>{'ok': false, 'error': 'ThemeService 未就绪：外观偏好读不回来'};
+      await expectLater(
+          _repo(ffi).themePreferences(),
+          throwsA(isA<EngineFailure>()
+              .having((EngineFailure e) => e.message, 'message', contains('ThemeService'))));
+    });
+
+    test('update_check：null 才是"已是最新"，对象落那五格', () async {
+      final ffi = _RecordingFFI()
+        ..handler = (action, params) => <String, dynamic>{'ok': true, 'data': null};
+      expect(await _repo(ffi).updateCheck(), isNull,
+          reason: '服务端只在真的比过且不相上下时才回 null；失败回的是错，不是 null');
+
+      ffi.handler = (action, params) => <String, dynamic>{
+            'ok': true,
+            'data': <String, Object?>{
+              'version': '2.3.0', 'notes': '说明', 'url': 'https://d/a.exe',
+              'size': 456, 'digest': 'ab',
+            },
+          };
+      final info = await _repo(ffi).updateCheck();
+      expect(info!.version, '2.3.0');
+      expect(info.notes, '说明');
+      expect(info.url, 'https://d/a.exe');
+      expect(info.size, 456);
+      expect(info.digest, 'ab');
+      expect(ffi.calls.first.action, 'update_check');
+    });
+
+    test('update_ignore 把 version 发出去，失败不静默', () async {
+      final ffi = _RecordingFFI()
+        ..handler = (action, params) => <String, dynamic>{'ok': true, 'data': true};
+      await _repo(ffi).updateIgnore('2.3.0');
+      expect(ffi.calls.single.action, 'update_ignore');
+      expect(ffi.calls.single.params, <String, Object?>{'version': '2.3.0'});
+
+      ffi.handler = (action, params) =>
+          <String, dynamic>{'ok': false, 'error': 'SettingsService 未就绪：忽略版本没处落库'};
+      await expectLater(_repo(ffi).updateIgnore('2.3.0'), throwsA(isA<EngineFailure>()));
+    });
+
+    test('qr_generate 读 result 那一格；qr_decode 的"未实现"是声音不是空串', () async {
+      final ffi = _RecordingFFI()
+        ..handler = (action, params) => <String, dynamic>{
+              'ok': true,
+              'data': <String, Object?>{
+                'result': 'iVBORw0KGgo=', 'content_type': 'image/png',
+              },
+            };
+      expect(await _repo(ffi).qrGenerate('书源文本'), 'iVBORw0KGgo=');
+      expect(ffi.calls.single.params, <String, Object?>{'text': '书源文本'});
+
+      ffi.handler = (action, params) => <String, dynamic>{
+            'ok': false, 'error': '二维码识别未实现：Go 引擎没有图像解码器',
+          };
+      await expectLater(
+          _repo(ffi).qrDecode('iVBORw0KGgo='),
+          throwsA(isA<EngineFailure>()
+              .having((EngineFailure e) => e.message, 'message', contains('未实现'))),
+          reason: '回空串在界面上长成"这张图里没有二维码"，那是另一件事');
+    });
+  });
+
+  // 导入那一链的 Dart 侧。Go 侧同一批键面钉在 `pkg/ffi/import_test.go`，
+  // 载荷形状钉在 `tests/gateway/golden/import.text.json`（五键，Python 时代真发过的回话）。
+  group('import.* 仓库面', () {
+    test('import_text 发 text/kind/mode 三键，读的是回话里那五格', () async {
+      final ffi = _RecordingFFI()
+        ..handler = (action, params) => <String, dynamic>{
+              'ok': true,
+              'data': <String, Object?>{
+                'kind': 'book_source', 'count': 3,
+                'errors': <Object?>['第 2 项缺 bookSourceUrl'],
+                'warnings': <Object?>[], 'placeholder': false,
+              },
+            };
+      final outcome =
+          await _repo(ffi).importText(text: '[]', kind: 'book_source', mode: 'replace');
+      expect(ffi.calls.single.action, 'import_text');
+      expect(ffi.calls.single.params, <String, Object?>{
+        'text': '[]', 'kind': 'book_source', 'mode': 'replace',
+      });
+      expect(outcome.kind, 'book_source');
+      expect(outcome.count, 3);
+      expect(outcome.errors, <String>['第 2 项缺 bookSourceUrl']);
+      expect(outcome.warnings, isEmpty);
+      expect(outcome.placeholder, isFalse);
+      expect(outcome.ok, isFalse, reason: '有 errors 就不算成，界面那句汇总不许长成一片绿');
+    });
+
+    test('placeholder 读回来还是 placeholder，不折成"成功 0 条"', () async {
+      final ffi = _RecordingFFI()
+        ..handler = (action, params) => <String, dynamic>{
+              'ok': true,
+              'data': <String, Object?>{
+                'kind': 'rss', 'count': 0,
+                'errors': <Object?>[],
+                'warnings': <Object?>['RSS 源请在书源管理里添加'], 'placeholder': true,
+              },
+            };
+      final outcome = await _repo(ffi).importText(text: '{}', kind: 'rss');
+      expect(outcome.placeholder, isTrue);
+      expect(outcome.ok, isFalse, reason: '占位不是"导入成功"，两者在 count 上同是 0');
+      expect(ffi.calls.single.params['mode'], 'append', reason: '缺省模式由 Dart 侧补齐再发');
+    });
+
+    test('回话不是那五格时是声音，不是静默的"成功 0 条"', () async {
+      final ffi = _RecordingFFI()
+        ..handler = (action, params) => <String, dynamic>{'ok': true, 'data': null};
+      final repo = _repo(ffi);
+      await expectLater(
+          repo.importText(text: '[]', kind: 'book_source'),
+          throwsA(isA<EngineFailure>()),
+          reason: '旧代码在这里造了一只 count=0 的成功回话：服务没落库和文件本来就空在界面上一模一样');
+      ffi.handler = (action, params) => <String, dynamic>{'ok': true, 'data': null};
+      await expectLater(repo.importUrl(url: 'https://x/a.json', kind: 'book_source'),
+          throwsA(isA<EngineFailure>()));
+
+      final ok = _RecordingFFI()
+        ..handler = (action, params) => <String, dynamic>{
+              'ok': true,
+              'data': <String, Object?>{
+                'kind': 'book_source', 'count': 1,
+                'errors': <Object?>[], 'warnings': <Object?>[], 'placeholder': false,
+              },
+            };
+      expect((await _repo(ok).importUrl(url: 'https://x/a.json', kind: 'book_source')).count, 1,
+          reason: '正对照：同样的两发只换 data，红的必须只有坏的那一臂');
+      expect(ok.calls.single.params, <String, Object?>{
+        'url': 'https://x/a.json', 'kind': 'book_source', 'mode': 'append',
+      });
     });
   });
 }

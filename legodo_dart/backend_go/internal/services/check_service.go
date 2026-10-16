@@ -17,7 +17,6 @@ import (
 	"github.com/legodo-booksource/legodo_go/internal/engine"
 	"github.com/legodo-booksource/legodo_go/internal/httpclient"
 	"github.com/legodo-booksource/legodo_go/internal/models"
-	"github.com/legodo-booksource/legodo_go/pkg/jsruntime"
 )
 
 // 书源检测（port 自 app/services/sources/source_check_service.py +
@@ -188,15 +187,15 @@ type chainOutcome struct {
 	Skipped           *string
 }
 
-type exploreCategory struct {
-	Title string
-	URL   string
-}
-
 // CheckEngine 检测流水线要用的规则引擎面（测试可注入替身）。
+//
+// Explore 吃**原始**分类地址 + 页号：分类地址的形状（`@js:`、`<a,b>` 页对、
+// `{{page}}`、POST 选项）只有引擎那一套解析，check 里再实现一遍必然漂移
+// （设计稿 D6）。分类清单同理走 ExploreCategories，check 不再自 parse。
 type CheckEngine interface {
 	Search(ctx context.Context, source *models.BookSource, keyword string, page int) ([]*models.BookItem, error)
-	Explore(ctx context.Context, source *models.BookSource, searchURL, category string) ([]*models.BookItem, error)
+	Explore(ctx context.Context, source *models.BookSource, categoryURL string, page int) ([]*models.BookItem, error)
+	ExploreCategories(ctx context.Context, source *models.BookSource) ([]engine.ExploreCategory, error)
 	BookInfo(ctx context.Context, source *models.BookSource, bookURL string) (*models.BookItem, error)
 	Chapters(ctx context.Context, source *models.BookSource, tocURL string) ([]*models.Chapter, error)
 	Content(ctx context.Context, source *models.BookSource, chapter *models.Chapter) (*models.ChapterContent, error)
@@ -208,8 +207,12 @@ func (r ruleCheckEngine) Search(ctx context.Context, source *models.BookSource, 
 	return r.re.SearchBook(ctx, source, keyword, page)
 }
 
-func (r ruleCheckEngine) Explore(ctx context.Context, source *models.BookSource, searchURL, category string) ([]*models.BookItem, error) {
-	return r.re.BrowseBooks(ctx, source, searchURL, category)
+func (r ruleCheckEngine) Explore(ctx context.Context, source *models.BookSource, categoryURL string, page int) ([]*models.BookItem, error) {
+	return r.re.Explore(ctx, source, categoryURL, page)
+}
+
+func (r ruleCheckEngine) ExploreCategories(ctx context.Context, source *models.BookSource) ([]engine.ExploreCategory, error) {
+	return r.re.ResolveCategories(ctx, source)
 }
 
 func (r ruleCheckEngine) BookInfo(ctx context.Context, source *models.BookSource, bookURL string) (*models.BookItem, error) {
@@ -982,7 +985,10 @@ func (s *SourceCheckService) engineSearchCheck(ctx context.Context, source *mode
 func (s *SourceCheckService) checkCategories(ctx context.Context, source *models.BookSource,
 	engineInst CheckEngine, timeout time.Duration, maxCategories int,
 	stopAfterValid bool) ([]map[string]interface{}, error) {
-	categories, err := s.resolveExploreCategories(source)
+	if engineInst == nil {
+		return nil, errors.New("规则引擎未就绪：分类校验没有可解析的引擎")
+	}
+	categories, err := engineInst.ExploreCategories(ctx, source)
 	if err != nil {
 		return nil, err
 	}
@@ -1027,17 +1033,11 @@ func (s *SourceCheckService) checkCategories(ctx context.Context, source *models
 var explorePagePairRe = regexp.MustCompile(`<[^<>]*,[^<>]*>`)
 
 func (s *SourceCheckService) checkCategoryPage(ctx context.Context, source *models.BookSource,
-	engineInst CheckEngine, category exploreCategory, page int, timeout time.Duration) map[string]interface{} {
+	engineInst CheckEngine, category engine.ExploreCategory, page int, timeout time.Duration) map[string]interface{} {
 	row := map[string]interface{}{
 		"page": page, "valid": false, "status_code": nil, "item_count": 0,
 		"content_type": "rule-engine", "error": nil, "attempts": 1,
 		"persistent_rate_limit": false, "books": []*models.BookItem{},
-	}
-	pageURL, err := resolveExploreURL(category.URL, source.BookSourceURL, page)
-	if err != nil {
-		text := checkErrorText(err)
-		row["error"] = text
-		return row
 	}
 	if engineInst == nil {
 		row["error"] = "规则引擎未就绪"
@@ -1045,7 +1045,7 @@ func (s *SourceCheckService) checkCategoryPage(ctx context.Context, source *mode
 	}
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	books, err := engineInst.Explore(callCtx, source, pageURL, category.URL)
+	books, err := engineInst.Explore(callCtx, source, category.URL, page)
 	if err != nil {
 		kind := checkErrorKind(err)
 		row["error"] = kind + ": " + checkErrorText(err)
@@ -1239,163 +1239,6 @@ func applyChain(result *CheckResult, chain *chainOutcome) {
 	result.SampleChapterURLs = chain.SampleChapterURLs
 	result.ReadingTried = chain.Tried
 	result.ReadingCheckSkipped = chain.Skipped
-}
-
-// ---------------------------------------------------------------------------
-// 发现分类解析（静态 + @js:）
-// ---------------------------------------------------------------------------
-
-func (s *SourceCheckService) resolveExploreCategories(source *models.BookSource) ([]exploreCategory, error) {
-	raw := strings.TrimSpace(strValue(source.ExploreURL))
-	if raw == "" {
-		return nil, nil
-	}
-	if !looksLikeJS(raw) {
-		return parseExploreCategories(raw), nil
-	}
-	if s.hub == nil || s.hub.JSRuntime() == nil {
-		return nil, errors.New("分类配置需要 JavaScript 引擎")
-	}
-	sourceMap := map[string]interface{}{}
-	if payload, err := json.Marshal(source); err == nil {
-		_ = json.Unmarshal(payload, &sourceMap)
-	}
-	script := strings.TrimSpace(raw)
-	if lower := strings.ToLower(script); strings.HasPrefix(lower, "@js:") {
-		script = script[len("@js:"):]
-	} else if strings.HasPrefix(lower, "@webjs:") {
-		script = script[len("@webjs:"):]
-	}
-	value, err := s.hub.JSRuntime().Execute(script, &jsruntime.Context{
-		BaseURL: source.BookSourceURL, Source: sourceMap,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return parseExploreCategoriesValue(value), nil
-}
-
-func looksLikeJS(raw string) bool {
-	lower := strings.ToLower(strings.TrimSpace(raw))
-	return strings.HasPrefix(lower, "@js:") || strings.HasPrefix(lower, "@webjs:") ||
-		strings.HasPrefix(lower, "<js") || strings.Contains(lower, "java.")
-}
-
-func parseExploreCategoriesValue(value interface{}) []exploreCategory {
-	switch typed := value.(type) {
-	case []interface{}:
-		entries := make([]exploreCategory, 0, len(typed))
-		for _, item := range typed {
-			if entry, ok := item.(map[string]interface{}); ok {
-				title := strings.TrimSpace(fmt.Sprintf("%v", entry["title"]))
-				entryURL := strings.TrimSpace(fmt.Sprintf("%v", entry["url"]))
-				if title != "" && title != "<nil>" && entryURL != "" && entryURL != "<nil>" {
-					entries = append(entries, exploreCategory{Title: title, URL: entryURL})
-				}
-			}
-		}
-		return entries
-	case map[string]interface{}:
-		return parseExploreCategoriesValue([]interface{}{typed})
-	case string:
-		return parseExploreCategories(typed)
-	default:
-		return nil
-	}
-}
-
-// parseExploreCategories 静态分类配置：JSON 数组或逐行 `标题::地址`
-// （url 为空的条目通常只是视觉分组标题，不是可点击分类）。
-func parseExploreCategories(raw string) []exploreCategory {
-	trimmed := strings.TrimSpace(raw)
-	if strings.HasPrefix(trimmed, "[") {
-		var payload []map[string]interface{}
-		if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
-			return nil
-		}
-		entries := make([]exploreCategory, 0, len(payload))
-		for _, item := range payload {
-			title := strings.TrimSpace(fmt.Sprintf("%v", item["title"]))
-			entryURL := strings.TrimSpace(fmt.Sprintf("%v", item["url"]))
-			if title != "" && title != "<nil>" && entryURL != "" && entryURL != "<nil>" {
-				entries = append(entries, exploreCategory{Title: title, URL: entryURL})
-			}
-		}
-		return entries
-	}
-	entries := make([]exploreCategory, 0)
-	for _, line := range strings.Split(trimmed, "\n") {
-		if index := strings.Index(line, "::"); index >= 0 {
-			title := strings.TrimSpace(line[:index])
-			entryURL := strings.TrimSpace(line[index+2:])
-			if title != "" && entryURL != "" {
-				entries = append(entries, exploreCategory{Title: title, URL: entryURL})
-			}
-		}
-	}
-	return entries
-}
-
-var explorePagePairReplaceRe = regexp.MustCompile(`<([^<>]*,[^<>]*)>`)
-
-// resolveExploreURL 分类地址的静态求值（port 自 rule_engine._resolve_explore_url）。
-func resolveExploreURL(raw, baseURL string, page int) (string, error) {
-	if looksLikeJS(raw) || strings.Contains(raw, "{{cookie.") || strings.Contains(raw, "{{java.") {
-		return "", errors.New("分类地址需要 JavaScript、Cookie 或动态签名")
-	}
-	expanded := expandPageTemplate(raw, page)
-	expanded = explorePagePairReplaceRe.ReplaceAllStringFunc(expanded, func(match string) string {
-		inner := match[1 : len(match)-1]
-		first, later, found := strings.Cut(inner, ",")
-		if !found {
-			return match
-		}
-		if page == 1 {
-			return first
-		}
-		return later
-	})
-	if strings.Contains(expanded, "{{") {
-		return "", errors.New("分类地址包含暂不支持的动态模板")
-	}
-	joined, err := joinBaseURL(baseURL, expanded)
-	if err != nil {
-		return "", err
-	}
-	return encodeNonASCIIURL(joined), nil
-}
-
-func expandPageTemplate(value string, page int) string {
-	value = strings.ReplaceAll(value, "{{page}}", fmt.Sprintf("%d", page))
-	value = strings.ReplaceAll(value, "{{page-1}}", fmt.Sprintf("%d", max(page-1, 0)))
-	value = strings.ReplaceAll(value, "{{page+1}}", fmt.Sprintf("%d", page+1))
-	return value
-}
-
-func joinBaseURL(baseURL, reference string) (string, error) {
-	base, err := url.Parse(strings.TrimRight(baseURL, "/") + "/")
-	if err != nil {
-		return "", err
-	}
-	ref, err := url.Parse(reference)
-	if err != nil {
-		return "", err
-	}
-	return base.ResolveReference(ref).String(), nil
-}
-
-func encodeNonASCIIURL(raw string) string {
-	var builder strings.Builder
-	builder.Grow(len(raw))
-	for index := 0; index < len(raw); index++ {
-		ch := raw[index]
-		if ch >= 0x80 {
-			fmt.Fprintf(&builder, "%%%02X", ch)
-		} else {
-			builder.WriteByte(ch)
-		}
-	}
-	return builder.String()
 }
 
 // ---------------------------------------------------------------------------

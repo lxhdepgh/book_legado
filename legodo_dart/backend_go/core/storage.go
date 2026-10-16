@@ -3,6 +3,7 @@ package core
 import (
 	"database/sql"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -367,6 +368,12 @@ CREATE INDEX IF NOT EXISTS idx_search_books_origin
 	if err := s.migrateToolsTables(); err != nil {
 		return err
 	}
+	if err := s.migrateLegacySettingsShape(); err != nil {
+		return err
+	}
+	if err := s.migrateLegacyBookSourceURL(); err != nil {
+		return err
+	}
 	// 索引等迁移之后建：旧形状的 rss_articles 还没有 star_flag 列，
 	// 旧形状的 replace_rules/download_tasks 也还没有契约列。
 	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_rss_articles_source
@@ -713,6 +720,142 @@ func (s *StorageService) migrateToolsTables() error {
 		}
 	}
 
+	return nil
+}
+
+// hasUniqueIndexOn 问一张表上有没有"正好覆盖这一列"的唯一索引。
+// 认两种来源：列上的内联 UNIQUE（SQLite 给它建 sqlite_autoindex_*，origin='u'）
+// 和显式 CREATE UNIQUE INDEX（origin='c'）。为什么不直接读表 DDL 里的字符串：
+// autoindex 那一行的 sql 是 NULL，看 DDL 会把"新形状已经有唯一约束"误读成没有。
+func (s *StorageService) hasUniqueIndexOn(table, column string) (bool, error) {
+	rows, err := s.db.Query(`PRAGMA index_list(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	type indexInfo struct {
+		name   string
+		unique int
+	}
+	var indexes []indexInfo
+	for rows.Next() {
+		var seq int
+		info := indexInfo{}
+		var origin, partial interface{}
+		if err := rows.Scan(&seq, &info.name, &info.unique, &origin, &partial); err != nil {
+			rows.Close()
+			return false, err
+		}
+		indexes = append(indexes, info)
+	}
+	rows.Close()
+
+	for _, idx := range indexes {
+		if idx.unique != 1 {
+			continue
+		}
+		cols, err := s.db.Query(`PRAGMA index_info(` + idx.name + `)`)
+		if err != nil {
+			return false, err
+		}
+		var names []string
+		for cols.Next() {
+			var seqno, cid int
+			var cname string
+			if err := cols.Scan(&seqno, &cid, &cname); err != nil {
+				cols.Close()
+				return false, err
+			}
+			names = append(names, cname)
+		}
+		cols.Close()
+		if len(names) == 1 && names[0] == column {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// migrateLegacySettingsShape 给 Python 时代建的 settings 补上 updated_at 列。
+//
+// 上面的 `CREATE TABLE IF NOT EXISTS settings` 撞上已存在的旧表就原样留着，而旧表是
+// `settings(key, value)` 两列。写侧（core/settings.go）发的是三列 INSERT OR REPLACE，
+// 于是每一条设置写入都红在 `table settings has no column named updated_at` 上——
+// 主题保存、字体选择、忽略版本号、以及 `source.audit` 那一路的落库，全在这张表上。
+// 读侧不碰这一列，所以应用看着是活的，只有写是坏的。
+//
+// 只加列、不动行：这一列没有任何读方（写了只为将来有读），旧行留 NULL 即可。
+func (s *StorageService) migrateLegacySettingsShape() error {
+	rows, err := s.db.Query(`PRAGMA table_info(settings)`)
+	if err != nil {
+		return err
+	}
+	hasUpdatedAt := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt interface{}
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "updated_at" {
+			hasUpdatedAt = true
+		}
+	}
+	rows.Close()
+	if hasUpdatedAt {
+		return nil
+	}
+	if _, err := s.db.Exec(`ALTER TABLE settings ADD COLUMN updated_at INTEGER`); err != nil {
+		return fmt.Errorf("migrate settings.updated_at: %w", err)
+	}
+	log.Printf("[StorageService] settings 是 Python 时代那两列的形状，已补 updated_at 列")
+	return nil
+}
+
+// migrateLegacyBookSourceURL 给旧形状的 book_sources 补 url 上的唯一索引。
+//
+// 真库那份是 Python 后端建的：`id TEXT PRIMARY KEY, url TEXT NOT NULL DEFAULT “”`——
+// url 上没有唯一约束。Go 的 `sourceUpsertSQL`（internal/services/source_service.go:352）
+// 发的是 `ON CONFLICT(url) DO UPDATE`，SQLite 在编译这条语句时就要在表上找到一条
+// 覆盖 url 的唯一索引，找不到直接报 `ON CONFLICT clause does not match any PRIMARY KEY
+// or UNIQUE constraint`。后果不止"改一条书源存不进去"：整批导入在恢复那一步也走同一条
+// upsert，所以 t114 探针在真库副本上看到的是 `count=0` 加一句 errors——导入界面报的是
+// "成功 0 条"，而库里 917 行一行没动。
+//
+// 为什么建索引而不重建整张表：Go 侧从不读 `book_sources.id`（读写都按 url，缓存从
+// json 那一列还原），`check_state` 在旧表是 TEXT、新表是 INTEGER 也没人按类型读它。
+// 唯一真正被 SQL 依赖的就是 url 上的唯一性，重建 917 行用户数据换不来任何多出来的正确。
+// 代价记在这里：旧库那 917 行 Python 是按 `id == url` 填的（实测 917/917），
+// 而 Go 的写入省略 id，新行在旧表上落 NULL（TEXT 主键允许，且 NULL 互不冲突）。
+// Go 没有任何读方，所以这只是一笔"把这份库再交回 Python 后端读"才看得见的欠账。
+//
+// 有重复 url 时**不建**这个索引，只把情况喊出来：建到一半失败会连带整个引擎起不来，
+// 而自动删行是在替用户决定丢哪一条。留着原样，写路径继续响亮地红（0 号原则）。
+func (s *StorageService) migrateLegacyBookSourceURL() error {
+	unique, err := s.hasUniqueIndexOn("book_sources", "url")
+	if err != nil {
+		return err
+	}
+	if unique {
+		return nil
+	}
+	var dups int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM (
+		SELECT url FROM book_sources GROUP BY url HAVING COUNT(*) > 1)`).Scan(&dups); err != nil {
+		return fmt.Errorf("数 book_sources 重复 url: %w", err)
+	}
+	if dups > 0 {
+		log.Printf("[StorageService] book_sources 有 %d 个 url 重复，没有替自动删行；"+
+			"书源写入会继续报 ON CONFLICT，请先在书源页删掉重复的那几条", dups)
+		return nil
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_book_sources_url
+		ON book_sources(url)`); err != nil {
+		return fmt.Errorf("migrate book_sources url uniqueness: %w", err)
+	}
+	log.Printf("[StorageService] book_sources 是 Python 时代那一份（url 上没有唯一约束），" +
+		"已建 idx_book_sources_url；书源写入现在按 ON CONFLICT(url) 走")
 	return nil
 }
 

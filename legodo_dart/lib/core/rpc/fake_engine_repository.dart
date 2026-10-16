@@ -949,29 +949,42 @@ class FakeEngineRepository implements EngineRepository {
   @override
   Future<void> fontSelect(String family) async {}
 
+  // 这六格原先是裸的 `async {}` / `=> []`：文件头写着「[failure] 非空时每个方法都抛
+  // 那条」，而它们绕过了 [_guard]，于是既接不到错误，也不记账（`callsFor` 数不到，
+  // "点了没发"与"发了但没接线"在替身眼里是同一个数）。走 `_guard` 之后这两句都成立。
   @override
-  Future<void> exportEpub(String bookKey, String outputPath) async {}
+  Future<void> exportEpub(String bookKey, String outputPath) => _guard(
+      () {},
+      'export.epub',
+      <String, Object?>{'book_key': bookKey, 'output_path': outputPath});
 
   @override
-  Future<void> exportTxt(String bookKey, String outputPath) async {}
+  Future<void> exportTxt(String bookKey, String outputPath) => _guard(
+      () {},
+      'export.txt',
+      <String, Object?>{'book_key': bookKey, 'output_path': outputPath});
 
   @override
-  Future<void> webdavBackup() async {}
+  Future<void> webdavBackup() => _guard(() {}, 'webdav.backup');
 
   @override
-  Future<void> webdavRestore(String backupId) async {}
+  Future<void> webdavRestore(String backupId) =>
+      _guard(() {}, 'webdav.restore', <String, Object?>{'backup_id': backupId});
 
   @override
-  Future<List<Map<String, Object?>>> webdavListBackups() async => [];
+  Future<List<Map<String, Object?>>> webdavListBackups() =>
+      _guard(() => const <Map<String, Object?>>[], 'webdav.list_backups');
 
   @override
-  Future<void> webbridgeStart(int port) async {}
+  Future<void> webbridgeStart(int port) =>
+      _guard(() {}, 'webbridge.start', <String, Object?>{'port': port});
 
   @override
-  Future<void> webbridgeStop() async {}
+  Future<void> webbridgeStop() => _guard(() {}, 'webbridge.stop');
 
   @override
-  Future<Map<String, Object?>> webbridgeStatus() async => {};
+  Future<Map<String, Object?>> webbridgeStatus() =>
+      _guard(() => const <String, Object?>{}, 'webbridge.status');
 
   Future<void> dispose() async {
     _calls.clear();

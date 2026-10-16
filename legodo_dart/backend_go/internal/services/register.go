@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/legodo-booksource/legodo_go/core"
 	"github.com/legodo-booksource/legodo_go/internal/engine"
@@ -53,10 +54,10 @@ func (h *ServiceHub) RegisterInfrastructure() error {
 	h.eventBus = eventBus
 
 	if err := h.registerNamed("EventBus", &infraSvc{
-		base:   core.NewBaseService("EventBus"),
+		base:    core.NewBaseService("EventBus"),
 		onStart: func(ctx context.Context) error { return nil },
-		stopFn: func() error { eventBus.Close(); return nil },
-		bus:    eventBus,
+		stopFn:  func() error { eventBus.Close(); return nil },
+		bus:     eventBus,
 	}); err != nil {
 		return err
 	}
@@ -213,22 +214,25 @@ func (h *ServiceHub) RegisterBusinessServices() error {
 		return err
 	}
 
-	// ThemeService
-	themeSvc := NewThemeService(h.settingsSvc, h.storageSvc)
+	// ThemeService：三格外观偏好（appearance.snapshot），不持文件、不产调色板。
+	themeSvc := NewThemeService(h.settingsSvc)
 	h.themeSvc = themeSvc
 	if err := h.registerNamed("ThemeService", &bizSvc{
-		base:   core.NewBaseService("ThemeService"),
-		stopFn: func() error { return nil },
+		base:    core.NewBaseService("ThemeService", "SettingsService"),
+		onStart: func(ctx context.Context) error { return themeSvc.Start() },
+		stopFn:  themeSvc.Stop,
 	}); err != nil {
 		return err
 	}
 
-	// UpdateService
-	updateSvc := NewUpdateService(h.settingsSvc, &http.Client{})
+	// UpdateService：只检查、不下载不安装（契约 §1.17 红线）。
+	// 超时必须钉在客户端上：更新源挂住 = 整个 FFI 调用线程挂住。
+	updateSvc := NewUpdateService(h.settingsSvc, &http.Client{Timeout: 10 * time.Second}, AppVersion)
 	h.updateSvc = updateSvc
 	if err := h.registerNamed("UpdateService", &bizSvc{
-		base:   core.NewBaseService("UpdateService"),
-		stopFn: func() error { return nil },
+		base:    core.NewBaseService("UpdateService", "SettingsService"),
+		onStart: func(ctx context.Context) error { return updateSvc.Start() },
+		stopFn:  updateSvc.Stop,
 	}); err != nil {
 		return err
 	}
@@ -275,7 +279,7 @@ func (h *ServiceHub) RegisterBusinessServices() error {
 	}
 
 	// ImportService
-	importSvc := NewImportService(sourceSvc, h.eventBus, &http.Client{})
+	importSvc := NewImportService(sourceSvc, nil)
 	h.importSvc = importSvc
 	if err := h.registerNamed("ImportService", &bizSvc{
 		base:   core.NewBaseService("ImportService", "SourceService"),

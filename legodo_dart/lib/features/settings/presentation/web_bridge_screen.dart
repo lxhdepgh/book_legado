@@ -17,7 +17,18 @@ class _WebBridgeScreenState extends ConsumerState<WebBridgeScreen> {
   bool _running = false;
   Map<String, Object?> _status = {};
   bool _loading = false;
+  String _error = '';
+
+  /// 有没有真读过那一发。没有它，页面在第一帧就报「已停止」——
+  /// 那是一句关于服务的断言，而当时一个字节都还没发出去。
+  bool _read = false;
   final _portController = TextEditingController(text: '8080');
+
+  @override
+  void initState() {
+    super.initState();
+    _loadStatus();
+  }
 
   @override
   void dispose() {
@@ -30,11 +41,21 @@ class _WebBridgeScreenState extends ConsumerState<WebBridgeScreen> {
       final repo = ref.read(engineRepositoryProvider);
       final status = await repo.webbridgeStatus();
       setState(() {
+        _read = true;
+        _error = '';
         _status = status;
         _running = status['running'] as bool? ?? false;
       });
     } catch (e) {
-      // 忽略错误
+      // 这一发现在只会红（Go 引擎没有网络桥后端，回的是「未实现：…」）。
+      // 吞掉它是让「读不到」长成「已停止」——那是这一页最像"在干活"的一种假。
+      // 状态未知就是未知：不报运行中，也不报已停止，把那一句摆出来。
+      setState(() {
+        _read = true;
+        _error = '$e';
+        _status = const {};
+        _running = false;
+      });
     }
   }
 
@@ -50,7 +71,10 @@ class _WebBridgeScreenState extends ConsumerState<WebBridgeScreen> {
       });
       await _loadStatus();
     } catch (e) {
-      setState(() => _loading = false);
+      setState(() {
+        _loading = false;
+        _error = '$e';
+      });
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('启动失败：$e')),
@@ -69,7 +93,10 @@ class _WebBridgeScreenState extends ConsumerState<WebBridgeScreen> {
         _running = false;
       });
     } catch (e) {
-      setState(() => _loading = false);
+      setState(() {
+        _loading = false;
+        _error = '$e';
+      });
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('停止失败：$e')),
@@ -134,10 +161,20 @@ class _WebBridgeScreenState extends ConsumerState<WebBridgeScreen> {
                       ],
                     ),
                     const SizedBox(height: 8),
+                    // 四格而不是两格：没读过、读不到，都不许报「已停止」。
+                    // 旧代码只有两格，还把读状态的错误吞了——那一发从来没成功过，
+                    // 于是这一页永远写着"已停止"，看着像服务在、只是没开。
                     Text(
-                      _running ? '状态：运行中' : '状态：已停止',
+                      !_read
+                          ? '状态：读取中…'
+                          : (_error.isNotEmpty
+                              ? '状态：未知（$_error）'
+                              : (_running ? '状态：运行中' : '状态：已停止')),
+                      key: const Key('webbridge.statusLine'),
                       style: theme.textTheme.bodySmall?.copyWith(
-                        color: _running ? Colors.green : Colors.grey,
+                        color: _error.isNotEmpty
+                            ? Colors.red
+                            : (_running ? Colors.green : Colors.grey),
                       ),
                     ),
                   ],

@@ -67,13 +67,16 @@ class _UpdateScreenState extends ConsumerState<UpdateScreen> {
   }
 
   Future<void> _ignoreVersion() async {
-    if (_updateInfo == null) return;
+    final info = _updateInfo;
+    if (info == null) return;
     try {
       final repo = ref.read(engineRepositoryProvider);
-      await repo.updateIgnore(_updateInfo!.version);
+      await repo.updateIgnore(info.version);
       setState(() {
         _updateInfo = null;
-        _status = '已忽略版本 ${_updateInfo!.version}';
+        // 版本号先抓下来再用：这一格刚置 null，`_updateInfo!.version` 会把
+        // "忽略成功"这句本身炸成 Null check operator 红屏。
+        _status = '已忽略版本 ${info.version}';
       });
     } catch (e) {
       setState(() {

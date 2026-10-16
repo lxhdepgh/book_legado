@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/legodo-booksource/legodo_go/internal/httpclient"
@@ -19,6 +20,10 @@ import (
 type RuleEngine struct {
 	httpClient *httpclient.ClientSession
 	jsRuntime  *jsruntime.Runtime
+	// sourceBags 是 `java.put/@put` 的变量袋，按 bookSourceUrl 分键（对齐 Python
+	// 引擎实例级的 self.js_variables；规则按源池化，故同一源的 put 跨调用可见）。
+	bagMu      sync.Mutex
+	sourceBags map[string]map[string]interface{}
 }
 
 // NewRuleEngine 创建规则引擎
@@ -26,6 +31,7 @@ func NewRuleEngine(client *httpclient.ClientSession, js *jsruntime.Runtime) *Rul
 	return &RuleEngine{
 		httpClient: client,
 		jsRuntime:  js,
+		sourceBags: map[string]map[string]interface{}{},
 	}
 }
 
@@ -603,66 +609,6 @@ func reverseChapters(items []*models.Chapter) {
 	for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
 		items[i], items[j] = items[j], items[i]
 	}
-}
-
-// BrowseBooks 浏览发现书籍（对齐 Legado Explore）
-func (re *RuleEngine) BrowseBooks(ctx context.Context, source *models.BookSource, searchURL string, category string) ([]*models.BookItem, error) {
-	rule := source.RuleExplore
-	if rule == nil || rule.BookList == nil {
-		return nil, fmt.Errorf("书源 %s 缺少发现规则", source.BookSourceURL)
-	}
-
-	urlToFetch := searchURL
-	if urlToFetch == "" {
-		// Try to use ExploreURL from source as base
-		if source.ExploreURL != nil {
-			urlToFetch = strings.ReplaceAll(*source.ExploreURL, "{{page}}", "1")
-		} else {
-			return nil, fmt.Errorf("未配置发现 URL")
-		}
-	}
-
-	resp, err := re.httpClient.Get(ctx, urlToFetch, nil)
-	if err != nil {
-		return nil, fmt.Errorf("浏览请求失败: %w", err)
-	}
-
-	html := resp.BodyString()
-	doc, err := ruleparser.ParseHTML(html)
-	if err != nil {
-		return nil, fmt.Errorf("解析 HTML 失败: %w", err)
-	}
-
-	nodes := doc.Select(*rule.BookList)
-	var books []*models.BookItem
-	for _, node := range nodes {
-		book := &models.BookItem{
-			Origin:     source.BookSourceURL,
-			OriginName: source.BookSourceName,
-		}
-
-		// Extract using ExploreRule fields (same structure as SearchRule)
-		if rule.Name != nil {
-			book.Name = node.Field(*rule.Name, "text")
-		}
-		if rule.Author != nil {
-			book.Author = re.formatAuthor(node.Field(*rule.Author, "text"))
-		}
-		if rule.Intro != nil {
-			book.Intro = re.formatIntro(node.Field(*rule.Intro, "text"))
-		}
-		if rule.CoverURL != nil {
-			book.CoverURL = resolvePageURL(urlToFetch, node.Field(*rule.CoverURL, "src"))
-		}
-		if rule.BookURL != nil {
-			book.URL = resolvePageURL(urlToFetch, node.Field(*rule.BookURL, "href"))
-		}
-		if book.Name != "" {
-			books = append(books, book)
-		}
-	}
-
-	return books, nil
 }
 
 // GetContent 获取章节内容（对齐 Legado WebBook.getContent）

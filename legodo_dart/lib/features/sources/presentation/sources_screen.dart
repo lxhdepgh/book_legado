@@ -26,6 +26,7 @@ import '../../../core/widgets/state_bar.dart';
 import '../../../core/widgets/tabbed_group.dart';
 import '../data/source_record.dart';
 import '../domain/sources_notifier.dart';
+import 'import_dialog.dart';
 
 class SourcesScreen extends ConsumerStatefulWidget {
   const SourcesScreen({super.key});
@@ -114,6 +115,10 @@ class _SourcesScreenState extends ConsumerState<SourcesScreen> {
             // （flet 那边控制器只发 `on_open_check` 这个动作，目的地由导航外壳给）。
             onOpenCheck: () =>
                 GroupTabsScope.maybeOf(context)?.select('检测'),
+            // 空列表那句话（「点『导入』从 JSON 文件或 URL 添加」）指的就是这颗按钮：
+            // 没有它，那句话是在承诺一个不存在的入口。
+            onImport: () => showSourceImportDialog(context,
+                existingCount: records.length),
           ),
           if (selectedInView.isNotEmpty)
             _BatchBar(
@@ -314,6 +319,7 @@ class _ToolBar extends StatelessWidget {
     required this.onStateChanged,
     required this.onSelectAll,
     required this.onOpenCheck,
+    required this.onImport,
   });
 
   final TextEditingController controller;
@@ -323,6 +329,7 @@ class _ToolBar extends StatelessWidget {
   final ValueChanged<String?> onStateChanged;
   final VoidCallback? onSelectAll;
   final VoidCallback onOpenCheck;
+  final VoidCallback onImport;
 
   @override
   Widget build(BuildContext context) {
@@ -387,6 +394,12 @@ class _ToolBar extends StatelessWidget {
               icon: const Icon(Icons.checklist),
               label: const Text('全选筛选结果'),
             ),
+          ),
+          OutlinedButton.icon(
+            key: const Key('sources.import'),
+            onPressed: onImport,
+            icon: const Icon(Icons.file_open),
+            label: const Text('导入'),
           ),
           OutlinedButton.icon(
             key: const Key('sources.openCheck'),

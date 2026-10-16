@@ -17,6 +17,7 @@ class _WebDavScreenState extends ConsumerState<WebDavScreen> {
   List<Map<String, Object?>> _backups = [];
   bool _loading = false;
   String _status = '';
+  String _loadError = '';
 
   @override
   void initState() {
@@ -32,9 +33,16 @@ class _WebDavScreenState extends ConsumerState<WebDavScreen> {
       setState(() {
         _backups = backups;
         _loading = false;
+        _loadError = '';
       });
     } catch (e) {
-      setState(() => _loading = false);
+      // 「暂无备份」是一句关于远端的断言，读失败时没资格说它。
+      // 那条 snackbar 四秒就没了，留下的这一句才是用户抬头看见的东西。
+      setState(() {
+        _backups = const [];
+        _loading = false;
+        _loadError = '$e';
+      });
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('加载失败：$e')),
@@ -118,25 +126,38 @@ class _WebDavScreenState extends ConsumerState<WebDavScreen> {
           Expanded(
             child: _loading && _backups.isEmpty
                 ? const Center(child: CircularProgressIndicator())
-                : _backups.isEmpty
-                    ? const Center(child: Text('暂无备份'))
-                    : ListView.builder(
-                        itemCount: _backups.length,
-                        itemBuilder: (ctx, i) {
-                          final backup = _backups[i];
-                          final id = backup['id']?.toString() ?? '';
-                          final name = backup['name']?.toString() ?? '备份 $id';
-                          final date = backup['date']?.toString() ?? '';
-                          return ListTile(
-                            title: Text(name),
-                            subtitle: Text(date),
-                            trailing: ElevatedButton(
-                              onPressed: () => _restore(id),
-                              child: const Text('恢复'),
-                            ),
-                          );
-                        },
-                      ),
+                : _loadError.isNotEmpty
+                    ? Center(
+                        child: Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: Text(
+                            _loadError,
+                            key: const Key('webdav.loadError'),
+                            textAlign: TextAlign.center,
+                            style: theme.textTheme.bodyMedium
+                                ?.copyWith(color: Colors.red),
+                          ),
+                        ),
+                      )
+                    : _backups.isEmpty
+                        ? const Center(child: Text('暂无备份'))
+                        : ListView.builder(
+                            itemCount: _backups.length,
+                            itemBuilder: (ctx, i) {
+                              final backup = _backups[i];
+                              final id = backup['id']?.toString() ?? '';
+                              final name = backup['name']?.toString() ?? '备份 $id';
+                              final date = backup['date']?.toString() ?? '';
+                              return ListTile(
+                                title: Text(name),
+                                subtitle: Text(date),
+                                trailing: ElevatedButton(
+                                  onPressed: () => _restore(id),
+                                  child: const Text('恢复'),
+                                ),
+                              );
+                            },
+                          ),
           ),
         ],
       ),

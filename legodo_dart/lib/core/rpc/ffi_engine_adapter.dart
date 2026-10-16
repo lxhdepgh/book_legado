@@ -32,6 +32,7 @@ import '../../features/sources/data/source_audit.dart';
 import '../../features/sources/data/source_record.dart';
 import '../../features/bookshelf/data/source_switch_models.dart';
 import '../../core/events/engine_event.dart';
+import '../../core/events/event_names.dart';
 import '../../core/settings/settings_map.dart';
 import '../../core/rpc/engine_status.dart';
 import '../../core/rpc/envelope.dart';
@@ -106,6 +107,37 @@ PollBatch framesToEvents(dynamic data) {
   final lastSeq = data['last_seq'];
   return PollBatch(
       events, lastSeq is num ? lastSeq.toInt() : 0, data['lost'] == true);
+}
+
+/// 一批轮询里允许合流的事件名（§4-M1 的白名单，一期就这一条）。
+///
+/// 能不能进来的判据只有一条：**界面读不读它的 payload**。
+/// `SourceChangedEvent` 那两个监听者（书源屏、找书页）都只把它当"库里变了，重取一次"，
+/// 一个字都不看——所以 60 条和 1 条对它们等价。
+/// 进度类一律不许进来：`CheckFinishedEvent`/`SourceSwitchProgressEvent`/
+/// `RssRefreshedEvent`/`SearchFinishedEvent` 那些界面画的就是"跑到第 37 源"这一条条，
+/// 合流会把逐条变成跳号。
+const Set<String> coalescableEventNames = {EngineEventNames.sourceChanged};
+
+/// 白名单里同名的多条收成一条：留**最后那条**（库里最新的形状），位置按第一次出现处
+/// （不把后面的进度帧挤到前面）。白名单之外的一根不动、顺序不变。
+List<EngineEvent> coalesceBatch(List<EngineEvent> events) {
+  final firstAt = <String, int>{};
+  final merged = <EngineEvent>[];
+  for (final event in events) {
+    if (!coalescableEventNames.contains(event.name)) {
+      merged.add(event);
+      continue;
+    }
+    final at = firstAt[event.name];
+    if (at == null) {
+      firstAt[event.name] = merged.length;
+      merged.add(event);
+    } else {
+      merged[at] = event;
+    }
+  }
+  return merged;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +259,8 @@ class FFIEngineAdapter implements EngineRepository {
     // 是实例字段），否则每次切页回来都会把环里整段历史重放一遍。
     // 出错时不丢流、继续轮询（下次成功就自愈）；错误按"变了才报"节流，
     // 否则 250ms 一条会同形状地刷爆 AsyncValue。
+    // 合流的窗口就是这里的"一批"：一批 = 一个轮询周期，白名单里同名的多条在出口
+    // 收成一条（[coalesceBatch]），所以不另起计时器、也不在各屏各写一份 debounce。
     late StreamController<EngineEvent> controller;
     controller = StreamController<EngineEvent>(
       onListen: () {
@@ -242,8 +276,11 @@ class FFIEngineAdapter implements EngineRepository {
             }
             _lastPollError = null;
             final batch = framesToEvents(result['data']);
+            // 游标跟着**服务端帧**走，不跟合流后的条数走：合流只少发几条给界面，
+            // 一条都不许漏记（漏记 = 下一批从头重放）。
             _eventCursor = batch.lastSeq;
-            for (final event in batch.events) {
+            // 一批就是一个轮询周期，所以合流的窗口天然对齐批界（§4-M1，不另起计时器）。
+            for (final event in coalesceBatch(batch.events)) {
               controller.add(event);
             }
           } on Object catch (error) {
@@ -452,7 +489,9 @@ class FFIEngineAdapter implements EngineRepository {
   @override
   Future<ImportOutcome> importText({required String text, required String kind, String mode = 'append'}) async {
     return await _syncCall<ImportOutcome>('import_text', {'text': text, 'kind': kind, 'mode': mode}, (data) {
-      if (data is! Map<Object?, Object?>) return ImportOutcome(kind: kind, count: 0, errors: [], warnings: [], placeholder: false);
+      // 回的不是那五格 = 服务侧没按形状回；这里绝不能落成"成功 0 条"，
+      // 那句话和用户自己数错了一次空文件完全同形。
+      if (data is! Map<Object?, Object?>) throw EngineFailure(EngineFailureKind.engine, 'invalid response', action: 'import_text');
       return ImportOutcome(kind: _s(data, 'kind', def: kind), count: _n(data, 'count'),
           errors: _toStrings(data['errors']), warnings: _toStrings(data['warnings']),
           placeholder: _b(data, 'placeholder'));
@@ -462,7 +501,7 @@ class FFIEngineAdapter implements EngineRepository {
   @override
   Future<ImportOutcome> importUrl({required String url, required String kind, String mode = 'append'}) async {
     return await _syncCall<ImportOutcome>('import_url', {'url': url, 'kind': kind, 'mode': mode}, (data) {
-      if (data is! Map<Object?, Object?>) return ImportOutcome(kind: kind, count: 0, errors: [], warnings: [], placeholder: false);
+      if (data is! Map<Object?, Object?>) throw EngineFailure(EngineFailureKind.engine, 'invalid response', action: 'import_url');
       return ImportOutcome(kind: _s(data, 'kind', def: kind), count: _n(data, 'count'),
           errors: _toStrings(data['errors']), warnings: _toStrings(data['warnings']),
           placeholder: _b(data, 'placeholder'));
@@ -488,9 +527,9 @@ class FFIEngineAdapter implements EngineRepository {
       'source_url': sourceUrl, 'category': category, 'page': page,
     }, (data) {
       if (data is! List) return [];
-      return _toMaps(data).map((it) => BookRow(name: _s(it, 'name'), author: _s(it, 'author'),
-          intro: _s(it, 'intro'), url: _s(it, 'url'), origin: _s(it, 'origin'),
-          originName: _s(it, 'originName'), coverUrl: _s(it, 'coverUrl'), raw: _toSourceRaw(it))).toList();
+      // 与 562 行那批书单**同一个入口**：服务端回的是 snake_case（bookToMapFull），
+      // 这里原先自拼一套 camelCase 键名，originName/coverUrl 恒为空。
+      return _toMaps(data).map((it) => BookRow.fromJson(_toSourceRaw(it))).toList();
     });
   }
 
@@ -829,18 +868,21 @@ class FFIEngineAdapter implements EngineRepository {
   @override
   Future<ThemePreferences> themePreferences() async {
     return await _syncCall<ThemePreferences>('theme_preferences', {}, (data) {
+      // 键名走线上契约那三格（snake_case；黄金样本 field_names = eink/mode/skin_id）。
+      // 这里原先读的是 'skinId'，服务端从不回那个键 → 存好的皮肤/eink 开关
+      // 每次重开都折回默认档，而保存那一步照样显示"已保存"。
       if (data is! Map<Object?, Object?>) return ThemePreferences.defaults;
-      return ThemePreferences(skinId: _s(data, 'skinId'),
-          mode: ThemeModeKind.fromWire(_s(data, 'mode')), eink: _b(data, 'eink'));
+      return ThemePreferences.fromJson(data.cast<String, Object?>());
     });
   }
 
   @override
   Future<ThemePreferences> saveTheme({String? skinId, String? mode, bool? eink}) async {
     return await _syncCall<ThemePreferences>('theme_save', {'skin_id': skinId, 'mode': mode, 'eink': eink}, (data) {
+      // 回的是服务端**归一后的三格**（不是 true）：界面上"已保存态"就用它，
+      // 省掉"开关写着 dark、库里存的是 light"那种自相矛盾。
       if (data is! Map<Object?, Object?>) return ThemePreferences.defaults;
-      return ThemePreferences(skinId: _s(data, 'skinId'),
-          mode: ThemeModeKind.fromWire(_s(data, 'mode')), eink: _b(data, 'eink'));
+      return ThemePreferences.fromJson(data.cast<String, Object?>());
     });
   }
 

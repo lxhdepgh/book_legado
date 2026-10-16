@@ -15,6 +15,9 @@ type Response struct {
 	Header     http.Header
 	Body       string // already decompressed
 	Encoding   string // detected encoding
+	// FinalURL 是重定向之后的当页地址（对齐 Python `_request` 返回的 final_url，
+	// 列表/字段规则以它为 base_url）。
+	FinalURL string
 }
 
 // parseResponse converts a *http.Response into our Response type, handling
@@ -25,12 +28,17 @@ func parseResponse(resp *http.Response) (*Response, error) {
 		return nil, err
 	}
 
+	finalURL := ""
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
 	return &Response{
 		Status:     resp.Status,
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,
 		Body:       bodyRaw,
 		Encoding:   encoding,
+		FinalURL:   finalURL,
 	}, nil
 }
 

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/legodo-booksource/legodo_go/core"
+	"github.com/legodo-booksource/legodo_go/internal/engine"
 	"github.com/legodo-booksource/legodo_go/internal/models"
 )
 
@@ -48,13 +49,14 @@ func newCheckTestHub(t *testing.T, sources []models.BookSource,
 	return hub, svc
 }
 
-// fakeCheckEngine 规则引擎替身：五个入口都可注入行为，nil 时回零值。
+// fakeCheckEngine 规则引擎替身：六个入口都可注入行为，nil 时回零值。
 type fakeCheckEngine struct {
-	searchFn   func(ctx context.Context, source *models.BookSource, keyword string, page int) ([]*models.BookItem, error)
-	exploreFn  func(ctx context.Context, source *models.BookSource, searchURL, category string) ([]*models.BookItem, error)
-	bookInfoFn func(ctx context.Context, source *models.BookSource, bookURL string) (*models.BookItem, error)
-	chaptersFn func(ctx context.Context, source *models.BookSource, tocURL string) ([]*models.Chapter, error)
-	contentFn  func(ctx context.Context, source *models.BookSource, chapter *models.Chapter) (*models.ChapterContent, error)
+	searchFn     func(ctx context.Context, source *models.BookSource, keyword string, page int) ([]*models.BookItem, error)
+	exploreFn    func(ctx context.Context, source *models.BookSource, categoryURL string, page int) ([]*models.BookItem, error)
+	categoriesFn func(ctx context.Context, source *models.BookSource) ([]engine.ExploreCategory, error)
+	bookInfoFn   func(ctx context.Context, source *models.BookSource, bookURL string) (*models.BookItem, error)
+	chaptersFn   func(ctx context.Context, source *models.BookSource, tocURL string) ([]*models.Chapter, error)
+	contentFn    func(ctx context.Context, source *models.BookSource, chapter *models.Chapter) (*models.ChapterContent, error)
 }
 
 func (f *fakeCheckEngine) Search(ctx context.Context, source *models.BookSource, keyword string, page int) ([]*models.BookItem, error) {
@@ -64,9 +66,16 @@ func (f *fakeCheckEngine) Search(ctx context.Context, source *models.BookSource,
 	return nil, nil
 }
 
-func (f *fakeCheckEngine) Explore(ctx context.Context, source *models.BookSource, searchURL, category string) ([]*models.BookItem, error) {
+func (f *fakeCheckEngine) Explore(ctx context.Context, source *models.BookSource, categoryURL string, page int) ([]*models.BookItem, error) {
 	if f.exploreFn != nil {
-		return f.exploreFn(ctx, source, searchURL, category)
+		return f.exploreFn(ctx, source, categoryURL, page)
+	}
+	return nil, nil
+}
+
+func (f *fakeCheckEngine) ExploreCategories(ctx context.Context, source *models.BookSource) ([]engine.ExploreCategory, error) {
+	if f.categoriesFn != nil {
+		return f.categoriesFn(ctx, source)
 	}
 	return nil, nil
 }

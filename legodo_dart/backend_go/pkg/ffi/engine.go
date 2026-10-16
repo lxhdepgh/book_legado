@@ -17,6 +17,7 @@ import "C"
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -175,6 +176,19 @@ func gbDefault(p map[string]interface{}, k string, def bool) bool {
 	return def
 }
 
+// gurls 取一串 url（批量启停/删除的入参数组）：非字符串元素丢掉，
+// 不能让它们数进"改动条数"里——那会把没改的也算成改了。
+func gurls(p map[string]interface{}, k string) []string {
+	raw, _ := p[k].([]interface{})
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // gid reads an integer id from params. Dart 侧的 rule_id/font_id 是
 // .toString() 发来的字符串（json.Number 是将来换 UseNumber 的兜底），
 // 数字键则解成 float64——三种都要收，否则删除/更新会永远匹配不到行。
@@ -215,6 +229,79 @@ func stringSlice(raw interface{}) []string {
 // ---------------------------------------------------------------------------
 // Convention-based router: <service>_<action> → Service.Method()
 // ---------------------------------------------------------------------------
+
+// 这一张表钉的是「这条能力在本引擎里就是没有」这件事本身，住在服务端而不是界面：
+// 界面拿到的是错误，不需要再自己猜哪一条算支持。
+//
+// 为什么不放行它们落进 `default`（那里回英文的 `unimplemented: <action>`）：
+// `default` 是给**没人登记过**的 action 用的，而下面这些是界面真的会发的——
+// 发的人要知道缺的是哪一个后端，以及"这一发之后磁盘/远端/库里到底多了什么"。
+//
+// 每一条都以"不会发生什么"收尾，因为这张表存在的理由就是它替掉的那些 `okResult`：
+// 导出回 `{path:"",success:true}`、WebDAV 备份回 `true`、朗读回 `true`、
+// 书架导入回 `{imported:0}`、`source.audit` 起一个协程给每条启用的书源写
+// `respond_time≈0`（它根本没联网）再回 `{started:true}`。
+// 那些回包在界面上长成"做完了"，而一个字节都没写、一个包都没发、
+// 库里那一列还被覆成了假的。护栏见 `unimplemented_test.go`。
+var unimplementedActions = map[string]string{
+	"browser_open_page": "打开网页未实现：Go 引擎没有 CDP/无头浏览器后端，" +
+		"网页由 Flutter 侧的 webview_flutter 直接渲染，不经这一发；这一发不会返回任何页面内容。",
+	"browser_navigate": "网页翻页未实现：Go 引擎没有可导航的浏览器会话；" +
+		"这一发不会让任何页面动起来。",
+	"browser_close": "关闭网页未实现：Go 引擎没有浏览器会话可关；这一发不会释放任何东西。",
+
+	"webbridge_start": "网络桥未实现：Go 引擎里没有内置的 HTTP/WebSocket 服务，" +
+		"这一发不会监听任何端口。",
+	"webbridge_stop": "网络桥未实现：这一发没有可停的服务，也不会改动任何监听。",
+	"webbridge_status": "网络桥未实现：没有可报状态的服务，" +
+		"这一发不会回「运行中」，也不会回一份空状态装成已停止。",
+
+	"export_epub": "EPUB 导出未实现：Go 引擎里的导出器没有取正文的调用点（章节内容不会喂进去），" +
+		"这一发不会写出任何 .epub 文件。",
+	"export_txt": "TXT 导出未实现：同上，缺的是把正文交给导出器的那一步；" +
+		"这一发不会写出任何 .txt 文件。",
+
+	"webdav_backup": "WebDAV 备份未实现：Go 引擎的 WebDAV 客户端上传时不带备份包，" +
+		"这一发不会在远端生成任何文件。",
+	"webdav_restore": "WebDAV 恢复未实现：没有可用的下载路径，这一发不会改动本地数据目录。",
+	"webdav_list_backups": "WebDAV 备份列表未实现：这一发不会去问远端，" +
+		"也不会回一份空列表装成「远端没有备份」。",
+
+	"read_aloud_start": "朗读未实现：Go 引擎没有 TTS 后端；朗读由 Flutter 侧的 flutter_tts " +
+		"直接实现，不经这一发。",
+	"read_aloud_pause": "朗读暂停未实现：这一发没有可控的发声状态。",
+	"read_aloud_stop":  "朗读停止未实现：这一发不会让任何正在读的声音停下来。",
+	"read_aloud_progress": "朗读进度未实现：没有发声状态就没有进度可读，" +
+		"这一发不会回 0 装成「刚开头」。",
+
+	"bookshelf_import": "书架导入未实现：本引擎没有定义可导入的书架文件格式，" +
+		"这一发不会往书架里写任何一行。",
+
+	"source_audit": "书源兼容性审计未实现：Go 引擎没有 Python 侧 CompatAuditService 的对应实现；" +
+		"这一发不会联网，也不会改动任何一条书源。",
+}
+
+// unimplementedText 按 action 取那句"未实现"。键把点号拼法折成下划线，
+// 所以 `webbridge.start` 与 `webbridge_start` 拿到的永远是同一句话——
+// 两条拼法各写一份，改天就会只改其中一条。
+func unimplementedText(action string) (string, bool) {
+	key := strings.ToLower(strings.ReplaceAll(action, ".", "_"))
+	msg, ok := unimplementedActions[key]
+	return msg, ok
+}
+
+// unimplementedResult 回的是**错误**，不是一个形状对的空成功。
+// `_callGo` 那一侧见 `ok != true` 就抛 `EngineFailure`，界面拿到的是这句话本身；
+// 用 `failResult` 而不是新造一种信封，是为了让"没实现"和"实现了但失败"走同一条出声路径。
+//
+// 表里没有这一格时不回空串：空错误的包在界面上是一句"失败："，
+// 那比英文的 `unimplemented:` 更难查。
+func unimplementedResult(action string) ResultEnvelope {
+	if msg, ok := unimplementedText(action); ok {
+		return failResult(msg, "")
+	}
+	return failResult("unimplemented: "+action, "")
+}
 
 func route(h *services.ServiceHub, action string, p map[string]interface{}) ResultEnvelope {
 	switch action {
@@ -263,7 +350,7 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 	case "source.export", "source_export":
 		return doSourceExport(h)
 	case "source.audit", "source_audit":
-		return doSourceAudit(h)
+		return unimplementedResult(action)
 
 	// --- bookshelf ---
 	case "bookshelf_list", "bookshelf.list":
@@ -275,7 +362,7 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 	case "bookshelf_delete", "bookshelf.delete":
 		return doBookshelfDelete(h, p)
 	case "bookshelf_import":
-		return okResult(map[string]interface{}{"imported": 0, "errors": []interface{}{}}, "")
+		return unimplementedResult(action)
 
 	// --- check ---
 	case "check_start", "check.start":
@@ -390,38 +477,28 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 		}
 		return failResult("rss service unavailable", "")
 
-	// --- browser ---
-	case "browser_open_page", "browser.open_page":
-		url := gs(p, "url")
-		return okResult(map[string]interface{}{"tabId": 0, "url": url, "html": ""}, "")
-	case "browser_navigate", "browser.navigate":
-		return okResult(true, "")
-	case "browser_close", "browser.close":
-		return okResult(true, "")
-	case "webbridge_start", "webbridge.start":
-		return okResult(map[string]interface{}{"status": "started"}, "")
-	case "webbridge_stop", "webbridge.stop":
-		return okResult(true, "")
-	case "webbridge_status", "webbridge.status":
-		return okResult(map[string]interface{}{"active": false}, "")
+	// --- browser / webbridge（两条都没有后端：见 unimplementedActions）---
+	case "browser_open_page", "browser.open_page",
+		"browser_navigate", "browser.navigate",
+		"browser_close", "browser.close",
+		"webbridge_start", "webbridge.start",
+		"webbridge_stop", "webbridge.stop",
+		"webbridge_status", "webbridge.status":
+		return unimplementedResult(action)
 	case "engine_web_content_ready", "engine.webContentReady":
 		return doWebContentReady(h, p)
 
 	// --- qr ---
 	case "qr_generate", "qr.generate":
-		text := gs(p, "text")
-		if text == "" {
-			return failResult("missing text", "")
-		}
-		return okResult(map[string]interface{}{"qr_data": text}, "")
+		return doQRGenerate(h, p)
 	case "qr_decode", "qr.decode":
-		return okResult(map[string]interface{}{"decoded": ""}, "")
+		return doQRDecode(h, p)
 
 	// --- update ---
 	case "update_check", "update.check":
-		return okResult(map[string]interface{}{"update_available": false, "current_version": "1.0.1"}, "")
+		return doUpdateCheck(h)
 	case "update_ignore", "update.ignore":
-		return okResult(true, "")
+		return doUpdateIgnore(h, p)
 
 	// --- settings ---
 	case "settings_read", "settings.read":
@@ -431,9 +508,9 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 
 	// --- theme ---
 	case "theme_preferences", "theme.preferences":
-		return okResult(defaultThemePrefs(), "")
+		return doThemePreferences(h)
 	case "theme_save", "theme.save":
-		return okResult(true, "")
+		return doThemeSave(h, p)
 
 	// --- font ---
 	case "font_scan_system", "font.scan_system":
@@ -457,19 +534,13 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 	case "replace_toggle_global", "replace.toggle_global":
 		return doReplaceToggleGlobal(h, p)
 
-	// --- export ---
-	case "export_epub", "export.epub":
-		return okResult(map[string]interface{}{"path": "", "success": true}, "")
-	case "export_txt", "export.txt":
-		return okResult(map[string]interface{}{"path": "", "success": true}, "")
-
-	// --- webdav ---
-	case "webdav_backup", "webdav.backup":
-		return okResult(true, "")
-	case "webdav_restore", "webdav.restore":
-		return okResult(true, "")
-	case "webdav_list_backups", "webdav.list_backups":
-		return okResult([]interface{}{}, "")
+	// --- export / webdav（服务在库里，但没有能把活干完的调用点）---
+	case "export_epub", "export.epub",
+		"export_txt", "export.txt",
+		"webdav_backup", "webdav.backup",
+		"webdav_restore", "webdav.restore",
+		"webdav_list_backups", "webdav.list_backups":
+		return unimplementedResult(action)
 
 	// --- browse ---
 	case "browse_categories", "browse.categories":
@@ -481,17 +552,14 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 	case "import_text", "import.text":
 		return doImportText(h, p)
 	case "import_url", "import.url":
-		return okResult(map[string]interface{}{"imported": 0}, "")
+		return doImportUrl(h, p)
 
-	// --- reading_aloud ---
-	case "read_aloud_start", "read_aloud.start":
-		return okResult(true, "")
-	case "read_aloud_pause", "read_aloud.pause":
-		return okResult(true, "")
-	case "read_aloud_stop", "read_aloud.stop":
-		return okResult(true, "")
-	case "read_aloud_progress", "read_aloud.progress":
-		return okResult(map[string]interface{}{"progress": 0}, "")
+	// --- read_aloud（发声在 Flutter 侧，Go 这一路没有后端）---
+	case "read_aloud_start", "read_aloud.start",
+		"read_aloud_pause", "read_aloud.pause",
+		"read_aloud_stop", "read_aloud.stop",
+		"read_aloud_progress", "read_aloud.progress":
+		return unimplementedResult(action)
 
 	default:
 		return failResult("unimplemented: "+action, "")
@@ -574,11 +642,12 @@ func doSourceEnable(h *services.ServiceHub, p map[string]interface{}) ResultEnve
 
 func doSourceGroup(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
 	if svc := h.SourceService(); svc != nil {
-		group := gs(p, "group")
-		for _, src := range svc.List() {
-			g := group
-			src.BookSourceGroup = &g
-			svc.Save(&src)
+		url := gs(p, "url")
+		if url == "" {
+			return failResult("missing url", "")
+		}
+		if err := svc.SetGroup(url, gs(p, "group")); err != nil {
+			return failResult(err.Error(), "")
 		}
 		return okResult(true, "")
 	}
@@ -587,41 +656,16 @@ func doSourceGroup(h *services.ServiceHub, p map[string]interface{}) ResultEnvel
 
 func doSourceBatchEnable(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
 	if svc := h.SourceService(); svc != nil {
-		urlsRaw, _ := p["urls"].([]interface{})
-		urls := make([]string, 0, len(urlsRaw))
-		for _, u := range urlsRaw {
-			if s, ok := u.(string); ok {
-				urls = append(urls, s)
-			}
-		}
-		en := gb(p, "enabled")
-		count := 0
-		for _, url := range urls {
-			if err := svc.Enable(url, en); err == nil {
-				count++
-			}
-		}
-		return okResult(map[string]interface{}{"updated": count}, "")
+		updated := svc.EnableBatch(gurls(p, "urls"), gb(p, "enabled"))
+		return okResult(map[string]interface{}{"updated": updated}, "")
 	}
 	return failResult("source service unavailable", "")
 }
 
 func doSourceBatchDelete(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
 	if svc := h.SourceService(); svc != nil {
-		urlsRaw, _ := p["urls"].([]interface{})
-		urls := make([]string, 0, len(urlsRaw))
-		for _, u := range urlsRaw {
-			if s, ok := u.(string); ok {
-				urls = append(urls, s)
-			}
-		}
-		count := 0
-		for _, url := range urls {
-			if err := svc.Delete(url); err == nil {
-				count++
-			}
-		}
-		return okResult(map[string]interface{}{"deleted": count}, "")
+		deleted := svc.DeleteBatch(gurls(p, "urls"))
+		return okResult(map[string]interface{}{"deleted": deleted}, "")
 	}
 	return failResult("source service unavailable", "")
 }
@@ -633,23 +677,6 @@ func doSourceExport(h *services.ServiceHub) ResultEnvelope {
 			return failResult(err.Error(), "")
 		}
 		return okResult(data, "")
-	}
-	return failResult("source service unavailable", "")
-}
-
-func doSourceAudit(h *services.ServiceHub) ResultEnvelope {
-	if svc := h.SourceService(); svc != nil {
-		go func() {
-			for _, src := range svc.List() {
-				if !src.Enabled {
-					continue
-				}
-				start := time.Now()
-				src.RespondTime = time.Since(start).Milliseconds()
-				svc.Save(&src)
-			}
-		}()
-		return okResult(map[string]interface{}{"started": true}, "")
 	}
 	return failResult("source service unavailable", "")
 }
@@ -1101,26 +1128,56 @@ func doFontSelect(h *services.ServiceHub, p map[string]interface{}) ResultEnvelo
 }
 
 // ---------------------------------------------------------------------------
-// Import handler
+// Import handlers
 // ---------------------------------------------------------------------------
 
-func doImportText(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
-	if svc := h.ImportService(); svc != nil {
-		text := gs(p, "text")
-		result, err := svc.ImportText(text)
-		if err != nil {
-			return failResult(err.Error(), "")
-		}
-		errs := result.Errors
-		if errs == nil {
-			errs = []string{}
-		}
-		return okResult(map[string]interface{}{
-			"imported": result.Sources,
-			"errors":   errs,
-		}, "")
+// importEnvelope 是 import.* 唯一的回包形状：`{kind, count, errors, warnings, placeholder}`
+// （Dart 侧 `ImportOutcome.fromJson` 逐格读这五个键）。少一格不是"字段没了"，是那一格
+// 在界面上退化成 0 或 false——placeholder 少了就把"这类东西今天没有落点"报成"导入了 0 条"。
+func importEnvelope(result *services.ImportResult) ResultEnvelope {
+	return okResult(map[string]interface{}{
+		"kind":        result.Kind,
+		"count":       result.Count,
+		"errors":      result.Errors,
+		"warnings":    result.Warnings,
+		"placeholder": result.Placeholder,
+	}, "")
+}
+
+// importKindMode 收两个可选参数：kind 缺了就按唯一有落点的那一类（对齐 Python 控制器
+// 的 IMPORT_KIND 默认），mode 缺省 append（Python 门面签名的默认值）。
+func importKindMode(p map[string]interface{}) (string, string) {
+	kind := gs(p, "kind")
+	if kind == "" {
+		kind = services.ImportKindBookSource
 	}
-	return failResult("import service unavailable", "")
+	mode := gs(p, "mode")
+	if mode == "" {
+		mode = services.ImportModeAppend
+	}
+	return kind, mode
+}
+
+func doImportText(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.ImportService()
+	if svc == nil {
+		return failResult("ImportService 未就绪：导入不会落库", "")
+	}
+	kind, mode := importKindMode(p)
+	return importEnvelope(svc.ImportText(gs(p, "text"), kind, mode))
+}
+
+func doImportUrl(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.ImportService()
+	if svc == nil {
+		return failResult("ImportService 未就绪：导入不会落库", "")
+	}
+	url := strings.TrimSpace(gs(p, "url"))
+	if url == "" {
+		return failResult("缺少 url：没说要导入哪个地址", "")
+	}
+	kind, mode := importKindMode(p)
+	return importEnvelope(svc.ImportFromURL(url, kind, mode))
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,19 +1211,130 @@ func bookToMap(b *internalmodels.BookItem) map[string]interface{} {
 	}
 }
 
-func defaultThemePrefs() map[string]interface{} {
-	return map[string]interface{}{
-		"theme_mode":    "system",
-		"background":    "#ffffff",
-		"text_color":    "#000000",
-		"font_family":   "",
-		"font_size":     16.0,
-		"line_spacing":  1.5,
-		"paragraph_sp":  1.0,
-		"margin_px":     20,
-		"show_cover_bg": false,
-		"scroll_mode":   false,
+// ---------------------------------------------------------------------------
+// Theme handlers（三格外观偏好，对齐 Python app/services/tools/theme_service.py）
+// ---------------------------------------------------------------------------
+
+func doThemePreferences(h *services.ServiceHub) ResultEnvelope {
+	svc := h.ThemeService()
+	if svc == nil {
+		return failResult("ThemeService 未就绪：外观偏好读不回来", "")
 	}
+	return okResult(svc.GetPreferences(), "")
+}
+
+func doThemeSave(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.ThemeService()
+	if svc == nil {
+		return failResult("ThemeService 未就绪：外观偏好存不下去", "")
+	}
+	// 回的是**服务端归一后的三格**（黄金样本 theme.save.json 的 response.data），
+	// 不是 true：界面拿返回值当"已保存态"，回 true 会把刚保存的那一版折回默认档。
+	return okResult(svc.SetPreferences(
+		optionalString(p, "skin_id"),
+		optionalString(p, "mode"),
+		optionalBool(p, "eink")), "")
+}
+
+// optionalString / optionalBool：键缺失或值是 JSON null → nil，意思是"这一格不改"
+// （schema theme.save.json 把三格都写成可 null）。类型对不上也当没给，不折回默认。
+func optionalString(p map[string]interface{}, k string) *string {
+	raw, ok := p[k]
+	if !ok {
+		return nil
+	}
+	s, isStr := raw.(string)
+	if !isStr {
+		return nil
+	}
+	return &s
+}
+
+func optionalBool(p map[string]interface{}, k string) *bool {
+	raw, ok := p[k]
+	if !ok {
+		return nil
+	}
+	b, isBool := raw.(bool)
+	if !isBool {
+		return nil
+	}
+	return &b
+}
+
+// ---------------------------------------------------------------------------
+// Update handlers（只检查、不下载不安装）
+// ---------------------------------------------------------------------------
+
+func doUpdateCheck(h *services.ServiceHub) ResultEnvelope {
+	svc := h.UpdateService()
+	if svc == nil {
+		return failResult("UpdateService 未就绪：没有可查询的更新源", "")
+	}
+	// 比服务里的客户端多留 2s 余量：这层先到期说明是调用方等不起，不是源挂了。
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	info, err := svc.Check(ctx)
+	if err != nil {
+		log.Printf("[update_check] %v", err)
+		return failResult(err.Error(), "")
+	}
+	// nil = 已是最新/该版本已被忽略 → data 为 null，界面读成"已是最新版本"。
+	if info == nil {
+		return okResult(nil, "")
+	}
+	return okResult(info, "")
+}
+
+func doUpdateIgnore(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.UpdateService()
+	if svc == nil {
+		return failResult("UpdateService 未就绪：忽略的版本没处落库", "")
+	}
+	version := gs(p, "version")
+	if version == "" {
+		return failResult("缺少 version：没说要忽略哪个版本", "")
+	}
+	if err := svc.IgnoreVersion(version); err != nil {
+		return failResult(err.Error(), "")
+	}
+	return okResult(true, "")
+}
+
+// ---------------------------------------------------------------------------
+// QR handlers
+// ---------------------------------------------------------------------------
+
+func doQRGenerate(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.QRService()
+	if svc == nil {
+		return failResult("QRService 未就绪：没有可用的二维码编码器", "")
+	}
+	text := gs(p, "text")
+	if text == "" {
+		return failResult("二维码内容不能为空", "")
+	}
+	png, err := svc.GeneratePNG(text)
+	if err != nil {
+		log.Printf("[qr_generate] %v", err)
+		return failResult("二维码生成失败："+err.Error(), "")
+	}
+	// 界面（qr_code_screen）拿 base64 直接喂 Image.memory；键名 result 是 Dart 侧
+	// 已经在读的那一个，不再另起一套。
+	return okResult(map[string]interface{}{
+		"result":       base64.StdEncoding.EncodeToString(png),
+		"content_type": "image/png",
+	}, "")
+}
+
+func doQRDecode(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	// 识别侧没实现（Go 侧没有纯 Go 的 QR 解码器，Python 用 opencv）。回显式错误，
+	// 不回空串——空串在界面上长成"这张图里没有二维码"，那是两件不同的事（0 号原则）。
+	if svc := h.QRService(); svc != nil {
+		_, err := svc.Decode(gs(p, "image_data"))
+		return failResult(err.Error(), "")
+	}
+	return failResult(services.ErrQRDecodeUnimplemented.Error(), "")
 }
 
 // parseBookItem converts raw bytes into a BookItem (handles snake_case Dart keys).
@@ -1317,6 +1485,8 @@ func doReaderContent(h *services.ServiceHub, p map[string]interface{}) ResultEnv
 // Browse handlers
 // ---------------------------------------------------------------------------
 
+// doBrowseCategories 把书源的 exploreUrl 解析成分类清单（静态 `标题::地址`、
+// JSON 数组、@js: 动态三类形状都走引擎那一套；webView 分类按设计稿 §7 显式报错）。
 func doBrowseCategories(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
 	sourceURL := gs(p, "source_url")
 	if sourceURL == "" {
@@ -1327,20 +1497,27 @@ func doBrowseCategories(h *services.ServiceHub, p map[string]interface{}) Result
 	if !ok {
 		return failResult("source not found", "")
 	}
-	if src.RuleExplore == nil {
-		return okResult([]interface{}{}, "")
+	categories, err := h.RuleEngine().ResolveCategories(context.Background(), src)
+	if err != nil {
+		log.Printf("[browse_categories] %s: %v", sourceURL, err)
+		return failResult(err.Error(), "")
 	}
-
-	categories := []map[string]interface{}{
-		{"title": "默认", "url": ""},
+	data := make([]interface{}, 0, len(categories))
+	for _, category := range categories {
+		data = append(data, map[string]interface{}{"title": category.Title, "url": category.URL})
 	}
-	return okResult(categories, "")
+	return okResult(data, "")
 }
 
+// doBrowseBooks 分类页书单。分类地址**原样**交给引擎（含 {{page}}、`<a,b>` 页对、
+// @js:、POST 选项等形状）——在这里预替换会让引擎的页号语义变成第二套实现。
 func doBrowseBooks(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
 	sourceURL := gs(p, "source_url")
 	categoryJSON := p["category"]
-	pageNum := gi(p, "page")
+	page := gi(p, "page")
+	if page < 1 {
+		page = 1
+	}
 
 	sourceSvc := h.SourceService()
 	src, ok := sourceSvc.Get(sourceURL)
@@ -1348,32 +1525,20 @@ func doBrowseBooks(h *services.ServiceHub, p map[string]interface{}) ResultEnvel
 		return failResult("source not found", "")
 	}
 
-	// Extract category URL and title from the passed category object
-	catTitle := "默认"
 	catURL := ""
 	if catMap, ok := categoryJSON.(map[string]interface{}); ok {
-		catTitle = gs(catMap, "title")
 		catURL = gs(catMap, "url")
 	}
-
-	ruleEngine := h.RuleEngine()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	var books []*internalmodels.BookItem
-	var err error
-
-	// If there's a category URL with pagination placeholder, handle it
-	if catURL != "" {
-		searchURL := strings.ReplaceAll(catURL, "{{page}}", fmt.Sprintf("%d", pageNum))
-		books, err = ruleEngine.BrowseBooks(ctx, src, searchURL, catTitle)
-	} else {
-		books, err = ruleEngine.BrowseBooks(ctx, src, "", catTitle)
+	if catURL == "" {
+		return failResult("该分类没有可浏览的地址", "")
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	books, err := h.RuleEngine().Explore(ctx, src, catURL, page)
 	if err != nil {
-		log.Printf("[browse_books] error: %v", err)
-		books = []*internalmodels.BookItem{}
+		log.Printf("[browse_books] %s page=%d: %v", sourceURL, page, err)
+		return failResult(err.Error(), "")
 	}
 
 	data := make([]interface{}, len(books))

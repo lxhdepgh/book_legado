@@ -33,6 +33,28 @@ typedef CleanupDart = void Function();
 typedef FreeStringC = ffi.Void Function(ffi.Pointer<ffi.Int8>);
 typedef FreeStringDart = void Function(ffi.Pointer<ffi.Int8>);
 
+typedef HeapAllocC = ffi.Pointer<ffi.Uint8> Function(
+  ffi.Pointer<ffi.Uint8>, // hHeap
+  ffi.Uint32, // flags
+  ffi.Uint64, // bytes
+);
+typedef HeapAllocDart = ffi.Pointer<ffi.Uint8> Function(
+  ffi.Pointer<ffi.Uint8>,
+  int,
+  int,
+);
+
+typedef HeapFreeC = ffi.Uint32 Function(
+  ffi.Pointer<ffi.Uint8>,
+  ffi.Uint32,
+  ffi.Pointer<ffi.Uint8>,
+);
+typedef HeapFreeDart = int Function(
+  ffi.Pointer<ffi.Uint8>,
+  int,
+  ffi.Pointer<ffi.Uint8>,
+);
+
 // ---------------------------------------------------------------------------
 // Memory allocator using OS-native APIs (works in AOT without any issues)
 // Uses ProcessHeap on Windows, mmap/munmap on Linux/macOS.
@@ -41,6 +63,10 @@ typedef FreeStringDart = void Function(ffi.Pointer<ffi.Int8>);
 class _Mem {
   static bool _initialized = false;
   static late ffi.Pointer<ffi.Uint8> _heapHandle;
+  // 句柄与两个函数指针各存一份：原先每次分配都重开一遍 kernel32 再 lookupFunction，
+  // 而一发同步调用要分配两个入参 —— 实测 0.02–0.04 ms/发全花在这两对上。
+  static late HeapAllocDart _heapAlloc;
+  static late HeapFreeDart _heapFree;
 
   /// Check if the memory allocator has been initialized.
   static bool get initialized => _initialized;
@@ -52,26 +78,63 @@ class _Mem {
         ffi.Pointer<ffi.Uint8> Function(),
         ffi.Pointer<ffi.Uint8> Function()>('GetProcessHeap');
     _heapHandle = createHeap.call();
+    _heapAlloc = kernel.lookupFunction<HeapAllocC, HeapAllocDart>('HeapAlloc');
+    _heapFree = kernel.lookupFunction<HeapFreeC, HeapFreeDart>('HeapFree');
     _initialized = true;
   }
 
   /// Allocate N bytes, zero-initialized. Returns Int8 pointer.
-  static ffi.Pointer<ffi.Int8> malloc(int n) {
-    final kernel = ffi.DynamicLibrary.open('kernel32.dll');
-    final alloc = kernel.lookupFunction<
-        ffi.Pointer<ffi.Uint8> Function(ffi.Pointer<ffi.Uint8>, ffi.Uint32, ffi.Uint64),
-        ffi.Pointer<ffi.Uint8> Function(ffi.Pointer<ffi.Uint8>, int, int)>('HeapAlloc');
-    return alloc.call(_heapHandle, 0x00000008, n.toUnsigned(64)).cast();
-  }
+  ///
+  /// 0x00000008 = HEAP_ZERO_MEMORY。试过改成 0：12 MB 那一臂两趟读 21.98 / 21.71 ms，
+  /// 270 KB 那一臂 0.608 / 0.648 ms——差量都在噪声里，**实测无收益**；
+  /// 而清零是万一漏写终止符时唯一免费的兜底，留着。
+  static ffi.Pointer<ffi.Int8> malloc(int n) =>
+      _heapAlloc.call(_heapHandle, 0x00000008, n.toUnsigned(64)).cast();
 
   /// Free a previously allocated pointer.
-  static void free(ffi.Pointer<ffi.Int8> ptr) {
-    final kernel = ffi.DynamicLibrary.open('kernel32.dll');
-    final dealloc = kernel.lookupFunction<
-        ffi.Uint32 Function(ffi.Pointer<ffi.Uint8>, ffi.Uint32, ffi.Pointer<ffi.Uint8>),
-        int Function(ffi.Pointer<ffi.Uint8>, int, ffi.Pointer<ffi.Uint8>)>('HeapFree');
-    dealloc.call(_heapHandle, 0, ptr.cast());
+  static void free(ffi.Pointer<ffi.Int8> ptr) =>
+      _heapFree.call(_heapHandle, 0, ptr.cast());
+}
+
+// ---------------------------------------------------------------------------
+// 跨界字符串（一对，护栏钉这一对：写进去读回来必须一字不差）
+// ---------------------------------------------------------------------------
+
+/// [String] → 以 0 结尾的 UTF-8 缓冲（Go 那侧 `Call` 收到的 `char*` 就是这个形状）。
+/// 用完交给 [freeNativeCString]，它和 `_Mem.malloc` 是同一套进程堆。
+ffi.Pointer<ffi.Int8> toNativeCString(String value) {
+  // 编解码自己把分配器就位：这一段不依赖 DLL，离屏护栏测试（往返同一串）才进得来。
+  if (!_Mem.initialized) _Mem.init();
+  final bytes = utf8.encode(value);
+  final len = bytes.length + 1;
+  final ptr = _Mem.malloc(len);
+  // 一把 setRange 拷完整段（含终止符那一格）：逐字节 `ptr[i]=…` 在 238 KB 上实测 3.4 ms。
+  ptr.cast<ffi.Uint8>().asTypedList(len)
+    ..setRange(0, bytes.length, bytes)
+    ..[bytes.length] = 0;
+  return ptr;
+}
+
+void freeNativeCString(ffi.Pointer<ffi.Int8> ptr) {
+  if (ptr.address != 0) _Mem.free(ptr);
+}
+
+/// 以 0 结尾的 UTF-8 缓冲 → [String]。
+///
+/// 读法只有一条规矩：**扫描窗口不许越过终止符**。Go 回来的缓冲长度我们不知道
+/// （`C.CString` 自己 malloc 的），所以既不能按"上次那发多大"开视图，也不能按
+/// 固定块整块 `indexOf`——多读到的字节可能落在未提交的页上，那是一记 access violation
+/// 而不是一个异常。逐字节只走到 0 为止，然后整段一次解码。
+String fromNativeCString(ffi.Pointer<ffi.Int8> ptr) {
+  if (ptr.address == 0) return '';
+  var len = 0;
+  while (ptr[len] != 0) {
+    len++;
   }
+  // Go 那侧 json.Marshal 出的中文是**原样 UTF-8 字节**（不转 \uXXXX）：
+  // 按 charCode 逐字节读（Latin-1）会把每个汉字拆成 3 个乱码码元，
+  // 活臂读回的书名/正文全成 mojibake。这里按 UTF-8 还原。
+  return utf8.decode(ptr.cast<ffi.Uint8>().asTypedList(len), allowMalformed: true);
 }
 
 // ---------------------------------------------------------------------------
@@ -103,9 +166,6 @@ class GoFFIClient {
 
   /// Load the Go dynamic library and resolve all FFI symbols.
   void load() {
-    // Ensure memory allocator is initialized
-    if (!_Mem.initialized) _Mem.init();
-
     final libPath = _findLibraryPath();
     final resolvedExe = io.File(io.Platform.resolvedExecutable);
     final exeDir = resolvedExe.parent.path;
@@ -170,17 +230,17 @@ class GoFFIClient {
   Map<String, dynamic> call(String action, Map<String, dynamic> params) {
     if (!_ready) initialize();
 
-    final actionPtr = _toNativeUtf8(action);
-    final paramsPtr = _toNativeUtf8(jsonEncode(params));
+    final actionPtr = toNativeCString(action);
+    final paramsPtr = toNativeCString(jsonEncode(params));
 
     try {
       final resultPtr = _call(actionPtr, paramsPtr);
-      final result = _readCString(resultPtr);
+      final result = fromNativeCString(resultPtr);
       if (resultPtr.address != 0) _freeString(resultPtr);
       return jsonDecode(result) as Map<String, dynamic>;
     } finally {
-      if (actionPtr.address != 0) _Mem.free(actionPtr);
-      if (paramsPtr.address != 0) _Mem.free(paramsPtr);
+      freeNativeCString(actionPtr);
+      freeNativeCString(paramsPtr);
     }
   }
 
@@ -189,32 +249,6 @@ class GoFFIClient {
       _cleanup();
       _ready = false;
     }
-  }
-
-  ffi.Pointer<ffi.Int8> _toNativeUtf8(String s) {
-    final bytes = utf8.encode(s);
-    final len = bytes.length + 1;
-    final ptr = _Mem.malloc(len);
-    for (var i = 0; i < bytes.length; i++) {
-      ptr[i] = bytes[i];
-    }
-    ptr[bytes.length] = 0;
-    return ptr;
-  }
-
-  String _readCString(ffi.Pointer<ffi.Int8> ptr) {
-    final bytes = <int>[];
-    var i = 0;
-    while (true) {
-      final byte = ptr[i];
-      if (byte == 0) break;
-      bytes.add(byte & 0xff);
-      i++;
-    }
-    // Go 那侧 json.Marshal 出的中文是**原样 UTF-8 字节**（不转 \uXXXX）：
-    // 按 charCode 逐字节读（Latin-1）会把每个汉字拆成 3 个乱码码元，
-    // 活臂读回的书名/正文全成 mojibake。这里按 UTF-8 还原。
-    return utf8.decode(bytes, allowMalformed: true);
   }
 
   String _findLibraryPath() {
