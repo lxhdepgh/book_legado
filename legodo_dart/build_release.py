@@ -473,12 +473,16 @@ def create_distribution_windows(lib_path: Path | None, lib_name: str, flutter_ou
     Checklist — every item here MUST exist in the final package:
       1. legodo_client.exe          — Flutter desktop release binary
       2. flutter_windows.dll        — Flutter engine runtime (from ephemeral)
-      3. flutter_windows.dll.pdb    — debug symbols (optional but recommended)
-      4. *.dat                      — AOT snapshot / ICU data
-      5. *.so                       — plugin native libraries (if any)
-      6. *.pdb                      — plugin debug symbols
+      3. data/app.so                — AOT snapshot (required on Windows --release)
+      4. data/icudtl.dat            — ICU locale data
+      5. data/flutter_assets/       — fonts / MaterialIcons / asset bundles
+      6. plugin DLLs                — native plugin libraries (if any)
       7. legodo_engine.dll          — Go FFI dynamic library
       8. README.txt                 — startup instructions
+
+    PDB 调试符号刻意不进发布包：Windows 加载器与运行时都不读它（仅崩溃转储
+    符号化用），而 flutter_windows.dll.pdb 单份就有 ~240 MB。符号文件留在
+    windows/flutter/ephemeral/ 原地，需要时单独取用即可。
     """
     print(f"\n[3/4] Assembling Windows distribution package...", flush=True)
 
@@ -498,16 +502,14 @@ def create_distribution_windows(lib_path: Path | None, lib_name: str, flutter_ou
     shutil.copy2(exe_src, dist_dir / "legodo_client.exe")
     collected.append(f"legodo_client.exe ({exe_src.stat().st_size / (1024*1024):.1f} MB)")
 
-    # === 2. flutter_windows.dll (+ PDB) ===
+    # === 2. flutter_windows.dll ===
+    # 同目录的 flutter_windows.dll.pdb（~240 MB）刻意不拷：运行时从不读符号文件，
+    # 只在崩溃转储符号化时用；文件留在 ephemeral/ 原地，需要时单独取。
     ephemeral_dir = DART_CLIENT / "windows" / "flutter" / "ephemeral"
     flutter_dll = ephemeral_dir / "flutter_windows.dll"
     if flutter_dll.exists():
         shutil.copy2(flutter_dll, dist_dir / "flutter_windows.dll")
         collected.append(f"flutter_windows.dll ({flutter_dll.stat().st_size / (1024*1024):.1f} MB)")
-        pdb = ephemeral_dir / "flutter_windows.dll.pdb"
-        if pdb.exists():
-            shutil.copy2(pdb, dist_dir / "flutter_windows.dll.pdb")
-            collected.append("flutter_windows.dll.pdb")
     else:
         print(f"[FATAL] Missing critical runtime: {flutter_dll}", file=sys.stderr)
         sys.exit(1)
@@ -618,7 +620,7 @@ def create_distribution_windows(lib_path: Path | None, lib_name: str, flutter_ou
         "  - Go 规则引擎、HTML 解析、JS 执行\n"
         "  - 并发扫描 100+ 源/秒\n\n"
         "注意:\n"
-        "  所有 DLL/PDB 文件必须与 EXE 在同一目录。\n",
+        "  所有 DLL 文件必须与 EXE 在同一目录。\n",
         encoding="utf-8", newline="",
     )
     collected.append("README.txt")

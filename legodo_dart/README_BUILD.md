@@ -32,7 +32,7 @@ python build_release.py windows
 | 条目 | 说明 |
 |------|------|
 | `legodo_client.exe` | Flutter 前端 |
-| `flutter_windows.dll`（+pdb） | Flutter 引擎 |
+| `flutter_windows.dll` | Flutter 引擎（PDB 调试符号刻意不进包：运行时不需要，仅崩溃转储符号化时用） |
 | `data/app.so` | AOT 快照（Windows `--release` 必需） |
 | `data/icudtl.dat` | ICU 国际化数据 |
 | `data/flutter_assets/` | 资源（shaders/字体/包）——**必须位于 `data/` 下**（runner 以 `DartProject(L"data")` 定位，放错位置会导致图标变方框） |
