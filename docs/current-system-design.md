@@ -1220,7 +1220,7 @@ M7 清理线**真正删掉的是旧单体 UI**（`app/app.py`、旧平铺 `app/v
 
 ## 9. 打包与分发
 
-详见 `docs/M7打包说明.md`（M7 新写）与 `docs/backend-operations-manual.md`。摘要：
+详见 `docs/M7打包说明.md`（M7 新写）与 `docs/archive/backend-operations-manual.md`（已归档，Python 时代）。摘要：
 
 - 依赖分两份：`requirements.txt` 全平台通用；`requirements-desktop.txt` 追加
   playwright（桌面内置无头浏览器用）与 `pywin32>=306 ; sys_platform == "win32"`

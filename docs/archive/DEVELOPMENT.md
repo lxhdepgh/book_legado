@@ -1,5 +1,11 @@
 # 开发约定 (Development Conventions)
 
+> **已归档（2026-10-16）。** 本文写于 Python 单进程 / WebSocket RPC 时代：文中引用的
+> 根 `app/` 共享后端、`LegadoReader.spec`、`test_backend_interaction.py`、
+> `rpc_engine_repository.dart` 均已不存在。现行架构为 FFI-only：Flutter 前端
+> （`legodo_dart/`）+ Go 引擎（`legodo_dart/backend_go/legodo_engine.dll`），
+> 打包与构建见 `legodo_dart/README_BUILD.md`。仅作历史参考，不再维护。
+
 ## 子项目独立性原则
 
 本项目采用**双前端 + 共享后端**架构：

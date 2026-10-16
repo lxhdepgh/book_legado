@@ -1,5 +1,10 @@
 # 构建与运维手册（backend-operations-manual）
 
+> **已归档（2026-10-16）。** 本文是 conda / PyInstaller / WebSocket RPC 时代的构建运维
+> 手册：`python main.py`、`legodo_dart/backend/`、Playwright 等命令与路径均已失效。
+> 现行构建/运维见 `legodo_dart/README_BUILD.md`（FFI-only，`build_release.py` 一键打包）。
+> 仅作历史参考，不再维护。
+
 > 状态：骨架（初始化生成于 2026-09-01），待补充处需开发者确认后补全。
 
 ## 1. 环境准备

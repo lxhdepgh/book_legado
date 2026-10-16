@@ -2,7 +2,7 @@
 
 ## 架构对比
 
-### 方案 A：独立进程 + WebSocket RPC（原有）
+### 方案 A：独立进程 + WebSocket RPC（历史方案，已弃用——WS 链已从双侧拆除）
 
 ```
 ┌─────────────┐         WebSocket          ┌──────────────┐
@@ -30,7 +30,7 @@
 
 ---
 
-### 方案 B：动态库 + FFI 直接调用（新增）
+### 方案 B：动态库 + FFI 直接调用（现行方案）
 
 ```
 ┌──────────────────────────────────────────┐
@@ -71,22 +71,26 @@
 
 ```go
 //export Initialize
-func Initialize() { ... }
+func Initialize()                             // 启动 ServiceHub（幂等，必须先于 Call）
 
-//export SearchBooks
-func SearchBooks(sourceJSON *C.char, keyword *C.char) *C.char { ... }
+//export Call
+func Call(action *C.char, paramsJSON *C.char) *C.char  // 唯一数据入口
 
-//export GetBookInfo
-func GetBookInfo(sourceJSON *C.char, bookURL *C.char) *C.char { ... }
+//export StatusReport
+func StatusReport() *C.char                   // 只读就绪快照（服务状态列表）
+
+//export Cleanup
+func Cleanup()                                // 停止全部服务
 
 //export FreeString
-func FreeString(s *C.char) { ... }
+func FreeString(s *C.char)                    // 释放返回的 C 字符串
 ```
 
 **关键点：**
 - 使用 `//export` 注释导出 C 函数
 - 字符串通过 `*C.char` 传递（UTF-8 编码）
 - 返回值需调用方手动释放（`FreeString`）
+- 所有 RPC action（含事件轮询 `engine_poll`）统一走 `Call`，返回 `{ok, data, error, id, v}` 信封；新增 action 只需改 Go 侧分发表，无需新增 FFI 导出
 
 ### 2. 编译命令
 
@@ -115,24 +119,29 @@ CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
 
 ### 3. Dart FFI 绑定
 
-文件：`lib/core/ffi/engine_ffi.dart`
+文件：`lib/core/ffi/engine_ffi.dart`（`GoFFIClient`）
 
 ```dart
-typedef SearchBooksFunc = ffi.Pointer<ffi.Char> Function(
-    ffi.Pointer<ffi.Char>, ffi.Pointer<ffi.Char>);
+typedef CallC = ffi.Pointer<ffi.Int8> Function(
+    ffi.Pointer<ffi.Int8>, ffi.Pointer<ffi.Int8>); // action, paramsJSON
 
-class EngineFFIClient {
+class GoFFIClient {
   late ffi.DynamicLibrary _dl;
-  late SearchBooksDart _searchBooks;
-  
-  void loadLibrary() {
-    _dl = ffi.DynamicLibrary.open('legodo_engine.dll');
-    _searchBooks = _dl.lookupFunction<SearchBooksFunc, SearchBooksDart>(
-      'SearchBooks'
-    );
+  late CallDart _call;
+
+  void load() {
+    _dl = ffi.DynamicLibrary.open(_findLibraryPath());
+    _initialize = _dl.lookupFunction<InitializeC, InitializeDart>('Initialize');
+    _call       = _dl.lookupFunction<CallC, CallDart>('Call');
+    _cleanup    = _dl.lookupFunction<CleanupC, CleanupDart>('Cleanup');
+    _freeString = _dl.lookupFunction<FreeStringC, FreeStringDart>('FreeString');
   }
+
+  Map<String, dynamic> call(String action, Map<String, dynamic> params) { ... }
 }
 ```
+
+动态库查找顺序（`_findLibraryPath()`）：`LEGODO_ENGINE_DLL` 环境变量覆盖 → 否则 exe 同目录的 `legodo_engine.dll`。
 
 ### 4. 适配器模式
 
@@ -140,18 +149,19 @@ class EngineFFIClient {
 
 ```dart
 class FFIEngineAdapter implements EngineRepository {
-  final EngineFFIClient _ffi = EngineFFIClient.instance;
-  
-  @override
-  Future<List<BookRow>> searchBooks({
-    required Map<String, dynamic> source,
-    required String keyword,
-  }) async {
-    final result = _ffi.searchBooks(source, keyword);
-    return (result['data'] as List)
-        .map((item) => BookRow.fromJson(item))
-        .toList();
+  /// 生产走 GoFFIClient.instance 单例；[client] 只为离屏测试注入替身。
+  FFIEngineAdapter({GoFFIClient? client}) : _injected = client;
+
+  GoFFIClient get ffi => _injected ?? GoFFIClient.instance;
+
+  Future<void> connect() async {
+    ffi.load();
+    ffi.initialize();
+    _eventCursor = 0;            // 引擎侧事件环随 Initialize 重开，游标归零
   }
+
+  // 数据请求：ffi.call(action, params) → 解析 {ok, data, error} 信封
+  // 进度事件：ffi.call('engine_poll', {'since': _eventCursor}) 游标轮询
 }
 ```
 
@@ -168,9 +178,9 @@ class FFIEngineAdapter implements EngineRepository {
 
 ---
 
-## 切换方式
+## 打包方式
 
-### 使用 FFI 模式（默认）
+当前为纯 FFI 单进程架构（独立进程 + WebSocket 模式已拆除）：
 
 ```bash
 python build_release.py windows
@@ -178,19 +188,8 @@ python build_release.py windows
 
 生成的分发包包含：
 - `legodo_client.exe` (Flutter UI)
-- `legodo_engine.dll` (Go 引擎)
-- `start.bat` (可选启动脚本)
-
-### 使用独立进程模式
-
-```bash
-python build_release.py windows --standalone
-```
-
-生成的分发包包含：
-- `legodo_client.exe` (Flutter UI)
-- `legodo_server.exe` (Go 服务器)
-- `start.bat` (必需启动脚本)
+- `legodo_engine.dll` (Go 引擎，与 exe 同目录，dart:ffi 加载)
+- `data/`（Flutter 资源与 AOT 快照）
 
 ---
 

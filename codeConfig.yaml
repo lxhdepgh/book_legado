@@ -36,8 +36,8 @@ knowledge_base:
       path: "docs/current-system-design.md"
       required: true                 # 系统设计文档，智能体必读
     operations_manual:
-      path: "docs/backend-operations-manual.md"
-      required: false                # 构建与运维手册（桌面端打包等）
+      path: "docs/archive/backend-operations-manual.md"
+      required: false                # 构建与运维手册（桌面端打包等；已于 2026-10-16 归档，仅历史参考）
     testing_guide:
       path: "docs/local-testing-guide.md"
       required: false                # 本地测试指南
