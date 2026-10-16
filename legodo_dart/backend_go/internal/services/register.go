@@ -85,10 +85,13 @@ func (h *ServiceHub) RegisterInfrastructure() error {
 	}
 	h.settingsSvc = settingsSvc
 
+	// SettingsService 读走内存缓存，只有 OnStart() 把 DB 全表装进去；
+	// 不接这根线，所有 settings 读取都会静默回默认值（真库有 6 个键）。
 	if err := h.registerNamed("SettingsService", &infraSvc{
-		base:   core.NewBaseService("SettingsService", "StorageService"),
-		stopFn: func() error { return nil },
-		bus:    eventBus,
+		base:    core.NewBaseService("SettingsService", "StorageService"),
+		onStart: func(ctx context.Context) error { return settingsSvc.OnStart() },
+		stopFn:  func() error { return nil },
+		bus:     eventBus,
 	}); err != nil {
 		return err
 	}
@@ -114,12 +117,15 @@ func (h *ServiceHub) RegisterBusinessServices() error {
 		return err
 	}
 
-	// SourceService
+	// SourceService。加载逻辑（loadAllSources 等）在真实服务的 Start() 里，
+	// 壳的 base 不会替它跑——必须经 onStart 转发，否则缓存永远是空的
+	// （书源/替换/字体/书内搜索四处同理）。
 	sourceSvc := NewSourceService(h.storageSvc, h.settingsSvc, ruleEngine, h.eventBus)
 	h.sourceSvc = sourceSvc
 	if err := h.registerNamed("SourceService", &bizSvc{
-		base:   core.NewBaseService("SourceService", "StorageService", "RuleEngineService"),
-		stopFn: func() error { return nil },
+		base:    core.NewBaseService("SourceService", "StorageService", "RuleEngineService"),
+		onStart: func(ctx context.Context) error { return sourceSvc.Start() },
+		stopFn:  func() error { return nil },
 	}); err != nil {
 		return err
 	}
@@ -148,8 +154,9 @@ func (h *ServiceHub) RegisterBusinessServices() error {
 	searchSvc := NewContentSearchService(h.storageSvc, h.eventBus)
 	h.searchSvc = searchSvc
 	if err := h.registerNamed("ContentSearchService", &bizSvc{
-		base:   core.NewBaseService("ContentSearchService", "StorageService"),
-		stopFn: func() error { return nil },
+		base:    core.NewBaseService("ContentSearchService", "StorageService"),
+		onStart: func(ctx context.Context) error { return searchSvc.Start() },
+		stopFn:  func() error { return nil },
 	}); err != nil {
 		return err
 	}
@@ -185,21 +192,23 @@ func (h *ServiceHub) RegisterBusinessServices() error {
 	}
 
 	// ReplaceService
-	replaceSvc := NewReplaceService(h.storageSvc, h.eventBus)
+	replaceSvc := NewReplaceService(h.storageSvc, h.settingsSvc, h.eventBus)
 	h.replaceSvc = replaceSvc
 	if err := h.registerNamed("ReplaceService", &bizSvc{
-		base:   core.NewBaseService("ReplaceService", "StorageService"),
-		stopFn: func() error { return nil },
+		base:    core.NewBaseService("ReplaceService", "StorageService"),
+		onStart: func(ctx context.Context) error { return replaceSvc.Start() },
+		stopFn:  func() error { return nil },
 	}); err != nil {
 		return err
 	}
 
-	// FontService
-	fontSvc := NewFontService(h.storageSvc, h.eventBus, filepath.Join(h.storageSvc.DataDir(), "user-fonts"))
+	// FontService（用户字体落点 = 数据目录 fonts/，对齐 Python app_paths）
+	fontSvc := NewFontService(h.storageSvc, h.settingsSvc, filepath.Join(h.storageSvc.DataDir(), "fonts"))
 	h.fontSvc = fontSvc
 	if err := h.registerNamed("FontService", &bizSvc{
-		base:   core.NewBaseService("FontService", "StorageService"),
-		stopFn: func() error { return nil },
+		base:    core.NewBaseService("FontService", "StorageService"),
+		onStart: func(ctx context.Context) error { return fontSvc.Start() },
+		stopFn:  func() error { return nil },
 	}); err != nil {
 		return err
 	}

@@ -124,8 +124,7 @@ func (s *ReadingService) readerSessionError(sourceURL, bookURL string) error {
 
 // TocByURL 目录行（对齐 Python chapter_rows）：会话不是这本书就报错而不是回空
 // 目录（回空目录看起来像书坏了）。refresh=true 忽略缓存重取并顶掉会话里那一份
-// ——Go 侧会话就是目录的唯一存放处（没有磁盘目录缓存），不顶掉的话刷新之后
-// 章号锚定与正文取章还指着旧表。
+// ——刷新时磁盘目录也跳过（force_refresh 语义），成功取回后照常写回磁盘。
 func (s *ReadingService) TocByURL(sourceURL, bookURL string, refresh bool) ([]*models.Chapter, error) {
 	if !s.sessionMatches(sourceURL, bookURL) {
 		return nil, s.readerSessionError(sourceURL, bookURL)
@@ -145,7 +144,7 @@ func (s *ReadingService) TocByURL(sourceURL, bookURL string, refresh bool) ([]*m
 	if source == nil {
 		return nil, fmt.Errorf("书源不存在：%s", sourceURL)
 	}
-	chapters, err := s.loadChapters(source, sess.Book)
+	chapters, err := s.loadChapters(source, sess.Book, refresh)
 	if err != nil {
 		return nil, err
 	}
@@ -157,11 +156,54 @@ func (s *ReadingService) TocByURL(sourceURL, bookURL string, refresh bool) ([]*m
 	return chapters, nil
 }
 
-// loadChapters 载目录：测试注入的 chapterLoader 优先，缺省走规则引擎。
-func (s *ReadingService) loadChapters(source *models.BookSource, book *models.BookItem) ([]*models.Chapter, error) {
-	if s.chapterLoader != nil {
-		return s.chapterLoader(source, book)
+// readerCache 当前存储的读者磁盘缓存（没有存储就是 nil——测试替身场景）。
+// 根目录取 StorageService.CacheDir()，reader-cache 那层由 NewReadingCache 补。
+func (s *ReadingService) readerCache() *ReadingCache {
+	storage := s.hub.StorageService()
+	if storage == nil {
+		return nil
 	}
+	return NewReadingCache(storage.CacheDir())
+}
+
+// loadChapters 载目录（对齐 Python load_chapters）：磁盘缓存优先（refresh 跳过
+// 读、成功仍写回）> 测试注入的 chapterLoader > 规则引擎。缓存与新取的目录是
+// 同一张盘上的同一份形状——flet 时代落的目录 Dart 侧这就直接能看了。
+func (s *ReadingService) loadChapters(source *models.BookSource, book *models.BookItem, refresh bool) ([]*models.Chapter, error) {
+	if book == nil || book.URL == "" {
+		return nil, fmt.Errorf("missing book url")
+	}
+	cache := s.readerCache()
+	sourceURL := ""
+	if source != nil {
+		sourceURL = source.BookSourceURL
+	}
+	if cache != nil && !refresh {
+		if chapters, ok := cache.LoadCatalog(sourceURL, book.URL); ok && len(chapters) > 0 {
+			return chapters, nil
+		}
+	}
+	var chapters []*models.Chapter
+	var err error
+	if s.chapterLoader != nil {
+		chapters, err = s.chapterLoader(source, book)
+	} else {
+		chapters, err = s.fetchChaptersFromEngine(source, book)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if cache != nil && len(chapters) > 0 {
+		cache.SaveCatalog(sourceURL, book.URL, chapters)
+	}
+	return chapters, nil
+}
+
+// fetchChaptersFromEngine 走规则引擎取目录（对齐 Python chapters 的详情面）：
+// 书没带 toc_url 就先取详情页信息——GetBookInfo 在 tocUrl 缺失时回落详情页
+// url，之后把 (tocURL, bookURL) 交给目录管线（空目录回详情页一次、还空报错
+// 都在管线里）。
+func (s *ReadingService) fetchChaptersFromEngine(source *models.BookSource, book *models.BookItem) ([]*models.Chapter, error) {
 	if s.hub.RuleEngine() == nil {
 		return nil, fmt.Errorf("rule engine unavailable")
 	}
@@ -175,7 +217,7 @@ func (s *ReadingService) loadChapters(source *models.BookSource, book *models.Bo
 		}
 		tocURL = info.TocURL
 	}
-	return s.hub.RuleEngine().GetChapters(ctx, source, tocURL)
+	return s.hub.RuleEngine().FetchChapterList(ctx, source, tocURL, book.URL)
 }
 
 // OpenByURL 开会话的 JSON 面（对齐 Python open_by_url）：载目录、恢复进度、
@@ -202,7 +244,7 @@ func (s *ReadingService) OpenByURL(sourceURL string, book *models.BookItem,
 		return nil, fmt.Errorf("书源不存在：%s", sourceURL)
 	}
 
-	chapters, err := s.loadChapters(source, book)
+	chapters, err := s.loadChapters(source, book, false)
 	if err != nil {
 		return nil, err
 	}
@@ -424,6 +466,22 @@ func (s *ReadingService) cachedDocument(chapterURL string) *models.ChapterConten
 	return s.cache[chapterURL]
 }
 
+// loadDiskContent 正文取不到内存副本时看盘：flet 时代预渲染落的 reader-cache
+// 里就躺着这些章（Python 落盘布局，键公式一致）。命中回填内存缓存，上层按
+// 既有路径出 blocks；miss 回 nil 让调用方走联网。
+func (s *ReadingService) loadDiskContent(sourceURL, bookURL, chapterURL string) *models.ChapterContent {
+	cache := s.readerCache()
+	if cache == nil || bookURL == "" || chapterURL == "" {
+		return nil
+	}
+	content, ok := cache.LoadContent(sourceURL, bookURL, chapterURL)
+	if !ok {
+		return nil
+	}
+	s.CacheChapterDocument(chapterURL, content)
+	return content
+}
+
 // contentTexts 一章的可显示文本块（Go 侧正文是一段文本 + 可选副内容；
 // 与 Python display_blocks 的文本块口径一致）。
 func contentTexts(content *models.ChapterContent) []string {
@@ -556,6 +614,9 @@ func (s *ReadingService) ChapterDocument(sourceURL, bookURL, chapterURL string) 
 
 	content := s.cachedDocument(chapterURL)
 	if content == nil {
+		content = s.loadDiskContent(sourceURL, bookURL, chapterURL)
+	}
+	if content == nil {
 		var source *models.BookSource
 		if srcSvc := s.hub.SourceService(); srcSvc != nil {
 			source, _ = srcSvc.Get(sourceURL)
@@ -620,6 +681,9 @@ func (s *ReadingService) prefetchAfter(sess *ReadingSession, chapter *models.Cha
 			}
 			if s.cachedDocument(target.URL) != nil {
 				continue
+			}
+			if s.loadDiskContent(sess.SourceURL, sess.BookURL, target.URL) != nil {
+				continue // 盘上有就不再联网（预取的目标本来就是"以后读着快"）
 			}
 			var source *models.BookSource
 			if srcSvc := s.hub.SourceService(); srcSvc != nil {

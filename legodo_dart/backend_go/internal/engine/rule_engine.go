@@ -282,7 +282,16 @@ func (re *RuleEngine) formatIntro(value string) string {
 	return ruleparser.StripHTML(text)
 }
 
-// GetBookInfo 获取书籍详情（对齐 Legado WebBook.getBookInfo）
+// GetBookInfo 获取书籍详情（对齐 Python _apply_book_info 的详情面）。
+//
+// 三处与旧版不同、都是真源实测出来的：
+//   - init 只有 JS 前缀（`@js:`/`<js>`）才当脚本跑；`'data'` 这类是选择器/JSON
+//     路径，旧版直接 evaluate 会在 "data is not defined" 上硬报错（少年梦源实锤）。
+//   - 字段规则是 JS 的走 fieldRaw 执行（lvsexs 的 tocUrl =
+//     `@js:baseUrl.replace(/\/xs\/(\d+)\.html/, '/shu/$1/')`：详情页 /xs/ 上
+//     根本没目录，目录在改写出的 /shu/ 页上），旧版把 `@js:` 当选择器抽空。
+//   - tocUrl 没规则或抽不到时**回落详情页 url**（对齐 `book.toc_url = value or
+//     base_url`）：qbmfxs/po5 两个真源没有 tocUrl 规则，目录就挂在详情页上。
 func (re *RuleEngine) GetBookInfo(ctx context.Context, source *models.BookSource, bookURL string) (*models.BookItem, error) {
 	rule := source.GetBookInfoRule()
 
@@ -294,23 +303,34 @@ func (re *RuleEngine) GetBookInfo(ctx context.Context, source *models.BookSource
 
 	html := resp.BodyString()
 
-	// 执行初始化 JS（如果有）
-	if rule.Init != nil {
-		_, err := re.jsRuntime.Execute(*rule.Init, &jsruntime.Context{
-			BaseURL: bookURL,
-			Source: map[string]interface{}{
-				"bookSourceUrl": source.BookSourceURL,
-			},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("执行 init JS 失败: %w", err)
-		}
-	}
-
 	// 解析 HTML
 	doc, err := ruleparser.ParseHTML(html)
 	if err != nil {
 		return nil, err
+	}
+
+	// 详情根：init 是 JS 前缀 → 执行脚本；否则按选择器收窄（收不到就用整页）。
+	// 文档级与节点级 Field 同形，收窄与否下面同一串规则照跑。
+	var root interface{ Field(rule, defAttr string) string } = doc
+	if rule.Init != nil {
+		init := strings.TrimSpace(*rule.Init)
+		switch {
+		case init == "" || strings.HasPrefix(init, "@put:"):
+			// @put: 是写变量，不是正文前处理；本轮不落变量注册表，跳过。
+		case isJSRule(init):
+			if _, err := re.jsRuntime.Execute(stripJSRule(init), &jsruntime.Context{
+				BaseURL: bookURL,
+				Source: map[string]interface{}{
+					"bookSourceUrl": source.BookSourceURL,
+				},
+			}); err != nil {
+				return nil, fmt.Errorf("执行 init JS 失败: %w", err)
+			}
+		default:
+			if narrowed := doc.Select(init); len(narrowed) > 0 {
+				root = narrowed[0]
+			}
+		}
 	}
 
 	book := &models.BookItem{
@@ -320,82 +340,269 @@ func (re *RuleEngine) GetBookInfo(ctx context.Context, source *models.BookSource
 
 	// 提取书名
 	if rule.Name != nil {
-		book.Name = doc.Field(*rule.Name, "text")
+		book.Name = re.fieldRaw(root, *rule.Name, "text", bookURL)
 	}
 
 	// 提取作者
 	if rule.Author != nil {
-		book.Author = re.formatAuthor(doc.Field(*rule.Author, "text"))
+		book.Author = re.formatAuthor(re.fieldRaw(root, *rule.Author, "text", bookURL))
 	}
 
 	// 提取简介
 	if rule.Intro != nil {
-		book.Intro = re.formatIntro(doc.Field(*rule.Intro, "html"))
+		book.Intro = re.formatIntro(re.fieldRaw(root, *rule.Intro, "html", bookURL))
 	}
 
 	// 提取封面
 	if rule.CoverURL != nil {
-		book.CoverURL = resolvePageURL(bookURL, doc.Field(*rule.CoverURL, "src"))
+		book.CoverURL = resolvePageURL(bookURL, re.fieldRaw(root, *rule.CoverURL, "src", bookURL))
 	}
 
-	// 提取目录 URL
+	// 提取目录 URL；缺失/为空回落详情页（目录多数就在详情页上）
 	if rule.TocURL != nil {
-		book.TocURL = resolvePageURL(bookURL, doc.Field(*rule.TocURL, "href"))
+		book.TocURL = resolvePageURL(bookURL, re.fieldRaw(root, *rule.TocURL, "href", bookURL))
+	}
+	if book.TocURL == "" {
+		book.TocURL = bookURL
 	}
 
 	return book, nil
 }
 
-// GetChapters 获取章节列表（对齐 Legado WebBook.getChapterList）
+// isJSRule 规则文本是不是 JS（Legado 的 @js: / <js> 两种标记；只有这两种
+// 才该送进 JS 运行时——选择器被当脚本 evaluate 就会炸在"未定义"上）。
+func isJSRule(rule string) bool {
+	rule = strings.TrimSpace(rule)
+	return strings.HasPrefix(rule, "@js:") || strings.HasPrefix(rule, "<js>")
+}
+
+// stripJSRule 剥掉 JS 标记留下脚本体。
+func stripJSRule(rule string) string {
+	rule = strings.TrimSpace(rule)
+	if strings.HasPrefix(rule, "@js:") {
+		return rule[len("@js:"):]
+	}
+	if strings.HasPrefix(rule, "<js>") {
+		body := rule[len("<js>"):]
+		if idx := strings.Index(body, "</js>"); idx >= 0 {
+			return body[:idx]
+		}
+		return body
+	}
+	return rule
+}
+
+// fieldRaw 字段规则的统一取值口：`@js:`/`<js>` 规则送 JS 运行时执行（对齐 Python
+// evaluate 的 js 分支——裸 baseUrl 由 injectGlobals 注入为当页地址），其余照走
+// 选择器。JS 出错回空：详情字段是"抽不到就回落"的语义（tocUrl 空了回落详情页），
+// 一条坏规则不该让整本书 0 章。
+func (re *RuleEngine) fieldRaw(root interface{ Field(rule, defAttr string) string }, rule, defAttr, baseURL string) string {
+	if !isJSRule(rule) {
+		return root.Field(rule, defAttr)
+	}
+	value, err := re.jsRuntime.Execute(stripJSRule(rule), &jsruntime.Context{BaseURL: baseURL})
+	if err != nil || value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprintf("%v", value))
+}
+
+// legadoWordCountRE Legado AppPattern.wordCountRegex 的逐字移植：
+// 从 updateTime 尾巴里抽 "3240 字" 这类字数（对齐 Python _LEGADO_WORD_COUNT_RE）。
+var legadoWordCountRE = regexp.MustCompile(`(?:^|字数[：:、]?|\s+)([0-9万千百\.]{1,6}字)`)
+
+// legadoTruthy Legado 布尔规则的真值：只有显式 false 字样为假（对齐 _legado_truthy）。
+func legadoTruthy(value string) bool {
+	text := strings.TrimSpace(value)
+	if text == "" || strings.EqualFold(text, "null") {
+		return false
+	}
+	switch strings.ToLower(text) {
+	case "false", "no", "not", "0":
+		return false
+	}
+	return true
+}
+
+// tocRuleTruthy 目录项上的真值字段（isVolume/isVip/isPay）。
+func tocRuleTruthy(node *ruleparser.Node, rule *string) bool {
+	if rule == nil || strings.TrimSpace(*rule) == "" {
+		return false
+	}
+	return legadoTruthy(node.Field(*rule, "text"))
+}
+
+// stripURLOptions 去掉 Legado 地址尾巴上的 `,{请求选项}`，留下地址本身——
+// "这一页来过了没"按它认（对齐 Python _media_request 的 [0] 那半）。
+func stripURLOptions(value string) string {
+	value = strings.TrimSpace(value)
+	if idx := strings.LastIndex(value, ",{"); idx > 0 {
+		return strings.TrimSpace(value[:idx])
+	}
+	return value
+}
+
+// GetChapters 目录页取章（check 线入口：目录 URL 与书 URL 同键时等价于全流程）。
 func (re *RuleEngine) GetChapters(ctx context.Context, source *models.BookSource, tocURL string) ([]*models.Chapter, error) {
+	return re.FetchChapterList(ctx, source, tocURL, tocURL)
+}
+
+// FetchChapterList 目录全流程（对齐 Python reading_engine.chapters 的目录段）：
+// 单页起步、nextTocUrl 逐页发现；一章没取到且详情页还没来过就回详情页一次；
+// 还是空就报 "chapter list is empty"。空名丢弃、javascript:/void( 地址置空、
+// 卷标题补合成 url（名+页内序）、按 url 去重（保源顺序里的最后一条）、统一编 index。
+func (re *RuleEngine) FetchChapterList(ctx context.Context, source *models.BookSource, tocURL, bookURL string) ([]*models.Chapter, error) {
 	rule := source.GetTocRule()
 	if rule.ChapterList == nil {
 		return nil, fmt.Errorf("书源 %s 缺少目录规则", source.BookSourceURL)
 	}
-
-	// 发起请求
-	resp, err := re.httpClient.Get(ctx, tocURL, nil)
-	if err != nil {
-		return nil, err
+	listRule := strings.TrimSpace(*rule.ChapterList)
+	reverseRule := strings.HasPrefix(listRule, "-")
+	if strings.HasPrefix(listRule, "-") || strings.HasPrefix(listRule, "+") {
+		listRule = strings.TrimSpace(listRule[1:])
+	}
+	if listRule == "" {
+		return nil, fmt.Errorf("书源 %s 缺少目录规则", source.BookSourceURL)
+	}
+	if tocURL == "" {
+		tocURL = bookURL
 	}
 
-	html := resp.BodyString()
-
-	// 解析 HTML
-	doc, err := ruleparser.ParseHTML(html)
-	if err != nil {
-		return nil, err
+	type tocPage struct {
+		url      string
+		discover bool // 是否跟这一页的 nextTocUrl（只有"一页一页翻"的那条链上才翻）
 	}
-
-	// 提取章节列表
-	nodes := doc.Select(*rule.ChapterList)
+	queue := []tocPage{{url: tocURL, discover: true}}
+	visited := make(map[string]bool)
 	var chapters []*models.Chapter
-	for i, node := range nodes {
-		chapter := &models.Chapter{
-			BookURL: tocURL,
-			Index:   i,
+
+	for len(queue) > 0 {
+		page := queue[0]
+		queue = queue[1:]
+		pageKey := stripURLOptions(page.url)
+		if pageKey == "" || visited[pageKey] {
+			continue
+		}
+		visited[pageKey] = true
+
+		resp, err := re.httpClient.Get(ctx, page.url, nil)
+		if err != nil {
+			return nil, err
+		}
+		doc, err := ruleparser.ParseHTML(resp.BodyString())
+		if err != nil {
+			return nil, err
 		}
 
-		// 章节名
-		if rule.ChapterName != nil {
-			chapter.Title = strings.TrimSpace(node.Field(*rule.ChapterName, "text"))
+		nodes := doc.Select(listRule)
+		for pageIndex, node := range nodes {
+			chapter := &models.Chapter{BookURL: bookURL}
+			if rule.ChapterName != nil {
+				chapter.Title = strings.TrimSpace(node.Field(*rule.ChapterName, "text"))
+			}
+			if rule.ChapterURL != nil {
+				raw := strings.TrimSpace(node.Field(*rule.ChapterURL, "href"))
+				if raw != "" {
+					raw = resolvePageURL(page.url, raw)
+					lowered := strings.ToLower(raw)
+					if strings.HasPrefix(lowered, "javascript:") ||
+						strings.HasPrefix(lowered, "void(") {
+						raw = ""
+					}
+				}
+				chapter.URL = raw
+			}
+			chapter.IsVolume = tocRuleTruthy(node, rule.IsVolume)
+			chapter.IsVip = tocRuleTruthy(node, rule.IsVip)
+			chapter.IsPay = tocRuleTruthy(node, rule.IsPay)
+			if rule.UpdateTime != nil && strings.TrimSpace(*rule.UpdateTime) != "" {
+				updateTime := strings.TrimSpace(node.Field(*rule.UpdateTime, "text"))
+				chapter.Tag = updateTime
+				// 字数拆分：updateTime 尾巴上的 "3240 字" 进 wordCount，剩余进 tag
+				// （卷标题不拆，对齐 Python chapters 的 tocCountWords 段）。
+				if chapter.IsVolume == false && updateTime != "" {
+					if match := legadoWordCountRE.FindStringSubmatch(updateTime); match != nil {
+						chapter.WordCountText = strings.TrimSpace(match[1])
+						chapter.Tag = strings.TrimSpace(strings.Replace(updateTime, match[0], "", 1))
+					}
+				}
+			}
+			if chapter.Title == "" {
+				continue
+			}
+			if chapter.URL == "" {
+				if chapter.IsVolume {
+					chapter.URL = chapter.Title + strconv.Itoa(pageIndex)
+				} else {
+					chapter.URL = page.url
+				}
+			}
+			chapters = append(chapters, chapter)
 		}
 
-		// 章节 URL
-		if rule.ChapterURL != nil {
-			chapter.URL = resolvePageURL(tocURL, node.Field(*rule.ChapterURL, "href"))
+		if page.discover && rule.NextTocURL != nil && strings.TrimSpace(*rule.NextTocURL) != "" {
+			nextURL := strings.TrimSpace(doc.Field(*rule.NextTocURL, "href"))
+			lowered := strings.ToLower(nextURL)
+			if nextURL != "" && !strings.HasPrefix(lowered, "javascript:") &&
+				!strings.HasPrefix(lowered, "void(") {
+				// 对齐 Legado getStringList(isUrl=true)：任何无 scheme 的下一跳都按
+				// **当页地址**拼成绝对地址（NetworkUtils.getAbsoluteURL 走 URL(base,
+				// rel)，裸 "2.html" 也算相对）。不回拼的话 http 层拿到裸相对串直接
+				// 报 unsupported protocol scheme，翻页链在第一跳就断。
+				nextURL = resolvePageURL(page.url, nextURL)
+				key := stripURLOptions(nextURL)
+				pending := false
+				for _, queued := range queue {
+					if stripURLOptions(queued.url) == key {
+						pending = true
+						break
+					}
+				}
+				if key != "" && !visited[key] && !pending {
+					queue = append(queue, tocPage{url: nextURL, discover: true})
+				}
+			}
 		}
 
-		// VIP 标识
-		if rule.IsVip != nil {
-			selector, _ := ruleparser.SplitFieldRule(*rule.IsVip)
-			chapter.IsVip = len(node.Select(selector)) > 0
+		// 目录页全空且没有下一页了：旧源把 tocUrl 指错到"第一章"上时，规则目录
+		// 其实是详情页——回详情页一次（对齐 Python 的 fallback 分支；详情页
+		// 已经来过就不重复）。
+		if len(chapters) == 0 && len(queue) == 0 {
+			if fallbackKey := stripURLOptions(bookURL); fallbackKey != "" && !visited[fallbackKey] {
+				queue = append(queue, tocPage{url: bookURL, discover: true})
+			}
 		}
-
-		chapters = append(chapters, chapter)
 	}
 
-	return chapters, nil
+	if len(chapters) == 0 {
+		return nil, fmt.Errorf("TocEmptyError: chapter list is empty")
+	}
+
+	// 顺序与去重（对齐 Python chapters 尾段）：非 "-" 规则先整体反转、按 url
+	// 去重（保源顺序里的最后一条）、再转回源顺序编 index——净效果就是源顺序。
+	if !reverseRule {
+		reverseChapters(chapters)
+	}
+	seen := make(map[string]bool, len(chapters))
+	unique := make([]*models.Chapter, 0, len(chapters))
+	for _, chapter := range chapters {
+		if seen[chapter.URL] {
+			continue
+		}
+		seen[chapter.URL] = true
+		unique = append(unique, chapter)
+	}
+	reverseChapters(unique)
+	for index, chapter := range unique {
+		chapter.Index = index
+	}
+	return unique, nil
+}
+
+func reverseChapters(items []*models.Chapter) {
+	for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
+		items[i], items[j] = items[j], items[i]
+	}
 }
 
 // BrowseBooks 浏览发现书籍（对齐 Legado Explore）

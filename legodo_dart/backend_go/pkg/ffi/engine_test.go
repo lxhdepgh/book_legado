@@ -60,6 +60,19 @@ func TestChapterRowShape(t *testing.T) {
 	if wordCount, ok := row["wordCount"].(string); !ok || wordCount != "4321" {
 		t.Errorf("wordCount 应是字符串 \"4321\"：%T %v", row["wordCount"], row["wordCount"])
 	}
+
+	// 真语料形状（缓存目录行 / Legado 规则）：卷、字数原文优先——"3240字"这类
+	// 原文是 Legado 语料里的显示口径，结构化字数只是没有原文时的回读。
+	live := chapterRow(&models.Chapter{
+		Title: "第二卷", URL: "https://src.test/g3/vol2", IsVolume: true,
+		Tag: "更新时间：2024-01-02", WordCountText: "3240字", WordCount: 3240,
+	})
+	if live["isVolume"] != true || live["tag"] != "更新时间：2024-01-02" {
+		t.Errorf("isVolume/tag 应原样上送：%v / %v", live["isVolume"], live["tag"])
+	}
+	if live["wordCount"] != "3240字" {
+		t.Errorf("有字数原文时应优先用原文，得到 %v", live["wordCount"])
+	}
 }
 
 // shelve/resume/save_progress 的缺省都是 true：gb 会把"没传"读成 false，

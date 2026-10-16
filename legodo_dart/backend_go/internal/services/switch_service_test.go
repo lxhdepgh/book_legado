@@ -699,9 +699,9 @@ func TestSwitchScanEndToEndViaRuleEngine(t *testing.T) {
 			SearchURL:      testStrPtr(server.URL + "/search?src=" + id + "&key={{key}}&page={{page}}"),
 			RuleSearch: &models.SearchRule{
 				BookList: testStrPtr(".book"),
-				Name:     testStrPtr("a.name"),
-				Author:   testStrPtr("span.author"),
-				BookURL:  testStrPtr("a.name"),
+				Name:     testStrPtr("a.name@text"),
+				Author:   testStrPtr("span.author@text"),
+				BookURL:  testStrPtr("a.name@href"),
 			},
 		}
 	}

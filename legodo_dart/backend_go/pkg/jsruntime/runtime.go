@@ -57,6 +57,17 @@ func (r *Runtime) injectGlobals(vm *goja.Runtime, ctx *Context) {
 		"source":  ctx.Source,
 	})
 
+	// baseUrl 裸全局：Legado 书源脚本直接写 `baseUrl.replace(...)` 这种形状
+	// （lvsexs 的 ruleBookInfo.tocUrl 实况），只有 java.baseUrl 不够。回落顺序
+	// 对齐 Python bootstrap 的 `context.base_url or bookSourceUrl`。
+	baseURL := ctx.BaseURL
+	if baseURL == "" {
+		if src, ok := ctx.Source["bookSourceUrl"].(string); ok {
+			baseURL = src
+		}
+	}
+	vm.Set("baseUrl", baseURL)
+
 	// page
 	vm.Set("page", ctx.Page)
 
@@ -84,6 +95,7 @@ func (r *Runtime) getVM() *goja.Runtime {
 func (r *Runtime) releaseVM(vm *goja.Runtime) {
 	// 清空全局变量，避免污染
 	vm.Set("java", nil)
+	vm.Set("baseUrl", nil)
 	vm.Set("page", nil)
 	vm.Set("result", nil)
 	vm.Set("variables", nil)

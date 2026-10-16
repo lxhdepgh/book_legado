@@ -135,9 +135,9 @@ func fakeFFISource(searchBase string) map[string]interface{} {
 		"searchUrl":      searchBase + "/search?key={{key}}&page={{page}}",
 		"ruleSearch": map[string]interface{}{
 			"bookList": ".book",
-			"name":     "a.name",
-			"author":   "span.author",
-			"bookUrl":  "a.name",
+			"name":     "a.name@text",
+			"author":   "span.author@text",
+			"bookUrl":  "a.name@href",
 		},
 	}
 }

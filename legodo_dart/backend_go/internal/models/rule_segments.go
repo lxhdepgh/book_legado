@@ -1,5 +1,41 @@
 package models
 
+import (
+	"bytes"
+	"encoding/json"
+	"strconv"
+)
+
+// RuleText 宽容解码"规则文本"类字段。canReName 在书源 JSON 里历来有
+// ""/"1"/"true"/布尔/数字 各种形状（Legado 自身是 String?，真库 917 行里
+// 38 行就那么写、被 *bool 整体拒掉——书源列表凭空少一截）。
+// 语义对齐 Python reading_engine `bool(str(v or "").strip())`：空（空串、
+// false、数值零、null）记为空串，其余标量取文本。
+type RuleText string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (r *RuleText) UnmarshalJSON(b []byte) error {
+	t := bytes.TrimSpace(b)
+	switch {
+	case len(t) == 0 || bytes.Equal(t, []byte("null")) || bytes.Equal(t, []byte("false")):
+		*r = ""
+	case t[0] == '"':
+		var s string
+		if err := json.Unmarshal(t, &s); err != nil {
+			return err
+		}
+		*r = RuleText(s)
+	default:
+		if f, err := strconv.ParseFloat(string(t), 64); err == nil && f == 0 {
+			*r = ""
+			return nil
+		}
+		*r = RuleText(string(t))
+	}
+	return nil
+}
+
+
 // BookListRule 书籍列表规则接口（SearchRule/ExploreRule 共用）
 type BookListRule interface {
 	GetBookList() *string
@@ -99,8 +135,8 @@ type BookInfoRule struct {
 	TocURL *string `json:"tocUrl"`
 	// 字数
 	WordCount *string `json:"wordCount"`
-	// 是否可重命名
-	CanReName *bool `json:"canReName,omitempty"`
+	// 是否可重命名（Legado 语义：规则文本，非空 ⇒ 允许；见 RuleText）
+	CanReName RuleText `json:"canReName,omitempty"`
 	// 下载链接
 	DownloadURLs *string `json:"downloadUrls"`
 }

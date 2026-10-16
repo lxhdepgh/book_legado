@@ -6,6 +6,8 @@ package services
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -471,6 +473,71 @@ func TestReaderTocShapeAndRefresh(t *testing.T) {
 	if _, err := rig.reading.TocByURL(readerSourceURL, "https://src.test/g3/book/9.html", false); err == nil ||
 		!strings.Contains(err.Error(), "ReaderSessionError") {
 		t.Fatalf("非会话书应报错，got %v", err)
+	}
+}
+
+// 目录的磁盘缓存（flet 时代落的 reader-cache 布局）：第二次开同一本书不再问
+// 加载器（缓存命中），refresh=true 则跳过读、重取并写回。这条链挂在 loadChapters
+// 的读/写两端，断哪一端 Dart 侧都会重新"目录 0 条"。
+func TestReaderTocDiskCacheAcrossSessions(t *testing.T) {
+	rig := newReaderRig(t, readerChapters(readerBookURL))
+	data := mustOpenReader(t, rig, readerBookURL, true)
+	if data["chapterCount"] != 3 || rig.loaderCalls != 1 {
+		t.Fatalf("首开 count=%v loaderCalls=%d", data["chapterCount"], rig.loaderCalls)
+	}
+	catalogPath := filepath.Join(
+		NewReadingCache(rig.hub.StorageService().CacheDir()).bookDir(readerSourceURL, readerBookURL),
+		"catalog.json")
+	if _, err := os.Stat(catalogPath); err != nil {
+		t.Fatalf("取目录成功后应把目录写回盘上：%v", err)
+	}
+
+	// 关掉会话再开：目录已在盘上，不该再问加载器。
+	rig.reading.CloseByURL(readerSourceURL, readerBookURL, false)
+	data = mustOpenReader(t, rig, readerBookURL, true)
+	if data["chapterCount"] != 3 || rig.loaderCalls != 1 {
+		t.Fatalf("第二次开应从盘上回目录：count=%v loaderCalls=%d（want 3/1）",
+			data["chapterCount"], rig.loaderCalls)
+	}
+
+	// refresh=true：跳过盘读重取，取回后照常写回。
+	refreshed, err := rig.reading.TocByURL(readerSourceURL, readerBookURL, true)
+	if err != nil {
+		t.Fatalf("toc refresh: %v", err)
+	}
+	if len(refreshed) != 3 || rig.loaderCalls != 2 {
+		t.Fatalf("refresh 应跳过盘读重取：n=%d loaderCalls=%d", len(refreshed), rig.loaderCalls)
+	}
+}
+
+// 正文的磁盘缓存：章节只在盘上（内存缓存没有、规则引擎没装）也要能出正文——
+// Dart 版此前在 flet 时代预渲染的正文上重新联网取，源挂了就白屏。
+func TestReaderChapterDocumentServesDiskContent(t *testing.T) {
+	rig := newReaderRig(t, readerChapters(readerBookURL))
+	mustOpenReader(t, rig, readerBookURL, true)
+	ch2 := readerSourceURL + "/ch/2.html"
+
+	cache := NewReadingCache(rig.hub.StorageService().CacheDir())
+	contentPath := filepath.Join(cache.bookDir(readerSourceURL, readerBookURL), "content",
+		cacheDigest(ch2)+".json")
+	if err := os.MkdirAll(filepath.Dir(contentPath), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(contentPath, []byte(`{"version": 1, "saved_at": 1,
+	  "title": "盘上标题", "image_style": "", "raw_content": "",
+	  "blocks": [{"kind": "text", "value": "盘上正文甲\n盘上正文乙", "bytes": false}]}`), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	doc, err := rig.reading.ChapterDocument(readerSourceURL, readerBookURL, ch2)
+	if err != nil {
+		t.Fatalf("盘上正文应能出：%v", err)
+	}
+	if doc["title"] != "盘上标题" || doc["paragraphCount"] != 2 {
+		t.Errorf("盘上正文没接上：title=%v paragraphs=%v", doc["title"], doc["paragraphCount"])
+	}
+	if doc["chapterName"] != "第2章 测试章" {
+		t.Errorf("章名应仍来自目录：%v", doc["chapterName"])
 	}
 }
 

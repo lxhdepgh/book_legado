@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -172,6 +173,29 @@ func gbDefault(p map[string]interface{}, k string, def bool) bool {
 		return v
 	}
 	return def
+}
+
+// gid reads an integer id from params. Dart 侧的 rule_id/font_id 是
+// .toString() 发来的字符串（json.Number 是将来换 UseNumber 的兜底），
+// 数字键则解成 float64——三种都要收，否则删除/更新会永远匹配不到行。
+func gid(p map[string]interface{}, k string) (int64, bool) {
+	switch v := p[k].(type) {
+	case float64:
+		return int64(v), true
+	case string:
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	}
+	return 0, false
 }
 
 func stringSlice(raw interface{}) []string {
@@ -413,25 +437,25 @@ func route(h *services.ServiceHub, action string, p map[string]interface{}) Resu
 
 	// --- font ---
 	case "font_scan_system", "font.scan_system":
-		return okResult([]interface{}{}, "")
+		return doFontScanSystem(h)
 	case "font_add_user", "font.add_user":
-		return okResult(true, "")
+		return doFontAddUser(h, p)
 	case "font_remove", "font.remove":
-		return okResult(true, "")
+		return doFontRemove(h, p)
 	case "font_select", "font.select":
-		return okResult(true, "")
+		return doFontSelect(h, p)
 
 	// --- replace ---
 	case "replace_list", "replace.list":
 		return doReplaceList(h)
 	case "replace_add", "replace.add":
-		return okResult(true, "")
+		return doReplaceAdd(h, p)
 	case "replace_update", "replace.update":
-		return okResult(true, "")
+		return doReplaceUpdate(h, p)
 	case "replace_delete", "replace.delete":
-		return okResult(true, "")
+		return doReplaceDelete(h, p)
 	case "replace_toggle_global", "replace.toggle_global":
-		return okResult(true, "")
+		return doReplaceToggleGlobal(h, p)
 
 	// --- export ---
 	case "export_epub", "export.epub":
@@ -937,22 +961,143 @@ func doSettingsWrite(h *services.ServiceHub, p map[string]interface{}) ResultEnv
 // ---------------------------------------------------------------------------
 
 func doReplaceList(h *services.ServiceHub) ResultEnvelope {
-	if svc := h.ReplaceService(); svc != nil {
-		rules := svc.List()
-		data := make([]interface{}, len(rules))
-		for i, r := range rules {
-			data[i] = map[string]interface{}{
-				"id":          r.ID,
-				"name":        r.Name,
-				"pattern":     r.Pattern,
-				"replacement": r.Replacement,
-				"enable":      r.Enabled,
-				"global":      r.Global,
-			}
-		}
-		return okResult(data, "")
+	svc := h.ReplaceService()
+	if svc == nil {
+		return failResult("replace service unavailable", "")
 	}
-	return failResult("replace service unavailable", "")
+	rules := svc.List()
+	data := make([]interface{}, len(rules))
+	for i, r := range rules {
+		// 键对齐 Python replace_rule_service.list_rules 的行形状
+		// （Dart 读 id/name/pattern/replacement/enabled，另三个键备用）。
+		data[i] = map[string]interface{}{
+			"id":          r.ID,
+			"name":        r.Name,
+			"pattern":     r.Pattern,
+			"replacement": r.Replacement,
+			"scope":       r.Scope,
+			"is_regex":    r.IsRegex,
+			"enabled":     r.Enabled,
+		}
+	}
+	return okResult(data, "")
+}
+
+func doReplaceAdd(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.ReplaceService()
+	if svc == nil {
+		return failResult("replace service unavailable", "")
+	}
+	id, err := svc.AddRule(gs(p, "name"), gs(p, "pattern"), gs(p, "replacement"),
+		gbDefault(p, "enabled", true))
+	if err != nil {
+		return failResult(err.Error(), "")
+	}
+	return okResult(id, "")
+}
+
+func doReplaceUpdate(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.ReplaceService()
+	if svc == nil {
+		return failResult("replace service unavailable", "")
+	}
+	id, ok := gid(p, "rule_id")
+	if !ok {
+		return failResult("rule_id required", "")
+	}
+	// Dart 只发 name/pattern/replacement/enabled（管理页没有 scope/is_regex 编辑）；
+	// scope/is_regex 保持行上原值，与 Dart 契约一致。
+	if err := svc.UpdateRule(id, gs(p, "name"), gs(p, "pattern"),
+		gs(p, "replacement"), gbDefault(p, "enabled", true)); err != nil {
+		return failResult(err.Error(), "")
+	}
+	return okResult(true, "")
+}
+
+func doReplaceDelete(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.ReplaceService()
+	if svc == nil {
+		return failResult("replace service unavailable", "")
+	}
+	id, ok := gid(p, "rule_id")
+	if !ok {
+		return failResult("rule_id required", "")
+	}
+	if err := svc.DeleteRule(id); err != nil {
+		return failResult(err.Error(), "")
+	}
+	return okResult(true, "")
+}
+
+func doReplaceToggleGlobal(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.ReplaceService()
+	if svc == nil {
+		return failResult("replace service unavailable", "")
+	}
+	enabled := gbDefault(p, "enabled", true)
+	if err := svc.SetGlobalEnabled(enabled); err != nil {
+		return failResult(err.Error(), "")
+	}
+	return okResult(enabled, "")
+}
+
+// ---------------------------------------------------------------------------
+// Font handlers
+// ---------------------------------------------------------------------------
+
+func doFontScanSystem(h *services.ServiceHub) ResultEnvelope {
+	svc := h.FontService()
+	if svc == nil {
+		return failResult("font service unavailable", "")
+	}
+	fonts, err := svc.ScanSystem()
+	if err != nil {
+		return failResult(err.Error(), "")
+	}
+	return okResult(fonts, "")
+}
+
+func doFontAddUser(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.FontService()
+	if svc == nil {
+		return failResult("font service unavailable", "")
+	}
+	path := gs(p, "file_path")
+	if path == "" {
+		return failResult("file_path required", "")
+	}
+	id, err := svc.AddUserFont(path)
+	if err != nil {
+		return failResult(err.Error(), "")
+	}
+	return okResult(id, "")
+}
+
+func doFontRemove(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.FontService()
+	if svc == nil {
+		return failResult("font service unavailable", "")
+	}
+	id, ok := gid(p, "font_id")
+	if !ok {
+		return failResult("font_id required", "")
+	}
+	removed, err := svc.RemoveUserFont(id)
+	if err != nil {
+		return failResult(err.Error(), "")
+	}
+	return okResult(removed, "")
+}
+
+func doFontSelect(h *services.ServiceHub, p map[string]interface{}) ResultEnvelope {
+	svc := h.FontService()
+	if svc == nil {
+		return failResult("font service unavailable", "")
+	}
+	if err := svc.SelectActive(gs(p, "family")); err != nil {
+		return failResult(err.Error(), "")
+	}
+	return okResult(true, "")
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,12 +1205,24 @@ func chapterRow(ch *internalmodels.Chapter) map[string]interface{} {
 		"name":      ch.Title,
 		"url":       ch.URL,
 		"index":     ch.Index,
-		"isVolume":  false,
+		"isVolume":  ch.IsVolume,
 		"isVip":     ch.IsVip,
 		"isPay":     ch.IsPay,
-		"tag":       "",
-		"wordCount": fmt.Sprintf("%d", ch.WordCount),
+		"tag":       ch.Tag,
+		"wordCount": chapterWordCount(ch),
 	}
+}
+
+// chapterWordCount 给 Dart 侧的显示串：规则/缓存里的原文（"3240字"）优先，
+// 没有原文才回读到结构化字数拼串，都没有就是空串（Dart 侧空串不显示）。
+func chapterWordCount(ch *internalmodels.Chapter) string {
+	if ch.WordCountText != "" {
+		return ch.WordCountText
+	}
+	if ch.WordCount != 0 {
+		return fmt.Sprintf("%d", ch.WordCount)
+	}
+	return ""
 }
 
 func bookToMapFull(b *internalmodels.BookItem) map[string]interface{} {
