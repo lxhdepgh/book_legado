@@ -20,8 +20,8 @@ project:
   platform: "windows"
   shell: "powershell"
   timezone: "Asia/Shanghai"
-  description: "Legado 书源连通性/搜索可用性检测与内置阅读器的 Flet 桌面应用"
-  primary_language: "python"
+  description: "Legado 书源连通性/搜索可用性检测与内置阅读器；主线为 Flutter + Go 单进程 FFI（legodo_dart），Flet 版保留作功能参照"
+  primary_language: "dart"           # 引擎为 Go（legodo_dart/backend_go）；Python 仅剩 legodo_flet 参照实现
 
 
 # ============================================================
@@ -32,18 +32,22 @@ knowledge_base:
 
   # ---- 2.1 开发文档：架构、接口、部署等"是什么/怎么用" ----
   docs:
+    index:
+      path: "docs/文档总览.md"
+      required: true                 # 入口：读哪篇、哪篇作废、同题两的说冲突时信谁
     design_doc:
       path: "docs/current-system-design.md"
       required: true                 # 系统设计文档，智能体必读
+      note: "2026-10-20 重写为现架构（Flutter + Go 单进程 FFI）；旧 Flet 进程内版已移入 docs/archive/"
     operations_manual:
-      path: "docs/archive/backend-operations-manual.md"
-      required: false                # 构建与运维手册（桌面端打包等；已于 2026-10-16 归档，仅历史参考）
+      path: "legodo_dart/README_BUILD.md"
+      required: false                # 构建与打包权威；根 BUILD.md 只是路标
     testing_guide:
       path: "docs/local-testing-guide.md"
-      required: false                # 本地测试指南
-    book_source_testing:
-      path: "书源测试方法说明.md"
-      required: false                # 书源两层测试方法的业务说明（已存在）
+      required: false                # 本地测试指南（四道守口 + Windows 仪器坑）
+    gap_ledger:
+      path: "docs/dart补缺方案.md"
+      required: false                # 缺口与待拍板台账（唯一仍在生长的高层文档）
 
   # ---- 2.2 开发约束：编码规范、架构红线、提交规范等"不许做什么" ----
   constraints:
@@ -52,7 +56,7 @@ knowledge_base:
       required: true                 # 代码风格
     architecture_rules:
       path: "docs/architecture-rules.md"
-      required: false                # 架构约束（模块边界、依赖方向等）
+      required: true                 # 架构红线（2026-10-20 重写；旧 G1 版在 docs/archive/，其编号已作废）
     git_workflow:
       path: "docs/git-workflow.md"
       required: false                # 分支/提交规范
@@ -64,7 +68,7 @@ knowledge_base:
   # ---- 2.3 开发日志：每次会话开始前的"续接点" ----
   dev_logs:
     root: "docs/dev-logs/"           # 日志目录（按日期命名，如 2026-09-01.md）
-    current: "docs/dev-logs/2026-10-16.md"  # 指向【最新】日志文件
+    current: "docs/dev-logs/2026-10-20.md"  # 指向【最新】日志文件
     required: true
     note: >
       智能体每次会话开始前必须读取 current 指向的日志，
@@ -85,25 +89,33 @@ knowledge_base:
 # ============================================================
 
 python:
-  enabled: true
+  enabled: true                      # 只对 legodo_flet 参照实现与根 tests/ 生效；主线不是 Python
   environment_manager: "conda"       # conda 安装于 D:\env_manger\minicaoda
   environment_name: "legodo_booksource_check"
   interpreter: "D:\\env_manger\\minicaoda\\envs\\legodo_booksource_check\\python.exe"
   activate: "conda activate legodo_booksource_check"
   version_requirement: ">=3.12"      # 当前环境 3.12.13
   commands:
-    test: "python -m pytest -q"
+    test: "python -m pytest -q --basetemp=.tmp_pt/pytest"   # 默认 basetemp 有 ACL 拒绝，会整批假红
     lint: ""                         # 暂不配置（ruff 未安装）
-    syntax_check: "python -m compileall -q app main.py"
+    syntax_check: "python -m compileall -q legodo_flet/app" # 旧值 `app main.py` 指向已删除的根 app/
 
 frontend:
-  enabled: false                     # 本项目无独立前端（UI 为 Flet，随 Python 构建）
-  directory: "?"
-  package_manager: "?"
+  enabled: true                      # 主线前端 = Flutter（legodo_dart）
+  directory: "legodo_dart"
+  package_manager: "pub"
   commands:
-    install: "?"
-    typecheck: "?"
-    build: "?"
+    install: "flutter pub get"
+    typecheck: "dart analyze"
+    build: "python build_release.py windows"
+
+backend_go:
+  enabled: true                      # 引擎：Go c-shared，经 dart:ffi 同进程直调（无端口、无子进程）
+  directory: "legodo_dart/backend_go"
+  commands:
+    test: "go test ./... -count=1"   # 需 C:\\mingw64\\bin 前置 PATH，否则 exit 2 不吐错误
+    lint: "go vet ./..."
+    build: "go build -buildmode=c-shared -o legodo_engine.dll ./pkg/ffi/"
 
 docker:
   enabled: false                     # 本项目不容器化
@@ -111,10 +123,11 @@ docker:
   validate: "docker compose config --quiet"
 
 database:
-  enabled: false                     # 无独立数据库（本地文件缓存）
-  type: "?"
-  migrations_dir: "scripts/migrations"
-  migrate_command: "?"
+  enabled: true                      # SQLite 主库，落在用户数据目录而非仓库
+  type: "sqlite"
+  path: "%LOCALAPPDATA%\\LegadoBookSourceCheck\\legado.db"   # 覆盖用 LEGADO_BOOKSOURCE_DATA_DIR
+  migrations_dir: ""                 # 建表与 *_v2 重建都在 backend_go/core/storage.go，无独立迁移目录
+  migrate_command: ""
 
 
 # ============================================================
@@ -125,16 +138,20 @@ workflow:
   # 会话开始时（续接上下文）
   on_session_start:
     - 读取 codeConfig.yaml，理解项目结构与约束
+    - 读取 knowledge_base.docs.index（docs/文档总览.md），查清"该读哪篇、哪篇已作废"
     - 读取 knowledge_base.dev_logs.current，续接上次进度
     - 读取 knowledge_base.constraints.*，明确红线
     - 读取 knowledge_base.docs.design_doc，理解架构
     - 检查 git status，保留开发者未提交的改动
 
-  # 改动完成后（验证）
+  # 改动完成后（验证；按改的是哪一侧选门，命令的坑见 docs/local-testing-guide.md）
   on_change_verify:
-    - 按 python.commands.test 运行测试（enabled 时）
-    - 按 frontend.commands.typecheck + build（enabled 且改动前端时）
-    - 按 docker.validate 校验 compose（enabled 且改动部署时）
+    - 改到 Go 引擎：按 backend_go.commands 跑 lint + test（需 MinGW 前置 PATH）
+    - 改到界面或协议面：按 frontend.commands 跑 typecheck + test（flutter test）
+    - 动过 action 清单：go test ./pkg/ffi -run Route 整表重提取，不许手工补条
+    - 改到 legodo_flet 参照实现：按 python.commands.test 跑根 tests/（必带 --basetemp）
+    - 按 backend_go.commands.build / frontend.commands.build 重编产物并同步 dist/（cmp 核逐字节）
+    - 按 docker.validate 校验 compose（enabled 时；本项目当前不容器化）
 
   # 会话结束前（沉淀上下文）
   on_session_end:

@@ -1,1237 +1,159 @@
-# 系统设计文档（current-system-design）
+# 系统设计（当前架构：Flutter + Go 单进程 FFI）
 
-> **本文档描述重构完成后的当前系统设计（M7 完成态），旧单体 UI（`app/app.py` + 平铺
-> `views/`）已删除；平铺 `app/services/*.py` 未删除，它们是分域外壳的共享实现基座。**
+> 状态：2026-10-20 重写，依据是**当场读码**（`legodo_dart/` 与 `legodo_dart/backend_go/`），
+> 每条给 `文件:行`。上一版本文（112 KB，M7 回写版）描述的是**已从工作树删除的根 `app/` Python/Flet
+> 进程内多服务架构**，全文移至 `docs/archive/flet时代设计与验收/系统设计基线-Flet进程内多服务.md`；
+> 它继续作为"为什么长成这样"的过程档案，但**不再是现状的权威来源**。
 >
-> 状态：M7 回写版（2026-09-24），2026-09-27 校正第 8 节的删除范围与下列基线计数。
-> 本次桌面端重构（依据 `docs/桌面端重构设计.md`）已按
-> M1–M7 全部落地：进程内多服务架构、28 个业务服务按域分包、`app/core/` 基础设施、
-> SQLite 主库 + 文件目录 + 互操作 JSON 三类存储、导航容器 `NavigationHost` 与
-> `ServiceDashboard` 上线。**M7 清理线删除的是旧单体 UI**（`app/app.py` + 旧平铺
-> `app/views/*.py` + `app/ui_feedback.py`）**以及被搬进域包的那 13 个旧平铺服务副本**；
-> **其余 14 个旧平铺 `app/services/*.py` 模块全部仍在树内、且仍是"在跑的基座"**——
-> 各域外壳经 import / 继承复用它们（逐条归属见 §8.2），删掉任何一个都会打断生产链
-> （见 `docs/M7清理回归记录.md`）。
->
-> 若本文与代码行为冲突，以代码为准并更新本文；红线以 `docs/architecture-rules.md`
-> （红线 v2）与设计文档 §5.3 为权威。
+> 读法与冲突裁决见 [文档总览.md](file:///D:/WorkSpace/PycharmProjects/legodo_booksource_check/docs/文档总览.md)。
+> 本文与代码冲突时以代码为准并更新本文；红线见 `architecture-rules.md`。
 
-## 1. 项目定位
+---
 
-Legado 书源连通性 / 搜索可用性检测与内置阅读器的桌面应用（Flet），参考实现来自
-Legado Android 版规则体系。
+## 1. 定位与三代沿革
 
-核心链路：导入书源 → 兼容性审计 → 四段检测 → 找书 / 换源 → 内置阅读。项目核心价值是
-与 Legado 规则行为对齐的兼容层（规则解析、JS 运行时、HTTP 语义），而非 UI 本身。
+Legado 书源连通性 / 搜索可用性检测与内置阅读器的桌面应用。核心价值不在 UI，而在
+**与 Legado 原版规则行为对齐的兼容层**（规则解析、JS 运行时、HTTP 语义）。核心链路：
+导入书源 → 兼容性审计 → 四段检测 → 找书 / 换源 → 内置阅读。
 
-M1–M7 重构后，业务组织形态从"旧单体（一个 `AppView` 装配 + 一个 172KB `ReadingView`）"
-升级为**进程内多服务架构**：全部服务跑在主进程内，仿 Legado `service/` 包职责划分，
-统一生命周期 / 启停 / 状态可见，UI 为轻壳 + Controller。
+| 代 | 形态 | 现状 |
+|---|---|---|
+| G1 | 根 `app/`：Flet UI 与 20+ 业务服务同 Python 进程（M1–M7 重构产物） | 根 `app/` 已删；活着的 Python 树只剩 `legodo_flet/app/`（参考实现） |
+| G2 | 双进程：Flutter exe 拉起后端（PyInstaller 的 `LegadoReader.exe`，或独立 Go WS 服务），over HTTP `/rpc` / `ws://…:8080/rpc` | **WS 链已从双侧拆除**；`deployment-guide` 那批"指南"作废并归档 |
+| G3 | **本文**：`legodo_client.exe`（Flutter AOT）`LoadLibrary` 同目录 `legodo_engine.dll`（Go c-shared），无子进程、无端口 | 现主线 |
 
-## 2. 总体架构
+规模（2026-10-20 当场数）：
+
+| 面 | 数 | 口径 |
+|---|---|---|
+| `legodo_dart/lib/` | 81 文件 / 20,244 行 | `find … -name "*.dart" \| wc -l`、`wc -l` |
+| 屏与对话框 | 20 | `*_screen.dart` + `*_dialog.dart` |
+| `legodo_dart/test/` | 36 文件 | 同口径 |
+| `backend_go/` | 98 文件 / 34,644 行；`go list ./...` = 10 包 | 同口径 |
+| FFI 动作分发面 | 89（同步 88 + 直连 1） | `go test ./pkg/ffi -run Route` 现绿，断言 `route_test.go:141` |
+| 在册 Go 服务 | 23 | `register.go` 里 `NewBaseService("X")` 去重 |
+| 根 `tests/`（Python 遗留门） | 80 文件 / 1547 个 `test_`，其中 77 个 import `app.*` | 面向 `legodo_flet/app/` |
+
+## 2. 进程模型与启动链
 
 ```
-main.py                # 入口：_build_hub() 装配 4 基础设施 + 26 业务服务
-                       #   → asyncio.run(hub.start_all()) → ft.run(build_app_shell)
-                       #   --smoke-test：冻结包动态依赖自检
-app/
-├── core/              # 基础设施（进程内底座，零 flet）
-│   ├── lifecycle.py   #   Service 基类 / ServiceState 状态机 / ServiceStatus 快照
-│   ├── hub.py         #   ServiceHub：注册 / 拓扑启停 / status_report / 优雅停止
-│   ├── bus.py         #   EventBus：typed 发布订阅（异步投递到 EngineHub 执行域）
-│   ├── events.py      #   AppEvent 基类 + 全部事件子类（不可变 frozen dataclass）
-│   ├── engine_worker.py # EngineHub：守护线程事件循环 + EngineProxy（全服务协程执行域）
-│   ├── storage.py     #   StorageService：legado.db 主库 / schema 迁移 / 目录分配
-│   ├── settings.py    #   SettingsService：settings 表键值 + 变更事件
-│   ├── registry.py    #   ViewRegistry：声明式目的地路由表（分组导航元数据）
-│   └── interfaces.py  #   BrowserInteractionCallback（跨层交互回调 Protocol）
-├── services/          # 28 个业务服务，按域分包（§4）
-│   ├── engine/        #   规则兼容层核心资产（9 模块，只加壳不改行为）+ RuleEngineService 外壳
-│   ├── sources/       #   书源域 5 服务
-│   ├── reading/       #   阅读域 6 服务（+engine 外壳共 7）
-│   ├── content/       #   内容形态域 4 服务
-│   ├── tools/         #   工具域 12 服务
-│   └── *.py           #   ⚠ 14 个旧平铺模块**未删除**，是上面各域外壳的共享实现 /
-│                      #   继承基座（source_service / check_service / rule_repair /
-│                      #   compat_audit / headless_browser / interactive_browser /
-│                      #   web_page_renderer / search_model / reading_cache /
-│                      #   block_pages / legado_url / request_compat / source_rule /
-│                      #   app_paths）；逐条归属见 §8
-├── views/             # Flet 视图（按域分包，轻壳）
-│   ├── navigation.py  #   NavigationHost：分组导航容器 + build_app_shell 入口装配
-│   ├── service_dashboard.py # ServiceDashboard：服务状态 / 启停控制 / 事件流
-│   ├── reading/       #   找书 / 书架 / 阅读器 / 漫画 / 订阅 / 朗读条 / 视频播放条 /
-│   │                  #   书签面板 / 书内搜索 / 登录框 / 换源框
-│   ├── source/        #   书源列表 / 导入 / 检测 / 规则编辑器 / 规则自愈
-│   ├── tools/         #   更多工具总览 / 浏览器 / 词典 / 替换 / 字体 / 二维码 /
-│   │                  #   导出 / 备份 / 更新 / 网络桥 / 朗读设置
-│   └── settings/      #   appearance_view.py（主题三件套下发，见 §5.7）
-├── controllers/       # 每视图一个 Controller（事件订阅 + 服务调用 + 节流）
-├── models/            # 数据类（BookSource 等，与主库映射）
-├── storage/
-│   └── schema.py      # 主库 schema（版本化，当前 v7）+ 逐版本迁移函数表
-├── themes/            # 内置主题纯数据（五命名皮肤 + 墨水屏，由 ThemeService 承接；
-│                      #   旧 `app/themes/builtin_themes.py` 仍是 tools 域的数据基座）
-└── resources/         # publicsuffixes.gz（公共后缀表，规则兼容层数据文件）
-tests/                 # 64 个 test_*.py，共 1804 个 `def test_`（含 `async def test_`；2026-10-05 实测；
-                       #   pytest 当场收集 1802 条通过 + 161 条 subtest）
-                       #   其中 test_legado_compat.py 493 条零漂移守门（当场收集数）
+legodo_client.exe  ──dart:ffi──►  legodo_engine.dll
+   main.dart:16  bootstrapEngine()          lib/main.dart:16
+     → bootstrap.dart:49-89                  FFIEngineAdapter() + connect()  :57-58
+       → ffi_engine_adapter.dart:165-174     ffi.load() → ffi.initialize()
+         → engine_ffi.dart:254 _findLibraryPath()      与 exe 同目录；LEGODO_ENGINE_DLL 仅测试注入
+         → engine.go:65  Initialize()        NewServiceHub → 注册基础设施 → 注册业务服务
+                                             → 挂 4096 容量 EventRing → SubscribeAll → StartAll(30s 超时)
+     → bootstrap.dart:63-65                 连上后做一次书架探针注入
 ```
 
-**基线（2026-09-27 实测，全程离线）**：注册服务 30 个 = 基础设施 4 + 业务 26
-（`ServiceHub.status_report()` 输出 31 行，多的一行是总控自己的行）；`NAV_META` 23 个
-目的地 = 11 页签 + 12 整页，分 3 组；`tests/` 46 个 `test_*.py` / 共 1220 个
-`def test_`（`--collect-only` 1215 条）；`test_legado_compat.py` 488 条 `def test_`
-（351 同步 + 137 异步）。当日全量 **1215 passed + 28 subtests，0 failed**（80.05s）。
-中间过程值得一提，因为它正是 §5.11 那条契约的现场：同一套代码当日连跑三次得到过
-`1210 passed + 1 failed`，红的是
-`tests/test_rss_reading_page.py::RssServiceSurfaceTests::test_refresh_all_publishes_progress_in_order`
-——它只 `_wait` 了 `RssRefreshedEvent`，却断言另一条流 `RssRefreshProgressEvent` 的最后一拍，
-末拍还没投递到就开断言（6 次观察挂 2 次）。**同日已把等待条件改对**（改后单跑 6 次全绿，
-并且拿"末拍 `done` 钉成 0"做过变异核验，用例确实会红），所以这条不再是 flaky。
-这些数字会随里程碑推进变化，引用前先重测。
-
-分层方向（红线 v2）：`views → controllers → services → core → storage`。
-视图间零 import；跨视图协作经服务事件与 `ViewRegistry` 路由。
-
-## 3. 启动装配（main.py）
-
-`main.py` 是唯一入口：
-
-1. `_build_hub()` 构造并按域注册全部服务（注册顺序即里程碑顺序：基础设施 → RuleEngineService
-   → 阅读域 → 书源域 → 内容形态域 → 工具域）。服务依赖拓扑由各服务声明的
-   `dependencies` 经 Kahn 拓扑排序决定启停顺序。
-2. `asyncio.run(hub.start_all())`：先依赖后消费者依次 `start()`；单服务启动失败不阻断
-   其余（进入 SUSPENDED + `last_error` 可见）。
-3. `_apply_saved_theme(page, hub)` → `build_app_shell(page, hub, shelf_probe=…,
-   key_filter=…, background=…)`：进 `ft.run` 的回调先把**已保存**的外观落到页面三件套，再装导航（否则
-   不进外观页就永远是 Flet 默认灰主题，见 §5.7）。三条可调用/初值都是装配根注入的**视图层
-   缺口**：`shelf_probe` 决定阅读组落书架还是落找书，`key_filter` 是全局按键的第一道闸
-   （老板键命中的那一拍不再往当前视图分发，见 §5.15），`background` 是首屏该垫哪张图
-   （`_wire_background(hub)` 的返回值，同时把 `appearance.background.image` 的订阅挂上，
-   见 §5.16）——视图层拿不到服务（红线 §7.5），所以只能由 `main.py` 把服务包成可调用递进去。
-4. `finally: hub.shutdown()`：主线程等守护 loop 上的逆序 `stop_all()` 落盘收尾，
-   之后再关掉 EngineHub 那条线程（见 §4.4 不变式 2）。
-
-`python main.py --smoke-test`：冻结包动态依赖自检（Crypto/PIL/fontTools/opencc/
-elementpath/jsonpath_ng.ext/playwright/quickjs + 引擎核心资产导入 + publicsuffixes.gz
-在位断言），打包回归必跑，exit 0 为通过。
-
-## 4. 服务层（28 个业务服务 + 5 个基础设施）
-
-### 4.1 基础设施（core/，非业务服务）
-
-| 服务 | 模块 | 职责 |
-| --- | --- | --- |
-| ServiceHub | `core/hub.py` | 主进程唯一总控制器：注册 / 依赖拓扑解析 / 拓扑序启动 / 逆序停止 / `status_report()` 状态汇聚；`get()` 返回 EngineProxy 句柄，`require()` 返回原始实例（服务间装配用），`service_by_id()` 供仪表盘单行反查 |
-| EventBus | `core/bus.py` | 进程内 typed 发布-订阅：`publish` 把每个处理器作为协程任务投递到 EngineHub 执行域（不阻塞调用方）；`subscribe` 返回退订句柄；单处理器异常不拖垮总线 |
-| EngineHub | `core/engine_worker.py` | 全服务协程的统一执行域：daemon 线程跑独立事件循环，`submit` 经 `run_coroutine_threadsafe` 投递；`EngineProxy` 只把协程方法派发到该 loop，普通属性读写直达 |
-| StorageService | `core/storage.py` | SQLite 主库 `legado.db` 独占访问（`check_same_thread=False` + RLock）；schema 版本化迁移；`cache_dir(kind)` / `download_dir()` 文件目录分配；M6 旧介质一次性只读导入（幂等，旧文件改 `.legacy-bak`） |
-| SettingsService | `core/settings.py` | 全局偏好统一读写（内存缓存 + settings 表 JSON 落库 + 发布 `SettingsChangedEvent`）；吸收旧 appearance.json / reader-layout.json |
-
-### 4.2 业务服务按域分包
-
-各域包里的类是**外壳**：路由 / 事件 / 主库读写 / 配置包装。方法体大量来自仍留在
-`app/services/` 平铺层的 14 个旧模块（继承 `SourceService`、直调 `check_service`、
-懒 import `headless_browser` 等）——逐条归属见 §8.2，那些旧文件不是遗留、是活的基座。
-
-**书源域 `services/sources/`（5）**
-
-| 服务 | 职责 |
-| --- | --- |
-| `SourceService` | 书源 CRUD / 分组 / 统计 / 导入导出（JSON 互操作，`mode` 支持追加与整表替换，逐条发 `ImportProgressEvent`）/ 书架与 notShelf 语义 / 换源落库 / 封面字段维护；M6 起读写主库 `book_sources` / `bookshelf` |
-| `SourceCheckService` | 四段检测（连通 → 搜索 → 分类 → 阅读链路）、九态结果分类、自动停用；`block_pages` 拦截识别随迁共享；每轮批量留可回放快照（`run_snapshot` / `await_run_finished`，见 §5.3） |
-| `RuleRepairService` | 正文规则自愈：样本页挖掘候选选择器、焊死样本 HTML 回放验证、RepairReport（用户确认后才写回书源，不自动改源） |
-| `CompatAuditService` | JS/Java API 支持面静态审计（导入即审 / 编辑保存即审 / 检测流水线复跑），缺口落 `audit_log` |
-| `OnlineImportService` | 多类型在线导入分发（书源 / 替换规则 / 词典 / RSS / TTS / 主题 / TXT 目录规则），落库前统一过审计；书源以外类型当前无存储落点，只登记**给人看的说明**（文案里不出现里程碑编号），阶段进度发 `ImportProgressEvent`；模块函数 `preview_book_source_text` 供界面做导入前预览 |
-
-**阅读域 `services/reading/`（6）+ 规则引擎外壳（services/engine/）**
-
-| 服务 | 职责 |
-| --- | --- |
-| `RuleEngineService`（`services/engine/rule_engine_service.py` 外壳） | 规则求值核心：parser → rule_engine → reading_engine 三层 + legado_js + Java 兼容件；aiohttp 网络栈（会话复用 / 超时三档 / 全局 UA / Cookie 单罐 / 连接重拨 / deflate 解压 / 每主机并发 5）。核心资产 9 模块原位冻结，只加壳不改行为 |
-| `ReadingService` | 目录 / 正文 / 媒体渲染数据、连续滚动进度（`chapter_index` + `scroll_offset/scroll_ratio` + `chapter_pos`）、阅读上下文、找书/换源 SearchModel 语义 |
-| `BookmarkService` | 用户主动书签增删 / 列表 / 跳转定位（与自动续读进度是两条独立数据） |
-| `ContentSearchService` | 书内全文搜索：SQLite FTS5 虚表（仅对已缓存章节建索引） |
-| `BookCacheService` | 整书离线缓存：书内 4 并发 / 断点续传 / 图片内联 / 钉住不淘汰 |
-| `DownloadService` | 下载任务中心：队列 / 进度事件（`DownloadProgressEvent`）/ 整书缓存与漫画预取的任务执行方 |
-| `ImageBookService` | 图片型书籍（漫画）数据服务：图片章节解析 / 预取 / 缓存策略 |
-
-**内容形态域 `services/content/`（4）**
-
-| 服务 | 职责 |
-| --- | --- |
-| `ReadAloudService` | 朗读三后端（系统 TTS pyttsx3 / edge-tts 在线 / HTTP-TTS 书源规则），`TtsBackend` 抽象；无音频设备自动降级 |
-| `MediaPlayService` | 视频书播放：`MediaBackend` 抽象（flet-video / 系统播放器降级）、章节播放列表、记忆位置落 `books.play_position`、播放列表索引落 `books.play_chapter_index`（v7）。界面面为阅读器底部 `VideoPlayBar`（`views/reading/video_play_bar.py`，7 槽 + `MediaPlayStateEvent` 订阅，见 §5.12） |
-| `RssService` | RSS 源管理 / 文章列表 / 订阅 / 已读收藏（主库 `rss_sources` / `rss_articles`） |
-| `LocalBookService` | 本地书导入解析：epub（ebooklib）/ pdf（pymupdf）/ txt 自写，归一化为与网络书源一致的数据模型落 `books` 表 |
-
-**工具域 `services/tools/`（12）**
-
-| 服务 | 职责 |
-| --- | --- |
-| `ReplaceRuleService` | 用户全局替换规则 CRUD + 正文/标题两级应用（书源内嵌 ∪ 全局，顺序对齐 Legado ContentProcessor） |
-| `DictService` | 划词词典规则 CRUD + 释义请求（复用 RuleEngineService 管线） |
-| `FontService` | 用户字体文件登记（fontTools 解析）+ 系统字体只读枚举 |
-| `QrCodeService` | 二维码生成（qrcode+Pillow）+ 图片文件/截图识别（opencv QRCodeDetector，无摄像头扫码） |
-| `BookExportService` | epub/txt 离线导出（复用已缓存章节，不重新联网） |
-| `WebDavService` | WebDAV 备份 / 恢复（导出 zip → 上传；**确认过才**拉取 → 校验 → 覆盖前留底 → 导入，`restore(..., confirm=True)` 是硬闸，见 §5.8）；备份对象按 `BACKUP_TARGETS`（sources/bookshelf/replace/dict/rss/config）真裁剪成员，成员方法名即跨服务契约（`export_*_json` / `import_*_json`，见 §5.8） |
-| `UpdateService` | GitHub/Gitee 发布检查、下载到 downloads/、用户手动安装（不做静默自替换） |
-| `WebBridgeService` | 本地 HTTP + WebSocket 服务（默认绑 127.0.0.1、默认关闭），远程书源管理/调试薄协议层 |
-| `BrowserService` | 浏览器会话统一管理：无头渲染（Playwright）/ CDP 投屏交互 / WebView 回退三模块收编，profile 目录与会话池由服务统一持有 |
-| `ThemeService` | 五命名皮肤 + 墨水屏配色 + 亮暗切换；外观偏好持久化并入 SettingsService |
-| `BossKeyService` | 老板键：一键把整个窗口藏掉（`page.window.visible=False`）+ 一只**只在藏窗期间存在**的托盘图标当唯一回来的入口；偏好走 SettingsService（`bosskey.enabled` / `bosskey.shortcut`），图标走 `services/tools/win_tray.py`（pywin32 懒 import）。**Windows 专属**：非 Windows 或缺 pywin32 时 `available=False`，快捷键页那句状态话写清"本机没有托盘能力"，其余功能照旧（见 §5.15） |
-| `BackgroundService` | 全应用一层背景图：把用户选中的图**归一后拷进 `<data>/backgrounds/`**（长边 ≤2560 的 JPEG，无 Pillow 则原样拷贝），偏好只落那条拷贝路径（`appearance.background.image`，SettingsService 单键）；换图时删掉被换下来的那份（**只删自己目录里的**），`current` 认文件不认键（文件没了就当没有）。`install()` 是协程（解码+缩放是重活）。把路径画到窗口上那一步在视图层（`NavigationHost.set_background`），本模块零 flet（见 §5.16） |
-
-### 4.3 服务间通信
-
-- **请求-响应**：经 `ServiceHub.get(X)` 拿 EngineProxy 句柄调用；协程方法一律派发到
-  EngineHub 执行域，调用方（UI 或服务）不阻塞。服务间装配（on_start 期）用
-  `hub.require(X)` 拿原始实例。
-- **通知（解耦）**：EventBus 发布 frozen dataclass 事件（不可变快照，禁止塞对象引用）。
-  `core/events.py` 声明 `AppEvent` 基类 + **22 个事件子类**，全部都有生产发布方：
-  `ServiceStateChangedEvent` / `SettingsChangedEvent` /
-  `ProgressSavedEvent` / `BookmarkChangedEvent` / `DownloadProgressEvent` /
-  `SearchFinishedEvent` / `ReadingSessionChangedEvent` / `SourceChangedEvent` /
-  `CheckFinishedEvent` / `RepairReportReadyEvent` / `RepairProgressEvent` /
-  `ImportFinishedEvent` /
-  `ImportProgressEvent` / `ReadAloudStateEvent` / `MediaPlayStateEvent` /
-  `RssRefreshedEvent` / `RssRefreshProgressEvent` /
-  `ReplaceRulesChangedEvent` / `BackupFinishedEvent` / `BackupProgressEvent` /
-  `ExportProgressEvent` / `UpdateAvailableEvent`。
-  **投递是异步的**（`publish` 只把处理器排进引擎循环），约束见 §5.11。
-
-### 4.4 生命周期
-
-状态机 `REGISTERED → INIT → STARTING → RUNNING ⇄ SUSPENDED → STOPPING → DISPOSED`。
-`ServiceHub.start_all()` 按 Kahn 拓扑序启动、`stop_all()` 逆序停止；每服务暴露
-`status: ServiceStatus`（state / last_error / started_at / updated_at / progress），
-每次迁移发 `ServiceStateChangedEvent`。轻量服务注册即 RUNNING；重服务
-（BrowserService 拉 Chromium、WebBridgeService 监听端口）懒启动，资源释放走 SUSPENDED。
-
-三条硬不变式（都由测试钉住，改生命周期前先读）：
-
-1. **`start/stop/suspend/resume` 是基类保留名**：服务子类里表示业务动作的方法绝不能
-   取这四个名字——`ReadAloudService.stop()`（停止朗读）和 `MediaPlayService.stop() /
-   resume()`（停止/继续播放）一度整块盖掉基类生命周期方法，结果是逆序停止轮到它们时
-   只停播放、不迁移状态，退出后服务表上永久留着两行 RUNNING，仪表盘的「恢复」也拨不动
-   状态机。业务面改名 `stop_speaking()` / `stop_playback()` / `resume_playback()`；
-   护栏见 `tests/test_core_lifecycle.py::test_no_service_subclass_shadows_lifecycle_methods`。
-2. **EngineHub 的 loop 由外层线程收尾**：`stop_all()` 本身就跑在 EngineHub 守护 loop 上，
-   而 EngineHub 也是注册服务，所以它的 `on_stop()` 只能标记不能 `thread.join()`
-   （join 当前线程 = `RuntimeError: cannot join current thread`，就是过去每次关闭都打的
-   那条「服务 EngineHub 停止异常」）。真正的关停放在 `ServiceHub.shutdown()` 的
-   `finally`，由主线程在 `stop_all` 跑完后执行；`EngineHub.shutdown()` 自带"不 join
-   自己所在线程"的守卫。
-3. **引擎循环上不许释放 COM/原生对象**：pyttsx3（Windows SAPI，comtypes）的最后一个引用
-   在哪个线程被丢掉，`_events.__del__` 就在那个线程同步等 COM 线程。实测在引擎循环上
-   `self._backends.clear()` 会**冻住整条 loop**（连 `asyncio.wait_for` 的超时都跑不到），
-   退出时 `stop_all` 卡到 10s 超时、后面所有服务停不掉。`ReadAloudService.on_stop`
-   因此把后端摘给一次性守护线程去释放。
-
-## 5. UI 层
-
-### 5.1 导航容器 NavigationHost（`views/navigation.py`）
-
-- 顶级入口只有三个，沿用旧单体的形状：**书源 / 阅读 / 配置**
-  （`ViewRegistry.NAV_META` 为权威清单，当前 24 个目的地 = 12 个页签 + 12 个整页）。
-  **一个分组 = 侧栏一个顶级入口**，组内的非整页目的地不再各占一行，而是那一页顶部的
-  Tab（`SectionView`）：书源 = 管理 / 导入 / 检测 / 规则 / 自愈；阅读 = 找书 / 书架 /
-  订阅；配置 = 更多工具 / 外观 / 快捷键 / 服务。
-- 宽窗（≥720px）走 `NavigationRail`（`extended` + `use_indicator`），窄窗走底部
-  `NavigationBar`；跨阈值 `on_resize` 重建外壳但保留当前内容视图。
-- **窄窗：外壳自适应之外，页面内容第七十六轮起开始降级**。Python 侧对窗宽作反应的判断
-  仍然只有上面那一条（`is_narrow_width` / 阈值 720）；内容侧靠 3 处 `ft.ResponsiveRow`
-  （`bookshelf_view`、`book_source_list_view`、`reader_view` 的阅读设置）与 13 处
-  `Row(wrap=True)` 按容器宽换行。第七十六轮把 004 待修清单 15 那五页改完（reader 工具条、
-  webdav 远端清单行、export 选书行、replace 工具行、dict 查词行），360 档的贴边候选从
-  5 页降到 1 页（剩下那 1 处是人眼确认过的通栏分隔线）。**验收判据只能像素筛 + 人眼**：
-  桌面 release 客户端对溢出零输出（明知溢出的那一拍日志仍只有正对照那行）。
-- **`wrap` 与 `expand` 不能同时出现在一条 `Row` 上**（第七十六轮五臂像素对照量到的客户端
-  契约）：`Row(wrap=True)` 里只要有任何子项带 `expand`——**连 `expand=False` 都算**——
-  release 客户端把整条行画成一块 196,196,196 的灰，并且不再产出后面的兄弟节点；
-  不换行的 `Row` + `expand` 是好的，且按 flex 分份。所以"给固定宽那位换 `expand`"和
-  "那一行改 `wrap`"是**两招互斥的修法**。复现：`.probe/probe_wrap_expand76.py`；
-  全库普查：`.probe/census_wrap_expand_clash76.py`（当前 0 处命中，只能当下界——运行时才改
-  `expand` 的写法扫不出来）。阅读器工具栏那颗 `Row` 的判据同步改成"必须 wrap、且子项不带
-  expand"（`tests/test_reader_read_aloud_placement.py`），代价是那一行行高随窗宽变。
-- **根控制外面按需垫一层全应用背景图**（`render()`：有背景时是 `Stack[图, 布局]`，没背景时
-  直接就是那个布局）；`set_background()` 路径没变时什么都不做，`rebuild()`（宽窄窗切换）走
-  `render()`，所以缩放重建不会把背景弄丢——形状与接线见 §5.16。
-- **阅读组的落地页签由「架上有书」决定**：`_anchor(group)` 的次序是
-  记住的页签 > 书架探测 > 分组第一个页签，所以首屏和再点「阅读」入口都**先落书架**，
-  空架才回落找书。探测由装配根注入（`main._shelf_has_books` →
-  `SourceService.shelved_books()`，同步读 `on_start` 已载入的内存缓存，不联网不查库），
-  `NavigationHost` / `build_app_shell` 只收 `shelf_probe` 可调用——视图层不 import 服务
-  这条红线不变；探测抛错记 warning 并回落找书。该规则只对同时声明「找书 + 书架」的
-  分组生效，其余分组仍落第一个页签。
-- `hidden` 标记的语义是「**整页目的地**」（阅读器 / 漫画 / 词典 / 导出 / 备份…）：
-  既不进侧栏也不进页签，`show()` 时直接替换内容区，侧栏高亮它所属的分组。
-- 切换目的地经 `ViewRegistry` 工厂重建内容区。**组内切签不重建子视图、不退订控制器**
-  （在飞的搜索/检测继续跑）；只在离开整个分组或切到整页目的地时统一 `detach()` 全部
-  已建页签（Controller / 仪表盘防跨页订阅泄漏）。未注册目的地直接 KeyError（侧栏无死项）。
-- **整页目的地的 `show()` 是幂等的**：已经在阅读器里再 `show(reading.reader)` 一次，
-  保留现视图直接返回。原先无条件重建会把上一趟在途的 `open_book` 连视图一起摘掉
-  （控制器 `_view` 变 `None` → `AttributeError`，界面停在详情页），用户侧的表现就是
-  "连点两下开始阅读，结果一下都没反应"。
-- 同组内的跨视图跳转（如书源列表 → 规则编辑器）由 `nav_actions` 槽位落到该分组的目标
-  页签并带 payload，不重跑页面装配；返回分组页时恢复「该组上次停留的页签」，整页目的地
-  （开读）不计入这份记忆。
-- 阅读器 / 漫画沉浸模式由各自视图内部处理。
-
-### 5.2 ServiceDashboard（`views/service_dashboard.py`）
-
-「配置 → 服务」页：**当前实现已全部拆分服务**——启动后注册 31 行（实测
-`ServiceHub` 总控 1 + 基础设施 4 + 业务 26，业务按域为 规则引擎 1 / 阅读 6 /
-书源 5 / 内容形态 4 / 工具 10），本页把每一行的状态摊开给人看。
-
-- **目的地形态**：`DashboardView` 继承 `ft.Column(expand=True, scroll=AUTO)`，
-  与 `AppearanceView` 等其余目的地同构。**绝不能返回 `ft.View`**——M6 之后目的地
-  是被 `SectionView` 嵌进页签容器的，`View` 是页面级路由容器，嵌在控件树里 Flutter
-  不渲染，表现就是整页灰底（静态测试全绿照不出来）。
-- 服务列表：名 / 所属域 / 状态 / 进度 / 最近错误 / 启动时间 + 每行挂起·恢复·停止。
-  状态用中文标签（运行中 / 已挂起 / 停止中…），域由服务类的 `__module__` 前缀归类；
-  `status_report()` 快照里 RUNNING 却带 `last_error` 的行（必需协作者缺失）状态格转橙。
-  列宽不定，整表包在 `ft.Row(scroll=AUTO)` 里横向滚动。
-- 启停控制：经 `hub.service_by_id()` 反查实例，`suspend/resume/stop` 协程经
-  `EngineHub.submit` 派发，Flet 事件线程不阻塞；按钮可用性由状态机裁决
-  （RUNNING 可挂起/停止，SUSPENDED 可恢复/停止，过渡态全禁），总控行无实例故全禁。
-- 事件流面板：`BaseController.subscribe` 订阅 `ServiceStateChangedEvent` /
-  `SettingsChangedEvent`，处理器编组回界面循环执行；环形缓冲保留最近 50 条。
-- 心跳：进度由 RSS / 下载 / 检测**就地写** `status.progress`，没有事件可订阅，
-  所以挂载期间每 2s 重读快照（`AUTO_REFRESH_SECONDS`）；快照签名未变则跳过重建，
-  不无谓下发整页。离页时心跳任务 `cancel()`。
-
-### 5.3 视图与 Controller
-
-视图 = 轻壳（Flet 布局）+ `Controller`（`controllers/`，基类 `base.py`）：
-attach 时订阅 EventBus 事件，detach 退订；协程调用经 `engine_call` 排进 EngineHub；
-高频事件（下载进度 / 搜索流 / 导入逐条落库）0.5s 节流在 Controller 层做。
-视图不 import 服务实现类，只经 `hub.get()` 按类型取句柄（红线 v2 由 import-lint 守门）。
-**凡是"跑的过程中要动的界面"都必须由服务发事件**（`ui_call` 只在收尾 flush 一次，
-见 §5.6），控制器里改完控件还须 `flush`（基类在订阅包装器与 `ui_call` 收尾各挂一次）。
-
-**事件只覆盖"在线的那段"，长任务还要在服务侧留一份可回放快照**。切页 `detach()` 退了
-订阅，但流水线照常在引擎循环上跑完——那期间发出的逐源事件没人接，回到该页看到的是空
-进度条，用户侧的表现就是"切个页把检测搞停了"（实际前后端拆分没问题，断的是渲染）。
-落法（`SourceCheckService` + `CheckController`，同思路可用于任何长任务）：
-
-- 服务为每轮维护 `{"total","running","cancelled","summary","results"}`，发事件的同一条
-  路径把逐源结果记进 `results`，收尾把 `summary` 写进同一份；
-- 读它的两个入口 **必须是协程**（`run_snapshot()` / `await_run_finished()`）：协程经
-  EngineProxy 跳回引擎循环，界面线程才不会读到流水线改到一半的撕裂进度；
-- 重复触发在同一处收口：`check_all` 见已有批量在跑就不再派第二遍全量联网，而是接到
-  那一轮的收尾（两份流水线同时打站点对既浪费又容易被封）；
-- 控制器 `on_attach` 用 `ui_call(self._restore())` 回放：逐源结果 + 进度 + 运行态，
-  这一轮不是本页签启动的就继续 `await_run_finished` 等收尾再画结论。回放排在界面队列
-  尾部，**可能晚于用户点「开始」**，所以 `_restore` 要先看 `self._running`，并且不画
-  "从没检测过"的空快照——否则旧快照/空快照会把刚开始的运行态盖回去（探针实测：开始
-  按钮又变可点）。渲染接口自身要幂等（`CheckView.render_result` 按 `source_id` 覆盖）。
-
-第三条硬约束（关闭时序）：**登记的界面循环可能已经 close**。Flet 收窗口时先把自己的
-loop 关掉，服务还在发 `ServiceStateChangedEvent`，往死循环上派发就刷一屏
-`RuntimeError: Event loop is closed`（控件也已经没人渲染了，等了也没用）。
-`subscribe()` 的包装器因此先查 `loop.is_closed()`：关闭即静默丢弃（debug 日志），
-`ui_call` 同条件退化成引擎循环执行协程——协程本身要跑完（收尾清理、aclose），
-只是没人再 await 它。
-
-由此推出一条调用侧约定：**编排协程里每次 `await` 之后再碰视图，都要先确认视图还在**
-（`self._view is None` 即 return）。切页 `detach()` 随时可能落在 `await` 的空档上，
-慢源开书/加载章节实测就是这样崩在 `_set_chapters`。第八轮把这条约定补全到了所有在途
-路径（阅读器偏好回填 / 书签面板 / 书内搜索 / 续读补的第二帧滚动、漫画阅读器整条线、
-字体与二维码的文件选择器回执）。两条细则：
-
-- **守卫只挡控件，不挡会话状态**：`open_chapter` 里图链解析回来后先更新
-  `_page_urls` 之类的会话字段，再判 `_view`——那些字段翻回来还要用，一起丢了等于
-  用守卫把功能弄坏；
-- **等回执的协程分两种失败**：切页了那句话就丢，其它失败必须说（选择器被取消的回执
-  仍要落进状态行），所以收进一个本地的 `say()` 而不是整段 `try/except: pass`。
-  护栏：`tests/test_controller_midflight_detach.py`（替身在 await 回来**之前** detach，
-  断言"不抛 **且** 一次控件都没碰"——`ui_call` 的异常只进日志，只断言不抛会一路绿）。
-
-**完成回调里不许同步等另一条 future**（第七十六轮，004 待修清单 16）。`ui_call` 返回的
-future 落值发生在**界面循环线程**上，`add_done_callback` 的回调因此也跑在那条线程——回调里
-再对**另一条**派发到同一条循环的 future 调 `.result()`，等的正是"这条循环腾出手去跑它"，
-于是必现死锁（不是竞态：先派发的先落值，回调必然跑在另一条之前）。要等多条结果就**合并成
-一条协程顺序 `await`**（`FontController._load_and_render`），或在回调里用 `ui_await` /
-`asyncio.wrap_future`。护栏 `tests/test_font_page_loop_liveness.py` 的判据是**另一条线程**
-拿着的秒表读出的"界面循环心跳断供秒数"——`asyncio.wait_for` 的超时自己就堵在那条循环上，
-不能当秒表（停摆时它连超时都不会响，这本身是读数）。同族扫描：全库控制器 done 回调里
-`.result()` 共 30 处，其余 29 处等的都是回调自己那条 future（值已落，不等）。
-
-**接"写入型"动作之前，先确认那个字段有人渲染**。书架换封面（09-27 第十九轮）是反面教材：
-`SourceService.update_cover` 在 `app/` 里零调用方，按"孤儿方法 ⇒ 接上即可"的套路补一个
-FilePicker 入口就能交差，而 grep `cover_url` 在 `app/views/**` 同样零命中——书架行画的是
-`ft.Icon(BOOK)`，全项目唯一消费这个字段的地方是 epub 导出内嵌封面。只接动作的那一版，
-用户看到的是"挑完图、状态行说一句、屏幕什么都不变"。落法：`BookshelfView._cover_control`
-把 `record["cover_url"]` 原样交给 `ft.Image(src=…)`，取不到回落原图标
-（`error_content` 收 `Control`），视图不判断地址是本地文件还是远端 URL——认地址是控制器
-与服务的事（红线 §7.5）；入口在长按管理对话框的「更换封面」行，控制器写完**读回书架记录**
-再报成败（`update_cover` 对不上 `book_url` 时照样返回 resolved 并发事件，
-拿返回值当成功就是假话）。详见 `docs/known-issues/003_refactor_dropped_orchestration_capabilities.md`
-的第五型。
-
-### 5.4 阅读器左侧抽屉（`views/reading/reader_view.py`）
-
-书签与书内搜索是同一类"章内定位列表"，共用一个左侧抽屉（宽 320px）：抽屉内一个
-`ft.Tabs`，两个页签分别挂 `BookmarkPanel` / `ContentSearchBar`，工具栏上「书签 /
-书内搜索」两个入口调 `show_side_panel(kind)` 只切页签、不重建面板；传 `""` 收起抽屉。
-工具栏入口顺序固定为 退出阅读 · 上一章 · 目录 · 书签 · 书内搜索 · 朗读 · 阅读设置 ·
-沉浸 · 进度 · 字号 · 下一章（同类动作相邻；三个"开面板"的动作放在一起，第二十八轮把阅读设置
-与沉浸也接在这一簇里，第二十九轮把朗读入口也接进来——见 §5.9）。
-
-**Stack 覆盖层必须自带不透明底色**：目录页 / 左抽屉都是叠在正文之上、`ft.Stack` 里的
-覆盖层，`bgcolor` 只能挂在 `Container` 上（0.86 的 `Column` 没有这个参数）。目录页早期
-是个透明 `Column`，正文直接从章节列表背后透出来——用户报的"选章节会叠加在正文上"。
-底色 `ft.Colors.SURFACE`，与漫画阅读器一致；`tests/test_views_reading_m2.py::
-ReaderChapterSelectTests` 钉住「点章节 → 目录收起 + 正文换章」。
-
-**目录必须分批渲染**（第八轮）：网文源三四千章，`render_chapters` 一次建完整份
-`ListTile` 就是一次可感知的冻结（重构时旧实装的批量追加被重写没了）。现在的形状是
-`DIRECTORY_BATCH_SIZE=50` + `ListView.on_scroll` 离底 `DIRECTORY_LOAD_AHEAD=320`
-补一批，状态行从"已加载 50/1001 章"走到"共 N 章"。三份状态必须分开：
-`_directory_all`（原始目录）/ `_directory_visible`（关键字过滤 + 正倒序之后）/
-`_directory_rendered`（已挂出行数）——清空搜索框能原样回来全靠这个区分。
-过滤与排序也留在视图层：目录搜索框 `_directory_query` 一度渲染出来了却没有
-`on_change`（打字没反应）、「倒序」只翻标志位（要点下次开书才生效），都属于
-"入口在、线没接"。护栏：`tests/test_reader_directory_batching.py`。
-`on_scroll` 是**控件事件回调**，Flet 在回调返回后自动 update，所以这条路径不需要
-额外 `flush`（与 §5.3 那条"事件总线/后台协程要自己 flush"是两回事）。
-
-**目录定位只能按像素，所以行高必须钉死**（第十轮）：分批之后"打开目录停在顶部"成了
-新问题（读到第 2000 章的人得自己滚过去）。0.86 的客户端在这一条上有三个反直觉点，
-都是探针实测出来的（`docs/dev-logs/2026-09-26.md` 第十轮 2）：
-`ListView.scroll_to(scroll_key=…)` **静默不动**（`ft.Column` 上却管用，别照搬），
-`item_extent` 客户端不认，只有 `scroll_to(offset=…)` 真的移动视口、且不受"行还没建"
-限制。既然按 `行号 × 行周期` 算 offset，`_chapter_row()` 就必须让每一行等高：
-`DIRECTORY_ROW_HEIGHT=44` + `DIRECTORY_ROW_SPACING=2`（行距只能挂在 `ListView.spacing`
-上），章名一律单行 `ELLIPSIS`。**任何一行自己撑高，它下面所有行的落点全偏**——而这
-种偏移单测看不出来（算的是常量），只有浏览器里的像素与截图认得。跨控制器/视图的锚点
-是 **url 而不是行号**（`focus_chapter(url)`）：过滤和倒序都会挪行号。补批要"补一批 →
-`update()` → 让出一次循环"，一口气建到目标行就等于把分批要避免的那次冻结又请回来。
-
-### 5.5 阅读器：连续续读与排版偏好（`controllers/reader_controller.py`）
-
-**读到底自动接下一章**（Legado 连续阅读，非翻页模式）：滚动事件距文档底部不足
-`_APPEND_TRIGGER_DISTANCE=180px` 时把下一章**接**在当前正文尾部（分隔线 + 章名 +
-正文），不是换掉整篇——整篇替换会连带把滚动位置打回顶部，看起来像书跳回第一章。
-两章之间用迟滞区间复防：退回 500px 以上才允许再次触发，一条阈值线会在边界上反复
-追加。追加那次滚动事件里记下的"追加前文档总高"就是新章在整篇文档里的起点，登记进
-`ReadingSession` 的视口表（`mount`），`track()` 据此把滚动偏移换算回"当前可见章"，
-工具栏计数与进度落库都跟着它走。卷标题与已加载过的 url 一律跳过。**加载途中滚到章尾
-那一发不作数**（`_reading_loading` / `_restoring_scroll` 两道早退，`_on_reader_scroll`
-:827/:845）：那一刻的文档几何是布局中间态而不是"用户读完了"，与"挂载瞬间那发偏移 0
-的滚动不是阅读进度"同源。代价是这一发没人补判，用户要再滚一下才接得上——真实手指是
-连续的所以看不出来，但它是一条**已知的、被用例钉住的**取舍，不是漏网。护栏：
-`tests/test_reader_continuous_scroll.py`（真 ReadingService + 真 reader-cache +
-真视图控制器，引擎用替身，全程离线）+
-`tests/test_views_reading_m2.py::ReaderAutoContinueTests`（三章 rig，钉"同一章不接两遍"
-与"加载窗口的丢弃/放行两面"）。
-
-**同书重复开读要去重**：`open_book` 记住 `书源|书名` 键，同一控制器上第二次开同一本
-书直接返回——两趟并发加载会互相把对方的正文换掉。
-
-**后台预取（章尾不等网络）**：每挂出一章，控制器调
-`ReadingService.prefetch_chapters(chapter)` 起**一轮**顺序预取（`PREFETCH_CHAPTER_COUNT=10`
-章，跳过卷标题与空 url）。这一轮跑在引擎循环上、只往缓存里放东西，绝不碰控件；
-`prefetch_chapters` 本身不等网络，所以界面那一趟只多一次极轻的派发。三层护栏：
-
-- **同章在飞去重**（`_content_flight`）：读者翻到的正是预取在跑的那一章时接上同一个
-  请求，不另发一条；等待方用 `asyncio.shield` 包住——换章/切页取消的是"等"，不是
-  "请求"，跑完照样进缓存（`test_cancelling_the_reader_does_not_kill_the_shared_request`）。
-- **副本有预算**（`PREFETCH_CACHE_LIMIT=64MB`）：超了只丢内存副本，磁盘 reader-cache
-  照写，等于安静退回旧行为。副本在 `open_book`/`close_book`/`on_stop` 一起作废。
-- **失败不留痕**：预取撞墙只 `logger.debug` 并收掉这一轮（连不通的源不该让后面九次
-  请求排在读者那一章前面），真翻到这一章时照常重新请求。
-
-`load_content` 的取用顺序因此是：**预取副本 > 磁盘缓存（追加路径不读它）> 联网**。
-切页（`ReaderController.on_detach`）叫停轮子但留着副本：切页不等于退出阅读，回到
-阅读器时预取过的章节还算数。护栏：`tests/test_reader_prefetch.py`（服务面，引擎替身）、
-`tests/test_offline_source_chain.py`（**真引擎 + 127.0.0.1 假源**，从服务端数出预取
-真的发了请求）、`tests/test_reader_continuous_scroll.py`（控制器触发与复用）。
-
-**滚动下发有两条 Flet 硬约束**（`ReaderView._run`）：0.86 的
-`ScrollableControl.scroll_to` 是**协程**，调用完就丢等于界面纹丝不动 + 满屏
-`coroutine was never awaited`；而 `Page.run_task` **只收协程函数**，把协程对象直接
-递过去会当场 `TypeError: handler must be a coroutine function`。所以 `scroll_by` /
-`restore_scroll` 把协程交给 `_run`，由 `_await_coroutine` 包一层再 `run_task`；取不到
-页面（控件没上页面时 `Control.page` 抛的是 RuntimeError，不是 AttributeError）或派发
-失败时**必须 `close()` 掉协程**。护栏在 `test_reader_continuous_scroll.py` 里用一个
-按 Flet 规矩记账的假 page（收到协程对象就抛 TypeError）钉住这两条。
-
-**排版（旧单体 ReadingView 的字号/行距/段距/宽度/缩进/对齐/背景/状态栏）**：
-正文渲染拆成两步——`content_plan(document)` 出**纯数据计划**（切段 + 标题识别 +
-缩进，不碰 ft 控件，因此可以丢 `asyncio.to_thread` 跑后台线程），`render_plan(plan)`
-在界面循环上照计划建控件。清洗（`render_use_html_spans`）与切段都在后台那步完成。
-
-改偏好（含字号 ± 按钮）走 `apply_preferences`：合并 + 夹取范围后**在已挂出来的控件上
-就地重排**（认 `data="reader-text"` / `data="reader-heading"` 标记），绝不重新拉取正文
-——重渲染会把自动续读接上的多章文档换成"只有当前章"，滚动位置一并丢。可用区间：
-字号 13-28、行距 1.3-2.2、段距 4-24、正文宽度 620/700/760、背景 5 色（跟随主题 /
-纸黄 / 护眼 / 夜间 / 墨水墨绿）。偏好经 `ReadingService.save_reader_preference` 落库，
-**attach 时读一次**（进程级，不必每本书重读），存的是夹取后的值。
-**键名是一条命名空间约定**：阅读偏好一律 `reader.<ReaderView 偏好名>`
-（`ReadingService._READER_PREFIX` + `ReaderView.DEFAULT_PREFERENCES`）。别的模块想改阅读
-设置就必须写同一个键——字体页以前写 `font.family`，阅读器读 `reader.font_family`，
-于是"选了字体、正文永远不变"；WebDAV 备份的白名单同理列了一套假键，偏好永远备不出去。
-新增偏好名时三处（视图默认表、其它写入方、`WebDavService._export_settings`）一起对齐，
-最后这一处现在有护栏：`PreferenceBackupWhitelistTests` 拿"对任何键都答存过"的替身设置跑
-一遍导出，正反两个方向钉住白名单与偏好表一一对应（`shortcuts`/`tts_rate` 由控制器写，
-是显式许可的例外）。
-「阅读设置」弹层由视图 `build_settings_dialog` 造、控制器 show/pop。护栏：
-`tests/test_reader_typography.py`。
-
-**划词查词典**（§1.8）：正文 `ft.Text` 带 `selectable` + `on_selection_change`，选中变化
-只把词亮到 `ReaderView.selection_bar`（那条「查词典」条），**一次拖拽一次网络都不发**——
-一次拖动会发几十次 selection_change，每条都去抓释义页等于对着词典站点做 DDoS。点按钮才
-经 `ReaderController.lookup_word` → `DictService.lookup` → 回填视图搭好的释义弹窗
-（`build_definition_dialog` / `update_definition`，先搭后填）。三处刻意的行为：整篇换章
-收起划词条（选区已经不在了，留着是假线索；追加下一章不动它）、弹窗换词后迟到结果按词号
-丢弃（晚到的 A 词释义不许贴到 B 词弹窗上）、`DictService` 未注册时直说"词典服务未就绪"。
-偏好键 `reader.text_selection` 可整条关掉划词（关掉同时收起已亮的条）。
-**关掉的理由是真实的**：按住拖动选中与滚动在同一块正文上抢手势。
-护栏：`tests/test_reader_text_selection_lookup.py`（选中不外呼 + 迟到结果不串窗两条性质）。
-
-**详情对话框只留一层**：`FindBooksController.show_detail` 若已有开着的对话框就直接
-返回。双击搜索结果会叠出两层一模一样的详情框，点「开始阅读」只 pop 掉最上面那层，
-阅读器开好了屏上还盖着一层（`_detail_dialog.open` 判活）。
-
-### 5.6 导入页：预览 → 确认 → 进度（`views/source/import_view.py`）
-
-导入是**破坏性最强**的入口（一份文件能覆盖整张书源表），所以链路上刻意留了两道闸：
-
-1. **预览卡**：选完文件只读不落库，由 `preview_book_source_text`（OnlineImportService
-   模块函数，纯解析不经引擎代理）给出「总条数 / 可导入 / 缺 `bookSourceUrl` 跳过 /
-   分组分布」。一条都读不出来（选错文件，典型是把 TXT 目录规则当书源）直接算
-   `error`，界面只回一行说明，**不给一张"可导入 0 条"的卡再让用户点一次确认**。
-2. **模式选择**：追加（按 `bookSourceUrl` 去重并进现有列表）/ 替换（整表覆盖）。
-   替换在控制器侧再弹一次 `AlertDialog` 确认，并写明"将覆盖现有 N 条"（N 读真实
-   服务侧列表）；拿不到 `page` 时**拒绝执行**而不是退回追加——破坏性动作宁可不作。
-
-进度可见性走**事件**不走回调：服务侧逐条落库发 `ImportProgressEvent`
-（`kind/phase/done/total`，`SourceService` 内 0.2s 节流、收尾强制补发最后一拍），
-URL 拉取阶段发 `total=0` 的不定长一拍；控制器订阅后在界面循环上刷进度条。
-不走"服务回调里直接改控件"，因为 `ui_call` 只在编排协程收尾时 flush 一次，
-中途改的控件要等整表落完才下发（用户感受：进度条一直空、跑完好才被 100% 覆盖）。
-小文件（几十条）跑不满一个节流窗口，看到的就是「不定长 → 1.0 → 收起」，属预期。
-
-界面灰框收敛：旧版「资源类型」下拉列 7 项只有 1 项能导入（点了只回一句说明），
-和 URL 输入框并排看着像三块没内容的灰砖——类型不进界面（服务侧 `kind` 仍是参数），
-URL 行只留「输入框 + 导入按钮」，预览卡与进度卡**只在有内容时出现**。
-
-**「导入即审」只有一处归属，在落库层**（第十一轮）：`SourceService.import_sources_json`
-是所有导入路径唯一的漏斗（在线/本地门面、扫码导入、WebDAV 恢复三条都走它），所以
-§3.7 触发点① 默认由它逐条过 `CompatAuditService.audit_source`。门面那条路例外——它要
-把兼容性缺口写进 `ImportResult.warnings` 给界面看，于是自己先审一遍，再传
-`audit=False` 让落库层闭嘴；审计服务没就绪时反过来（门面审不动，`audit=True`）。
-**为什么非得钉死**：重构后两条链都在审，几百条的源文件白审两遍，更要紧的是每次审计
-（含干净源）都往 `audit_log` 落一行——一个源两行，回溯时认不出哪行属于这次导入。
-`audit` 是关键字参数且默认 `True`，新加的导入入口不传就等于有审计。护栏：
-`test_import_audit_runs_once_per_source_not_twice`（门面侧数审计次数）+
-`test_import_sources_json_audit_false_skips_the_auditor`（落库侧认开关）。
-
-### 5.7 外观：主题三件套与实时预览（`views/settings/appearance_view.py`）
-
-`ThemeService.apply()` 只给**纯颜色数据**（`ThemeData.light/dark` 两套角色字典），
-把它落成 Flet 主题的全部逻辑在视图层 `apply_page_theme(page, data)`。
-
-**不变式：主题必须三件套一起下发**——`page.theme` 只在**亮面**模式下生效，
-`page.dark_theme` 管暗面，`page.theme_mode` 决定用哪一面（`SYSTEM` 时跟操作系统）。
-重构后只设了 `page.theme`、`theme_mode` 留在默认 `SYSTEM`、`dark_theme` 从不赋值，
-在深色桌面上就是"换皮肤/切深色毫无反应，整页仍是 Flet 默认灰"。三条配套：
-
-- `ft.Theme` 除 `color_scheme` 外还带 `use_material3 / scaffold_bgcolor /
-  card_bgcolor / divider_color`——少了 `scaffold_bgcolor` 时窗口底色由默认主题给，
-  换皮肤只改到按钮，看不出"皮肤换了"。
-- **墨水屏**两面共用同一套纯黑白，并强制 `theme_mode=LIGHT`（暗面桌面上深色底 +
-  纯黑字会糊成一片），另给 `visual_density=COMPACT`。
-- **启动即应用已保存偏好**（`main._apply_saved_theme`，见 §3 第 3 步）：装配根把服务
-  数据交给视图层函数，视图不 import 服务（红线 §7.5）。
-
-预览区是**一小组真控件**（FilledButton / OutlinedButton / Chip / TextField / Divider），
-配色完全来自已下发的主题——预览即所见。它曾经是三块手写 `bgcolor` 的色板，还用
-`ft.Container(expand=True)` 塞进 `ft.Row(wrap=True)`：wrap 与 expand 互斥，整行渲染成
-一片灰色区域，且色板只涂三块底色，看不出控件会怎么变。
-
-> Flet 0.86 这一类"表面 API 与记忆不一致"的坑**统一记在
-> `docs/known-issues/001_flet_0_86_surface_breaks.md`**（症状 / 根因 / 复发时先查），
-> 本文不另列清单，免得两处各自走样；那类缺陷由
-> `tests/test_controller_service_surface.py` 的 AST 静态扫描在导入期就挑出来。
-
-**外观页底部那行背景图不走 pending/保存**（第七十四轮）：皮肤 / 亮暗 / 墨水屏是"预览了但
-没点保存就不落库"，换图不是——**选完就该看到**，落偏好即生效，"恢复默认"也**不动背景**
-（把用户刚选的图连带清掉最容易被当成丢数据）。形状、服务面与装配根那一跳见 §5.16。
-
-护栏：`tests/test_appearance_theme.py`（18 项：三件套下发 ×5、五皮肤 ×亮暗真构造
-`ft.Theme`、预览区结构静态扫描"wrap Row 里不许有 expand 子控件"、控制器 pending→预览
-不写库 / 预览失败必须写状态行、启动引导）+ `tests/test_background_image.py`（38 项，见 §5.16）；
-端到端取证走离线界面探针（真点：亮面
-`(255,251,255)` → 深色 `(20,18,24)` → 墨水屏 98% 像素落在黑白两极；换皮肤后主按钮均色
-`(84,100,189)` → `(69,139,123)`）。
-
-### 5.8 「更多工具」七页的接线契约（`views/tools/**` + `controllers/tools/**`）
-
-这七页（导出/替换/字体/词典/备份/二维码/更新）的服务**全都注册在 `main.py`**，历史上
-"点了没反应"没有一条是服务缺失，断点全在接线。七条契约（护栏集中在
-`tests/test_tools_chains.py`，40 项，全部吃**真 Flet 控件**）：
-
-- **下拉/清单的值是 key，不是中文标签**：视图按 `(key, 文案)` 二元组建
-  `ft.dropdown.Option(key, text)`，把 `option.text` 传下去等于服务收到「词典」两个字后
-  什么也不做（备份的 `kind` 以前就只是事件标签，选什么都整库上传）。
-- **能力要有调用方**：`list_exportable_books` / `list_remote` / 词典规则 CRUD 都曾建好
-  了零调用方。新增服务方法时同一次改动里必须指出界面入口，否则它算未落地。
-- **对话框用 `controller._page()`**：视图未挂载时 `view.page` 抛 `RuntimeError`（不是
-  `AttributeError`），`getattr(view, "page", None)` 挡不住。拿不到 page 时**拒绝执行**
-  而不是"问不了那就不问了直接干"（`WebDavController.restore` 返回"界面尚未就绪，
-  本次恢复没有执行"）——闸的口不能开在异常分支上。
-- **备份成员是跨服务契约**：`WebDavService` 鸭子探测
-  `export_{sources,rules}_json` / `import_{sources,rules}_json`，
-  `SourceService` / `ReplaceRuleService` / `DictService` / `RssService` 各自实现一对
-  （导出去掉本地 id 与时间戳；导入按自然键去重、返回 `(新增数, 告警)`）。少一个方法，
-  `BACKUP_TARGETS` 里对应那个 kind 就永远「没有可备份的内容」。
-- **高风险写的闸在服务侧，不在界面侧**（第十二轮）：`WebDavService.restore(url, token,
-  confirm=False)` 未确认时在**解析客户端之前**就返回，PROPFIND / GET 一个都不发。界面
-  只负责"问一句"（模态框列包名、将被覆盖的书源条数、"此操作不可撤销"），因为绕过界面的
-  调用方（脚本 / 网络桥 / 仪表盘）也得被挡住；同理 `confirm=True` 是调用方的显式声明，
-  默认值保守。落库前先把**将被覆盖的那几样**现状抄进
-  `<数据根>/restore-safety/<时间戳>/`（不放 cache；只抄与包成员名相交的那些；同一秒内
-  两次恢复用 `_1` 后缀避让），路径随 `BackupResult.snapshot` 报进结果行。留底是
-  **保险丝不是关卡**：任何失败只 warning + 照常恢复，不能反过来成为"点了没反应"的新理由。
-  在途期间第二次确认直接拒——那一次的留底抄的是第一次恢复完的样子，真旧数据已经没了。
-  护栏：`test_restore_without_confirm_never_downloads` 等 4 条（服务侧）+
-  `test_tools_chains.py` 5 条（控制器侧：填路径不恢复 / 确认才派发 / 取消不派发 /
-  在途拒绝 / 无 page 拒绝）。
-  **假绿教训**：这条闸的第一版护栏用"假客户端抛错 + 断言 `"确认" in detail`"，把
-  `if not confirm:` 短路掉**仍然绿**——抛的错被服务 `except` 吞成
-  "下载备份包失败: 未确认的恢复不该下载备份包"，错误消息正好喂饱了断言。钉"这件事没发生"
-  （`client.calls == []` + 闸门自己的措辞），不要钉"结果是失败的"（失败的原因有一百种）。
-- **服务侧不校验的，界面必须当场拒**：`tts_profiles`（`tools.tts` 页，第九轮）的
-  `add_profile` 什么都能存，而 HTTP-TTS 的地址模板缺 `{text}` 时服务只会照原样拼一次
-  地址——第一条念完就再没声音。这种"存进去才发现是坏的"要在对话框里挡住，并且**话写在
-  框里**（状态行在模态框背后看不见）、**不关框**（关了等于把用户填的内容一起扔了）。
-  护栏：`tests/test_tts_profile_page.py`。
-- **控制器不得探测真服务类面上不存在的成员**（第二十七轮）：`getattr(self._svc, "x", 默认)`
-  在成员缺失时**静默跳过那一行**，界面就永远停在视图自初始化的占位文案上；而单测里替身自己
-  定义了 `x`，所以照绿。要读就直读属性（`self._svc.x`）——缺成员当场 `AttributeError`，
-  比"看起来正常工作"好。这条形状全库静态扫过：`app/controllers/**` 里 150 条
-  "服务句柄 → 成员"引用逐条对照真类面，命中 1 条（`UpdateController` 探
-  `UpdateService.current_version`，而装配处也从没传过版本 ⇒ 界面恒「当前版本：未知」+
-  比较闸门恒放行）。护栏：`tests/test_service_surface_probes.py`（扫描器 + 元护栏
-  "到底核了几条" + 真服务→真视图 / 真装配两条端到端，**不装替身**）。
-
-### 5.9 内容形态与网络能力的界面承接（本地书 / 网络桥 / RSS / 朗读）
-
-这四条在 M4/M5 只有**服务面**：能力都在、事件都在，就是没人点得到。补界面时发现
-的坑都在"界面与服务之间那层"，与具体功能无关：
-
-- **本地书**：地址形态（`localsource://` 伪源、`file://` 书地址）只认在服务层
-  （`local_book_service.is_local_source_url`、`ReadingService._local_source_for`），
-  视图**不认得这个前缀**——控制器把 `local: bool` 随记录注进渲染字典，视图只据此收起
-  「换源 / 整书缓存」两个对本地书无意义的入口。既然 `_to_render_record` 写键，就必须
-  先 `dict(raw)` **复制**：`list_bookshelf()` 发的是 SourceService 内存里的那批 dict，
-  直接写等于把界面派生字段落进 `bookshelf.json`。本地书重开靠
-  `_local_source_for` 补一个只带 `bookSourceUrl` 的合成源对象，reader-cache 的键才命得中
-  （查不到规则源不等于书坏了）。护栏：`tests/test_local_book_import_chain.py`、
-  `tests/test_local_book_m4.py`。
-- **网络桥**：`WebBridgeService`（回环绑定 + 令牌 + 默认不监听）此前唯一的入口是服务
-  仪表盘上"停止整个服务"那颗按钮——地址看不懂、令牌拿不到。设置页
-  （`views/tools/web_bridge_view.py`）只吃 dict 状态，写动作全走服务向导方法
-  （`set_enabled` / `set_port` / 重新生成令牌），端点清单由服务侧导出而不是在界面里
-  抄一份。护栏：`tests/test_web_bridge_settings_page.py`。
-- **RSS**：阅读组第三个页签「订阅」（`RssView` 三栏：源 / 文章 / 正文）。刷新进度
-  **必须走事件**（`RssRefreshProgressEvent`，见 §5.3 那条红线），不然逐源刷新期间界面
-  停在 0；未读计数一次 `article_counts()` 的 GROUP BY 全量取出，不在界面侧按源逐次问。
-  HTML→纯文本（BeautifulSoup，剥 `script`/`style`）在**控制器**做，视图只收文本。
-  删源走确认对话框。护栏：`tests/test_rss_reading_page.py`（服务面另见
-  `test_rss_m4.py`）。
-- **朗读**：`ReadAloudBar` 挂在**工具栏正下方**（第二十九轮：用户要求"朗读放到区域上方，
-  和书内搜索、设置放在一起"；它此前沉在正文与状态栏之间，离自己的入口有一屏远），
-  由 `ReaderController` 编排。六条不显然的：
-  1. 粒度是**章**——系统 TTS 后端不上报位置（`ReadAloudStateEvent.position` 恒 0），
-     所以播放条没有进度条也不做逐句高亮，只显示"正在念哪一章"；
-  2. 朗读循环是一条长协程，而 `ui_call` 只在收尾 flush 一次，所以每章开念前必须
-     就地 `set_state` + `flush`，否则连读时播放条永远停在第一章；
-  3. 停止用**换号**（`_tts_generation`）而不是取消任务：再按一次、手动翻章、切页
-     离开阅读器三条路径都换号并叫停后端，在途循环回到检查点自己收工。
-  4. 语速档位（`RATE_PRESETS`，慢/正常/快/很快 → pyttsx3 词/分钟）落
-     `reader.tts_rate`，与快捷键同类属"进程级读一次"的偏好（不参与重排）；**只有系统
-     TTS 后端吃这个参数**，而服务自己会回退（system→edge→http），所以 `speaking` 态的
-     标签必须带上 `active_backend.name` 的中文名——不显示是谁在念，用户就是对着一个
-     不吃这参数的后端调语速，"调了没反应"重新变成查不出来的静默退化。
-  5. 音色下拉的选项来自 `tts_profiles` 表（管理面在 `tools.tts`，见 §5.8），
-     **key 是行 id 不是中文名**，首项 `BUILTIN_VOICE`（`builtin`）表示不启用任何语音档。
-     选中之后的三样接法（`engine_type` / `url` / `headers`）必须一起进 speak 的 `opts`：
-     `set_voice()` 只负责切后端，带不齐就是"选了一条不存在的引擎"。默认档落
-     `reader.tts_profile`。正在念时改音色**不打断**当前这句（opts 每章算一次），
-     标签要写"从下一章生效"。表里那条档被删了则下拉退回 `builtin`，不留幽灵值。
-  6. **可见性归视图、可用性归控制器**：工具栏那颗「朗读」管收起/展开（`_read_aloud_open`
-     只在 `ReaderView` 里），控制器只写"这会儿到底能不能念"
-     （`set_read_aloud_available(有朗读服务 且 有可念的章)`）。只有一条规则不许坏：
-     **正在念的时候那一条不许藏着**——桌面没有通知栏，藏掉就等于屏幕上没有能按停的地方。
-     这条规则写在 `sync_read_aloud()` 一处：`speaking` 时把面板钉成展开，同时把那颗粒键
-     禁用并写明原因（"朗读中：先停止才能收起"）。
-  `ReadAloudStateEvent` 的渲染按「当前书 + 当前章」过滤，上一章迟到的 `idle` 不能把
-  界面从"正在朗读"拽回去。服务在 `hub` 里缺席时整条播放条不出现
-  （`_safe_service`）。设计 §1.1 设想过**全局覆盖层**形态（切页继续念）：阅读器是整页
-  视图、切页即拆，声音继续放着却没地方按停比安静更糟，因此**有意**做成随视图停。
-  护栏：`tests/test_reader_read_aloud_page.py`（落点与那颗键的折叠契约另见
-  `tests/test_reader_read_aloud_placement.py`，服务面另见 `test_read_aloud_m4.py`）。
-
-### 5.10 书源登录：Legado 的三种形态（`views/reading/login_dialog.py` + `controllers/find_books_controller.py`）
-
-引擎面早就按 Legado 实现了（`LegadoReadingEngine.login_schema / execute_login_action /
-submit_login / login_target`，`tests/test_legado_compat.py` 有对拍），断的一直是界面侧的
-**分流**。对照 `base_history/legado-3.23.110211/.../ui/login/SourceLoginActivity.kt`
-（`initView`）与 `SourceLoginDialog.kt`，登录只有三条路，桌面端必须一样分：
-
-| 形态 | Legado 判据 | 桌面端 |
-| --- | --- | --- |
-| ① 有表单 | `loginUi` 非空 | 铺输入框（`text`/`password`）**并回填 `source.getLoginInfoMap()` 的已存值**；`type:"button"` 的行铺**按钮**，点它只执行该行 `action`（带当前表单值进 `result`） |
-| ② 网页登录 | `loginUi` 空 | Legado 开 `WebViewLoginFragment` 加载 `loginUrl`；桌面端**报地址**（可复制）+ 一个**显式**的「清除已存登录信息」 |
-| ③ 脚本登录 | 无 `loginUi`、`loginUrl` 不是地址 | 直接把源的登录脚本跑一遍，结果写状态行，不弹框 |
-
-三条契约（第十二轮之后由第十三轮补齐，护栏 `tests/test_source_login_chain.py`）：
-
-- **`loginUi` 的行类型不是只有输入框**：控制器早先只映射 `key/label/hint/password`，
-  于是 `{name:"登 录",type:"button",action:"Login()"}` 变成了一个标着"登 录"的**空输入
-  框**，它的 `action` 被整行丢弃——靠按钮登录的源（扫码 / 过验证码 / 免密跳转那类）在
-  桌面上根本登不进去，表现为 `execute_login_action` **生产零调用方**。行的 `action`
-  非空就渲染按钮并绑 `on_action`，绝不进 `_collect_fields()`。
-- **已存值只在引擎里，界面不接就等于没有**：`login_schema` 已经把
-  `item["value"]` 填好（Legado 是 `editText.setText(loginInfo[name])`），控制器映射时
-  漏读这个键 → 每次打开全空、密码要重打。
-- **②那种源不能走表单这条路**：引擎的 `submit_login(source, {})` 语义是
-  `source.removeLoginInfo()`（这条**照抄 Legado 是对的**——它的 `login()` 里
-  `loginData.isEmpty() → removeLoginInfo()`），错的是界面给一个没有字段可填的源弹了
-  一张空表单：用户点「登录」= 把自己的登录信息删了。所以"清除"必须是**看得见的那个
-  按钮**（`show_web_login` 里连提交按钮都不出现），不是某个分支的副作用。
-  同 §5.8「对话框用 `controller._page()`」那条：拿不到 page 就不弹、不执行。
-- **网页登录要做成合法形态还差 Cookie 回流**：`webview_fetcher` 对登录页只是无头抓一次
-  HTML，登录态不会回到该源引擎的 cookie 罐；JS 桥的 `browser_starter` 钩子在全项目
-  **无人赋值**。所以 ② 目前只报地址（用户自己去「工具 → 内置浏览器」登录），
-  就地登录 + 回流是记在 `docs/dev-logs/2026-09-26.md` 遗留里的服务侧缺口。
-
-服务侧新增的两个转发是这条的接口面：`RuleEngineService.login_target(source)`
-（同步纯函数，不碰引擎池，界面用它决定铺表单还是报地址）与
-`run_login_action(source, action, values)`（转 `execute_login_action`）。
-
-### 5.11 事件投递是异步的 + 进度事件覆盖现状
-
-**`EventBus.publish` 不等处理器跑完**（`core/bus.py:46-53`）：它先在锁内抄一份处理器
-快照，然后对**每个**处理器调一次 `self._engine.submit(...)` 把 `_invoke(handler, event)`
-排进 EngineHub 的执行域，立刻返回 future 列表——调用方（发事件的服务）当场就返回了，
-处理器稍后才在另一条循环上被执行。三条别人必须遵守的后果：
-
-- **测试要"等投递"，不能发完就断言**：`publish` 返回时处理器一次都还没跑。要断言
-  "界面收到了这个事件"，必须显式等事件真正落地（`_wait(...)` 之类的自旋等待），而且
-  **等的那条流必须就是被断言的那条流**——§2 基线里那条用例当日就栽在"等了一种事件、
-  却断言另一种事件的最后一拍"上（已按这条改对，改后单跑 6 次全绿）。
-- **`detach()` 之后处理器仍可能被调到**：订阅退订只是把 handler 从集合里摘掉，**已
-  经排进去的任务不会被撤回**。切页落在 `await` 空档上时，控制器 `subscribe` 的 handler
-  完全可能在 `detach()` 之后才执行——所以**碰控件的事件处理器必须再查一次
-  `self._view is None`** 才动控件，与 §5.3 那条编排协程约定同源，不是可选项。
-- **同一事件的多个处理器之间没有顺序保证**，跨事件类型之间同样没有。要顺序就把它做成
-  一个事件里的一个列表字段，别指望"先发的一定先被处理"。
-
-**进度反馈的事件化覆盖现状**：长任务里发**进度**事件的有六处——
-`DownloadProgressEvent`（整书离线缓存，`reading/download_service.py`）、
-`ImportProgressEvent`（导入，`sources/source_service.py` 逐条 + `sources/online_import_service.py`
-阶段）、`RssRefreshProgressEvent`（RSS 批量刷新，`content/rss_service.py`）、
-`RepairProgressEvent`（正文规则自愈的阶段行，`sources/rule_repair_service.py`）、
-`BackupProgressEvent`（备份/恢复的导出 → 校验 → 压缩 → 上传 → 落库逐拍，
-`tools/web_dav_service.py`）、`ExportProgressEvent`（整本导出 epub/txt 的逐章拍，
-`tools/book_export_service.py`）。后三条是近两轮补的：补之前它们只发收尾事件，
-十几秒的过程里界面一潭死水。
-
-导出这一条还多一个别人没有的坑：**它通体是同步的磁盘/CPU 工作，全程不 await**。
-`publish` 只把处理器排进引擎循环，所以"发了事件"和"处理器跑了"之间差一次让出——
-不让出，几百章攒下的进度拍会全部堆到导出返回之后，界面就是"条不动，然后一下子完成"。
-`_paced` 每章 `await asyncio.sleep(0)` 就是干这个的（有护栏：慢缓存 + 同构派发总线，
-变异核验拿掉 sleep 立刻红）。**任何"同步重活 + 进度事件"的组合都要照这条写。**
-
-还差什么（下一轮的真实起点）：
-
-| 长任务 | 现状 | 缺什么 |
-| --- | --- | --- |
-| 换源扫描 / 书源检测 | 有 `CheckFinishedEvent`，检测页进度走 `SourceCheckService.run_snapshot()` 轮询 | 跨页续跑时进度只在快照里，切走再切回靠轮询补 |
-
-**「批量替换规则应用」不在这张表里，之前列进来是误判**：替换规则不是"批量任务"。
-用户改的永远是规则表（`ReplaceRuleService` 只做 CRUD + 启停，改完发
-`ReplaceRulesChangedEvent`），正文里的替换发生在阅读链路上——
-`reading_engine.process_book_content` 每章就地调
-`get_global_replace_rules(scope)`（provider 由 `set_global_replace_rules_provider`
-在 `on_start` 注入）。项目里根本没有"把规则应用到全部书源/全部章节"这个动作，
-所以也就没有可报的进度。
-
-形状约束（补新事件时照这条走，服务侧发事件、不在服务里改控件）：**低频的阶段事件
-不要节流**——0.5s 合并是给逐条高频事件的（下载进度、搜索结果流），阶段事件一共就
-十几拍，节流反而会把最后几拍推到收尾之后，界面上就是"结果都出来了进度条还在转"。
-跨页切走的还要在服务侧留一份可回放快照（`run_snapshot()` / `await_run_finished()`
-那对协程入口）。新增进度事件时记得同时补进 §4.3 的事件清单。
-
-### 5.12 视频书：一个播放面、懒建控件、跨 loop 编组（`views/reading/video_play_bar.py` + `controllers/reader_controller.py:1122-1330`）
-
-正文里的视频块（书源规则产出的 `{{video.…}}` / `<video>` 归一化结果）过去由
-`reader_view` 直接 `import flet_video` 自建控件——**每个视频块一个播放器，且完全绕过
-`MediaPlayService`**，于是服务面上那套"播放列表 + 记忆位置 + 后端抽象"在界面上没有
-承接方（M5 核对表 1.4 那格 ✗ 就是这么来的）。现在只有一条链：
-
-`ReaderView._collect_videos()` → 条目行「在本页播放」→ `ReaderController.play_video` →
-`MediaPlayService.open_book/play_chapter`（`FletVideoBackend`）→ `MediaPlayStateEvent`
-→ `_on_media_play_state` 镜像回 `VideoPlayBar`。九槽绑定见 reader_controller.py:201-211
-（七条按钮 + 播放器自己上报的两条 `on_ended`/`on_failed`）。
-
-四条别人必须守住的实现约束（都是这一轮踩出来的）：
-
-1. **全场只有一个 `ftv.Video`**，挂在面板上（`ReaderView._video_control`）。两处各放一
-   个播放器 = 一个出声一个出画，且服务的位置回读会指错对象。音频块不受这条约束，仍在
-   正文里就地 `flet_audio`（它是"章内一段"，不是"一部片"）。
-2. **`flet_video` 懒建**：原生插件，读小说的人不该在打开阅读器时就付它的加载成本；
-   控件只在第一次起播时 import + 构造。
-3. **先上屏再下发**：`playlist` 赋值和 `play()` 必须在控件已有 `page` 之后发，否则命令
-   落进空管道。换片的「要播」意图**与换源同一条消息**下发（`playlist=[media]` +
-   `autoplay=True`，不再补 `play()`）；叫停在控件上落的是 `pause()` 而不是 `stop()`。
-   两条都是 web 面实测出来的（见下"web 面的三处实错"），位置回读用 `get_current_position()`。
-4. **服务在引擎循环、控件在界面循环**：控制器碰控件一律走 `ui_call` / `ui_await`
-   （§5.3、`engine-hub-loop-split`）。测试与探针要**自己** `set_ui_loop(...)`——生产由
-   `build_app_shell` 登记，绕开装配层的探针不登记，则 `ui_call` 退回引擎守护循环，
-   界面一帧也收不到，看着像"点了没反应"。
-
-播放进度与阅读进度**分列**存储（v7 `books.play_chapter_index` + `play_position`，见 §6）；
-书架行"读到第几章"仍只跟阅读进度，不随播放推进（差距已记 §1.4）。
-
-连播（第二十二轮接上，第二十四轮取证）：客户端 `on_complete` → `VideoPlayBar.on_ended` →
-`ReaderController.video_ended` → 服务 `mark_ended()`（清了位置再发 `ended` 态）→
-`_finish_video_entry()` 按列表顺序点下一条。三条闸门都是必要的：
-**只认"正在放"**（停止/收起后客户端还会补发完成事件，照单连播会把刚收掉的播放器点亮回来）、
-**等落库期间换条/切页就放弃**（`index != self._video_index` 或 `_view is None`）、
-**报错不连播**（书源里的视频常常整本都坏，连播就是一路错到底）。片尾位置必须清零，
-否则"接着看"从那一秒起播。
-
-**web 面的三处实错**（`.probe/probe_complete_source.py` / `probe_stop_recovery.py` 用
-ffmpeg 现制的 6s/4s 真片 + 无头 Chromium 量出来的，不是读码猜的）：
-
-1. **起播竞态**：`playlist=[media]` 之后立刻 `play()`，客户端回
-   `The play() request was interrupted by a new load request.` /
-   `The element has no supported sources.`，面板停在 error、位置恒为 0。改法是让播放意图
-   随换源那一条消息一起下发（`autoplay=True`），`play()` 在那一发之后**故意不发**。
-2. **建控件自带一发伪 `completed`**：`ftv.Video` 构造后约 40 毫秒回 `on_complete(data=False)`
-   + `on_error('MEDIA_ELEMENT_ERROR: Empty src attribute')`，**传不传空 `playlist=[]` 都一样**。
-   真片尾是 6 秒那片放完时的 `data=True`。所以 `VideoPlayBar` 只做两件事：`on_complete`
-   认 `data` 为真才算片尾（否则起播那一瞬间就能把整本翻到最后一页），`Empty src attribute`
-   那条报错丢掉（此时用户那本还没开始放，涂红等于凭空报错）。真坏源的话
-   （`no supported sources` / `FFmpegDemuxer`）照原样递上去。
-3. **`stop()` 会把播放面弄废**：控件的 `stop()` 之后 `<video>` 被摘出文档，再换任何片——
-   假源照样被要（UA 是 Mozilla）、位置一动不动，并回
-   `The play() request was interrupted because the media was removed from the document.`。
-   三种救法实测：停止改用 `pause()` 能放、`stop()` 后补 `play()` 放不起来、`stop()` 后重建控件
-   能放（但要视图层配合）。故 `FletVideoBackend.stop()` 在控件上落 `pause()`。
-
-真实挂载面的端到端证据：`.probe/probe_auto_next.py` **8/8 通过**（0.1s 客户端去要片，
-位置序列 0→4 往上走，**+6.06s 客户端报真片尾**后面板自己换到第 2 集、回环新增一次
-`/clip/ep2.webm` 请求；按停止后补发 `data=True` 的完成事件不再连播；最后一条放完停在
-`ended` 不绕回第一条）。还有一条跨源前提记在这儿：flet_web 给页面带了
-`Cross-Origin-Embedder-Policy: require-corp`，视频地址在**另一个端口**（书源都是这样）时，
-服务端不回 `Cross-Origin-Resource-Policy: cross-origin` 就被浏览器拦成"没有可用源"——
-这解释了 web 面看第三方视频书为什么会黑屏，不是本项目能替源站补的头。
-
-护栏 `tests/test_reader_video_panel.py` + `test_media_play_m4.py`；变异核验两轮共 8 条
-（面板两条过滤器 4 条，`.probe/mutate_web_artifacts.py`；后端起播/叫停 4 条，
-`.probe/mutate_media_start.py`）全红。第二十二轮那条"绕回第一条"的变异第一轮是
-**绿的**——"没发生"的判据写得会在"该发生的"落账那一刻就成立（见 dev 日志第二十二轮）。
-上一轮"客户端真产 `on_complete`"未取证的空洞已在第二十四轮补上；顺带发现：**当时那条
-PASS 是伪事件给的**（`completed=False` 被当成片尾），所以连播的取证必须等真位置走完再看。
-
-### 5.13 规则编辑器：选源 → 选字段 → 合并保存（`views/source/code_editor_view.py`）
-
-「找书 → 规则」页签（`DEST_SOURCE_EDITOR` = `sources.editor`，`registry.py:158`）第二十三轮
-重做。旧形态只有一个编辑框：进来面对一份不知道属于哪本书的 JSON，改完只能整份手贴。现在的
-编辑单位是**一条规则字段**：
-
-书源下拉（`SourceService.list_sources`，进页即拉，`↻` 可重拉）→ 规则字段下拉（首项固定
-「整份书源 JSON」，其余**只列这份 JSON 里真实存在的字符串字段**，按 搜索/发现/详情/目录/正文/书评
-分组）→ 编辑框 → 关键字识别摘要 → 示例正文框 → 「保存并校验」/「试跑调试」。
-从书源列表带来源跳入走导航载荷 `load_source(record)`（`NavigationHost._open_nav_action` 认
-`load_source`/`load_record`），这条路径只把该源**并进**下拉（`add_source_option`），
-不能整表替换——否则切源得退回上一页。
-
-三条不能省的约束：
-
-1. **字段模式保存 = 合并，不是新建**。`_merged()` 拿 `_current` 深拷贝后只改那一个键；
-   没有 `_current`（还没选源就点保存）直接拒绝——凭空造一条只有该字段的书源去覆盖库里那条
-   等于删数据。
-2. **切字段先暂存**（`_stash_text` 只动内存，不写库不调校验），且换目标用**事件递来的键**，
-   不回读下拉 `.value`：控件状态什么时候落定不归控制器管。
-3. **试跑要先有示例正文**。本页不联网抓样本（见「全库联网扫描触发杀软拦截」），没样本就
-   **不调引擎**并说明原因——拿空串求值回显「没命中」，会把「规则写错了」和「没给正文」
-   混成同一个结果。引擎按 `_kind_of(rule, sample)` 选 html/json（`$.`/`[` 开头的规则走 JSONPath）。
-   求值本身在 `RuleEngineService.extract_values(rule, sample, kind)`：**整段示例正文就是被求值
-   的节点**。这里不能套 `rule_engine.select_nodes(sample, kind, "")`——那是搜索管线"先按列表
-   规则选容器、再逐容器取字段"的第一步，试跑现场没有 bookList 可依，空列表规则一个容器都选不出，
-   求值对象就成了空列表，**任何规则都只会回"没取到值"**（第二十六轮浏览器面实测的实错）。
-
-高亮层是关键字识别，不是逐 token 上色：`tokenize_rule` 切完只列**识别到的**规则关键字
-（`@text` / `css:` / `$.JSONPath` / `<js>…</js>` / `|| && %%`，去重封顶 40 个）。两个坑记下来：
-正则组名是 `str`（Python 里 `string` 不是合法组名），对外统一成 `string`，否则引号串
-从来没被上过色；JSON 文档模式若整串跳掉引号段，`".title@text"` 里的 `@text` 会一起丢，
-所以要**钻进引号串里再切一次**。
-
-红线照旧：本视图零 `app.services.*` import，高亮词表是方言常量；控制器可以 import flet，
-`WHOLE_SOURCE` 常量从视图侧惰性取，避免两份字面量漂移。护栏 `tests/test_source_rule_editor.py`
-（12 条变异核验全红）。
-
-### 5.14 版面契约：只有截图认得的那一类（`views/reading/bookshelf_view.py` + `reader_view.py`）
-
-第二十八轮的输入是**像素**，不是代码走查：这一片的行为用例本来就全绿，坏的是版面。
-前四条钉的是"单测看不出来、只有眼睛认得"，第 5/6 条钉的是"够得着 / 看得见"那一类。
-
-1. **`ResponsiveRow` 的子项必须写 `col`**。0.86 上 `col` **默认 12 = 独占一行**，
-   不写就等于放弃栅格：书架工具栏六个控件排成六行，工具区被撑到 ~330px 高，书反而
-   沉到屏幕下半部。现在按 4/2/3/3 分完 `columns=12`（三个图标按钮合在一个 `col=3`
-   的 `Container` 里）。护栏钉的是"没有子项停在默认 12"和"列宽之和 == 12"。
-2. **下拉的宽度由栅格位给，不由内容量给**。`ft.Dropdown` 默认**按内容量一次宽**，
-   且这一次量在字体晚到的面上拿的是回退字体：实测量成 120px 把"最近阅读"截成
-   "最近阅…"，**等 6s 不变、任何一次重排（改视口 / 切网格）才自己变回 148px**。
-   改法是 `width=float("inf")`（填满所在格），不是写死像素——720px 窄窗时 `col=3`
-   只有 ~113px，写死 150 就溢出。同理，`ReadAloudBar` 那种**不在栅格里**的下拉只能
-   写死宽度，音色那条 120→150 是截图量出来的。
-3. **状态行跟着它的对象，不挂 `Column` 末尾**。挂在末尾的状态行永远贴着窗口底边
-   （实测 y≈875），离它说的那张列表几百像素；空文本时整条收起，不留一条灰字占位。
-4. **存储形状不外泄到视图**：书架行"读到第几章"从来不是一个裸键（在 `reading` 子对象
-   / 旧数据 `durChapterTitle` 上），投影放在 `BookshelfController._to_render_record`，
-   视图只读归一化后的 `chapter_name`，且投影不回写源 dict（否则会被落进 json）。
-5. **沉浸模式必须有明确的入口和出口**。正文段是 selectable 的（§5.3 划词），点版心那
-   一下**被文本控件吃掉**（实测既不切沉浸，旧版还把整段亮到划词条上——
-   `TextSelectionChangeCause.TAP` 也带 `selected_text`，故过滤器只挡 TAP，
-   `DRAG`/`DOUBLE_TAP`/无 cause 三面放行）。入口是工具栏那颗按钮，出口是右下角浮标
-   （`bottom=76`，压在「连读下一章」上那一版是 18）；浮标在目录页盖上来时收掉，
-   因为目录自己带返回。手势出口没做，见开发日志遗留 16。
-6. **阅读控制区在正文上方，一条都不许沉到底部**。工具栏左组 8 颗图标（退出/上一章/
-   目录/书签/书内搜索/**朗读**/阅读设置/沉浸）实测排在 40px 栅格上（中心 x=36..316），
-   进度标签从 x=336 起。朗读条就在工具栏下面（量得 顶部 y=62，离工具栏底 21px，
-   正文从 y=137 起），不再是"正文与状态栏之间"那条。护栏钉的是 `_reader_page` 里的
-   **槽位相邻**与那颗键在 `Row` 里的**先后**。见 `tests/test_reader_read_aloud_placement.py`。
-   ~~这一簇不该换成 `wrap`~~ —— 第七十六轮**推翻**了这条：12 颗 40px 图标在 344px 客户区
-   里怎么排都不缺颗是不可能的，判据改成"必须 wrap、且行里任何子项不带 `expand`"。
-   代价写明：**这一簇的行高随窗宽变**（窄窗里工具栏从一行变三行，它下面的朗读条跟着往下走）。
-7. **客户端对"比窗还宽"的东西分两种做法，窄窗降级必须按这两种来**（第七十七轮桌面像素，
-   两臂对照量的）：
-   - **方框自己**（`AlertDialog`、`Stack` 的子项）会被**夹到父框宽**，而且里面的内容是
-     **照窄框重排**、不是画宽了再切。侧栏抽屉那条实测：`width=320` 装进 304 客户区，
-     面板画出来 284（= Stack 自己的宽），头部那行的 `+`/`✕` 跟着面板右移同样的像素。
-     → 所以**给容器写定宽在窄窗里不是缺陷**，不用为它加 `page.width` 夹宽那类代码。
-     反过来**删掉**定宽也不是免费的：阅读设置那块去掉 `width=420` 之后，宽窗里整块塌到
-     280px，"左对齐"截成"左对"（第七十七轮两臂，`out_dlg77A_reader_settings_1200.png`）。
-   - **定宽子项**（`width=150` 的下拉、一条不换行 Row 里几位定宽控件）是**照字面排完再被裁**：
-     明知塞不进的对照臂里，色条右端越过了方框右界、后面的子项整只没了。
-     → 真要在窄窗里活下来的，是**行**这一层：要么 `wrap`，要么拆成 `ResponsiveRow` 的格子。
-8. **`Row(wrap=True)` 不能挂在 `ResponsiveRow` 的格子里**（第七十七轮三臂对照）：同一位置
-   格子里套 wrap 行，音色+语速排完就换行、右边空着 400px；把那条 wrap 换成不换行 Row，
-   三件立刻排回一行——而格子本身量到 665px，**该给的宽给了**，是 wrap 行在松约束下自己
-   塌成固有宽。所以降级只走 `col`，控件各占一格，不在格内再造会换行的行。
-   与第 7 条同族的另一根钉子：`wrap` 行里**任何子项显式传过 `expand`**（`expand=False` 也算）
-   → 整条行画成一块灰（第七十六轮五臂量的）。两条合起来 = `tests/test_narrow_window_layout_contract.py`。
-9. **`col` 的份额算不出来，只能按"该档最窄客户区"直接读回来**。朗读条那三件定宽
-   （音色 150 / 语速 110 / 连读 122）第一版给 7 与 5：344 客户区量到 175/124 够，
-   304 那一档语速格只有 **107 < 110**，下拉右端被裁 3 个像素。改成音色独占一行
-   （`xs=12`）、语速与连读并排（各 6），同一档量到 264 / 130 / 130，四格全 ≥ 自己的定宽，
-   而**行数没变多**（还是三行）。宽窗那档不动：1184 客户区 474 / 186 / 186 / 282 一行排完。
-   为什么不能算：格子宽不是 栏宽 × col/12 这么直白——朗读条自己有 `padding=10` 左右、
-   `ResponsiveRow` 有 spacing，这套扣减没有一条写在文档里，算出来的 165/118 与量到的
-   175/124 差 10px 级别，正好够把"够不够"判反。探针写法：四格各涂一色、逐列扫跨度，
-   另放 5:7 两块纯色当尺子（三档量得 1.405 / 1.417 / 1.414，应有 1.400）证明读回来的是
-   终态不是中间态。见 `.probe/probe_readaloud_cell77.py`。
-10. **`ft.Switch` 的 label 永远不换行，包一层控件也没用**（第七十七轮两臂：`label=ft.Text(...)`
-    与裸字符串两张图**完全重合**，304 档）。开关把标签按无限宽排，长标签只能**自己拆**——
-    阅读设置那两条现在是短标签 + 一行 12px 小字（`hint()`）。同理，`col` 的份额、
-    弹层被夹之后的实际宽度都**算不出来**，只能量。
-11. **承载记录行的容器必须是 `ft.ListView`，不能是 `Column(scroll=AUTO)`**（第七十八轮
-    真窗口逐拍 `SetWindowPos` 实测）。判据不是行数、是"**行 × 每行控件数 × 容器会不会
-    虚拟化**"：917 条裸 `Text` 装进滚动 `Column` 每拍改尺寸只要 **13ms**，同一批窗口
-    **真实书源行**（≈9200 个控件）装进滚动 `Column` 要 **238ms**，换成 `ListView` 装同样
-    917 条真实行回到 **12ms**（空页底价 11ms；两臂都回跑过一遍）。客户端只对 `ListView`
-    按可见区建行，`Column(scroll=AUTO)` 把整棵子树实化——这就是用户那句"应用无法顺畅
-    拖动"。护栏 `tests/test_resize_band_gate.py` 里那张表逐页钉行容器类名，加新页要加进表。
-12. **窗口缩放的档位判定住在外壳，重发只发生在"跨过阈值"那一拍**（第七十八轮）。
-    拖 30 拍 Python 只收到 **1–4 次** `on_resize`（客户端自己合掉了），但**每一次**处理器
-    重下发整棵根树要 **0.5–2.1s** 界面循环（同期心跳落后 max 545ms）。所以
-    `page.on_resize` 只在 `_is_narrow()` 翻转时才 `rebuild() + _repaint_root()`。
-    需要换形状的页**不自己读 `page.width`**：它要的是"跨过档位"这个时机而不是某个时刻的
-    宽度，由 :meth:`NavigationHost._notify_band` 在**重发 / `show()` / 切页签**三处推给
-    实现了 `on_band_change(narrow)` 的视图（没实现的 getattr 兜空，一次调用不许多花；
-    某个页的降级抛了不许拖垮外壳重建）。改完五臂每拍 p50 **12–13ms**、处理器合计 **0ms**。
-13. **`ListTile.trailing` 放 `Row` 会把标题挤成 0 宽**（第七十八轮像素，两档宽度都中）：
-    订阅页源行原来是 `trailing=Row([Text("N 未读"), IconButton])`，屏幕上四行源只剩图标
-    和「⋮」，源名与副标题整个消失；同页文章栏的 `trailing` 是单个 `IconButton`，同档宽度
-    下标题正常。→ 统计数字写进 `subtitle`，`trailing` 只留一颗按钮。
-    反过来 `visible=False` **确实把位置让出来了**：窄窗单栏那副形状里内容区竖向实线列从
-    宽窗的 3 条变成 **0 条**，首行最右落墨到 344 窗的第 **320** 列（距右边缘 23px）。
-
-**探针纪律**（这一轮踩过三条，都影响结论真假）：图标按钮的 tooltip 不进语义树，只能按
-截图量出的坐标可信点击，而**坐标会随布局漂移**（浮标挪位后探针还在点老位置，产出的
-是"没退出沉浸"的假状态）；阅读页起来时外壳页签条是隐藏的，回书架必须先点退出阅读；
-**只等固定秒数就截图 = 量到中间态**，要分清"宽度不够"和"量宽只做一次"，得做一次
-强制重排当对照。中文字体由 `page.route` 喂本地 woff2，否则满屏豆腐块，截字问题根本
-看不见。护栏：`tests/test_shelf_reader_ui_layout.py`（26 条）+ 12 条变异核验。
-
-### 5.15 快捷键页与老板键（`views/settings/shortcut_view.py` + `controllers/settings/shortcut_controller.py` + `services/tools/boss_key_service.py`）
-
-用户报的是两句：「打开软件没有找到对应按键设置的位置」「阅读页面中也需要可以设置
-翻页/上下一章的快捷键」。落地形态是**配置组里新增一个「快捷键」页签**
-（`DEST_SETTINGS_SHORTCUTS` = `settings.shortcuts`），一张表管八行——七个阅读动作
-（翻页上/下、上一章/下一章、目录、阅读设置、退出）加老板键那一条。
-
-**键表住在 `app/core/shortcuts.py`，两边共用**。这是本页唯一的设计要点：阅读器原来
-自己带一张表，录键页再写一张的话，页面显示 `PageDown`、比较用的是 `pagedown`，
-用户录进去的键位**永远不会命中**。core 模块零 flet，三件事是纯函数——
-`normalize_key`（flet 的 `KeyboardEvent.key` 写法很野：`Arrow Left` / `arrowleft` /
-`ControlLeft` 都可能出现）、`chord_of`（把按住 Ctrl 再按 H 合成
-`ctrl+alt+shift+meta` 固定顺序的一条弦；单独按修饰键返回空串）、`format_binding`
-（反过来给人看）。`chord_of` 在无修饰键时给出的正是 `left`/`pagedown` 这种裸串，
-所以**历史偏好不用迁移**。显示写法里非拉丁那几条（`空格`/`逗号(,)`/`↑`）由
-`_DISPLAY_REVERSE` 读回同一个绑定，否则"显示过一次再存库，键位自己变了"。
-
-**存量分两处**：七个阅读动作存在 `reader.shortcuts`（一个字典，
-`ReadingService.save_reader_preference`），老板键存在 `bosskey.enabled` /
-`bosskey.shortcut` 两条标量（`SettingsService`）。界面一张表、落库两处，所以
-`save()` 分别写，任一处失败都要写在状态行上而不是只记日志。撞键**不拦保存**
-（Legado 也不拦），但分发是"表内第一个命中"（`action_for`），提示语必须说清
-"按下去只有排前面的会动"。
-
-**录键走既有分发链，不开新口子**。视图把 `on_key` 槽交给控制器（只在页签是当前视图
-时收得到），命中录制中那一拍才落绑定；用户"点一下录制、按一下键"就录完，没有输入框
-让他手敲组合串。控制器只认"正在录的那个动作"，其余按键一律不看——否则在页面上翻别的
-控件会被当成录键。
-
-**老板键的形状是"藏"不是"最小化"**（第七十三轮桌面 ctypes 实测）：
-`page.window.visible=False` 让 `IsWindowVisible` 与 `WS_VISIBLE` 同时转假、任务栏那格
-消失，且 `visible=True` 原样回得来；`minimized=True` 只转 `IsIconic`，窗口还在任务栏；
-`skip_task_bar=True` 在这套客户端上**样式位一位没动**，不能当"从任务栏摘掉"。所以
-唯一入口是**一只只在藏窗期间存在**的托盘图标（`services/tools/win_tray.py`，pywin32
-`Shell_NotifyIcon` + 自带消息窗口线程）。顺序是硬约束：
-
-1. `hide()`：**先挂图标、图标挂不上就绝不藏窗**。窗口消失又没有任何入口，用户只会
-   以为程序崩了直接强杀，读过的进度全丢——比功能没做成严重得多。
-2. `restore()`：**先回窗、再摘图标**。图标比窗口先没，用户同样以为程序消失了。
-3. 回窗必须 `to_front()`（0.86 是**协程**，裸调用只会得到 "never awaited"，窗口一动
-   没动；藏起来的窗口也不会自己抢回前台）——但这条要**等 `_FRONT_DELAY = 0.3` 秒、
-   到点时看藏窗标志再发**：客户端把 toFront 做在收到之后，它晚于其后那条 `visible=False`
-   落地，"点完图标立刻再按一次老板键"就会让窗口赖在桌面上而标志说藏着，此后每一拍
-   `handle_key` 都直接 return（桌面探针 0 秒间隔那一臂 2/2 复现；改成"落地后补一次藏"
-   **没用**，那条协程在消息发出去时就算完成了）。
-4. 托盘回调**跑在托盘线程上**，控件只认界面循环，所以经 `_run_on_ui` 用
-   `run_coroutine_threadsafe` 编组回 `ui_loop()`（§5.2 同一条契约；无头/测试没登记
-   界面循环时就地执行）。
-
-**真键盘那一条腿量过了**（`SendInput` 一次一键、间隔 60ms，同时读 `GetAsyncKeyState` 对账）：
-flet 自己造的 `KeyboardEvent` 写的是 `key='H'`（**大写**，`normalize_key` 折成小写才碰得上）
-+ `ctrl/alt` 真布尔，`chord_of` 得到 `ctrl+alt+h` → 命中默认绑定、当场藏窗（等了 0.0s）；
-从托盘回来之后再按一把仍然命中，所以老板键不是"只能用一次"。
-
-**两处接线都在装配根**，视图层拿不到服务（红线 §7.5）：`main._wire_boss_key` 把
-`lambda: page` 注给 `set_page_provider` 并返回一个 `key_filter`，
-`build_app_shell(page, hub, shelf_probe=..., key_filter=...)` 把它挂在
-`page.on_keyboard_event` 的**最前面**——命中老板键那一拍必须吃掉，既藏窗又翻页是灾难。
-非 Windows / 没装 pywin32 → `available` 为 False，服务照样注册，快捷键页明说
-"本机没有托盘能力"，其它一切照旧。
-
-护栏：`tests/test_shortcut_page.py`（42 条，藏/回两条顺序用一份共享 sink 钉死
-`["tray_start","visible=False"]` 与 `["visible=True","tray_stop"]`，那条把关另钉"连按两下
-时 toFront 根本不许发"）+ 17 条变异核验；桌面真类探针 `.probe/probe_bosskey_roundtrip73.py`。
-**人手点托盘图标这一腿离线造不出来**（仪器只能把消息塞进回调），记在 `docs/known-issues/`
-待修清单 12，探针带 `--human` 留了 12 秒人工确认口；0.3 秒那道关是量出来的常数，
-客户端换版本后要重跑（同 004 待修清单 13）。
-
-### 5.16 全应用背景图（`services/tools/background_service.py` + `views/navigation.py` + 装配根订阅）
-
-同一条需求里的后半句："背景图片替换能力"。定下来的是**全应用一层**（不是每页一张、
-也不是只有书架换底）：**读的是同一个偏好，画的是同一个根**。
-
-**服务面**（`BackgroundService`，工具域）：用户选中的原图**归一后拷进
-`<data>/backgrounds/<md5-16>.jpg`**，库里落的键值是那份拷贝的路径——原图可能在移动盘、
-网盘或一个马上会被整理的下载文件夹里，下次开机它就没了，界面上只剩一块裂图。归一走
-Pillow：长边压到 2560、转 JPEG（背景层永远罩着一层半透明，85 质量看不出压缩痕迹；
-一张 6000×4000 的手机照片天天被解码不值）。**没装 Pillow 就原样拷贝**，功能不退化成
-"用不了"。`install()` 是协程（读原图 + 解码 + 缩放是几百毫秒到几秒的重活，同步方法会把
-窗口冻在那里），顺序是硬约束：**先写新图 → 再落键 → 最后删旧图**，落键之后界面已经指向
-新文件，这时删旧的才不会闪出一道"既没旧的也没新的"空窗。`current` **认文件不认键**
-（文件没了就当没有，这一层的替代品是纯色底，裂图比没背景难看）；`_prune` 只删**我们自己
-目录里**的路径，绝不碰用户自己的文件。偏好键 `appearance.background.image`（空串 = 没有）。
-
-**外壳那一层**（`NavigationHost.render()`，`views/navigation.py:346`）：有背景时把宽/窄窗
-布局垫进 `ft.Stack`，最底一层是 `Container(expand=True, image=DecorationImage(src,
-fit=COVER, opacity=_BACKGROUND_OPACITY))`，`_BACKGROUND_OPACITY = 0.25`。
-**是"图半透明压在主题底色上"，不是"图 + 一层黑纱"**：`DecorationImage` 的 opacity 让它跟
-窗口自己的 scaffold 底色合成，所以浅色面仍是浅底深字、深色面仍是深底浅字，两套主题都不
-用认当前是哪一面。反过来若在上面盖一层固定颜色的压暗层，就得知道系统此刻在亮面还是暗面
-——`theme_mode` 可以是 `SYSTEM`，Python 侧问不到解析结果。`set_background()` 路径没变时
-**什么都不做**（这条线会被每次偏好写入打到，重建整棵根树代价大，还会把当前视图的在途渲染
-一起掀掉）；`rebuild()`（宽/窄窗切换）走 `render()`，所以缩放重建不会把背景弄丢。
-
-**接线在装配根**（`main._wire_background`，红线 §7.5：视图层拿不到服务）：换图的是外观页
-控制器，画那一层的是导航外壳，两者互相不认识，中间这一跳只能由把两边都捏在手里的地方搭
-——`settings.subscribe([BACKGROUND_IMAGE_KEY], …)`，处理器**跑在 EngineHub 守护 loop 上**
-而 `set_background` 要改控件，所以经 `engine_worker.call_on_ui` 编组回界面循环（§5.2 同一条
-契约，老板键的托盘回调走的是同一个口子）。函数**返回首屏路径**给
-`build_app_shell(page, hub, …, background=…)`：外壳创建时就要拿到它，晚一步就得整棵根树
-重建一次。
-
-**外观页不走 pending/保存**：主题三件套是"预览→保存才落库"，换图不是——选完就该看到，
-落偏好即生效。所以"恢复默认"也**不动背景**（把用户刚选的图连带清掉是最容易被当成丢数据的
-意外，状态行明说）。控制器报成败前**自己读回一次**再比：`install` 落了键，但真正铺上去的是
-装配根那一跳订阅，服务没起来/键没写进去时说"已换上"就是假话。视图上标签只写**文件名**
-（`Path(...).name`），不把整条数据目录路径摊给用户看。
-
-护栏：`tests/test_background_image.py`（服务面：拷图归一/清除/换图删旧/不碰目录外/认文件不认
-键；界面面：Stack 层形状与不盖固定色压暗层、同路径不重建、`rebuild()` 后背景还在、装配根
-那一推必须**经编组而不是就地执行**、视图/服务模块零 `app.services.*` 与零 flet 用 AST 扫
-import 钉）+ 变异核验 `.probe/mutate_round74.py`；桌面像素探针
-`.probe/probe_background_paint74.py`（读数见 `docs/dev-logs/2026-10-05.md` 第七十四轮：这一层
-没有 DOM / 语义节点，所以走 `FLET_APP` + `page.take_screenshot` 逐格比图，不是
-WEB_BROWSER 那条语义树路）。
-
-## 6. 存储（三类介质，设计 §6.2 落地态）
-
-| 介质 | 内容 | 位置 |
-| --- | --- | --- |
-| SQLite 主库 `legado.db` | 全部结构化数据，StorageService 独占，schema 版本化（当前 v7） | AppPaths.data（Windows `%LOCALAPPDATA%`，Linux/macOS XDG；可用 `LEGADO_BOOKSOURCE_DATA_DIR` 覆盖） |
-| 文件目录 | `reader-cache/`（章节正文）、`image-cache/`（封面/漫画图）、`downloads/`（导出/下载产物）、`chromium-profile*/`（浏览器登录态）、`backgrounds/`（用户背景图归一后的拷贝，SettingsService 键指的就是这里，见 §5.16） | AppPaths.cache / data；可用 `LEGADO_BOOKSOURCE_CACHE_DIR` 覆盖 |
-| 互操作 JSON / zip | 书源导入导出、WebDAV 备份包——运行时不读写，仅在导入导出/备份恢复时生成与消费 | — |
-
-主库 v7 表清单（`app/storage/schema.py` 为权威）：
-
-- v1：`settings`（键值）、`cookies`（JS 罐持久层，对标 Legado CookieStore）
-- v2：`books`（书元数据 + 连续滚动进度）、`bookmarks`
-- v3：`audit_log`（审计历史）
-- v4：`tts_profiles`、`rss_sources`、`rss_articles`（已读/收藏折叠为行内 0/1 列）、`books.play_position`（秒）
-- v5：`replace_rules`、`dict_rules`、`fonts`、`download_tasks`
-- v6：`book_sources`（json 列存互操作全文）、`bookshelf`（reading/vars/payload JSON）、`search_books`（换源种子，TTL 24h）
-- v7：`books.play_chapter_index`——**播放进度不再占用阅读进度**。v4 起播放位置借用了
-  `chapter_index` 表示"播到第几条"，于是视频书"读到第几章"会跟着播放走；播放列表索引
-  从此单列一列存（`play_position` 留在原处不动）
-- 运行时建：`content_search`（FTS5 虚表，ContentSearchService）
-
-M6 迁移：启动时 `StorageService.migrate()` 从旧 `bookSource.json` / `bookshelf.json` /
-`search-books.sqlite3` / appearance 等**只读导入一次**（幂等标记 `m6.legacy_migrated`），
-导入成功旧文件改名 `.legacy-bak` 保留回退；异常介质不改名、不阻断启动。
-
-## 7. 关键行为对齐（延续旧文档有价值段落）
-
-### 7.1 规则求值三层结构与 Legado 兼容层
-
-parser（语法/选择器工具）→ rule_engine（通用求值管线）→ reading_engine（阅读专用路径）。
-搜索/探索走基类，阅读走子类；`@js:` 规则一律 QuickJS（legado_js），Python 侧不做 JS 解释。
-行为对齐做到行号级（`docs/找书与换源逻辑对齐.md`），守门靠
-`tests/test_legado_compat.py`（2026-09-27 实测 488 条 `def test_`，核心资产零漂移为通过）；
-对拍的判据来自只读参考树 `base_history/`（Legado）与 `other_history/`（jsoup / rhino），
-两者都不参与运行时依赖。⚠ 本节旧版点名的差分工具目录 `tools/legado_diff/` **在当前
-工作树里已经不存在**（整个 `tools/` 连同 jsoup / rhino / charset / legado 四套 oracle
-一起被移除，`HEAD` 里才还看得到），因此当前唯一的机械守门就是上面那个测试文件。
-M1 网络组修复已落地：三档超时 / dnsIp 钉 IP / Cookie 单罐入 SQLite / deflate 解压 /
-连接失败自动重拨 / 每主机并发 5 / 全局 UA 可配 / charset-normalizer 兜底探测。
-
-### 7.2 搜索与换源模型
-
-`SearchModel` 完整移植 Legado 生命周期：searchId 区分新搜索/翻页、页码模型内维护、
-并发上限 32、模型层每源 30s 兜底超时；四桶合并 + origins 聚合。结果落主库
-`search_books`（TTL 24h）。换源"先读本地种子、为空才用户触发联网扫描、候选排序"；
-命中判定用书名包含。notShelf 语义不变（试读 `in_bookshelf=0` 不进书架，退出选否删记录，
-启动清理残留）。
-
-### 7.3 浏览器分级
-
-`{webView:true}` 与 `webJs` 需要真实浏览器：无人值守走内置无头 Chromium（Playwright）；
-需人处理在 Windows/Linux 走 CDP 投屏窗口（屏外停放 + screencast 推帧 + CDP input 回灌），
-macOS/移动走 `ftw.WebView`。统一收编进 `BrowserService`，profile 目录隔离。
-内核缺失时 `available_fetcher()` 返回 None，检测与阅读退回非浏览器路径、不报错。
-
-**投屏会话只以 session id 跨过循环边界**：playwright 的 page / screenshot 对象绑在
-EngineHub 专属循环上，视图层拿到句柄后从界面循环 `await` 一次——**不是抛错，是永久挂死**。
-所以 `BrowserController` 手里只有 `open_page()` 返回的 `sid`，一切动作以协程形式转给服务
-（`navigate_page` / `cast_gesture` / `cast_viewport` / `close_page`），手势名过 `GESTURES`
-白名单；帧字节是唯一递到界面的东西（`on_frame` → 视图 `set_frame`）。装配根
-`main._engine_browser_fetchers(browser)` 把**同一个** `BrowserService` 实例的
-`render_webview` / `verification_fetcher` 绑进 `RuleEngineService`（内核缺失时给
-`(None, None)`），`_wire_browser_page` 提供 page 给投屏面板。护栏：
-`tests/test_browser_render_chain.py`（含装配身份断言：注册实例 == fetcher 的 `__self__`）。
-
-## 8. 历史对照（旧单体 → 新架构映射）
-
-M7 清理线**真正删掉的是旧单体 UI**（`app/app.py`、旧平铺 `app/views/*.py`、
-`app/ui_feedback.py`）和被搬进域包的那批旧平铺服务；其余 **14 个旧平铺
-`app/services/*.py` 全部仍在树内，而且是在跑的基座**——各域外壳经"继承类 / 直接调模块
-函数 / 懒 import"复用它们，删掉任何一个都会打断生产链。三张表分别记这三种命运，
-不要当成一处已经清空。
-
-### 8.1 已删除（旧文件确实不在了）
-
-| 旧（已删除） | 新（当前） |
-| --- | --- |
-| `main.py`（旧）+ `app/app.py` 三页装配 | `main.py`（_build_hub）+ `app/views/navigation.py: build_app_shell / NavigationHost` |
-| `app/ui_feedback.py` / `app/models/appearance_settings.py` | 旧单体那层统一反馈随之移除，面向用户的反馈现在由 Controller 落状态行 / 弹层（见 §5.3、§5.8）；外观偏好改以快照形式存进 `core/settings.py`（见 §5.7） |
-| `app/services/rule_engine.py` / `reading_engine.py` / `legado_rule_parser.py` / `legado_js.py` / `java_regex.py` / `icu_charset.py` / `custom_url.py` / `public_suffix.py` / `query_ttf.py` | **整体搬进** `app/services/engine/`（9 核心资产原位冻结）+ `rule_engine_service.py` 外壳；平铺旧副本已删 |
-| `app/services/engine_worker.py` | `app/core/engine_worker.py`（升级为全服务执行域 Service）；旧垫片已删 |
-| `app/services/book_cache_service.py` | `app/services/reading/book_cache_service.py`；旧副本已删 |
-| `app/services/reading_progress.py` | `app/services/reading/reading_service.py`（进度入 books 表）；旧副本已删 |
-| `app/services/theme_service.py` | `app/services/tools/theme_service.py`（外观偏好并入 SettingsService）+ `app/views/settings/appearance_view.py: build_theme / apply_page_theme`（旧 `apply(page, settings)` 里"页面三件套 + `_make_theme`"那半边的落点，见 §5.7）。⚠ 同一条里被点名的 `app/themes/builtin_themes.py` **没删**，见 §8.2 |
-| `app/views/reading_view.py`（172KB 单体） | `app/views/reading/`（find_books / bookshelf / reader / manga / bookmark_panel / content_search_bar / login_dialog / source_switch_dialog / read_aloud_bar / rss_view） |
-| `app/views/{book_source_view,manage_view,import_view,check_view,rule_repair_ui,settings_view,appearance_view}.py` | `app/views/source/` + `app/views/tools/` 各域视图 + `app/views/settings/appearance_view.py` + `service_dashboard.py` |
-
-### 8.2 仍在用为基座（14 个旧平铺 `app/services/*.py`，均未删除）
-
-这些是**活的依赖**，不是待清的遗留。归属方按 2026-09-27 实测的 import 站点列出。
-
-| 仍在用的旧平铺模块 | 谁在用它（复用方式） |
-| --- | --- |
-| `source_service.py` | **被继承**：`sources/source_service.py:33` 取作 `_LegacySourceService`，`:46` `class SourceService(_LegacySourceService, Service)`——方法体原样复用，壳只加事件与主库读写 |
-| `check_service.py` | **被直接调用**：`sources/source_check_service.py:29` import 模块本体，`:86` 用 `check_service.check_sources`、`:72` 用 `check_service.CHECK_CONCURRENCY`；`main.py:125` 与 `controllers/source/check_controller.py:23` 也引它 |
-| `rule_repair.py` | `sources/rule_repair_service.py:26` import `RepairReport` / `diagnose_content_rule` |
-| `compat_audit.py` | `sources/compat_audit_service.py:24` import 为 `ca`（`SUPPORTED_JAVA_APIS` / `SUPPORTED_OBJECT_APIS` / `SUPPORTED_JSOUP_PSEUDOS` / `scan_missing_java_packages` / `_validate_*` / `_script_blocks`）。规则字段的合法表**不在这里**：`KNOWN_RULE_FIELDS` 已删，改由 `models/book_source.py` 的 `RULE_FIELDS` 逐段判定 |
-| `headless_browser.py` | `tools/browser_service.py:154`（`chromium_installed`）/`:311`（`BROWSER`）/`:321`（`BrowserUnavailable`）懒 import；`check_service.py:13` 亦依赖 |
-| `interactive_browser.py` | `tools/browser_service.py:258`（CDP 投屏会话工厂） |
-| `web_page_renderer.py` | `tools/browser_service.py:337`（`render_webview`：webView / 验证码生产路径）。⚠ **全仓库唯一被授权 `import flet` 的服务层文件**（`:20` flet、`:89` flet_webview），例外与其白名单见 `docs/architecture-rules.md` 红线 1 |
-| `search_model.py` | `reading/reading_service.py:39`（`SearchModel` / `SearchBookStore`，找书与换源链路整体复用） |
-| `reading_cache.py` | `reading/book_cache_service.py:23`、`reading/reading_service.py:38`、`content/local_book_service.py:44`、`sources/source_service.py:124`、`engine/reading_engine.py:518/1710` |
-| `block_pages.py` | `engine/rule_engine.py:32`、`reading/reading_service.py:30`、`sources/source_check_service.py:30`、`rule_repair.py:18`、`web_page_renderer.py:23` |
-| `legado_url.py` | `engine/rule_engine.py:45`、`engine/reading_engine.py:26`、`engine/legado_js.py:853/6417`、`tools/browser_service.py:42`、`controllers/tools/browser_controller.py:25` |
-| `request_compat.py` | `engine/rule_engine.py:50`、`engine/legado_js.py:854/6418`、`legado_url.py:241` |
-| `source_rule.py` | `engine/rule_engine.py:53`、`engine/reading_engine.py:28`、`engine/legado_js.py:3858/6580` |
-| `app_paths.py` | **连基础设施都依赖它**：`core/storage.py:25`（`AppPaths` / `default_app_paths`）+ `tools/font_service.py:125` + 上面各平铺模块 |
-| `app/themes/builtin_themes.py` | 不在 services 平铺里，但同属"M7 没删的数据基座"：`tools/theme_service.py:25` 取 `BUILTIN_SKINS` / `EINK_PALETTE` / `Palette`（纯数据，零 flet） |
-
-反过来说：§8.1 里"搬进域包"的那些旧副本确实是**旧文件已删 + 新位置是唯一实现**；
-本表这 14 个则是**旧文件就是实现本身**，两者不要混。判断某个平铺模块能不能删，
-先 `grep -rn "app\.services\.<名>" app tests main.py`，零引用才算。
-
-### 8.3 形态与行为对照（没有文件删除，纯形状回归）
-
-| 旧 | 新（当前） |
-| --- | --- |
-| `bookSource.json` / `bookshelf.json` / `search-books.sqlite3` / `appearance.json` / cookie .jar | 主库 `legado.db`（M6 一次性只读导入，旧文件 `.legacy-bak`） |
-| 三页导航（书源/阅读/配置）+ 页内 `ft.Tabs`（找书/管理/导入/检测） | 三顶级入口 `NavigationHost` + 组内页签 `SectionView` + ViewRegistry 声明式路由（形状回归旧架构，清单归 NAV_META） |
-| 导入页「选文件 → 预览卡（条数/分组/追加·替换）→ 确认 → 进度条」 | 同一条链回到 `SourceImportView` + `SourceImportController`（预览与模式一度被整块删掉，选完文件直接落库；进度条改了没人下发，见 §5.6） |
-| `service_dashboard.py` 返回 `ft.View(route="/dashboard")` + 在 EngineHub 循环里直改控件 | `DashboardView(ft.Column)` + `DashboardController(BaseController)`（嵌进页签才渲染；事件编组回界面循环 + 2s 心跳，见 §5.2） |
-| 服务子类上的业务动作方法 `stop()` / `resume()`（朗读停 / 播放停 / 继续播放） | `stop_speaking()` / `stop_playback()` / `resume_playback()`（让开基类生命周期保留名，见 §4.4 不变式 1） |
-| 阅读器目录页 `ft.Column`（无底色）叠在正文上 | `ft.Container(bgcolor=SURFACE, content=Column)`（覆盖层必须不透明，见 §5.4） |
-| 旧 `ReadingView` 读到底自动接下一章 + 字号/行距/段距/宽度/缩进/对齐/背景/状态栏 + 「阅读设置」弹层 | `ReaderController._on_reader_scroll` 迟滞追加 + `ReaderView.content_plan`/`render_plan`/`apply_preferences`/`build_settings_dialog`（见 §5.5） |
-| 旧单体一次 `show` 一个页面，重复进入不重建 | `NavigationHost.show()` 对整页目的地幂等 + `open_book` 同书去重（重复重建曾把在途开书摘成 `_view=None`，见 §5.1） |
-| 旧 `ReadingView._chapter_cache` + `PREFETCH_CHAPTER_COUNT=10` + `_content_flight` 在飞去重（视图里自带引擎租约 `_EngineLease`） | 整体上移到 `ReadingService.prefetch_chapters`（内存副本 + 预算 + 同章在飞去重 + shield），引擎仍归 `RuleEngineService` 池管，故不再需要租约（见 §5.5） |
-
-
-## 9. 打包与分发
-
-详见 `docs/M7打包说明.md`（M7 新写）与 `docs/archive/backend-operations-manual.md`（已归档，Python 时代）。摘要：
-
-- 依赖分两份：`requirements.txt` 全平台通用；`requirements-desktop.txt` 追加
-  playwright（桌面内置无头浏览器用）与 `pywin32>=306 ; sys_platform == "win32"`
-  （老板键的托盘图标用，见 §5.15；实测环境是 312，此前只靠 pyttsx3 传递带进来，
-  现在显式声明，免得朗读那条哪天去掉就把托盘一起带走）。pywin32 在
-  `services/tools/win_tray.py` 里是**懒 import**：非 Windows / 没装都只让
-  `is_available()` 返回 False，功能降级，绝不带着 ImportError 往上冒——所以
-  PyInstaller 要打 Windows 包时必须补 `--hidden-import=win32gui`（以及
-  `win32con`/`win32api`），懒 import 它自己扫不出来。
-- PyInstaller 入口 `main.py`；`--add-data` 必须把 `app/resources/publicsuffixes.gz`
-  放到包内 `app/resources/` 下（`public_suffix._DATA` 按 `__file__` 相对定位，冻结包
-  即 `sys._MEIPASS/app/resources/`）；新依赖按服务懒加载，`--hidden-import` 清单见打包说明。
-- 冒烟：`python main.py --smoke-test` 自检动态依赖，构建产物必须 exit 0。
-- Chromium 内核体积过大不入包，目标机缺失时 `python -m playwright install chromium`。
+- **DLL 只认 exe 同目录**（`engine_ffi.dart:254-271`）。禁止把绝对路径写进代码——换机即坏。
+- 数据目录取 `LEGADO_BOOKSOURCE_DATA_DIR`，缺省落 `%LOCALAPPDATA%\LegadoBookSourceCheck`
+  （`register.go:65-69` + `defaultDataDir()` `register.go:30-49`；macOS/Linux 分支在同函数）。
+  这条 env 变量是继承自 Python `app_paths.py` 的既有契约，语料与打包两侧共用。
+
+## 3. Dart 侧分层
+
+| 目录 | 职责 | 代表落点 |
+|---|---|---|
+| `lib/app/` | bootstrap、`router.dart`、`shell.dart`（壳宽窄阈值 720，`shell.dart:17`） | 3 文件 |
+| `lib/core/ffi/` | DLL 加载、跨界字符串（自己 `HeapAlloc`/`HeapFree`，`engine_ffi.dart:81-82`） | `engine_ffi.dart` |
+| `lib/core/rpc/` | 契约基类 `engine_repository.dart:119` + `ffi_engine_adapter.dart` 实装 + 失败模型 `envelope.dart` | — |
+| `lib/core/events/` | 一帧的解码与事件名契约 | `engine_event.dart`、`event_names.dart` |
+| `lib/core/di/` | Riverpod 装配（`flutter_riverpod: ^3.4.3`，`pubspec.yaml:37`） | `providers.dart:16-17`（repository）、`:43-45`（`StreamProvider` 事件流） |
+| `lib/features/<域>/` | 7 域 57 文件，域内 `data / domain / presentation`；notifier 放 `domain/` | — |
+
+**导航**：分组进路由表（3 条：reading / sources / settings，`router.dart:258-278`），组内页签是分组页
+自己的状态、不在路由表里；整页目的地 9 条用根导航器 `context.push` 压在壳之上
+（reader `:284-307`、browser、replaceRules、font、qr、export、webdav、webBridge、tts，`:309-371`）。
+
+**事件**：引擎侧**没有推送**。Dart 每 250 ms 带游标轮询 `engine_poll {'since': cursor}`
+（`ffi_engine_adapter.dart:293`，周期常量 `:323`）。游标按**服务端帧**推进、不按合流条数（`:305`），
+`Initialize` 后归零（`:177`）。同一批里同名的多条在出口收成一条
+（白名单常量 `coalescableEventNames:130`，目前只有 `SourceChangedEvent`；合流函数 `coalesceBatch:134-151`，
+同名留最后一条、位置取首次出现）。⇒ 界面不许假设事件有序或逐条到达。
+
+## 4. Go 侧分层
+
+| 包 | 成员 | 边界 |
+|---|---|---|
+| `core/`（9 文件） | `lifecycle.go`（`Service` 接口 `:52`、`BaseService` `:79`）、`hub.go`、`storage.go`（877 行 SQLite）、`event_bus` / `event_ring` / `events`、`settings.go` | 基础设施，不认识业务 |
+| `internal/services/`（48 文件，18 测） | 23 个在册服务 + `hub.go`（`registerNamed:71`、`StartAll:107`、`StopAll:126`、`StatusReport:139`、拓扑序 `topoOrder:158`）+ `register.go` 装配 | 业务层唯一有状态处 |
+| `internal/engine/`（5 文件） | `rule_engine.go`、`explore.go`、`content_blocks.go` | 规则执行核心 |
+| `pkg/ruleparser/`（10 文件） | CSS / JSONPath / XPath 解析 | 与 Legado 行为对齐的守门对象 |
+| `pkg/jsruntime/`（3 文件） | goja VM 池 `runtime.go:36`、中断看门狗 `:66`、`goja.New()` `:83` | JS 运行时 |
+| `pkg/ffi/`（13 文件，12 测） | `engine.go` 导出面 + 一堆形状/契约护栏 | 唯一对外 ABI |
+| `internal/{httpclient,models,storage}/`、顶层 `models/` | — | **`internal/storage/` 全仓零 import**（`grep legodo_go/internal/storage` = 0 命中），是与 `core/storage.go` 平行的旧 schema，属待清理死码 |
+
+**HTTP 语义**：全局单例 `ClientSession`（`register.go:105` 创建，`hub.go:38` 存，`hub.go:211` 共享）；
+连接池 MaxIdleConns 100 / 每主机 10 / 闲置 90 s（`client.go:26-30`），30 s 超时、≤10 跳重定向（`:35-40`）。
+cookie 罐是**自管的 per-host map**（`client.go:19 baseCookies`；`SetCookieJar:66-70`、`GetCookies:84-88`），
+**没用** `net/http` 的 CookieJar——这保住了与 Legado 一致的域名行为。检测服务每轮另起独立 client
+（`check_service.go:328,381`），不与阅读路径共罐。
+
+**JS**：`@js:` 走 **goja**（`go.mod:11`；调用点 `internal/engine/rule_engine.go:329,413,677`、`explore.go:207`）。
+旧红线那句「只走 QuickJS、不引入新 JS 引擎」已被这一条取代（裁决表 §2 第 1 行）。
+
+## 5. 协议面（唯一 ABI）
+
+- 对外只有 4 个被 Dart 用到的 C 符号：`Initialize`(`engine.go:64`)、`Call`(`:163`)、`Cleanup`(`:97`)、
+  `FreeString`(`:52`)。另有第 5 个 `StatusReport`(`:184`) 已导出，但 `lib/` 内**未发现调用点**。
+- `Call(action, paramsJSON)` → `route(h, actionStr, p)`（`engine.go:164-181`，`route()` 在 `:338-627` 一个 switch）。
+- 动作名两种拼法以**成对 case 标签**实现（例：`:355 case "engine_status", "engine.status":`）；
+  未实现表查键时先折平（`:320` 把点号换下划线并小写）。
+- 覆盖面由仓库自己的提取器钉：`pkg/ffi/route_test.go:141` 断言 `syncCalls==88 / directCalls==1 /
+  len(actions)==89`，提取器现读 Dart 发送面（`:129-136`），另有形状夹具（`:117-119`）。
+  **改发送面必须整表机械重提取，不许手工补条**（历史上 `bookshelf_delete` 就是这样漏掉一整轮的）。
+- 未识别的 action 走 `default` 回 `unimplemented: <action>` 错误信封（`:625-626`）。
+
+## 6. 存储
+
+单一主库 `%LOCALAPPDATA%\LegadoBookSourceCheck/legado.db`（`core/storage.go:40`），
+缓存目录 `stateDir/cache`（`:32`），下载目录 `stateDir/downloads`（`:83`）。建表常量区
+`core/storage.go:162-337`：**15 张基表**（settings / cookies / books / bookmarks / audit_log /
+tts_profiles / rss_sources / rss_articles / replace_rules / dict_rules / fonts / download_tasks /
+book_sources / bookshelf / search_books）+ 7 张迁移期 `*_v2` 重建表（`:423-699`）。
+
+结构化数据一律进主库；JSON 只作互操作 / 备份格式，运行时不读写（红线 8）。
+注意：`cookies` 表建了但 Go 非测试代码**无读写点**，与 `client.go` 的内存罐是两条路——待收口。
+
+## 7. 明写不补的能力边界
+
+`pkg/ffi/engine.go:283-314` 的 `unimplementedActions` 表是**服务端自己承认"没做"**的地方，
+6 族 15 条：`browser_*`（`:284-288`）、`webbridge_*`（`:290-294`）、`webdav_*`（`:296-300`）、
+`read_aloud_*`（`:302-307`，发声改由 Flutter 侧 `flutter_tts` 承担，`pubspec.yaml:44`）、
+`bookshelf_import`（`:309-310`）、`source_audit`（`:312-313`）。二维码只做了生成，
+识别侧显式回 `ErrQRDecodeUnimplemented`（`internal/services/qr_service.go:21,52`）。
+
+界面**不许**为这些格子自造判据或自拼地址——要么补服务端这一格，要么显式回未实现。
+缺口台账与拍板项在 [dart补缺方案.md](file:///D:/WorkSpace/PycharmProjects/legodo_booksource_check/docs/dart补缺方案.md)。
+
+## 8. 两棵 Python 树的角色
+
+| 树 | 角色 | 谁在用它 |
+|---|---|---|
+| `legodo_flet/app/`（152 个 py 文件 / 52,836 行） | 可运行的 Flet UI，**parity 参考实现**，不再演进 | 根 `tests/` 那 80 个 pytest 契约文件（`sys.path.insert(0, FLET)`，如 `test_gateway_contract_single_source.py:31,40`）；`docs/archive/flet时代设计与验收/flet子项目功能清单.md` 的静态盘点 |
+| `legodo_dart/app/`（147 个 py 文件） | Go 端口的**参考来源**（`Dart-FFI-only切换与Go后端补全方案.md` §1.6 的端口清单出处） | 只读；不在其上开发 |
+
+两棵树**包名都叫 `app`**：全局 `pytest.ini` 里加路径会指错，所以那句 `sys.path` 写在各测试文件里。
+
+## 9. 守门口
+
+| 门 | 命令 | 说明 |
+|---|---|---|
+| Go | `go vet ./...` + `go test ./... -count=1` | 10 包，其中 6 包有测试 |
+| 协议面 | `go test ./pkg/ffi -run Route` | 发送面 89 条的钉子 |
+| Dart | `dart analyze` + `flutter test` | `test/` 36 文件；3 条活臂要真 DLL（`LEGODO_ENGINE_DLL`，`engine_ffi.dart:257`） |
+| 出包 | `cd legodo_dart && python build_release.py windows` | 引擎单编：`go build -buildmode=c-shared -o legodo_engine.dll ./pkg/ffi/`（需 `C:\mingw64\bin` 在 PATH 前缀） |
+| Python 遗留 | `python -m pytest -q --basetemp=<新目录>` | 默认 basetemp 有 ACL 拒绝，会整批假红 |
+
+改到 Go 的那步之后：重编 DLL 并同步 `dist/legodo_windows/`，用 `cmp` 核逐字节一致。
+静态全绿不等于真链路通——活臂（真 DLL + 真语料）见 `docs/local-testing-guide.md`。
+
+## 10. 已知观察项（本文写作时当场测得，未排期）
+
+1. `internal/storage/` 全仓零 import——死码。
+2. `StatusReport` 已导出但 Dart 侧无调用点。
+3. SQLite `cookies` 表无消费方，与 `client.go` 的内存罐并行存在。
+4. `flutter test` / `dart analyze` 这两条命令没有成文在任何 README 里，只在开发日志的验收段出现。
+5. 根 `BUILD.md` 旧版整段描述 G2；已重写为指路页（`legodo_dart/README_BUILD.md` 才是构建权威）。

@@ -1,88 +1,38 @@
-# 构建与打包指南
+# 构建与打包
 
-本项目包含两个前端子项目，各自有独立的打包流程。
+**这一页只是路标。** 构建的权威文档是 **[`legodo_dart/README_BUILD.md`](legodo_dart/README_BUILD.md)**，
+本文件不复述它的参数与产物清单（旧版本复述过，结果每次改构建这里都要坏一次——
+它当时写的"Dart 通过 RPC 调用 Python 后端""包含 `backend/` 目录""Dart 仅桌面端"三句全已作废，
+引用的 `legodo_flet/BUILD.md` 与 `legodo_dart/DEPLOYMENT.md` 也从来不存在）。
 
----
+## 现状一句话
 
-## Flet 子项目（Python 桌面端 + Android）
-
-**入口脚本**：`legodo_flet/build_release.py`
-
-```bash
-cd legodo_flet
-
-# Windows 单文件 exe（默认，体积小适合分发）
-python build_release.py windows
-
-# Windows 目录版（启动快，适合开发测试）
-python build_release.py windows --onedir
-
-# macOS / Linux
-python build_release.py macos
-python build_release.py linux
-
-# Android APK（可直接安装）
-python build_release.py apk
-
-# Android AAB（Google Play 上传）
-python build_release.py aab
-```
-
-产物位置：
-- Windows: `legodo_flet/legodo_flet_windows.zip`
-- macOS: `legodo_flet/legodo_flet_macos.tar.gz`
-- Linux: `legodo_flet/legodo_flet_linux.tar.gz`
-- Android APK: `legodo_flet/app.apk`
-- Android AAB: `legodo_flet/app.aab`
-
-**架构说明**：Flet 是纯 Python 项目，UI 和后端在同一个进程（ServiceHub）。桌面端使用 `flet pack` 打包为独立可执行文件；Android 使用 `flet build apk/aab` 通过 Flutter 工具链编译。
-
-详见 `legodo_flet/BUILD.md`。
-
----
-
-## Dart/Flutter 子项目（多平台）
-
-**入口脚本**：`legodo_dart/build_release.py`
+主线是**单进程 FFI**：`legodo_client.exe`（Flutter AOT）用 `dart:ffi` 加载同目录的
+`legodo_engine.dll`（Go `c-shared` 规则引擎）。构建链**不涉及** Python 后端、PyInstaller、
+Enigma Virtual Box，也没有服务进程和网络端口。
 
 ```bash
 cd legodo_dart
-
-# Windows 标准版（目录，包含 exe + DLLs + backend/）
-python build_release.py windows
-
-# macOS / Linux
-python build_release.py macos
-python build_release.py linux
-
-# Android APK
-python build_release.py apk
+python build_release.py windows        # 产物 dist/legodo_windows/ 与 legodo_windows.zip
 ```
 
-产物位置：
-- 桌面版：`legodo_dart/build/windows/x64/runner/Release/`
-- Android：`legodo_dart/build/app/outputs/flutter-apk/app-release.apk`
+单独重编引擎：`cd legodo_dart/backend_go && go build -buildmode=c-shared -o legodo_engine.dll ./pkg/ffi/`
+（Windows 需要 `C:\mingw64\bin` 排在 PATH 前面，否则 `go build` 只报 `exit status 2` 而不吐编译错误）。
+其他目标：`android`（Go 编 `.so` + `flutter build apk`）、`linux`、`macos`。
+参数表、产物校验清单、PDB 剔除之类的内容都在 `README_BUILD.md`。
 
-**架构说明**：Dart 前端通过 RPC 调用 Python 后端。Windows 打包为标准目录版（包含 exe、DLLs 和 backend/ 目录）。如需制作安装包，可使用 Inno Setup 或 NSIS（后续实现）。
+## 已废弃的打包路线（别再照这些找）
 
-详见 `legodo_dart/DEPLOYMENT.md`。
+| 路线 | 结论 | 原始记录 |
+|---|---|---|
+| Flutter exe + PyInstaller `backend/LegadoReader.exe` 子进程 | 双进程 WS/RPC 链已从双侧拆除（`db778cd`） | `docs/archive/双进程与单exe记录/`（整簇） |
+| Go 独立服务 + WebSocket `:8080/rpc` | 同上 | 同上 |
+| Enigma Virtual Box 把 FFI 多文件合单 exe | 已从构建链移除 | `docs/archive/双进程与单exe记录/single-exe-changelog.md` |
+| Chaquopy 把 Python 打进 Android APK | Chaquopy 12.0.0（2022）停更，与 AGP 8.x 不兼容 | `docs/archive/平台与打包评估/Android后端打包可行性评估.md` |
+| `flet build apk/aab` 出 Android 包 | 试过，放弃 | `docs/archive/flet界面优化20261011/flet架构恢复方案.md` |
 
----
+## `legodo_flet/` 那一侧
 
-## 架构说明
-
-两个子项目共享同一套 Python 后端引擎（LegadoReader），但前端技术栈不同：
-
-| 特性 | Flet | Dart/Flutter |
-|------|------|--------------|
-| 前端语言 | Python | Dart |
-| 后端集成 | 同进程 ServiceHub | 子进程 RPC |
-| 打包方式 | flet pack（桌面）/ flet build（Android） | Flutter build + PyInstaller |
-| 适用平台 | 桌面端（Windows/macOS/Linux）+ Android | 仅桌面端（Windows/Linux/macOS） |
-
-**关键区别**：Flet 基于 Python，可通过 `flet build apk/aab` 打包为 Android 应用（Python 代码由 Flutter 工具链编译）。Dart/Flutter 版本因后端依赖限制，目前仅支持桌面端。
-
-选择建议：
-- **纯桌面场景**：两者均可，Dart/Flutter UI 更流畅
-- **需要移动端**：选 Flet（Python 原生支持 Android 打包）
-- **快速原型**：Flet（纯 Python，无需 Dart 工具链）
+`legodo_flet/build_release.py`（基于 `flet pack`）**仍在树内**，但那是参考实现的打包线：
+flet 子项目现在只作功能 parity 参照、不再演进。**本轮没有跑过它**，不保证可用；
+要用之前先读 `docs/文档总览.md` §2 的裁决表与 `docs/current-system-design.md` §8。
